@@ -1587,8 +1587,12 @@ def _write_dump_worker(path: Path) -> None:
     path.chmod(0o755)
 
 
-@pytest.mark.slow
-def test_suspend_resume_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def _wire_epoch_setup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    fork_pin: bool,
+) -> tuple[Path, Path, Path, dict[str, Any], str | None]:
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
     base = _make_repo(repo, {"a.txt": "file a\n", "b.txt": "file b\n"})
@@ -1603,6 +1607,18 @@ def test_suspend_resume_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     monkeypatch.setenv("CONTEXT_DUMP_PATH", str(context_dump))
     monkeypatch.setenv("CHILD_DUMP_PATH", str(child_dump))
 
+    child_options: dict[str, Any] = {}
+    tools_sha: str | None = None
+    if fork_pin:
+        tools_sha = worker._provider_task_tools_hash()
+        monkeypatch.setenv("FAKE_TOOLS_SHA", tools_sha)
+        monkeypatch.setenv("FAKE_EPOCH_PROVIDER", "fake-provider")
+        monkeypatch.setenv("FAKE_EPOCH_MODEL", "fake-model")
+        child_options = {
+            "authorized_providers": ["fake-provider"],
+            "fanout_config": {"model": "fake-model"},
+        }
+
     child = _task(
         session_dir,
         repo,
@@ -1614,6 +1630,7 @@ def test_suspend_resume_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPat
         marker="// child-marker",
         worker_path=str(dump_worker),
         provider_env_keys=["FAKE_MODE", "CHILD_DUMP_PATH"],
+        **child_options,
     )
     root = _task(
         session_dir,
@@ -1637,6 +1654,14 @@ def test_suspend_resume_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPat
             "FAKE_MESSAGES_SHA",
         ],
         proposed_children=[_child_proposal(child)],
+    )
+    return session_dir, context_dump, child_dump, root, tools_sha
+
+
+@pytest.mark.slow
+def test_suspend_resume_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    session_dir, context_dump, _child_dump, root, _tools_sha = _wire_epoch_setup(
+        tmp_path, monkeypatch, fork_pin=False
     )
 
     result = asyncio.run(run_plan(session_dir, {"tasks": [root]}, context_reuse=True))
@@ -1671,60 +1696,8 @@ def test_suspend_resume_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 
 @pytest.mark.slow
 def test_fork_pin_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    session_dir = tmp_path / "session"
-    repo = session_dir / "repo"
-    base = _make_repo(repo, {"a.txt": "file a\n", "b.txt": "file b\n"})
-
-    suspend_worker = tmp_path / "suspend_worker.py"
-    dump_worker = tmp_path / "dump_worker.py"
-    _write_suspend_worker(suspend_worker)
-    _write_dump_worker(dump_worker)
-
-    context_dump = tmp_path / "parent-inits.jsonl"
-    child_dump = tmp_path / "child-init.json"
-    monkeypatch.setenv("CONTEXT_DUMP_PATH", str(context_dump))
-    monkeypatch.setenv("CHILD_DUMP_PATH", str(child_dump))
-    tools_sha = worker._provider_task_tools_hash()
-    monkeypatch.setenv("FAKE_TOOLS_SHA", tools_sha)
-    monkeypatch.setenv("FAKE_EPOCH_PROVIDER", "fake-provider")
-    monkeypatch.setenv("FAKE_EPOCH_MODEL", "fake-model")
-
-    child = _task(
-        session_dir,
-        repo,
-        base,
-        "c1",
-        worktree="wt-c1",
-        branch="wt-c1",
-        target_file="b.txt",
-        marker="// child-marker",
-        worker_path=str(dump_worker),
-        provider_env_keys=["FAKE_MODE", "CHILD_DUMP_PATH"],
-        authorized_providers=["fake-provider"],
-        fanout_config={"model": "fake-model"},
-    )
-    root = _task(
-        session_dir,
-        repo,
-        base,
-        "t-root",
-        worktree="wt-root",
-        branch="wt-root",
-        target_file="a.txt",
-        marker="// parent-marker",
-        worker_path=str(suspend_worker),
-        provider_env_keys=[
-            "FAKE_MODE",
-            "CONTEXT_DUMP_PATH",
-            "CHILD_DUMP_PATH",
-            "FAKE_CHECKPOINT_REF",
-            "FAKE_EPOCH_PROVIDER",
-            "FAKE_EPOCH_MODEL",
-            "FAKE_TOOLS_SHA",
-            "FAKE_SYSTEM_SHA",
-            "FAKE_MESSAGES_SHA",
-        ],
-        proposed_children=[_child_proposal(child)],
+    session_dir, _context_dump, child_dump, root, tools_sha = _wire_epoch_setup(
+        tmp_path, monkeypatch, fork_pin=True
     )
 
     result = asyncio.run(run_plan(session_dir, {"tasks": [root]}, context_reuse=True))
