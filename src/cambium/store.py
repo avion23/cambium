@@ -198,6 +198,37 @@ def read_events_file(
     return [event for event in events if event["seq"] > after_seq]
 
 
+def count_events_file(
+    db_path: Path | str,
+    *,
+    busy_timeout_ms: int = _READER_BUSY_TIMEOUT_MS,
+) -> int:
+    """Return a store's row count without materializing its events."""
+    path = Path(db_path)
+    try:
+        path_stat = path.lstat()
+    except FileNotFoundError:
+        return 0
+    except OSError as exc:
+        raise StoreError(f"cannot inspect event store {path}: {exc}") from exc
+    if stat.S_ISLNK(path_stat.st_mode):
+        raise StoreError(f"event store path must not be a symlink: {path}")
+    if not stat.S_ISREG(path_stat.st_mode):
+        return 0
+    try:
+        with path.open("rb") as handle:
+            if handle.read(len(_SQLITE_HEADER)) != _SQLITE_HEADER:
+                return 0
+        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+            return int(conn.execute("SELECT COUNT(*) FROM events").fetchone()[0])
+        finally:
+            conn.close()
+    except (OSError, sqlite3.Error) as exc:
+        raise _event_store_error(path, str(exc)) from exc
+
+
 def _make_private_dir(path: Path) -> None:
     """Ensure a session-owned directory is not readable by other local users."""
     try:

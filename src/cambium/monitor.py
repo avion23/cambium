@@ -25,7 +25,7 @@ from .observability import (
     SessionSnapshot,
 )
 from .store import StoreError
-from .supervisor import read_events
+from .supervisor import EventCursor, read_events_with_cursor
 from .terminal import sanitize_terminal_text
 
 _ALT_ENTER = "\x1b[?1049h\x1b[?25l"
@@ -431,11 +431,12 @@ async def monitor_session_async(
     session = resolve_session(session_dir)
     out = sys.stdout if output_stream is None else output_stream
     state = ObservabilityState()
+    event_cursor = EventCursor()
     dashboard = AnsiDashboard(session, stream=out, enabled=not once and not json_output)
     try:
         with dashboard:
             while True:
-                events = read_events(session, after_seq=state.last_seq)
+                events, event_cursor = read_events_with_cursor(session, event_cursor)
                 state.extend(events)
                 snapshot = state.snapshot(session_dir=session)
                 if json_output:

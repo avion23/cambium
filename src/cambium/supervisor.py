@@ -127,7 +127,13 @@ from .routing import (
     resolve_assignment,
     validate_requirements,
 )
-from .store import CRITICAL_KINDS, EventStore, StoreError, read_events_file
+from .store import (
+    CRITICAL_KINDS,
+    EventStore,
+    StoreError,
+    count_events_file,
+    read_events_file,
+)
 from .tasktree import (
     _ENVELOPE_KEYS,
     MAX_WIDTH,
@@ -1472,35 +1478,75 @@ def _interactive_event_timestamp(event: Mapping[str, Any]) -> float | None:
 _INTERACTIVE_READ_BUSY_TIMEOUT_MS = 200
 
 
-def _read_interactive_events(session_dir: Path, after_seq: int) -> list[dict[str, Any]]:
-    """Replay immutable turn stores as one logical session event stream.
+@dataclass(frozen=True, slots=True)
+class EventCursor:
+    """Monotonic interactive replay state.
 
-    InteractiveSession deliberately gives every prompt its own supervisor
-    leaf, so each ``turn-NNNN`` has a local sequence space.  Option (b) keeps
-    those stores immutable and treats the parent ``events.db`` URI used by
-    archived results as the logical session log: turn number and local ``seq``
-    provide stable ordering, with ``ts`` breaking local ties.  The returned
-    sequence is renumbered only at this read boundary so monitor polling can
-    use one ``after_seq`` cursor without rewriting history.
+    ``watermark`` is the number of events delivered through this cursor;
+    ``positions`` stores each source store's last delivered local ``seq``.
+    Sorting is only applied to newly read rows, so a late event with a lower
+    turn/payload sort key is delivered after the existing watermark instead of
+    being hidden behind it.  The legacy integer ``read_events`` API remains
+    available; monitors use this explicit cursor because one integer cannot
+    represent independent per-store positions.
     """
-    turn_stores = _interactive_turn_event_stores(session_dir)
-    if not turn_stores:
-        return read_events_file(session_dir / ".cambium" / "events.db", after_seq)
 
+    watermark: int = 0
+    positions: tuple[tuple[str, int], ...] = ()
+
+    def position(self, store_key: str) -> int:
+        for key, sequence in self.positions:
+            if key == store_key:
+                return sequence
+        return 0
+
+
+def _cursor_positions(cursor: EventCursor) -> dict[str, int]:
+    if type(cursor.watermark) is not int or cursor.watermark < 0:
+        raise ValueError("event cursor watermark must be a non-negative integer")
+    positions: dict[str, int] = {}
+    for key, sequence in cursor.positions:
+        if not isinstance(key, str) or not key:
+            raise ValueError("event cursor store key must be a non-empty string")
+        if type(sequence) is not int or sequence < 0:
+            raise ValueError("event cursor position must be a non-negative integer")
+        positions[key] = sequence
+    return positions
+
+
+def _interactive_store_key(turn: int) -> str:
+    return f"turn:{turn}"
+
+
+def _transient_event_store_lock(exc: StoreError) -> bool:
+    cause = exc.__cause__
+    return isinstance(cause, sqlite3.Error) and any(
+        marker in str(cause).lower() for marker in ("locked", "busy")
+    )
+
+
+def _read_interactive_events_with_cursor(
+    session_dir: Path, cursor: EventCursor
+) -> tuple[list[dict[str, Any]], EventCursor]:
+    """Read only rows beyond each source's cursor and append a new watermark."""
+    positions = _cursor_positions(cursor)
+    next_positions = dict(positions)
+    turn_stores = _interactive_turn_event_stores(session_dir)
     records: list[tuple[int, int, float | None, int, dict[str, Any]]] = []
     for turn, event_db in turn_stores:
+        store_key = _interactive_store_key(turn)
         try:
             events = read_events_file(
                 event_db,
+                positions.get(store_key, 0),
                 busy_timeout_ms=_INTERACTIVE_READ_BUSY_TIMEOUT_MS,
             )
         except StoreError as exc:
-            cause = exc.__cause__
-            if not isinstance(cause, sqlite3.Error) or not any(
-                marker in str(cause).lower() for marker in ("locked", "busy")
-            ):
-                raise
-            continue
+            if _transient_event_store_lock(exc):
+                continue
+            raise
+        if events:
+            next_positions[store_key] = max(event["seq"] for event in events)
         for event in events:
             records.append(
                 (
@@ -1512,13 +1558,24 @@ def _read_interactive_events(session_dir: Path, after_seq: int) -> list[dict[str
                 )
             )
 
-    # ``/compact`` is the one legacy path that can write the parent store;
-    # retain those records after the turn leaves rather than dropping them.
     root_event_db = session_dir / ".cambium" / "events.db"
-    for event in read_events_file(root_event_db):
+    try:
+        root_events = read_events_file(
+            root_event_db,
+            positions.get("root", 0),
+            busy_timeout_ms=_INTERACTIVE_READ_BUSY_TIMEOUT_MS,
+        )
+    except StoreError as exc:
+        if not _transient_event_store_lock(exc):
+            raise
+        root_events = []
+    if root_events:
+        next_positions["root"] = max(event["seq"] for event in root_events)
+    fallback_turn = turn_stores[-1][0] + 1 if turn_stores else 0
+    for event in root_events:
         payload = event.get("payload")
         event_turn = payload.get("turn") if isinstance(payload, Mapping) else None
-        turn = event_turn if type(event_turn) is int and event_turn >= 0 else turn_stores[-1][0] + 1
+        turn = event_turn if type(event_turn) is int and event_turn >= 0 else fallback_turn
         records.append(
             (
                 turn,
@@ -1528,6 +1585,7 @@ def _read_interactive_events(session_dir: Path, after_seq: int) -> list[dict[str
                 event,
             )
         )
+
     records.sort(
         key=lambda item: (
             item[0],
@@ -1538,15 +1596,128 @@ def _read_interactive_events(session_dir: Path, after_seq: int) -> list[dict[str
         )
     )
     merged: list[dict[str, Any]] = []
+    for offset, (_turn, _local_seq, _timestamp, _source, event) in enumerate(records, 1):
+        normalized = dict(event)
+        normalized["seq"] = cursor.watermark + offset
+        merged.append(normalized)
+    next_cursor = EventCursor(
+        watermark=cursor.watermark + len(merged),
+        positions=tuple(sorted(next_positions.items())),
+    )
+    return merged, next_cursor
+
+
+def read_events_with_cursor(
+    session_dir: Path | str, cursor: EventCursor | None = None
+) -> tuple[list[dict[str, Any]], EventCursor]:
+    """Replay an interactive session with a per-store monotonic cursor."""
+    if cursor is None:
+        cursor = EventCursor()
+    if not isinstance(cursor, EventCursor):
+        raise TypeError("cursor must be an EventCursor")
+    return _read_interactive_events_with_cursor(Path(session_dir), cursor)
+
+
+def _read_interactive_events(session_dir: Path, after_seq: int) -> list[dict[str, Any]]:
+    """Replay the legacy integer-watermark view of interactive turn stores.
+
+    New monitor polling uses :func:`read_events_with_cursor`.  For this
+    compatibility API, turn stores without parent records can still push the
+    integer watermark into SQL by subtracting each earlier store's row count;
+    late inserts require the explicit cursor because an integer has no room for
+    one local position per store.
+    """
+    turn_stores = _interactive_turn_event_stores(session_dir)
+    if not turn_stores:
+        return read_events_file(session_dir / ".cambium" / "events.db", after_seq)
+
+    root_event_db = session_dir / ".cambium" / "events.db"
+    root_events = read_events_file(root_event_db)
+    if root_events:
+        # ``/compact`` is the one legacy path that can write the parent store;
+        # retain its historical ordering and filtering semantics.
+        records: list[tuple[int, int, float | None, int, dict[str, Any]]] = []
+        for turn, event_db in turn_stores:
+            try:
+                events = read_events_file(
+                    event_db,
+                    busy_timeout_ms=_INTERACTIVE_READ_BUSY_TIMEOUT_MS,
+                )
+            except StoreError as exc:
+                if not _transient_event_store_lock(exc):
+                    raise
+                continue
+            for event in events:
+                records.append((turn, event["seq"], _interactive_event_timestamp(event), 0, event))
+        fallback_turn = turn_stores[-1][0] + 1
+        for event in root_events:
+            payload = event.get("payload")
+            event_turn = payload.get("turn") if isinstance(payload, Mapping) else None
+            turn = event_turn if type(event_turn) is int and event_turn >= 0 else fallback_turn
+            records.append((turn, event["seq"], _interactive_event_timestamp(event), 1, event))
+        records.sort(
+            key=lambda item: (
+                item[0],
+                item[1],
+                item[2] is None,
+                item[2] if item[2] is not None else 0.0,
+                item[3],
+            )
+        )
+    else:
+        records = []
+        remaining = max(after_seq, 0)
+        for turn, event_db in turn_stores:
+            try:
+                store_count = count_events_file(
+                    event_db,
+                    busy_timeout_ms=_INTERACTIVE_READ_BUSY_TIMEOUT_MS,
+                )
+                local_after = min(remaining, store_count)
+                events = read_events_file(
+                    event_db,
+                    local_after,
+                    busy_timeout_ms=_INTERACTIVE_READ_BUSY_TIMEOUT_MS,
+                )
+            except StoreError as exc:
+                if not _transient_event_store_lock(exc):
+                    raise
+                continue
+            remaining = max(remaining - store_count, 0)
+            records.extend(
+                (turn, event["seq"], _interactive_event_timestamp(event), 0, event)
+                for event in events
+            )
+
+    records.sort(
+        key=lambda item: (
+            item[0],
+            item[1],
+            item[2] is None,
+            item[2] if item[2] is not None else 0.0,
+            item[3],
+        )
+    )
+    merged: list[dict[str, Any]] = []
+    sequence_base = 0 if root_events else max(after_seq, 0)
     for sequence, (_turn, _local_seq, _timestamp, _source, event) in enumerate(records, 1):
         normalized = dict(event)
-        normalized["seq"] = sequence
+        normalized["seq"] = sequence_base + sequence
         merged.append(normalized)
     return [event for event in merged if event["seq"] > after_seq]
 
 
-def read_events(session_dir: Path | str, after_seq: int = 0) -> list[dict[str, Any]]:
-    """Replay a session's durable event log from ``after_seq`` (arch §6.3)."""
+def read_events(
+    session_dir: Path | str, after_seq: int | EventCursor = 0
+) -> list[dict[str, Any]]:
+    """Replay durable events; use :class:`EventCursor` for interactive polling.
+
+    Passing an ``int`` preserves the historical public replay contract.
+    Passing an ``EventCursor`` reads only rows newer than each store's local
+    cursor; :func:`read_events_with_cursor` also returns the updated cursor.
+    """
+    if isinstance(after_seq, EventCursor):
+        return read_events_with_cursor(session_dir, after_seq)[0]
     return _read_interactive_events(Path(session_dir), after_seq)
 
 

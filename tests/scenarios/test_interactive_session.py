@@ -16,7 +16,13 @@ from cambium.interactive import InteractiveSession, InteractiveSessionError
 from cambium.monitor import monitor_session
 from cambium.oneshot import OneShotConfig, default_session_root
 from cambium.store import EventStore
-from cambium.supervisor import PlanResult, TaskResult, read_events
+from cambium.supervisor import (
+    EventCursor,
+    PlanResult,
+    TaskResult,
+    read_events,
+    read_events_with_cursor,
+)
 from cambium.tui_screen import Transcript
 
 
@@ -224,6 +230,39 @@ def test_interactive_read_events_merges_turn_stores(tmp_path: Path) -> None:
     ]
     assert [event["seq"] for event in events] == [1, 2, 3]
     assert [event["kind"] for event in read_events(root, after_seq=2)] == ["result"]
+
+
+def test_interactive_cursor_delivers_late_events_from_each_store(tmp_path: Path) -> None:
+    root = tmp_path / "interactive"
+    (root / ".cambium").mkdir(parents=True)
+    (root / ".cambium" / "events.db").touch()
+    stores: dict[int, EventStore] = {}
+    for turn, kind in ((1, "t1"), (2, "t2"), (3, "t3")):
+        event_db = root / f"turn-{turn:04d}" / ".cambium" / "events.db"
+        event_db.parent.mkdir(parents=True)
+        stores[turn] = EventStore(event_db, fsync_interval_s=60.0)
+        stores[turn].append({"kind": kind, "payload": {}})
+        stores[turn].close()
+
+    first, cursor = read_events_with_cursor(root)
+    assert isinstance(cursor, EventCursor)
+    assert [event["kind"] for event in first] == ["t1", "t2", "t3"]
+    assert [event["seq"] for event in first] == [1, 2, 3]
+    assert cursor.watermark == 3
+
+    for turn, kind in ((1, "compact"), (2, "late-t2")):
+        event_db = root / f"turn-{turn:04d}" / ".cambium" / "events.db"
+        store = EventStore(event_db, fsync_interval_s=60.0)
+        try:
+            store.append({"kind": kind, "payload": {}})
+        finally:
+            store.close()
+
+    late, cursor = read_events_with_cursor(root, cursor)
+    assert [event["kind"] for event in late] == ["compact", "late-t2"]
+    assert [event["seq"] for event in late] == [4, 5]
+    assert cursor.watermark == 5
+    assert read_events(root, after_seq=cursor) == []
 
 
 def test_interactive_read_events_skips_symlinked_turn_store(tmp_path: Path) -> None:
