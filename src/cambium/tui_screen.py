@@ -234,7 +234,8 @@ def _color_enabled(stream: Any) -> bool:
 
 
 def _paint(text: str, color: str, enabled: bool) -> str:
-    return f"{color}{text}{_RESET}" if enabled else text
+    clean = _sanitize(text)
+    return f"{color}{clean}{_RESET}" if enabled else clean
 
 
 def _event_data(record: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -1089,6 +1090,7 @@ class ActivityState:
         )
         if tool is not None:
             tool_name, tool_started_at = tool
+            tool_name = _sanitize(tool_name)
             tool_elapsed = max(0.0, current - tool_started_at)
             label = f"running {tool_name} {tool_elapsed:.1f}s · turn {turn_elapsed:.1f}s"
         elif self._responding:
@@ -1193,7 +1195,8 @@ def _entry_lines(
                 else entry.role
             )
             rendered.append((role, body_prefix + line))
-    rendered.append((entry.role, ""))
+    if entry.role != "system":
+        rendered.append((entry.role, ""))
     return rendered
 
 
@@ -1814,7 +1817,7 @@ def _status_fields(
         fields["epoch"] = str(getattr(context, "epoch", 0))
         checkpoint = getattr(context, "checkpoint_ref", None)
         if isinstance(checkpoint, str) and checkpoint:
-            fields["checkpoint"] = checkpoint
+            fields.setdefault("checkpoint", _sanitize(checkpoint))
     fields.setdefault("tokens", _human_count(_usage_int(getattr(snapshot, "total_tokens", 0))))
     rate = _usage_float(getattr(snapshot, "output_tokens_per_s", 0.0))
     fields.setdefault("out/s", f"{rate:.1f}")
@@ -1953,7 +1956,7 @@ def _status_rows(
     ]
     if len(" · ".join(identity)) > width:
         identity = [
-            f"{provider}/{model}",
+            f"provider={provider} model={model}",
             f"t={turn}",
             f"b={branch}/g={generation}",
             f"e={epoch}",

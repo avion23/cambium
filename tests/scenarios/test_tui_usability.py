@@ -112,7 +112,8 @@ def test_tui_operator_commands_render_without_provider_calls(tmp_path: Path) -> 
     assert "branches: none" in text
     assert "cannot fork: no successful checkpoint" in text
     assert "compact: no successful checkpoint" in text
-    assert "provider=auto model=auto" in text
+    assert "provider=auto" in text
+    assert "model=auto" in text
     assert "press Ctrl-C while a turn is running" in text
     assert "┌ Cambium" in text
 
