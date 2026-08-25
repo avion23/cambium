@@ -819,9 +819,8 @@ def test_failed_turn_is_one_consolidated_block_with_preceding_context() -> None:
     assert "cause=max_restarts (0): wall" in failures[0].text
     assert "↳ run_shell: failed" in failures[0].text
     assert "↳ timeout: wall" in failures[0].text
-    assert [entry.text for entry in transcript.entries if entry.role == "assistant"] == [
-        "plan=failed"
-    ]
+    assert [entry.text for entry in transcript.entries if entry.role == "assistant"] == []
+    assert "plan=failed" not in "\n".join(entry.text for entry in transcript.entries)
 
 
 def test_repeated_failure_events_do_not_duplicate_the_block_or_cause() -> None:

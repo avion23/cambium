@@ -825,8 +825,8 @@ class Transcript:
             task_id, cause = summary_failure
             self._record_failure(task_id, None, cause)
             # The detailed task/cause/context is already in the red failure
-            # block. Keep the model footer useful without repeating it.
-            final = "plan=failed"
+            # block. Never render the worker's failure summary as model text.
+            return
         if not final:
             if current and role is not None:
                 self.add(role, current)
