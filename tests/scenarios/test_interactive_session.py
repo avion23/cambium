@@ -703,6 +703,7 @@ def test_hostile_manifest_turn_is_rejected_without_sequential_probe(tmp_path: Pa
 
     with pytest.raises(InteractiveSessionError, match="implausibly ahead"):
         InteractiveSession(OneShotConfig(repo=tmp_path, session_root=root))
+    assert InteractiveSession.latest_for_repo(tmp_path) is None
 
 
 def test_stale_interactive_lock_is_detected_and_reclaimed(tmp_path: Path) -> None:

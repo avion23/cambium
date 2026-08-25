@@ -518,7 +518,15 @@ class InteractiveSession:
         if document.get("repo") != str(repo):
             return False
         turn = document.get("turn")
-        return type(turn) is int and turn >= 1 and cls._has_durable_state(root)
+        max_listed_turn = max(
+            (number for number, _turn_dir in cls._listed_turn_dirs(root)),
+            default=0,
+        )
+        return (
+            type(turn) is int
+            and 1 <= turn <= max_listed_turn + _MANIFEST_TURN_MARGIN
+            and cls._has_durable_state(root)
+        )
 
     @staticmethod
     def _has_durable_state(root: Path) -> bool:
