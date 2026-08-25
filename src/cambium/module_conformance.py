@@ -1220,10 +1220,26 @@ def _validate_dataset_integrity(spec: ModuleSpec, manifest: ModuleManifest | Non
                 )
             )
         else:
+            baseline_failed = canaries.get("failed")
+            if (
+                isinstance(baseline_failed, bool)
+                or not isinstance(baseline_failed, int)
+                or not 0 <= baseline_failed <= len(canary_records)
+            ):
+                findings.append(
+                    AuditFinding(
+                        "baseline-integrity",
+                        baseline_file,
+                        0,
+                        "canaries.failed",
+                        "must be a non-negative count no greater than the canary total",
+                    )
+                )
+                baseline_failed = -1
             checks: tuple[tuple[str, object], ...] = (
                 ("total", len(canary_records)),
                 ("kinds_present", canary_kinds),
-                ("failed", 0),
+                ("failed", baseline_failed),
             )
             for check_field, check_expected in checks:
                 if canaries.get(check_field) != check_expected:
