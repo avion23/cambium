@@ -52,6 +52,14 @@ dependencies. Install the published/runtime package with:
 python -m pip install .
 ```
 
+The interactive TUI uses Rich for Markdown rendering when the optional `tui`
+extra is installed. Without it, the built-in fallback renderer remains
+supported:
+
+```bash
+python -m pip install '.[tui]'
+```
+
 For local development and tests, install the optional `test` extra. Quote the
 requirement so shells do not expand the brackets:
 

@@ -27,11 +27,17 @@ from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, TextIO
 
 from .provider_scheduler import QuotaLedger
 from .terminal import sanitize_terminal_text
+
+try:
+    import readline as _readline
+except ImportError:  # pragma: no cover - platform dependent
+    _readline = None
 
 _RESET = "\x1b[0m"
 _DIM = "\x1b[2m"
@@ -168,6 +174,7 @@ _FAILURE_EVENT_KINDS = frozenset(
 )
 _FAILURE_STATUSES = frozenset({"error", "failed", "timeout"})
 _TOOL_ERROR_PREFIX = "tool errors:"
+_LIVE_DRAW_INTERVAL = 0.1
 
 _SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 _FIRST_TOKEN_KINDS = frozenset(
@@ -1427,7 +1434,7 @@ def _md_rule(width: int, closing: bool, color: bool) -> str:
     return _md_style("  " + glyph + "─" * max(3, width - 4), _MD_RULE, color)
 
 
-def render_markdown_lines(
+def _render_markdown_lines_fallback(
     text: str,
     width: int = 80,
     *,
@@ -1504,8 +1511,7 @@ def render_markdown_lines(
             ):
                 hanging = prefix if index == 0 else " " * _display_width(prefix)
                 output.append(
-                    _md_style(hanging, _MD_RULE, color)
-                    + _render_inline_markdown(part, color)
+                    _md_style(hanging, _MD_RULE, color) + _render_inline_markdown(part, color)
                 )
             continue
 
@@ -1522,6 +1528,231 @@ def render_markdown_lines(
     while output and output[-1] == "":
         output.pop()
     return output
+
+
+_MD_TABLE_DELIMITER_RE = re.compile(r"^:?-{3,}:?$")
+
+
+def _markdown_table_cells(line: str) -> tuple[str, ...] | None:
+    stripped = line.strip()
+    if stripped.count("|") < 2 or not (stripped.startswith("|") or stripped.endswith("|")):
+        return None
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    return tuple(cell.strip() for cell in stripped.split("|"))
+
+
+def _narrow_table_ranges(text: str, width: int) -> list[tuple[int, int]]:
+    """Find tables whose natural Rich width would silently clip cells."""
+    lines = text.splitlines()
+    ranges: list[tuple[int, int]] = []
+    in_fence = False
+    index = 0
+    while index + 1 < len(lines):
+        if _MD_FENCE_RE.match(lines[index]) is not None:
+            in_fence = not in_fence
+            index += 1
+            continue
+        if in_fence:
+            index += 1
+            continue
+        header = _markdown_table_cells(lines[index])
+        delimiter = _markdown_table_cells(lines[index + 1])
+        if (
+            header is None
+            or delimiter is None
+            or len(header) != len(delimiter)
+            or not all(
+                _MD_TABLE_DELIMITER_RE.fullmatch(cell.replace(" ", "")) for cell in delimiter
+            )
+        ):
+            index += 1
+            continue
+
+        end = index + 2
+        rows = [header, delimiter]
+        while end < len(lines):
+            row = _markdown_table_cells(lines[end])
+            if row is None:
+                break
+            rows.append(row)
+            end += 1
+        column_widths = [0] * len(header)
+        for row in rows:
+            for column, cell in enumerate(row):
+                if column < len(column_widths):
+                    column_widths[column] = max(column_widths[column], _display_width(cell))
+        # ponytail: conservative width estimate; use Rich's measure API if its
+        # table layout changes and this starts falling back too early.
+        minimum_width = sum(column_width + 2 for column_width in column_widths)
+        if width < minimum_width:
+            ranges.append((index, end))
+        index = end
+    return ranges
+
+
+@lru_cache(maxsize=1)
+def _rich_markdown_components() -> tuple[Any, Any, Any, Any]:
+    """Load Rich's custom Markdown element classes once, only when needed."""
+    from rich.box import ROUNDED
+    from rich.color import ColorSystem
+    from rich.console import Console
+    from rich.markdown import BlockQuote, CodeBlock, Heading, Markdown
+    from rich.padding import Padding
+    from rich.panel import Panel
+    from rich.segment import Segment
+    from rich.text import Text
+    from rich.theme import Theme
+
+    class PaneHeading(Heading):
+        LEVEL_ALIGN = {level: "left" for level in ("h1", "h2", "h3", "h4", "h5", "h6")}
+
+    class PaneBlockQuote(BlockQuote):
+        def __rich_console__(self, console, options):
+            render_options = options.update(width=max(1, options.max_width - 2))
+            lines = console.render_lines(
+                self.elements,
+                render_options,
+                style=self.style,
+                pad=False,
+            )
+            for line in lines:
+                yield Segment("│ ", self.style)
+                yield from line
+                yield Segment.line()
+
+    class PaneCodeBlock(CodeBlock):
+        def __rich_console__(self, console, options):
+            code = Text(
+                str(self.text).rstrip(),
+                style="markdown.code_block",
+                no_wrap=False,
+                overflow="fold",
+            )
+            panel = Panel(
+                code,
+                box=ROUNDED,
+                border_style="markdown.code_block",
+                expand=True,
+                padding=(0, 1),
+            )
+            yield Padding(panel, (0, 0, 0, 2))
+
+    class PaneMarkdown(Markdown):
+        elements = {
+            **Markdown.elements,
+            "heading_open": PaneHeading,
+            "blockquote_open": PaneBlockQuote,
+            "fence": PaneCodeBlock,
+            "code_block": PaneCodeBlock,
+        }
+
+    theme = Theme(
+        {
+            "markdown.h1": "bold cyan",
+            "markdown.h2": "bold cyan",
+            "markdown.h3": "bold cyan",
+            "markdown.h4": "bold cyan",
+            "markdown.h5": "bold cyan",
+            "markdown.h6": "bold cyan",
+            "markdown.code": "yellow",
+            "markdown.code_block": "dim cyan",
+            "markdown.item.bullet": "bold cyan",
+            "markdown.item.number": "bold cyan",
+            "markdown.block_quote": "dim cyan",
+            "markdown.table.border": "dim cyan",
+            "markdown.table.header": "bold",
+            "markdown.link": "bold cyan",
+            "markdown.link_url": "dim cyan",
+        }
+    )
+    return PaneMarkdown, Console, ColorSystem, theme
+
+
+@lru_cache(maxsize=32)
+def _rich_console(width: int, color: bool) -> tuple[Any, Any]:
+    _, Console, ColorSystem, theme = _rich_markdown_components()
+    console = Console(
+        color_system="standard" if color else None,
+        force_terminal=color,
+        height=None,
+        highlight=False,
+        markup=False,
+        no_color=not color,
+        theme=theme,
+        width=width,
+    )
+    return console, ColorSystem.STANDARD if color else None
+
+
+def _render_markdown_lines_rich_document(text: str, width: int, color: bool) -> list[str]:
+    PaneMarkdown, _, _, _ = _rich_markdown_components()
+    console, ansi_color_system = _rich_console(width, color)
+    rendered: list[str] = []
+    for line in console.render_lines(PaneMarkdown(text, hyperlinks=False), pad=False):
+        parts: list[str] = []
+        for segment in line:
+            if segment.control:
+                continue
+            if color and segment.style:
+                parts.append(segment.style.render(segment.text, color_system=ansi_color_system))
+            else:
+                parts.append(segment.text)
+        rendered.append("".join(parts))
+    while rendered and not _visible(rendered[-1]).strip():
+        rendered.pop()
+    return rendered
+
+
+def _render_markdown_lines_rich(text: str, width: int, color: bool) -> list[str]:
+    """Render sanitized Markdown through Rich, falling back for narrow tables."""
+    table_ranges = _narrow_table_ranges(text, width)
+    if not table_ranges:
+        return _render_markdown_lines_rich_document(text, width, color)
+
+    lines = text.splitlines()
+    rendered: list[str] = []
+    cursor = 0
+    for start, end in table_ranges:
+        prefix = "\n".join(lines[cursor:start])
+        if prefix.strip():
+            rendered.extend(_render_markdown_lines_rich_document(prefix, width, color))
+        rendered.extend(
+            _render_markdown_lines_fallback("\n".join(lines[start:end]), width, color=color)
+        )
+        cursor = end
+    suffix = "\n".join(lines[cursor:])
+    if suffix.strip():
+        rendered.extend(_render_markdown_lines_rich_document(suffix, width, color))
+    while rendered and not _visible(rendered[-1]).strip():
+        rendered.pop()
+    return rendered
+
+
+@lru_cache(maxsize=512)
+def _render_markdown_lines_cached(text: str, width: int, color: bool) -> tuple[str, ...]:
+    """Cache immutable per-entry Markdown rows by source, width, and color."""
+    try:
+        rendered = _render_markdown_lines_rich(text, width, color)
+    except ImportError:
+        rendered = _render_markdown_lines_fallback(text, width, color=color)
+    return tuple(rendered)
+
+
+def render_markdown_lines(
+    text: str,
+    width: int = 80,
+    *,
+    color: bool = True,
+) -> list[str]:
+    """Render sanitized Markdown through Rich, with the old renderer as fallback."""
+    width = max(1, width)
+    clean = _sanitize(text)
+    if not clean:
+        return []
+    return list(_render_markdown_lines_cached(clean, width, color))
 
 
 # Keep the private name convenient for presentation tests and old callers.
@@ -1592,6 +1823,31 @@ def _bounded_render_lines(lines: list[str], limit: int) -> list[str]:
     return [f"… {hidden} lines hidden", *lines[-max(1, limit - 1) :]]
 
 
+def _bounded_markdown_lines(
+    text: str,
+    width: int,
+    limit: int,
+    *,
+    color: bool,
+) -> list[str]:
+    """Bound source detail and then wrapped rows without changing entry state."""
+    limit = max(1, limit)
+    source_lines = text.splitlines()
+    hidden_source = 0
+    if len(source_lines) > limit:
+        keep = max(1, limit - 1)
+        hidden_source = len(source_lines) - keep
+        text = "\n".join(source_lines[-keep:])
+
+    rendered = render_markdown_lines(text, width, color=color)
+    if hidden_source or len(rendered) > limit:
+        keep = max(1, limit - 1)
+        hidden_rendered = max(0, len(rendered) - keep)
+        hidden = hidden_source + hidden_rendered
+        return [f"… {hidden} lines hidden", *rendered[-keep:]]
+    return rendered
+
+
 def _entry_lines(
     entry: TranscriptEntry,
     width: int,
@@ -1603,13 +1859,7 @@ def _entry_lines(
     if entry.role == "tool" and entry.text.startswith(_TOOL_ERROR_PREFIX):
         return [("dim", _clip(" " + entry.text, width))]
     label = "· SYSTEM" if entry.role == "system" else _ROLE_LABELS[entry.role]
-    body_prefix = (
-        "   │ "
-        if entry.role == "system"
-        else "   ↳ "
-        if entry.role == "user"
-        else "   "
-    )
+    body_prefix = "   │ " if entry.role == "system" else "   ↳ " if entry.role == "user" else "   "
     body_width = max(1, width - _display_width(body_prefix))
     rendered = [(entry.role, _clip(f" {label}", width))]
     if entry.tool_name is not None:
@@ -1622,16 +1872,18 @@ def _entry_lines(
         if detail.startswith(summary):
             detail = detail.split("\n", 1)[1] if "\n" in detail else ""
         if detail:
-            detail_lines = render_markdown_lines(detail, body_width, color=color)
-            if detail_limit is not None:
-                detail_lines = _bounded_render_lines(detail_lines, detail_limit)
-            rendered.extend(
-                (entry.role, _clip(body_prefix + line, width)) for line in detail_lines
+            detail_lines = (
+                _bounded_markdown_lines(detail, body_width, detail_limit, color=color)
+                if detail_limit is not None
+                else render_markdown_lines(detail, body_width, color=color)
             )
+            rendered.extend((entry.role, _clip(body_prefix + line, width)) for line in detail_lines)
     else:
-        lines = render_markdown_lines(entry.text, body_width, color=color)
-        if detail_limit is not None:
-            lines = _bounded_render_lines(lines, detail_limit)
+        lines = (
+            _bounded_markdown_lines(entry.text, body_width, detail_limit, color=color)
+            if detail_limit is not None
+            else render_markdown_lines(entry.text, body_width, color=color)
+        )
         for line in lines:
             role = (
                 "dim"
@@ -1709,6 +1961,15 @@ def _transcript_blocks(
     return blocks
 
 
+def _transcript_block_kind(block: list[tuple[str, str]]) -> str:
+    if not block:
+        return ""
+    role, text = block[0]
+    if role == "tool" or text.lstrip().startswith(("✓ ", "✗ ", "• ", _TOOL_ERROR_PREFIX)):
+        return "tool"
+    return role
+
+
 def _stream_lines(
     transcript: Transcript,
     width: int,
@@ -1724,9 +1985,7 @@ def _stream_lines(
     if len(text) > _STREAM_RENDER_LIMIT:
         text = "…\n" + text[-_STREAM_RENDER_LIMIT:]
     label = _ROLE_LABELS[transcript.streaming_role]
-    rendered = [
-        (transcript.streaming_role, _clip(f" {label} · generating", width))
-    ]
+    rendered = [(transcript.streaming_role, _clip(f" {label} · generating", width))]
     rendered.extend(
         (transcript.streaming_role, _clip("   " + line, width))
         for line in render_markdown_lines(text, body_width, color=color)
@@ -1747,15 +2006,23 @@ def _transcript_lines(
     rendered: list[tuple[str, str]] = []
     if remaining:
         history: list[tuple[str, str]] = []
+        previous_kind = ""
         for block in _transcript_blocks(
             transcript.entries,
             width,
             expanded=transcript.tool_details_expanded,
             color=color,
         ):
-            if history:
+            kind = _transcript_block_kind(block)
+            if history and kind != previous_kind:
                 history.append(("system", ""))
             history.extend(block)
+            previous_kind = kind
+        while len(history) > remaining:
+            try:
+                history.remove(next(row for row in history if not row[1]))
+            except StopIteration:
+                break
         rendered = history[-remaining:]
     rendered.extend(active)
     if not rendered:
@@ -2313,6 +2580,7 @@ def _status_parts(fields: Mapping[str, str], previous: Mapping[str, str] | None)
 
     def changed(key: str) -> bool:
         return previous is None or fields.get(key) != previous.get(key)
+
     if fields.get("branch") and changed("branch"):
         parts.append(f"b={fields['branch']}")
     if fields.get("generation") and changed("generation"):
@@ -2493,6 +2761,7 @@ def _cockpit_frame_lines(
     color: bool,
     input_label: str,
     activity_line: str,
+    primary_rows: tuple[tuple[str, str], ...] | None = None,
 ) -> list[str]:
     width = max(8, width)
     height = max(_FIXED_MIN_HEIGHT, height)
@@ -2500,11 +2769,10 @@ def _cockpit_frame_lines(
     conversation_capacity = max(1, height - _FRAME_OVERHEAD)
     status = _sanitize(getattr(snapshot, "session_status", "idle"))
     lines = [_paint("┌" + _pad(f" Cambium · conversation · {status} ", inner) + "┐", _CYAN, color)]
-    conversation = _transcript_lines(
-        transcript,
-        inner,
-        conversation_capacity,
-        color=color,
+    conversation = (
+        list(primary_rows[-conversation_capacity:])
+        if primary_rows is not None
+        else _transcript_lines(transcript, inner, conversation_capacity, color=color)
     )
     for role, text in conversation[:conversation_capacity]:
         lines.append(
@@ -2551,15 +2819,18 @@ def render_primary(
         _paint(text, _ROLE_COLORS.get(role, ""), color)
         for role, text in _primary_rows(transcript, width, color=color)
     ]
-    lines.extend(_paint(text, _DIM_CYAN, color) for text in _status_rows(
-        snapshot,
-        transcript,
-        session_description=session_description,
-        branch_line=branch_line,
-        cumulative_line=cumulative_line,
-        width=width,
-        activity_line=activity_line,
-    ))
+    lines.extend(
+        _paint(text, _DIM_CYAN, color)
+        for text in _status_rows(
+            snapshot,
+            transcript,
+            session_description=session_description,
+            branch_line=branch_line,
+            cumulative_line=cumulative_line,
+            width=width,
+            activity_line=activity_line,
+        )
+    )
     return lines
 
 
@@ -2614,9 +2885,9 @@ class Cockpit:
     Unlike a conventional full-screen dashboard, a draw never homes the
     cursor or clears the terminal.  New transcript rows and changed status
     rows are appended to the terminal's normal buffer, which gives the
-    operator native terminal scrollback for free.  While readline owns the
-    input line, the newest draw is retained and flushed after that read ends;
-    asynchronous event output therefore cannot overwrite text being edited.
+    operator native terminal scrollback for free.  Idle redraws coalesce while
+    readline owns the input line; active-turn redraws preserve that line and
+    stream event output at a bounded rate.
     """
 
     def __init__(self, stream: TextIO, *, enabled: bool = True) -> None:
@@ -2627,7 +2898,12 @@ class Cockpit:
         self._previous_sigterm_handler: Any = None
         self._last_size = os.terminal_size((120, 40))
         self._input_active = False
+        self._native_input = False
+        self._input_prompt_label = "›"
         self._pending_draw: tuple[Any, Transcript, str, str, str, str, str] | None = None
+        self._turn_active = False
+        self._last_live_draw_at = 0.0
+        self._draw_in_flight = False
         self._last_primary_rows: tuple[tuple[str, str], ...] = ()
         self._last_status_line = ""
         self._last_status_fields: dict[str, str] | None = None
@@ -2688,9 +2964,10 @@ class Cockpit:
         cumulative_line: str,
         input_label: str = "›",
         activity_line: str = "",
+        turn_active: bool = False,
         force: bool = False,
     ) -> None:
-        """Draw the conversation, bypassing input coalescing for final frames."""
+        """Draw a frame, streaming active-turn events around pending input."""
         if not self.enabled:
             return
         self._last_size = shutil.get_terminal_size((120, 40))
@@ -2703,14 +2980,78 @@ class Cockpit:
             _clip(_sanitize(input_label).replace(chr(10), " "), 8),
             _sanitize(activity_line).replace(chr(10), " "),
         )
+        live_turn = turn_active or bool(activity_line)
+        self._turn_active = live_turn and not force
+        if self._draw_in_flight:
+            self._pending_draw = request
+            return
         if self._input_active and not force:
             self._pending_draw = request
+            if not live_turn:
+                return
+            now = time.monotonic()
+            if now - self._last_live_draw_at < _LIVE_DRAW_INTERVAL:
+                return
+            self._pending_draw = None
+            self._draw_live_now(request)
+            self._last_live_draw_at = now
             return
         if force:
             self._pending_draw = None
-        self._draw_now(request, force=force)
+        if self._input_active and force:
+            self._draw_live_now(request, force=True)
+        else:
+            self._paint_now(request, force=force)
+        if live_turn and not force:
+            self._last_live_draw_at = time.monotonic()
         if force:
             self.stream.flush()
+
+    def _paint_now(
+        self,
+        request: tuple[Any, Transcript, str, str, str, str, str],
+        *,
+        force: bool = False,
+    ) -> None:
+        if self._draw_in_flight:
+            self._pending_draw = request
+            return
+        self._draw_in_flight = True
+        try:
+            self._draw_now(request, force=force)
+        finally:
+            self._draw_in_flight = False
+
+    def _input_line_text(self) -> str:
+        if not self._native_input or _readline is None:
+            return ""
+        try:
+            value = _readline.get_line_buffer()
+        except (AttributeError, OSError, RuntimeError):
+            return ""
+        return _sanitize(value).replace("\r", " ").replace("\n", " ").replace("\t", " ")
+
+    def _restore_input_line(self, text: str) -> None:
+        if not self._input_active:
+            return
+        self.stream.write(f"\r{_CLEAR_LINE}{self._input_prompt_label} {text}")
+
+    def _draw_live_now(
+        self,
+        request: tuple[Any, Transcript, str, str, str, str, str],
+        *,
+        force: bool = False,
+    ) -> None:
+        input_text = self._input_line_text()
+        if self._input_active and not self._fixed_frame:
+            self.stream.write("\r\n")
+        self._draw_in_flight = True
+        try:
+            self._draw_now(request, force=force)
+        finally:
+            self._draw_in_flight = False
+        self._restore_input_line(input_text)
+        self.stream.flush()
 
     def _draw_now(
         self,
@@ -2736,11 +3077,6 @@ class Cockpit:
             self._draw_stream_now(request)
             return
 
-        if self._fixed_frame and (force or self._frame_size != self._last_size):
-            # Leave the current input/status row before appending a fresh frame.
-            self.stream.write("\x1b[1B\r\n")
-            self._fixed_frame = False
-
         rows = tuple(_primary_rows(transcript, self._last_size.columns, color=self.color))
         status_rows = tuple(
             _status_rows(
@@ -2753,7 +3089,26 @@ class Cockpit:
                 activity_line=activity_line,
             )
         )
+        if self._fixed_frame and (
+            self._frame_size != self._last_size or (force and rows != self._last_primary_rows)
+        ):
+            # Leave the current input/status row before appending a fresh frame.
+            self.stream.write("\x1b[1B\r\n")
+            self._fixed_frame = False
         if not self._fixed_frame:
+            conversation_capacity = max(1, self._last_size.lines - _FRAME_OVERHEAD)
+            hidden_rows = rows[:-conversation_capacity]
+            if self._last_primary_rows:
+                if rows[: len(self._last_primary_rows)] != self._last_primary_rows:
+                    hidden_rows = ()
+                else:
+                    hidden_rows = hidden_rows[len(self._last_primary_rows) :]
+            if hidden_rows:
+                # The fixed frame keeps only the tail; flush newly hidden rows
+                # so restored history and large live entries reach scrollback.
+                for role, text in hidden_rows:
+                    self.stream.write(_paint(text, _ROLE_COLORS.get(role, ""), self.color))
+                    self.stream.write("\n")
             lines = _cockpit_frame_lines(
                 snapshot,
                 transcript,
@@ -2765,6 +3120,7 @@ class Cockpit:
                 color=self.color,
                 input_label=input_label,
                 activity_line=activity_line,
+                primary_rows=rows,
             )
             self.stream.write("\n".join(lines))
             self.stream.write("\x1b[1A\r")
@@ -2836,39 +3192,49 @@ class Cockpit:
         status_rows: tuple[str, ...],
     ) -> None:
         snapshot, transcript, session_description, branch_line, cumulative_line, _, _ = request
-        inner = max(1, self._last_size.columns - 2)
-        bottom = [
-            "├" + "─" * inner + "┤",
-            *(
-                _paint(_frame_inside(row, self._last_size.columns), _DIM_CYAN, self.color)
-                for row in status_rows
-            ),
-        ]
+        rendered_rows = tuple(
+            _paint(_frame_inside(row, self._last_size.columns), _DIM_CYAN, self.color)
+            for row in status_rows
+        )
         del snapshot, transcript, session_description, branch_line, cumulative_line
-        self.stream.write(f"\x1b[s\x1b[{_BOTTOM_RESERVED_ROWS - 1}A\r")
-        for index, line in enumerate(bottom):
-            changed = index > 0 and (
-                index - 1 >= len(self._last_status_rows)
-                or status_rows[index - 1] != self._last_status_rows[index - 1]
+        # The cursor is on the input row; rewrite the fixed status rows in place.
+        self.stream.write(f"\x1b[s\x1b[{len(rendered_rows)}A\r")
+        for index, line in enumerate(rendered_rows):
+            changed = index >= len(self._last_status_rows) or (
+                status_rows[index] != self._last_status_rows[index]
             )
             if changed:
                 self.stream.write(f"\r{_CLEAR_LINE}{line}")
-            if index < len(bottom) - 1:
+            if index < len(rendered_rows) - 1:
                 self.stream.write("\n")
         self.stream.write("\x1b[u")
         self.stream.flush()
 
     def flush(self) -> None:
         """Flush the newest draw once the input line is no longer active."""
-        if not self.enabled or self._input_active or self._pending_draw is None:
+        if (
+            not self.enabled
+            or self._input_active
+            or self._pending_draw is None
+            or self._draw_in_flight
+        ):
             return
         request = self._pending_draw
         self._pending_draw = None
-        self._draw_now(request)
+        self._paint_now(request)
 
     def draw_activity(self, activity_line: str) -> None:
         """Update only the fixed status pane while readline owns the input."""
-        if not self.enabled or not self._fixed_frame or self._last_request is None:
+        if not self.enabled or self._last_request is None or self._draw_in_flight:
+            return
+        if self._turn_active and self._input_active and self._pending_draw is not None:
+            now = time.monotonic()
+            if now - self._last_live_draw_at >= _LIVE_DRAW_INTERVAL:
+                request = self._pending_draw
+                self._pending_draw = None
+                self._draw_live_now(request)
+                self._last_live_draw_at = now
+        if not self._fixed_frame:
             return
         self._activity_line = _sanitize(activity_line).replace(chr(10), " ")
         request = (*self._last_request[:6], self._activity_line)
@@ -2888,11 +3254,13 @@ class Cockpit:
         self._last_request = request
         self._last_status_rows = status_rows
 
-    def move_to_input(self, *, label: str = "›") -> None:
+    def move_to_input(self, *, label: str = "›", native: bool = False) -> None:
         if not self.enabled:
             return
         self._input_active = True
+        self._native_input = native
         label_text = _clip(_sanitize(label).replace(chr(10), " "), 8)
+        self._input_prompt_label = label_text
         if self._fixed_frame:
             self.stream.write(f"\r{_CLEAR_LINE}{label_text} ")
         else:

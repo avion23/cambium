@@ -1,15 +1,21 @@
 """Pure presentation tests for the persistent terminal cockpit."""
 
 import io
+import os
+import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+import cambium.tui_screen as tui_screen
 from cambium.tui import _queued_prompt_notice
 from cambium.tui_screen import (
     ActivityState,
     Cockpit,
     Transcript,
+    _bounded_markdown_lines,
     _display_width,
     _side_sections,
     _transcript_lines,
@@ -48,9 +54,7 @@ def _snapshot():
         total_tokens=12345,
         output_tokens_per_s=47.5,
         context=context,
-        recent_events=(
-            SimpleNamespace(kind="usage_event", detail="tokens=12345"),
-        ),
+        recent_events=(SimpleNamespace(kind="usage_event", detail="tokens=12345"),),
     )
 
 
@@ -86,10 +90,10 @@ def test_conversation_markdown_is_structured_styled_and_sanitized() -> None:
         "# Heading\n\n**bold** *italic* `code`\n\n"
         "- a long list item that hangs on continuation\n\n"
         "> quote\n\n---\n\n```py\nprint('ok')\n```\n\n"
-        "| a | b |\n|---|---|",
+        "| a | b |\n|---|---|\n| one | two |",
         36,
     )
-    visible = [_visible(line) for line in lines]
+    visible = [_visible(line).rstrip() for line in lines]
     rendered = "\n".join(lines)
 
     assert visible[0].startswith("Heading")
@@ -98,7 +102,14 @@ def test_conversation_markdown_is_structured_styled_and_sanitized() -> None:
     assert any(line.startswith("  ") for line in visible)
     assert any(line.startswith("  │") for line in visible)
     assert any("─" in line for line in visible)
-    assert any("| a | b |" in line for line in visible)
+    assert any(line.startswith("│ quote") for line in visible)
+    table_header = next((line for line in visible if line.strip().startswith("a")), None)
+    table_row = next((line for line in visible if line.strip().startswith("one")), None)
+    if table_header is not None and table_row is not None:
+        assert table_header.index("a") == table_row.index("one")
+        assert table_header.index("b") == table_row.index("two")
+    else:
+        assert all(cell in "\n".join(visible) for cell in ("a", "b", "one", "two"))
     assert "\x1b[1m" in rendered
     assert "\x1b[33m" in rendered
     assert "\x1b[2;36m" in rendered
@@ -106,6 +117,81 @@ def test_conversation_markdown_is_structured_styled_and_sanitized() -> None:
     hostile = render_markdown_lines("safe\x1b[31m\x1b]2;secret\x07 text", 36)
     assert "secret" not in "\n".join(hostile)
     assert "\x1b[31m" not in "\n".join(hostile)
+
+
+def test_rich_markdown_sanitizes_before_the_parser_sees_text(monkeypatch) -> None:
+    seen: list[str] = []
+    rich_renderer = tui_screen._render_markdown_lines_rich
+
+    def capture(text: str, width: int, color: bool) -> list[str]:
+        seen.append(text)
+        return rich_renderer(text, width, color)
+
+    monkeypatch.setattr(tui_screen, "_render_markdown_lines_rich", capture)
+    render_markdown_lines("safe\x1b[31m injected\x00\x1b]2;secret\x07 text", 36)
+
+    assert seen == ["safe injected text"]
+
+
+def test_markdown_falls_back_when_rich_import_is_unavailable(monkeypatch) -> None:
+    text = "# Heading\n\n**bold** `code`\n\nvalue_with_underscores"
+    expected = tui_screen._render_markdown_lines_fallback(text, 36, color=False)
+
+    def unavailable(*args, **kwargs):
+        raise ImportError("rich unavailable")
+
+    monkeypatch.setattr(tui_screen, "_render_markdown_lines_rich", unavailable)
+    assert render_markdown_lines(text, 36, color=False) == expected
+
+
+def test_tui_screen_import_does_not_import_rich() -> None:
+    source_root = Path(__file__).resolve().parents[2] / "src"
+    probe = (
+        "import sys; import cambium.tui_screen; "
+        "assert not any(name == 'rich' or name.startswith('rich.') for name in sys.modules)"
+    )
+    subprocess.run(
+        [sys.executable, "-c", probe],
+        check=True,
+        env={**os.environ, "PYTHONPATH": str(source_root)},
+    )
+
+
+def test_rich_path_keeps_literal_markup_text() -> None:
+    pytest.importorskip("rich")
+    rendered = "\n".join(render_markdown_lines("[bold]x[/bold]", 36, color=False))
+    assert "[bold]x[/bold]" in rendered
+
+
+@pytest.mark.parametrize(
+    ("text", "cells", "width"),
+    [
+        (
+            "| one | two |\n| --- | --- |\n| three | four |",
+            ("one", "two", "three", "four"),
+            8,
+        ),
+        (
+            "| 界 | 文字 |\n| --- | --- |\n| 一 | 二三 |",
+            ("界", "文字", "一", "二三"),
+            10,
+        ),
+    ],
+)
+def test_narrow_tables_fall_back_without_losing_cells(
+    text: str, cells: tuple[str, ...], width: int
+) -> None:
+    rendered = render_markdown_lines(text, width, color=False)
+    visible = "\n".join(_visible(line) for line in rendered)
+    assert all(cell in visible for cell in cells)
+    assert all(_display_width(line) <= width for line in rendered)
+
+
+def test_bounded_markdown_lines_limits_wrapped_rows() -> None:
+    text = "\n".join("x" * 400 for _ in range(100))
+    rendered = _bounded_markdown_lines(text, 20, 40, color=False)
+    assert len(rendered) <= 40
+    assert rendered[0].startswith("… ") and rendered[0].endswith(" lines hidden")
 
 
 def test_resume_summary_identifiers_survive_deferred_startup_draw(monkeypatch) -> None:
@@ -118,7 +204,8 @@ def test_resume_summary_identifiers_survive_deferred_startup_draw(monkeypatch) -
     summary = (
         "Detected prior interactive session; resuming durable state: "
         "turns=1 last_epoch=7 last_checkpoint=interactive-main/epoch-7-"
-        + "c" * 64
+        + "c"
+        * 64
         + ".json. session=/tmp/interactive_session turn=1 branch=1 "
         "provider=provider-a model=model-a epoch=7"
     )
@@ -159,10 +246,13 @@ def test_transcript_blocks_are_dense_with_one_separator_and_no_trailing_blank() 
     rows = _transcript_lines(transcript, 60, 100)
     values = [value for _, value in rows]
     assert values[-1].strip()
-    assert max(
-        sum(not value.strip() for value in values[index : index + 3])
-        for index in range(max(1, len(values) - 2))
-    ) <= 1
+    assert (
+        max(
+            sum(not value.strip() for value in values[index : index + 3])
+            for index in range(max(1, len(values) - 2))
+        )
+        <= 1
+    )
     assert values.count("") <= 1
 
 
@@ -336,6 +426,38 @@ def test_cockpit_appends_to_primary_buffer_without_repainting() -> None:
     assert "\x1b[2J" not in text
 
 
+def test_cockpit_flushes_overflow_history_once() -> None:
+    class _Tty(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    stream = _Tty()
+    transcript = Transcript()
+    for index in range(20):
+        transcript.system(f"restored-{index}")
+    cockpit = Cockpit(stream)
+
+    with cockpit:
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+        )
+        first = stream.getvalue()
+        assert all(f"restored-{index}" in first for index in range(20))
+
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+        )
+        assert stream.getvalue() == first
+
+
 def test_cockpit_coalesces_draws_while_input_line_is_active() -> None:
     class _Tty(io.StringIO):
         def isatty(self) -> bool:
@@ -368,6 +490,148 @@ def test_cockpit_coalesces_draws_while_input_line_is_active() -> None:
     assert "deferred output" in stream.getvalue()
 
 
+def test_cockpit_paints_mid_turn_tool_tick_while_input_is_pending() -> None:
+    class _Tty(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    stream = _Tty()
+    transcript = Transcript()
+    cockpit = Cockpit(stream)
+    with cockpit:
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+        )
+        cockpit.move_to_input()
+        transcript.observe_event(
+            {
+                "kind": "tool_event",
+                "payload": {"tool": "run_shell", "ok": True, "duration_ms": 118215},
+            }
+        )
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=1",
+            activity_line="⠋ WAITING",
+            turn_active=True,
+        )
+
+        live_output = stream.getvalue()
+        assert "✓ run_shell 118215ms" in live_output
+        assert live_output.endswith("› ")
+        assert cockpit._input_active
+
+
+def test_cockpit_throttles_active_turn_frames(monkeypatch) -> None:
+    class _Tty(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    now = [10.0]
+    monkeypatch.setattr("cambium.tui_screen.time.monotonic", lambda: now[0])
+    stream = _Tty()
+    transcript = Transcript()
+    cockpit = Cockpit(stream)
+    with cockpit:
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+        )
+        cockpit.move_to_input()
+        for tool in ("run_shell", "read_batch"):
+            transcript.observe_event({"kind": "tool_event", "payload": {"tool": tool, "ok": True}})
+            cockpit.draw(
+                _snapshot(),
+                transcript,
+                session_description="session",
+                branch_line="branch",
+                cumulative_line="usage: calls=2",
+                activity_line="⠋ WAITING",
+                turn_active=True,
+            )
+            if tool == "run_shell":
+                now[0] = 10.05
+
+        assert "✓ read_batch" not in stream.getvalue()
+        now[0] = 10.11
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=2",
+            activity_line="⠋ WAITING",
+            turn_active=True,
+        )
+
+    assert "✓ read_batch" in stream.getvalue()
+
+
+def test_cockpit_replaces_failed_to_idle_status_in_place() -> None:
+    class _Tty(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    stream = _Tty()
+    transcript = Transcript()
+    snapshot = _snapshot()
+    snapshot.agents[0].state = "failed"
+    snapshot.active_agents = 0
+    cockpit = Cockpit(stream)
+    with cockpit:
+        cockpit.draw(
+            snapshot,
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+        )
+        cockpit.move_to_input()
+        transcript.error("turn failed")
+        cockpit.draw(
+            snapshot,
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+            activity_line="✗ ERROR",
+            turn_active=True,
+        )
+        cockpit.draw(
+            snapshot,
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+            activity_line="✗ ERROR",
+            force=True,
+        )
+        cockpit.draw(
+            snapshot,
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+        )
+        cockpit.hide_cursor()
+        cockpit.flush()
+
+    agent_rows = [row for row in cockpit._last_status_rows if row.startswith(" agents=")]
+    assert len(agent_rows) == 1
+    assert agent_rows[0].endswith("state=IDLE")
+    assert stream.getvalue().count("┌ Cambium · conversation") == 2
+
+
 def test_cockpit_forces_completed_frame_while_input_read_is_pending() -> None:
     class _Tty(io.StringIO):
         flush_count = 0
@@ -393,9 +657,7 @@ def test_cockpit_forces_completed_frame_while_input_read_is_pending() -> None:
             cumulative_line="usage: calls=0",
         )
         cockpit.move_to_input()
-        transcript.observe_event(
-            {"kind": "assistant_delta", "payload": {"delta": "partial"}}
-        )
+        transcript.observe_event({"kind": "assistant_delta", "payload": {"delta": "partial"}})
         cockpit.draw(
             _snapshot(),
             transcript,
@@ -446,7 +708,7 @@ def test_cockpit_updates_fixed_status_pane_in_place() -> None:
 
     delta = stream.getvalue()[len(first) :]
     assert "\x1b[s" in delta
-    assert "\x1b[5A" in delta
+    assert "\x1b[4A" in delta
     assert "running run_shell" in delta
     assert "┌ Cambium · conversation" not in delta
 
@@ -466,6 +728,34 @@ def test_short_terminal_falls_back_to_stream_rows() -> None:
     assert not any(line.startswith("┌") for line in lines)
     assert not any("─" in line for line in lines)
     assert any("provider=codex" in line for line in lines)
+
+
+def test_live_cockpit_keeps_short_terminal_fallback(monkeypatch) -> None:
+    class _Tty(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    monkeypatch.setattr(
+        tui_screen.shutil,
+        "get_terminal_size",
+        lambda _fallback: os.terminal_size((80, 11)),
+    )
+    stream = _Tty()
+    transcript = Transcript()
+    transcript.system("restored history")
+    cockpit = Cockpit(stream)
+
+    with cockpit:
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+        )
+
+    assert "restored history" in stream.getvalue()
+    assert "conversation ·" not in stream.getvalue()
 
 
 def test_control_sequences_are_removed_and_color_is_opt_in() -> None:
@@ -495,9 +785,7 @@ def test_transcript_is_bounded() -> None:
 
 def test_assistant_deltas_render_in_the_active_tail_before_turn_completion() -> None:
     transcript = Transcript()
-    transcript.observe_event(
-        {"kind": "assistant_delta", "payload": {"delta": "# Findings\n"}}
-    )
+    transcript.observe_event({"kind": "assistant_delta", "payload": {"delta": "# Findings\n"}})
     first = render_cockpit(
         _snapshot(),
         transcript,
@@ -549,9 +837,7 @@ def test_message_events_switch_roles_and_keep_streaming_text_bounded() -> None:
         }
     )
     for _ in range(20_000):
-        transcript.observe_event(
-            {"kind": "assistant_delta", "payload": {"delta": "x"}}
-        )
+        transcript.observe_event({"kind": "assistant_delta", "payload": {"delta": "x"}})
 
     assert any(entry.role == "tool" and "old" in entry.text for entry in transcript.entries)
     assert transcript.streaming_role == "assistant"
@@ -783,6 +1069,26 @@ def test_mixed_successful_tools_do_not_collapse_across_each_other() -> None:
     assert "✓ run_shell 9273ms" in text
     assert "✓ git_op 2395ms" in text
     assert "×" not in text
+
+
+def test_adjacent_tool_ticks_have_no_blank_separator() -> None:
+    transcript = Transcript()
+    for tool in ("run_shell", "read_batch", "git_op"):
+        transcript.observe_event(
+            {
+                "kind": "tool_event",
+                "payload": {"tool": tool, "ok": True},
+            }
+        )
+
+    rows = _transcript_lines(transcript, 80, 20)
+    tick_rows = [index for index, (_, value) in enumerate(rows) if value.lstrip().startswith("✓ ")]
+
+    assert len(tick_rows) == 3
+    assert tick_rows[1] == tick_rows[0] + 1
+    assert tick_rows[2] == tick_rows[1] + 1
+
+
 def test_failed_turn_is_one_consolidated_block_with_preceding_context() -> None:
     transcript = Transcript()
     events = (
@@ -810,8 +1116,7 @@ def test_failed_turn_is_one_consolidated_block_with_preceding_context() -> None:
         transcript.observe_event(event)
 
     transcript.finish_stream(
-        "plan=tasks:1 plan_status={failed} "
-        "plan_failures={task-timeout:'max_restarts (0): wall'}"
+        "plan=tasks:1 plan_status={failed} plan_failures={task-timeout:'max_restarts (0): wall'}"
     )
 
     failures = [entry for entry in transcript.entries if entry.role == "error"]
@@ -835,9 +1140,7 @@ def test_empty_queued_prompt_has_no_dangling_system_label() -> None:
     if notice is not None:
         transcript.system(notice)
     assert not any("queued:" in entry.text for entry in transcript.entries)
-    assert "queued:" not in "\n".join(
-        value for _, value in _transcript_lines(transcript, 80, 20)
-    )
+    assert "queued:" not in "\n".join(value for _, value in _transcript_lines(transcript, 80, 20))
 
     notice = _queued_prompt_notice("follow-up")
     assert notice == "queued: follow-up"
@@ -923,7 +1226,6 @@ def test_side_sections_are_width_safe(width: int) -> None:
     stats_line = next(line for line in text.splitlines() if line.startswith("   12.3k"))
     assert task_line.index("M") == 1
     assert task_line.index("a-") == model_line.index("codex") == stats_line.index("12.3k")
-
 
 
 def test_activity_state_transitions_thinking_responding_tool_and_done() -> None:

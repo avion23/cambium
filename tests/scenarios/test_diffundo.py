@@ -1158,35 +1158,42 @@ def test_tool_call_response_with_valid_read_file_args_passes(tmp_path, monkeypat
         server.close()
 
 
-def test_200_refusal_content_cascades_to_next_provider(tmp_path, monkeypatch) -> None:
-    # Issue 4: a 200 completion whose TEXT is a refusal must fall through like
-    # any other refusal — it must not win the cascade as a "success".
-    refusing = FakeServer([(200, _ok_payload("I can't assist with that."), 0.0)])
-    ok = FakeServer([(200, _ok_payload("real answer"), 0.0)])
-    _set_keys(monkeypatch, "K_REFUSE", "K_OK")
+def test_refusal_like_completion_content_passes_through(monkeypatch) -> None:
+    content = (
+        "```text\n"
+        "You are a change-risk triage assistant. Explain when to refuse unsafe "
+        "requests; a provider cannot assist with prohibited work.\n"
+        "```"
+    )
+    primary = FakeServer([(200, _ok_payload(content), 0.0)])
+    fallback = FakeServer([(200, _ok_payload("fallback must not win"), 0.0)])
+    _set_keys(monkeypatch, "K_PRIMARY", "K_FALLBACK")
     router = Diffundo(
         (
-            _config("p_refuse", refusing, "K_REFUSE"),
-            _config("p_ok", ok, "K_OK"),
+            _config("p_primary", primary, "K_PRIMARY"),
+            _config("p_fallback", fallback, "K_FALLBACK"),
         )
     )
     try:
         result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
-        assert result.provider == "p_ok"
-        assert result.content == "real answer"
-        # refusal is a request-level fall-through: never marks a provider down
-        assert router.health("p_refuse") is HealthState.UNKNOWN
-        assert len(refusing.calls) == 1 and len(ok.calls) == 1
+        assert result.provider == "p_primary"
+        assert result.content == content
+        assert router.health("p_primary") is HealthState.HEALTHY
+        assert len(primary.calls) == 1 and len(fallback.calls) == 0
     finally:
-        refusing.close()
-        ok.close()
+        primary.close()
+        fallback.close()
 
 
-def test_all_providers_refuse_raises_refusal_outcome(tmp_path, monkeypatch) -> None:
-    # All-refused is distinct from all-down: the last error carries the REFUSAL
-    # outcome and no provider is marked unhealthy (cascade-design §1.2).
-    a = FakeServer([(200, _ok_payload("Sorry, I can't complete this request."), 0.0)])
-    b = FakeServer([(200, _ok_payload("I cannot assist with that."), 0.0)])
+def test_structural_refusals_raise_refusal_outcome(monkeypatch) -> None:
+    # Structural refusal signals remain request-level fall-throughs and never
+    # mark a provider unhealthy (cascade-design §1.2).
+    refusal_field = _ok_payload("provider refusal details")
+    refusal_field["choices"][0]["message"]["refusal"] = "safety policy"
+    content_filter = _ok_payload("partial output")
+    content_filter["choices"][0]["finish_reason"] = "content_filter"
+    a = FakeServer([(200, refusal_field, 0.0)])
+    b = FakeServer([(200, content_filter, 0.0)])
     _set_keys(monkeypatch, "K_A", "K_B")
     router = Diffundo((_config("p_a", a, "K_A"), _config("p_b", b, "K_B")))
     try:
