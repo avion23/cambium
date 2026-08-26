@@ -1682,19 +1682,27 @@ class Diffundo:
         last_error: BaseException | None = None
         selection_tier = self._active_tier or tier
         selection_model = None if self._fallback_origin is not None else model
+        fallback_triggered = False
+        fallback_origin: str | None = None
         while True:
-            candidates = await self._await_candidates(
+            (
+                candidates,
+                selection_model,
+                request,
+                terminal_origin,
+            ) = await self._await_candidates_with_fallback(
                 selection_tier,
                 selection_model,
                 deadline,
                 allow_model_substitution=allow_model_substitution,
                 request=request,
             )
+            fallback_origin = terminal_origin or fallback_origin
+            fallback_triggered = fallback_triggered or terminal_origin is not None
             if not candidates:
                 raise AllProvidersFailed(tried, last_error)
             probe_rejected = False
             pending = list(candidates)
-            fallback_triggered = False
             while pending:
                 provider = pending.pop(0)
                 try:
@@ -1727,6 +1735,7 @@ class Diffundo:
                         and (exc.is_real_death or exc.outcome is ProviderOutcome.TIMEOUT)
                     )
                     if pinned_fallback:
+                        fallback_origin = self._pinned_provider
                         existing = {item.name for item in pending}
                         if existing:
                             fallback_triggered = True
@@ -1745,7 +1754,7 @@ class Diffundo:
                     raise CostBudgetExceeded(result.provider, result.estimated_cost_usd, budget_usd)
                 self._primary_provider = provider.name
                 if fallback_triggered:
-                    self._fallback_origin = self._pinned_provider
+                    self._fallback_origin = fallback_origin
                     self._active_tier = provider.tier
                 if self._fallback_origin is not None:
                     result = replace(result, fell_back_from=self._fallback_origin)
@@ -2052,17 +2061,7 @@ class Diffundo:
         tiers = [tier, *(candidate for candidate in ProviderTier if candidate is not tier)]
         result: list[ProviderConfig] = []
         seen = set(excluded)
-        candidate_request = request
-        if request is not None:
-            try:
-                candidate_request = replace(
-                    request,
-                    model="",
-                    allow_model_substitution=True,
-                    lease=None,
-                )
-            except TypeError:
-                candidate_request = request
+        candidate_request = self._relaxed_request(request)
         for candidate_tier in tiers:
             for provider in self._candidates_unleased(
                 candidate_tier, None, request=candidate_request
@@ -2072,6 +2071,75 @@ class Diffundo:
                 seen.add(provider.name)
                 result.append(provider)
         return result
+
+    def _terminal_pin_origin(
+        self,
+        tier: ProviderTier,
+        model: str | None,
+        request: Any | None,
+    ) -> str | None:
+        """Return a dead strict lane's provider when model relaxation is safe."""
+        if model is None:
+            return None
+        pinned = [
+            provider
+            for provider in self._providers
+            if provider.tier is tier and provider.enabled and provider.model == model
+        ]
+        if request is not None:
+            from .routing import provider_satisfies_request
+
+            pinned = [
+                provider for provider in pinned if provider_satisfies_request(provider, request)
+            ]
+        if not pinned or not all(
+            provider.name in self._terminal_death_providers for provider in pinned
+        ):
+            return None
+        names = {provider.name for provider in pinned}
+        if self._pinned_provider in names:
+            return self._pinned_provider
+        return pinned[0].name
+
+    @staticmethod
+    def _relaxed_request(request: Any | None) -> Any | None:
+        if request is None:
+            return None
+        try:
+            return replace(request, model="", allow_model_substitution=True, lease=None)
+        except TypeError:
+            return request
+
+    async def _await_candidates_with_fallback(
+        self,
+        tier: ProviderTier,
+        model: str | None,
+        deadline: float,
+        *,
+        allow_model_substitution: bool,
+        request: Any | None,
+    ) -> tuple[list[ProviderConfig], str | None, Any | None, str | None]:
+        candidates = await self._await_candidates(
+            tier,
+            model,
+            deadline,
+            allow_model_substitution=allow_model_substitution,
+            request=request,
+        )
+        if candidates or model is None:
+            return candidates, model, request, None
+        origin = self._terminal_pin_origin(tier, model, request)
+        if origin is None:
+            return candidates, model, request, None
+        relaxed_request = self._relaxed_request(request)
+        candidates = await self._await_candidates(
+            tier,
+            None,
+            deadline,
+            allow_model_substitution=allow_model_substitution,
+            request=relaxed_request,
+        )
+        return candidates, None, relaxed_request, origin
 
     async def _await_candidates(
         self,

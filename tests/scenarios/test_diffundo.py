@@ -174,6 +174,53 @@ def test_pinned_endpoint_death_falls_back_same_tier_and_records_origin(monkeypat
         other_tier.close()
 
 
+def test_pinned_death_stays_on_sibling_on_next_call(monkeypatch) -> None:
+    dead = FakeServer(
+        [
+            (503, _error_payload("Endpoint is unavailable"), 0.0),
+            (200, _ok_payload("must not retry dead lane"), 0.0),
+        ]
+    )
+    healthy = FakeServer(
+        [
+            (200, _ok_payload("first sibling response", model="m-sibling"), 0.0),
+            (200, _ok_payload("second sibling response", model="m-sibling"), 0.0),
+        ]
+    )
+    _set_keys(monkeypatch, "K_PINNED_DEATH", "K_HEALTHY_SIBLING")
+    router = Diffundo(
+        (
+            _config("p_pinned", dead, "K_PINNED_DEATH", model="m-pinned"),
+            _config("p_sibling", healthy, "K_HEALTHY_SIBLING", model="m-sibling"),
+        ),
+        primary_provider="p_pinned",
+        pause_timeout_s=0.01,
+    )
+    attempted: list[str] = []
+    original_attempt = router._attempt
+
+    async def capture_attempt(provider, prompt, *, deadline=None):
+        attempted.append(provider.name)
+        return await original_attempt(provider, prompt, deadline=deadline)
+
+    monkeypatch.setattr(router, "_attempt", capture_attempt)
+    try:
+        first = asyncio.run(router.call(ProviderTier.FAST, PROMPT, model="m-pinned"))
+        second = asyncio.run(router.call(ProviderTier.FAST, PROMPT, model="m-pinned"))
+
+        assert first.provider == "p_sibling"
+        assert first.fell_back_from == "p_pinned"
+        assert second.provider == "p_sibling"
+        assert second.fell_back_from == "p_pinned"
+        assert attempted == ["p_pinned", "p_sibling", "p_sibling"]
+        assert len(dead.calls) == 1
+        assert len(healthy.calls) == 2
+        assert router._terminal_death_providers == frozenset({"p_pinned"})
+    finally:
+        dead.close()
+        healthy.close()
+
+
 def test_pinned_timeout_falls_back_to_sibling_and_records_origin(monkeypatch) -> None:
     pinned = FakeServer([(200, _ok_payload("late", model="m-pinned"), 0.1)])
     sibling = FakeServer([(200, _ok_payload("served by sibling", model="m-sibling"), 0.0)])
