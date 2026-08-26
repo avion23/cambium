@@ -2721,6 +2721,8 @@ def _activity_status(snapshot: Any, activity_line: str) -> str:
         verb = "cooldown"
     elif "STREAMING" in upper or "RESPONDING" in upper:
         verb = "responding"
+    elif "IDLE" in upper:
+        return f"{spinner} idle"
     elif "WAITING" in upper or "THINKING" in upper or "RUNNING" in upper:
         verb = "thinking"
     else:
