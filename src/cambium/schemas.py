@@ -216,7 +216,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "kind": {
                     "type": "string",
                     "minLength": 1,
-                    "description": "Tree kind of the proposed child task.",
+                    "description": (
+                        "Tree kind of the proposed child task. Allowed values: feature, "
+                        "bugfix, refactor, test, docs, investigation."
+                    ),
                 },
                 "spec": {
                     "type": "object",
