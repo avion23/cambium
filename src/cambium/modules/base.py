@@ -770,9 +770,7 @@ class SharedDatasetLoader(DatasetLoader):
             raise DatasetError(f"{path}:{line_no}: input.context must be a string")
         expected = record["expected"]
         if not isinstance(expected.get(self.label_field), bool):
-            raise DatasetError(
-                f"{path}:{line_no}: expected.{self.label_field} must be a boolean"
-            )
+            raise DatasetError(f"{path}:{line_no}: expected.{self.label_field} must be a boolean")
         if self.require_decompose_mirror:
             decompose = expected.get("decompose")
             if not isinstance(decompose, bool) or decompose != expected[self.label_field]:
@@ -950,9 +948,7 @@ async def _module_evaluate(
             raise SchemaInvalidError(f"record {index}.expected must be a JSON object")
         expected_label = expected.get(label_field)
         if not isinstance(expected_label, bool):
-            raise SchemaInvalidError(
-                f"record {index}.expected.{label_field} must be a boolean"
-            )
+            raise SchemaInvalidError(f"record {index}.expected.{label_field} must be a boolean")
         if not isinstance(expected.get("reason"), str):
             raise SchemaInvalidError(f"record {index}.expected.reason must be a string")
         canary = record.get("canary", False)
@@ -993,6 +989,7 @@ def run_module_entrypoint(
     module_name: str,
 ) -> int:
     """Run one module's neutral JSON stdin/stdout adapter."""
+
     def write_json(payload: object) -> None:
         sys.stdout.write(json.dumps(payload, sort_keys=True) + "\n")
 

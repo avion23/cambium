@@ -63,12 +63,8 @@ class ReviewRuleLM(dspy.LM):
         del args
         self.calls += 1
         content = kwargs["messages"][-1]["content"]
-        task = content.split("[[ ## task ## ]]\n", 1)[1].split(
-            "\n\n[[ ## context ## ]]", 1
-        )[0]
-        context = content.split("[[ ## context ## ]]\n", 1)[1].split(
-            "\n\nRespond", 1
-        )[0]
+        task = content.split("[[ ## task ## ]]\n", 1)[1].split("\n\n[[ ## context ## ]]", 1)[0]
+        context = content.split("[[ ## context ## ]]\n", 1)[1].split("\n\nRespond", 1)[0]
         output = should_review(task, context)
         return [
             json.dumps(
@@ -131,17 +127,12 @@ class OfflineProgram(dspy.Module):
 
 
 class ParseFailureProgram(OfflineProgram):
-    def __init__(
-        self, lm: dspy.LM, parse_failure_tasks: set[str] | None = None
-    ) -> None:
+    def __init__(self, lm: dspy.LM, parse_failure_tasks: set[str] | None = None) -> None:
         super().__init__(lm)
         self.parse_failure_tasks = parse_failure_tasks
 
     async def decide(self, input: TaskInputType) -> DecomposeOutputType:
-        if (
-            self.parse_failure_tasks is not None
-            and input.task not in self.parse_failure_tasks
-        ):
+        if self.parse_failure_tasks is not None and input.task not in self.parse_failure_tasks:
             return await super().decide(input)
         return DecomposeOutput(
             decision=Decision.DO_NOT_DECOMPOSE,
@@ -188,9 +179,7 @@ def _eval_manifest() -> SimpleNamespace:
     )
 
 
-def _patch_eval(
-    monkeypatch, loader: MemoryLoader, artifact_root: Path | None = None
-) -> None:
+def _patch_eval(monkeypatch, loader: MemoryLoader, artifact_root: Path | None = None) -> None:
     if artifact_root is not None:
         monkeypatch.setattr(optimize, "_ARTIFACT_ROOT", artifact_root)
     monkeypatch.setattr(optimize, "_load_manifest", lambda _name: _eval_manifest())
@@ -298,7 +287,8 @@ def test_eval_json_shape_is_stable(monkeypatch, tmp_path: Path, capsys) -> None:
     report = json.loads(capsys.readouterr().out)
     assert set(report) == {"dataset", "module", "parse_failures", "program", "splits"}
     assert all(
-        set(summary) == {
+        set(summary)
+        == {
             "count",
             "mean",
             "parse_failures",
@@ -779,9 +769,9 @@ def test_gepa_is_available_in_parser_and_dry_run(capsys) -> None:
     args = optimize._parser().parse_args(["should_decompose", "--optimizer", "gepa"])
 
     assert args.optimizer == "gepa"
-    assert optimize.main(
-        ["--dry-run", "should_decompose", "--optimizer", "gepa", "--seed", "23"]
-    ) == 0
+    assert (
+        optimize.main(["--dry-run", "should_decompose", "--optimizer", "gepa", "--seed", "23"]) == 0
+    )
     assert "optimizer=gepa" in capsys.readouterr().err
 
 

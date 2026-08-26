@@ -1704,9 +1704,9 @@ class Diffundo:
                         probe_rejected = True
                         continue
                     if exc.is_real_death:
-                        self._terminal_death_providers = (
-                            self._terminal_death_providers | {provider.name}
-                        )
+                        self._terminal_death_providers = self._terminal_death_providers | {
+                            provider.name
+                        }
                         lease = self._provider_lease
                         if (
                             lease is not None
@@ -2017,9 +2017,7 @@ class Diffundo:
                 continue
             eligible.append(provider)
         live = [
-            provider
-            for provider in eligible
-            if provider.name not in self._terminal_death_providers
+            provider for provider in eligible if provider.name not in self._terminal_death_providers
         ]
         if live:
             eligible = live

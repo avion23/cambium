@@ -928,9 +928,7 @@ async def _evaluate_examples_async(
             score = 0.0
         if not math.isfinite(score) or not 0.0 <= score <= 1.0:
             score = 0.0
-        outcomes.append(
-            {"index": index, "score": float(score), "parse_failure": parse_failure}
-        )
+        outcomes.append({"index": index, "score": float(score), "parse_failure": parse_failure})
     return outcomes
 
 
@@ -1576,9 +1574,7 @@ def _run_eval(args: argparse.Namespace) -> int:
         "program": "optimized" if optimized else "fresh",
         "dataset": str(args.dataset),
         "splits": splits,
-        "parse_failures": {
-            split: summary["parse_failures"] for split, summary in splits.items()
-        },
+        "parse_failures": {split: summary["parse_failures"] for split, summary in splits.items()},
     }
     if args.json:
         print(json.dumps(report, ensure_ascii=True, sort_keys=True))
