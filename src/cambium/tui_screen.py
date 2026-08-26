@@ -698,7 +698,11 @@ class Transcript:
         self._failure_order: deque[tuple[str, int | None, int]] = deque()
         self._tool_failure_key: int | None = None
         self._tool_failure_count = 0
+        self._tool_error_total = 0
         self._tool_failure_entry: TranscriptEntry | None = None
+        self._tool_count = 0
+        self._last_tool_name: str | None = None
+        self._last_tool_duration_ms: int | float | None = None
         self._tool_details_expanded = False
 
     @property
@@ -715,7 +719,11 @@ class Transcript:
         self._failure_order.clear()
         self._tool_failure_key = None
         self._tool_failure_count = 0
+        self._tool_error_total = 0
         self._tool_failure_entry = None
+        self._tool_count = 0
+        self._last_tool_name = None
+        self._last_tool_duration_ms = None
 
     @property
     def tool_details_expanded(self) -> bool:
@@ -762,13 +770,21 @@ class Transcript:
 
     @property
     def tool_error_count(self) -> int:
-        """Return collapsed routine tool failures retained in the transcript."""
-        total = 0
-        for entry in self._entries:
-            match = re.match(rf"{re.escape(_TOOL_ERROR_PREFIX)}\s+(\d+)", entry.text)
-            if match is not None:
-                total += int(match.group(1))
-        return total
+        """Return routine tool failures observed during this session."""
+        return self._tool_error_total
+
+    @property
+    def tool_count(self) -> int:
+        """Return tool calls observed during this session."""
+        return self._tool_count
+
+    @property
+    def last_tool_name(self) -> str | None:
+        return self._last_tool_name
+
+    @property
+    def last_tool_duration_ms(self) -> int | float | None:
+        return self._last_tool_duration_ms
 
     def _clear_stream(self) -> None:
         self._stream_role = None
@@ -842,7 +858,7 @@ class Transcript:
             if final.startswith(current) or current.startswith(final):
                 final = final if len(final) >= len(current) else current
             elif current != final:
-                final = f"{current}\n\n{final}"
+                final = f"{current}\n{final}"
         elif current and role is not None:
             self.add(role, current)
         self.assistant(final)
@@ -904,6 +920,7 @@ class Transcript:
         tool: Any,
     ) -> None:
         del task_id, turn
+        self._tool_error_total += 1
         key = self._turn_serial
         if self._tool_failure_key != key or self._tool_failure_entry not in self._entries:
             self._tool_failure_key = key
@@ -922,6 +939,13 @@ class Transcript:
             if current is previous_entry:
                 self._entries[index] = self._tool_failure_entry
                 return
+
+    def _remember_tool_activity(self, tool: Any, duration: int | float | None) -> None:
+        self._tool_count += 1
+        self._last_tool_name = (
+            _sanitize(tool).strip() if isinstance(tool, str) and tool.strip() else "tool"
+        )
+        self._last_tool_duration_ms = duration
 
     def _clear_tool_failure_notice(self, task_id: str | None, turn: int | None) -> None:
         del task_id, turn
@@ -1015,6 +1039,7 @@ class Transcript:
             tool = data.get("tool")
             ok = _tool_status(data)
             duration = _duration_ms(data.get("duration_ms"))
+            self._remember_tool_activity(tool, duration)
             if ok is False:
                 context_line = _failure_context_line(kind, data)
                 if context_line is not None:
@@ -1848,6 +1873,11 @@ def _bounded_markdown_lines(
     return rendered
 
 
+def _dense_rendered_lines(lines: list[str]) -> list[str]:
+    """Remove markdown's visual spacer rows from the transcript view."""
+    return [line for line in lines if _visible(line).strip()]
+
+
 def _entry_lines(
     entry: TranscriptEntry,
     width: int,
@@ -1857,15 +1887,18 @@ def _entry_lines(
 ) -> list[tuple[str, str]]:
     width = max(1, width)
     if entry.role == "tool" and entry.text.startswith(_TOOL_ERROR_PREFIX):
-        return [("dim", _clip(" " + entry.text, width))]
-    label = "· SYSTEM" if entry.role == "system" else _ROLE_LABELS[entry.role]
-    body_prefix = "   │ " if entry.role == "system" else "   ↳ " if entry.role == "user" else "   "
-    body_width = max(1, width - _display_width(body_prefix))
-    rendered = [(entry.role, _clip(f" {label}", width))]
+        return []
+    label_prefix = f"{_ROLE_LABELS[entry.role]} ▸ "
+    body_width = max(1, width - _display_width(label_prefix))
     if entry.tool_name is not None:
+        summary_lines = _dense_rendered_lines(
+            _wrap_markdown(_tool_line(entry), body_width)
+        )
+        rendered = [
+            (entry.role, _clip(label_prefix + (summary_lines[0] if summary_lines else ""), width))
+        ]
         rendered.extend(
-            (entry.role, _clip("   " + line, width))
-            for line in _wrap_markdown(_tool_line(entry), max(1, width - 3))
+            (entry.role, _clip("    " + line, width)) for line in summary_lines[1:]
         )
         summary = f"{entry.tool_name}: "
         detail = entry.text
@@ -1877,20 +1910,27 @@ def _entry_lines(
                 if detail_limit is not None
                 else render_markdown_lines(detail, body_width, color=color)
             )
-            rendered.extend((entry.role, _clip(body_prefix + line, width)) for line in detail_lines)
+            rendered.extend(
+                (entry.role, _clip("    " + line, width))
+                for line in _dense_rendered_lines(detail_lines)
+            )
     else:
         lines = (
             _bounded_markdown_lines(entry.text, body_width, detail_limit, color=color)
             if detail_limit is not None
             else render_markdown_lines(entry.text, body_width, color=color)
         )
-        for line in lines:
+        lines = _dense_rendered_lines(lines)
+        rendered = [
+            (entry.role, _clip(label_prefix + (lines[0] if lines else ""), width))
+        ]
+        for line in lines[1:]:
             role = (
                 "dim"
                 if entry.role == "error" and line.lstrip().startswith(_FAILURE_CONTEXT_PREFIX)
                 else entry.role
             )
-            rendered.append((role, _clip(body_prefix + line, width)))
+            rendered.append((role, _clip("    " + line, width)))
     return rendered
 
 
@@ -1918,6 +1958,9 @@ def _transcript_blocks(
     while index < len(entries):
         entry = entries[index]
         if entry.role != "tool" or entry.tool_name is None:
+            if entry.role == "tool" and entry.text.startswith(_TOOL_ERROR_PREFIX):
+                index += 1
+                continue
             detail_limit = _TOOL_DETAIL_RENDER_LIMIT if entry.role == "error" else None
             blocks.append(_entry_lines(entry, width, detail_limit=detail_limit, color=color))
             index += 1
@@ -1970,6 +2013,13 @@ def _transcript_block_kind(block: list[tuple[str, str]]) -> str:
     return role
 
 
+def _rendered_row_is_tool(row: tuple[str, str]) -> bool:
+    role, text = row
+    return role == "tool" or _visible(text).lstrip().startswith(
+        ("✓ ", "✗ ", "• ", _TOOL_ERROR_PREFIX)
+    )
+
+
 def _stream_lines(
     transcript: Transcript,
     width: int,
@@ -1980,15 +2030,20 @@ def _stream_lines(
     if not transcript.streaming_text or transcript.streaming_role is None:
         return []
     width = max(1, width)
-    body_width = max(1, width - 3)
     text = transcript.streaming_text
     if len(text) > _STREAM_RENDER_LIMIT:
         text = "…\n" + text[-_STREAM_RENDER_LIMIT:]
-    label = _ROLE_LABELS[transcript.streaming_role]
-    rendered = [(transcript.streaming_role, _clip(f" {label} · generating", width))]
+    label_prefix = f"{_ROLE_LABELS[transcript.streaming_role]} ▸ "
+    body_width = max(1, width - _display_width(label_prefix))
+    lines = _dense_rendered_lines(render_markdown_lines(text, body_width, color=color))
+    rendered = [
+        (
+            transcript.streaming_role,
+            _clip(label_prefix + (lines[0] if lines else "generating…"), width),
+        )
+    ]
     rendered.extend(
-        (transcript.streaming_role, _clip("   " + line, width))
-        for line in render_markdown_lines(text, body_width, color=color)
+        (transcript.streaming_role, _clip("    " + line, width)) for line in lines[1:]
     )
     return rendered[-max(1, capacity) :]
 
@@ -2014,7 +2069,12 @@ def _transcript_lines(
             color=color,
         ):
             kind = _transcript_block_kind(block)
-            if history and kind != previous_kind:
+            if (
+                history
+                and kind != previous_kind
+                and kind != "tool"
+                and previous_kind != "tool"
+            ):
                 history.append(("system", ""))
             history.extend(block)
             previous_kind = kind
@@ -2024,6 +2084,14 @@ def _transcript_lines(
             except StopIteration:
                 break
         rendered = history[-remaining:]
+    if (
+        active
+        and rendered
+        and rendered[-1][0] != active[0][0]
+        and not _rendered_row_is_tool(rendered[-1])
+        and not _rendered_row_is_tool(active[0])
+    ):
+        rendered.append(("system", ""))
     rendered.extend(active)
     if not rendered:
         rendered = [("system", _clip(" Waiting for a prompt. Type /help for commands.", width))]
@@ -2543,6 +2611,10 @@ def _status_fields(
         fields["provider"] = _sanitize(provider)
     if isinstance(model, str) and model:
         fields["model"] = _sanitize(model)
+    if main is not None:
+        main_turn = getattr(main, "turn", None)
+        if isinstance(main_turn, int) and main_turn >= 0:
+            fields.setdefault("turn", str(main_turn))
 
     context = getattr(snapshot, "context", None)
     if context is not None:
@@ -2610,41 +2682,133 @@ def _primary_status_line(
     cumulative_line: str,
     width: int,
     previous: Mapping[str, str] | None = None,
+    transcript: Transcript | None = None,
+    activity_line: str = "",
 ) -> str:
-    """Build the compact status row appended after each changed draw."""
+    """Build the one-line status strip used by both cockpit renderers."""
     fields = _status_fields(
         snapshot,
         session_description=session_description,
         branch_line=branch_line,
         cumulative_line=cumulative_line,
     )
-    fields["status"] = _sanitize(getattr(snapshot, "session_status", "idle"))
-    parts = _status_parts(fields, previous)
-    line = " · ".join(parts)
+    del previous
     width = max(8, width)
-    if len(line) <= width:
-        return line
-
-    # Usage is useful, but never earns a wrapped status row.  Keep the
-    # identity fields first and retry without the trailing usage group.
-    if len(parts) > 2:
-        compact = " · ".join(parts[:-1])
-        if len(compact) <= width:
-            return compact
-        line = compact
-
-    # Session roots and checkpoint names are the unbounded inputs.  Shorten
-    # those fields before applying the final width guard and ellipsis.
-    for index, part in enumerate(parts):
-        if part.startswith("session="):
-            parts[index] = f"session={_clip(part[8:], 20)}"
-        elif part.startswith("ckpt="):
-            parts[index] = f"ckpt={_clip(part[5:], 16)}"
+    parts = [_activity_status(snapshot, activity_line)]
+    provider = fields.get("provider")
+    model = fields.get("model")
+    if provider or model:
+        provider = _side_clean(provider or "?").strip()
+        model = _short_model(model or "?")
+        parts.append(f"{provider}/{model}")
+    if turn := fields.get("turn"):
+        parts.append(f"t{_side_clean(turn)}")
+    tokens = _human_count(
+        _usage_int(fields.get("tokens"), _usage_int(getattr(snapshot, "total_tokens", 0)))
+    )
+    parts.append(f"{tokens} tok")
+    if transcript is not None and transcript.tool_error_count > 0:
+        parts.append(f"err{transcript.tool_error_count}")
     return _clip(" · ".join(parts), width)
 
 
+def _compact_seconds(value: Any) -> str:
+    number = _usage_float(value)
+    if number <= 0:
+        return "0s"
+    rendered = f"{number:.1f}".rstrip("0").rstrip(".")
+    return f"{rendered}s"
+
+
+def _activity_status(snapshot: Any, activity_line: str) -> str:
+    """Reduce the verbose activity ticker to a single state-and-duration pair."""
+    clean = _side_clean(activity_line).strip()
+    spinner = next((frame for frame in _SPINNER_FRAMES if clean.startswith(frame)), "⠋")
+    upper = clean.upper()
+    if "✗" in clean or "ERROR" in upper:
+        return "✗ error"
+    if "✓" in clean or "DONE" in upper or "SUCCEEDED" in upper:
+        return "✓ done"
+
+    if "COOLDOWN" in upper:
+        verb = "cooldown"
+    elif "STREAMING" in upper or "RESPONDING" in upper:
+        verb = "responding"
+    elif "WAITING" in upper or "THINKING" in upper or "RUNNING" in upper:
+        verb = "thinking"
+    else:
+        status = _side_clean(getattr(snapshot, "session_status", "idle")).casefold()
+        if status in {"done", "ended", "succeeded", "complete", "completed"}:
+            return "✓ done"
+        if status in {"error", "failed", "failure"}:
+            return "✗ error"
+        verb = "thinking" if getattr(snapshot, "active_agents", 0) else "idle"
+
+    duration = None
+    if verb == "thinking" and "RUNNING" in upper:
+        match = re.search(r"\bturn\s+(\d+(?:\.\d+)?)s", clean, re.IGNORECASE)
+        if match is not None:
+            duration = match.group(1)
+    if duration is None:
+        match = re.search(
+            r"(?:thinking|responding|turn)\s*…?\s*(\d+(?:\.\d+)?)s",
+            clean,
+            re.IGNORECASE,
+        )
+        if match is not None:
+            duration = match.group(1)
+    return f"{spinner} {verb}{f' {_compact_seconds(duration)}' if duration is not None else ''}"
+
+
+def _short_model(value: Any) -> str:
+    model = _side_clean(value).strip() or "?"
+    return model.replace("/", "-")
+
+
+def _format_tool_seconds(duration_ms: int | float | None) -> str:
+    if duration_ms is None:
+        return ""
+    seconds = _usage_float(duration_ms) / 1000
+    if seconds <= 0:
+        return "0s"
+    if seconds >= 10:
+        return f"{seconds:.0f}s"
+    return _compact_seconds(seconds)
+
+
+def _running_tool(activity_line: str) -> tuple[str, str] | None:
+    match = re.search(
+        r"\brunning\s+(\S+)(?:\s+(\d+(?:\.\d+)?)s)?",
+        _side_clean(activity_line),
+        re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    duration = _compact_seconds(match.group(2)) if match.group(2) is not None else ""
+    return _sanitize(match.group(1)), duration
+
+
+def _tool_activity_row(transcript: Transcript, activity_line: str, width: int) -> str:
+    count = transcript.tool_count
+    name = transcript.last_tool_name
+    duration = _format_tool_seconds(transcript.last_tool_duration_ms)
+    running = _running_tool(activity_line)
+    if running is not None:
+        count += 1
+        name, duration = running
+    if count <= 0:
+        return _status_row(["· 0 tools"], width)
+    parts = [f"✓ {count} tools"]
+    if name:
+        last = f"last {name}"
+        if duration:
+            last += f" {duration}"
+        parts.append(last)
+    return _status_row(parts, width)
+
+
 _FIXED_MIN_HEIGHT = 12
-_STATUS_ROW_COUNT = 4
+_STATUS_ROW_COUNT = 2
 _BOTTOM_RESERVED_ROWS = 1 + _STATUS_ROW_COUNT + 1
 _FRAME_OVERHEAD = 2 + _BOTTOM_RESERVED_ROWS
 
@@ -2664,82 +2828,24 @@ def _status_rows(
     width: int,
     activity_line: str = "",
 ) -> list[str]:
-    """Render the fixed, four-row status pane without repeating source rows."""
+    """Render the rolling tool row and one compact status strip."""
     width = max(1, width)
-    fields = _status_fields(
-        snapshot,
-        session_description=session_description,
-        branch_line=branch_line,
-        cumulative_line=cumulative_line,
-    )
-    provider = fields.get("provider", "?")
-    model = fields.get("model", "?")
-    turn = fields.get("turn", "?")
-    branch = fields.get("branch", "?")
-    generation = fields.get("generation", "?")
-    epoch = fields.get("epoch", "?")
-
-    identity = [
-        f"provider={provider}",
-        f"model={model}",
-        f"turn={turn}",
-        f"branch={branch}",
-        f"generation={generation}",
-        f"epoch={epoch}",
-    ]
-    if len(" · ".join(identity)) > width:
-        identity = [
-            f"provider={provider} model={model}",
-            f"t={turn}",
-            f"b={branch}/g={generation}",
-            f"e={epoch}",
-        ]
-
-    total_tokens = _human_count(
-        _usage_int(fields.get("tokens"), _usage_int(getattr(snapshot, "total_tokens", 0)))
-    )
-    usage = [f"tokens={total_tokens}"]
-    for key in ("in", "out", "cached"):
-        value = fields.get(key)
-        if value is not None:
-            usage.append(f"{key}={_human_count(_usage_int(value))}")
-    rate = fields.get("out/s")
-    if rate:
-        usage.append(f"out/s={rate}")
-    cost = fields.get("cost") or _format_cost(getattr(snapshot, "estimated_cost_usd", 0.0))
-    usage.append(f"cost={_sanitize(cost)}")
-    if len(" · ".join(usage)) > width:
-        usage = [usage[0], *(part for part in usage if part.startswith("out/s=")), usage[-1]]
-
-    agents = tuple(getattr(snapshot, "agents", ()))
-    agent_states = [
-        f"{_clip(_side_clean(getattr(agent, 'task_id', '?')), 16)}:"
-        f"{_side_clean(getattr(agent, 'state', '?'))}"
-        for agent in agents[-4:]
-    ]
-    active = getattr(snapshot, "active_agents", 0)
-    agent_row = [f"agents={active} active"]
-    if agent_states:
-        agent_row.append(" ".join(agent_states))
-    if not activity_line:
-        agent_row.append("state=IDLE")
-
-    checkpoint = fields.get("checkpoint")
-    context_row = []
-    if session := fields.get("session"):
-        context_row.append(f"session={_clip(session, 24)}")
-    if checkpoint:
-        context_row.append(f"checkpoint={_compact_checkpoint(checkpoint)}")
-    tool_errors = transcript.tool_error_count
-    context_row.insert(0, f"tool errors={tool_errors}")
-    if activity_line:
-        context_row.insert(0, _side_clean(activity_line))
-
     return [
-        _status_row(identity, width),
-        _status_row(usage, width),
-        _status_row(agent_row, width),
-        _status_row(context_row, width),
+        _tool_activity_row(transcript, activity_line, width),
+        _status_row(
+            [
+                _primary_status_line(
+                    snapshot,
+                    session_description=session_description,
+                    branch_line=branch_line,
+                    cumulative_line=cumulative_line,
+                    width=width,
+                    transcript=transcript,
+                    activity_line=activity_line,
+                )
+            ],
+            width,
+        ),
     ]
 
 
@@ -2813,7 +2919,7 @@ def render_primary(
     color: bool = False,
     activity_line: str = "",
 ) -> list[str]:
-    """Render conversation rows followed by the deterministic status pane."""
+    """Render conversation rows followed by the rolling tool/status rows."""
     width = max(8, width)
     lines = [
         _paint(text, _ROLE_COLORS.get(role, ""), color)
@@ -3162,9 +3268,9 @@ class Cockpit:
             cumulative_line=cumulative_line,
             width=self._last_size.columns,
             previous=self._last_status_fields,
+            transcript=transcript,
+            activity_line=request[-1],
         )
-        if current_status_fields == self._last_status_fields and self._last_status_line:
-            status_line = self._last_status_line
 
         if rows[: len(self._last_primary_rows)] == self._last_primary_rows:
             new_rows = rows[len(self._last_primary_rows) :]
