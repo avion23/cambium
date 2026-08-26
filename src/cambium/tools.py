@@ -24,6 +24,7 @@ from typing import Any, cast
 from .auth import scrub_environment
 from .lint_diag import LintDiag
 from .schemas import TOOL_SCHEMAS, validate_tool_call
+from .tasktree import TaskKind
 
 MAX_READ_BYTES = 100 * 1024
 MAX_OUTPUT_BYTES = 64 * 1024
@@ -31,6 +32,8 @@ GIT_TIMEOUT_S = 30
 BATCH_READ_MAX_CONCURRENCY = 4
 READ_TRUNCATION_MARKER = "\n... [file truncated]"
 OUTPUT_TRUNCATION_MARKER = "\n... [output truncated]"
+_ALLOWED_TASK_KINDS = frozenset(member.value for member in TaskKind)
+_ALLOWED_TASK_KINDS_TEXT = ", ".join(member.value for member in TaskKind)
 
 ToolEventSink = Callable[[dict[str, Any]], Awaitable[None] | None]
 
@@ -437,6 +440,14 @@ async def _delegate(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
     rejects the child.
     """
     child_task_id = args["child_task_id"]
+    kind = args["kind"]
+    if kind not in _ALLOWED_TASK_KINDS:
+        return _Outcome(
+            ok=False,
+            error=(
+                f"validation failed: unknown task kind {kind} (allowed: {_ALLOWED_TASK_KINDS_TEXT})"
+            ),
+        )
     return _Outcome(
         ok=True,
         output=(f"child {child_task_id} proposed; admission is validated when this task completes"),

@@ -419,3 +419,23 @@ def test_run_tool_validates_before_dispatch_and_rejects_unknown_tools(tmp_path: 
     removed = _run("read_file", {"path": "anything.txt"}, ToolContext(tmp_path))
     assert not removed.ok
     assert removed.error == "unknown tool: 'read_file'"
+
+
+def test_delegate_rejects_unknown_task_kind_at_call_time(tmp_path: Path) -> None:
+    invalid = _run(
+        "delegate",
+        {"child_task_id": "child", "kind": "message", "spec": {}},
+        ToolContext(tmp_path),
+    )
+    assert not invalid.ok
+    assert invalid.error == (
+        "validation failed: unknown task kind message "
+        "(allowed: feature, bugfix, refactor, test, docs, investigation)"
+    )
+
+    valid = _run(
+        "delegate",
+        {"child_task_id": "child", "kind": "test", "spec": {}},
+        ToolContext(tmp_path),
+    )
+    assert valid.ok
