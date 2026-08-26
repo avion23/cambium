@@ -8,28 +8,20 @@ linting and dependency wiring out of process-global state.
 from __future__ import annotations
 
 import asyncio
-import json
-import keyword
 import os
-import re
-import secrets
 import shlex
-import shutil
 import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from concurrent.futures import Executor, Future
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from inspect import isawaitable
 from pathlib import Path
-from queue import Empty, Queue
-from threading import Lock, Thread, current_thread
 from typing import Any, cast
 
-from . import ast_tools, code_index, lsp_query
 from .auth import scrub_environment
 from .lint_diag import LintDiag
 from .schemas import TOOL_SCHEMAS, validate_tool_call
@@ -37,8 +29,6 @@ from .schemas import TOOL_SCHEMAS, validate_tool_call
 MAX_READ_BYTES = 100 * 1024
 MAX_OUTPUT_BYTES = 64 * 1024
 GIT_TIMEOUT_S = 30
-GET_SIGNATURE_READ_TIMEOUT_S = 1.0
-GREP_TIMEOUT_S = 10
 BATCH_READ_MAX_CONCURRENCY = 4
 READ_TRUNCATION_MARKER = "\n... [file truncated]"
 OUTPUT_TRUNCATION_MARKER = "\n... [output truncated]"
@@ -62,40 +52,18 @@ class ToolContext:
     init: Mapping[str, Any] | None = None
     emit: ToolEventSink | None = None
     policy: ToolPermissionPolicy | None = None
-    _root: Path = field(init=False, repr=False)
-    _root_fd: int | None = field(init=False, default=None, repr=False)
 
     def __post_init__(self) -> None:
-        root = Path(self.cwd).resolve()
-        self.cwd = root
-        self._root = root
-        flags = (
-            os.O_RDONLY
-            | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_CLOEXEC", 0)
-        )
-        self._root_fd = os.open(root, flags)
+        self.cwd = Path(self.cwd).resolve()
 
     def close(self) -> None:
-        root_fd = self._root_fd
-        self._root_fd = None
-        if root_fd is not None:
-            os.close(root_fd)
+        return None
 
     def __enter__(self) -> ToolContext:
         return self
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
         self.close()
-
-    def __del__(self) -> None:
-        root_fd = getattr(self, "_root_fd", None)
-        if root_fd is not None:
-            try:
-                os.close(root_fd)
-            except OSError:
-                pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,77 +88,6 @@ class _ToolFailure(Exception):
 
 
 ToolImplementation = Callable[[dict[str, Any], ToolContext], Awaitable[_Outcome]]
-_DaemonWorkItem = tuple[Future[Any], Callable[..., Any], tuple[Any, ...], dict[str, Any]] | None
-
-
-class _DaemonSingleThreadExecutor(Executor):
-    """Run one blocking operation without joining it during loop shutdown.
-
-    The executor is one-shot and owns a daemon worker.  A timed-out read calls
-    ``shutdown(wait=False)``, so ``asyncio.run`` does not wait for a blocked
-    system call and the worker cannot consume the event loop's shared default
-    executor.  The daemon thread can remain until the underlying call returns;
-    this is the deliberate tradeoff for protecting the caller from an
-    uninterruptible regular-file read.
-    """
-
-    def __init__(self) -> None:
-        self._work_queue: Queue[_DaemonWorkItem] = Queue()
-        self._shutdown_lock = Lock()
-        self._shutdown = False
-        self._thread = Thread(
-            target=self._worker,
-            name="cambium-get-signature-read",
-            daemon=True,
-        )
-        self._thread.start()
-
-    def submit(
-        self,
-        fn: Callable[..., Any],
-        /,
-        *args: Any,
-        **kwargs: Any,
-    ) -> Future[Any]:
-        future: Future[Any] = Future()
-        with self._shutdown_lock:
-            if self._shutdown:
-                raise RuntimeError("cannot schedule work after executor shutdown")
-            self._work_queue.put((future, fn, args, kwargs))
-        return future
-
-    def _worker(self) -> None:
-        while True:
-            work_item = self._work_queue.get()
-            if work_item is None:
-                return
-            future, fn, args, kwargs = work_item
-            if not future.set_running_or_notify_cancel():
-                continue
-            try:
-                result = fn(*args, **kwargs)
-            except BaseException as exc:
-                future.set_exception(exc)
-            else:
-                future.set_result(result)
-
-    def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
-        with self._shutdown_lock:
-            if self._shutdown:
-                return
-            self._shutdown = True
-            if cancel_futures:
-                while True:
-                    try:
-                        work_item = self._work_queue.get_nowait()
-                    except Empty:
-                        break
-                    if work_item is not None:
-                        work_item[0].cancel()
-            self._work_queue.put(None)
-
-        if wait and current_thread() is not self._thread:
-            self._thread.join()
 
 
 def _duration_ms(started_ns: int) -> int:
@@ -210,88 +107,22 @@ def _truncate_text(text: str, limit: int, marker: str) -> str:
     return _truncate_bytes(text.encode("utf-8"), limit, marker)
 
 
-def _serialize_signature_result(result: dict[str, Any]) -> str:
-    def serialize(value: dict[str, Any]) -> str:
-        return json.dumps(value, ensure_ascii=False, sort_keys=True)
-
-    output = serialize(result)
-    if len(output.encode("utf-8")) <= MAX_OUTPUT_BYTES:
-        return output
-
-    envelope = {**result, "signature": "", "truncated": True}
-    if len(serialize(envelope).encode("utf-8")) > MAX_OUTPUT_BYTES:
-        return serialize({"signature": OUTPUT_TRUNCATION_MARKER, "truncated": True})
-
-    signature = result["signature"]
-    low = 0
-    high = len(signature)
-    best_signature = ""
-    while low <= high:
-        midpoint = (low + high) // 2
-        candidate = signature[:midpoint] + OUTPUT_TRUNCATION_MARKER
-        envelope["signature"] = candidate
-        if len(serialize(envelope).encode("utf-8")) <= MAX_OUTPUT_BYTES:
-            best_signature = candidate
-            low = midpoint + 1
-        else:
-            high = midpoint - 1
-
-    if not best_signature:
-        return serialize({"signature": OUTPUT_TRUNCATION_MARKER, "truncated": True})
-    envelope["signature"] = best_signature
-    return serialize(envelope)
-
-
-def _confined_path(ctx: ToolContext, raw_path: str) -> Path:
-    root = ctx._root
-    candidate = (root / raw_path).resolve()
-    if not candidate.is_relative_to(root):
-        raise _ToolFailure(f"path escapes worktree: {raw_path!r}")
-    return candidate
-
-
-def _open_confined_read_fd(ctx: ToolContext, path: Path) -> int:
-    """Open a resolved worktree path without following a replacement symlink."""
-    root = ctx._root
-    try:
-        components = path.relative_to(root).parts
-    except ValueError as exc:
-        raise _ToolFailure(f"path escapes worktree: {path!r}") from exc
-    if not components:
-        raise IsADirectoryError(path)
-
-    nofollow = getattr(os, "O_NOFOLLOW", 0)
-    nonblocking = getattr(os, "O_NONBLOCK", 0)
-    directory = getattr(os, "O_DIRECTORY", 0)
-    close_on_exec = getattr(os, "O_CLOEXEC", 0)
-    directory_flags = os.O_RDONLY | nofollow | directory | close_on_exec
-    file_flags = os.O_RDONLY | nofollow | nonblocking | close_on_exec
-
-    root_fd = ctx._root_fd
-    if root_fd is None:
-        raise _ToolFailure("worktree context is closed")
-    directory_fd = os.dup(root_fd)
-    try:
-        for component in components[:-1]:
-            next_directory_fd = os.open(component, directory_flags, dir_fd=directory_fd)
-            os.close(directory_fd)
-            directory_fd = next_directory_fd
-        return os.open(components[-1], file_flags, dir_fd=directory_fd)
-    finally:
-        os.close(directory_fd)
-
-
 def _display_path(ctx: ToolContext, path: Path) -> str:
-    relative = path.relative_to(ctx._root)
+    try:
+        relative = path.relative_to(Path(ctx.cwd))
+    except ValueError:
+        return str(path)
     return relative.as_posix() or "."
 
 
-def _read_text(ctx: ToolContext, path: Path) -> str:
-    descriptor: int | None = None
+def _read_text(path: Path) -> str:
     try:
-        descriptor = _open_confined_read_fd(ctx, path)
-        with os.fdopen(descriptor, "rb") as handle:
-            descriptor = None
+        mode = path.stat().st_mode
+        if stat.S_ISDIR(mode):
+            raise IsADirectoryError(path)
+        if not stat.S_ISREG(mode):
+            raise _ToolFailure(f"path is not a regular file: {path}")
+        with path.open("rb") as handle:
             raw = handle.read(MAX_READ_BYTES + 1)
     except FileNotFoundError as exc:
         raise _ToolFailure(f"file not found: {path}") from exc
@@ -301,9 +132,6 @@ def _read_text(ctx: ToolContext, path: Path) -> str:
         raise _ToolFailure(f"file is not valid UTF-8: {path}") from exc
     except OSError as exc:
         raise _ToolFailure(f"could not read {path}: {exc}") from exc
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
 
     if len(raw) > MAX_READ_BYTES:
         raise _ToolFailure(
@@ -315,86 +143,35 @@ def _read_text(ctx: ToolContext, path: Path) -> str:
         raise _ToolFailure(f"file is not valid UTF-8: {path}") from exc
 
 
-def _open_confined_parent_fd(ctx: ToolContext, path: Path) -> tuple[int, str]:
-    try:
-        components = path.relative_to(ctx._root).parts
-    except ValueError as exc:
-        raise _ToolFailure(f"path escapes worktree: {path!r}") from exc
-    if not components:
-        raise IsADirectoryError(path)
-
-    root_fd = ctx._root_fd
-    if root_fd is None:
-        raise _ToolFailure("worktree context is closed")
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_CLOEXEC", 0)
+def _atomic_write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
     )
-    directory_fd = os.dup(root_fd)
+    temporary_path: Path | None = Path(temporary_name)
     try:
-        for component in components[:-1]:
-            try:
-                next_directory_fd = os.open(component, flags, dir_fd=directory_fd)
-            except FileNotFoundError:
-                try:
-                    os.mkdir(component, dir_fd=directory_fd)
-                except FileExistsError:
-                    pass
-                next_directory_fd = os.open(component, flags, dir_fd=directory_fd)
-            os.close(directory_fd)
-            directory_fd = next_directory_fd
-        return directory_fd, components[-1]
-    except BaseException:
-        os.close(directory_fd)
-        raise
-
-
-def _atomic_write(ctx: ToolContext, path: Path, content: str) -> None:
-    directory_fd, filename = _open_confined_parent_fd(ctx, path)
-    temporary_name: str | None = None
-    try:
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
-        while True:
-            candidate = f".{filename}.{secrets.token_hex(8)}.tmp"
-            try:
-                descriptor = os.open(candidate, flags, 0o600, dir_fd=directory_fd)
-                temporary_name = candidate
-                break
-            except FileExistsError:
-                continue
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(
-            temporary_name,
-            filename,
-            src_dir_fd=directory_fd,
-            dst_dir_fd=directory_fd,
-        )
-        temporary_name = None
+        os.replace(temporary_name, path)
+        temporary_path = None
     finally:
-        if temporary_name is not None:
+        if temporary_path is not None:
             try:
-                os.unlink(temporary_name, dir_fd=directory_fd)
+                temporary_path.unlink()
             except FileNotFoundError:
                 pass
-        os.close(directory_fd)
 
 
-def _read_file_sync(ctx: ToolContext, path: Path, display_path: str) -> _Outcome:
-    descriptor: int | None = None
+def _read_file_sync(path: Path, display_path: str) -> _Outcome:
     try:
-        descriptor = _open_confined_read_fd(ctx, path)
-        mode = os.fstat(descriptor).st_mode
+        mode = path.stat().st_mode
         if stat.S_ISDIR(mode):
             raise IsADirectoryError(path)
         if not stat.S_ISREG(mode):
             raise _ToolFailure(f"path is not a regular file: {display_path}")
-        with os.fdopen(descriptor, "rb") as handle:
-            descriptor = None
+        with path.open("rb") as handle:
             raw = handle.read(MAX_READ_BYTES + 1)
     except FileNotFoundError as exc:
         raise _ToolFailure(f"file not found: {display_path}") from exc
@@ -402,9 +179,6 @@ def _read_file_sync(ctx: ToolContext, path: Path, display_path: str) -> _Outcome
         raise _ToolFailure(f"path is a directory: {display_path}") from exc
     except OSError as exc:
         raise _ToolFailure(f"could not read {display_path}: {exc}") from exc
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
 
     if len(raw) > MAX_READ_BYTES:
         output = _truncate_bytes(raw, MAX_READ_BYTES, READ_TRUNCATION_MARKER)
@@ -417,9 +191,9 @@ def _read_file_sync(ctx: ToolContext, path: Path, display_path: str) -> _Outcome
 
 
 async def _read_file(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
-    path = _confined_path(ctx, args["path"])
+    path = (Path(ctx.cwd) / Path(args["path"]).expanduser()).resolve()
     display_path = _display_path(ctx, path)
-    return await asyncio.to_thread(_read_file_sync, ctx, path, display_path)
+    return await asyncio.to_thread(_read_file_sync, path, display_path)
 
 
 def _lint_feedback(ctx: ToolContext, path: Path) -> str:
@@ -431,9 +205,9 @@ def _lint_feedback(ctx: ToolContext, path: Path) -> str:
 
 
 async def _write_file(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
-    path = _confined_path(ctx, args["path"])
+    path = (Path(ctx.cwd) / Path(args["path"]).expanduser()).resolve()
     try:
-        await asyncio.to_thread(_atomic_write, ctx, path, args["content"])
+        await asyncio.to_thread(_atomic_write, path, args["content"])
     except OSError as exc:
         raise _ToolFailure(f"could not write {_display_path(ctx, path)}: {exc}") from exc
 
@@ -455,8 +229,8 @@ def _edit_context(content: str, old_string: str) -> str:
 
 
 async def _edit_file(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
-    path = _confined_path(ctx, args["path"])
-    content = await asyncio.to_thread(_read_text, ctx, path)
+    path = (Path(ctx.cwd) / Path(args["path"]).expanduser()).resolve()
+    content = await asyncio.to_thread(_read_text, path)
     old_string = args["old_string"]
     occurrences = content.count(old_string)
     if occurrences != 1:
@@ -468,7 +242,7 @@ async def _edit_file(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
 
     replacement = content.replace(old_string, args["new_string"], 1)
     try:
-        await asyncio.to_thread(_atomic_write, ctx, path, replacement)
+        await asyncio.to_thread(_atomic_write, path, replacement)
     except OSError as exc:
         raise _ToolFailure(f"could not edit {_display_path(ctx, path)}: {exc}") from exc
     output = f"edited {_display_path(ctx, path)}"
@@ -476,180 +250,6 @@ async def _edit_file(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
     if feedback:
         output += f"\nLint diagnostics:\n{feedback}"
     return _Outcome(ok=True, output=output)
-
-
-def _search_files(root: Path) -> list[Path]:
-    if root.is_file():
-        return [root]
-    if not root.is_dir():
-        raise _ToolFailure(f"search path is not a file or directory: {root}")
-
-    files: list[Path] = []
-    for directory, directories, names in os.walk(root, followlinks=False):
-        directories[:] = sorted(name for name in directories if name != ".git")
-        for name in sorted(names):
-            path = Path(directory) / name
-            try:
-                resolved = path.resolve()
-            except OSError:
-                continue
-            if resolved.is_relative_to(Path(root).resolve()) and resolved.is_file():
-                files.append(resolved)
-    return files
-
-
-def _append_bounded_text(parts: list[str], used: int, text: str) -> tuple[int, bool]:
-    separator = "\n" if parts else ""
-    raw = (separator + text).encode("utf-8")
-    remaining = MAX_OUTPUT_BYTES - used
-    if len(raw) <= remaining:
-        parts.append(separator + text)
-        return used + len(raw), True
-    marker_bytes = OUTPUT_TRUNCATION_MARKER.encode("utf-8")
-    if remaining > len(marker_bytes):
-        parts.append(_truncate_bytes(raw, remaining, OUTPUT_TRUNCATION_MARKER))
-        return MAX_OUTPUT_BYTES, False
-    return used, False
-
-
-def _grep_fallback(pattern: str, root: Path, worktree: Path) -> str:
-    try:
-        expression = re.compile(pattern)
-    except re.error as exc:
-        raise _ToolFailure(f"invalid regular expression: {exc}") from exc
-
-    matches: list[str] = []
-    used = 0
-    for path in _search_files(root):
-        display = path.relative_to(worktree).as_posix()
-        file_matches: list[str] = []
-        file_used = 0
-        truncated = False
-        binary = False
-        try:
-            with path.open("r", encoding="utf-8") as handle:
-                for line_number, raw_line in enumerate(handle, start=1):
-                    if "\x00" in raw_line:
-                        binary = True
-                        break
-                    line = raw_line.rstrip("\r\n")
-                    if not truncated and expression.search(line):
-                        file_used, complete = _append_bounded_text(
-                            file_matches,
-                            file_used,
-                            f"{display}:{line_number}:{line}",
-                        )
-                        truncated = not complete
-        except (OSError, UnicodeDecodeError):
-            continue
-        if binary:
-            continue
-        if file_matches:
-            used, complete = _append_bounded_text(matches, used, "".join(file_matches))
-            if not complete:
-                break
-    return "".join(matches)
-
-
-async def _grep_code(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
-    raw_path = args.get("path")
-    root = _confined_path(ctx, raw_path if raw_path is not None else ".")
-    if not root.exists():
-        raise _ToolFailure(f"search path not found: {raw_path!r}")
-
-    rg = shutil.which("rg")
-    if rg is None:
-        output = await asyncio.to_thread(_grep_fallback, args["pattern"], root, Path(ctx.cwd))
-        return _Outcome(ok=True, output=output)
-
-    command = [rg, "-n", "--no-heading", args["pattern"]]
-    if raw_path is not None:
-        command.append(_display_path(ctx, root))
-    try:
-        result = await _run_process(command, Path(ctx.cwd), GREP_TIMEOUT_S)
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        output = await asyncio.to_thread(_grep_fallback, args["pattern"], root, Path(ctx.cwd))
-        return _Outcome(ok=True, output=output)
-    except OSError as exc:
-        raise _ToolFailure(f"could not run ripgrep: {exc}") from exc
-
-    if result.returncode not in (0, 1):
-        detail = result.stderr.strip() or f"exit status {result.returncode}"
-        raise _ToolFailure(f"ripgrep failed: {detail}")
-    return _Outcome(
-        ok=True,
-        output=_truncate_text(result.stdout, MAX_OUTPUT_BYTES, OUTPUT_TRUNCATION_MARKER),
-    )
-
-
-def _read_and_extract_signature(
-    ctx: ToolContext, path: Path, display_path: str, symbol: str
-) -> dict[str, Any] | None:
-    descriptor: int | None = None
-    try:
-        descriptor = _open_confined_read_fd(ctx, path)
-        mode = os.fstat(descriptor).st_mode
-        if stat.S_ISDIR(mode):
-            raise IsADirectoryError(path)
-        if not stat.S_ISREG(mode):
-            raise _ToolFailure(f"path is not a regular file: {display_path}")
-        with os.fdopen(descriptor, "rb") as handle:
-            descriptor = None
-            raw = handle.read(MAX_READ_BYTES + 1)
-    except FileNotFoundError as exc:
-        raise _ToolFailure(f"file not found: {display_path}") from exc
-    except IsADirectoryError as exc:
-        raise _ToolFailure(f"path is a directory: {display_path}") from exc
-    except OSError as exc:
-        raise _ToolFailure(f"could not read {display_path}: {exc}") from exc
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
-
-    if len(raw) > MAX_READ_BYTES:
-        raise _ToolFailure(
-            f"get_signature source exceeds MAX_READ_BYTES ({MAX_READ_BYTES} bytes): {display_path}"
-        )
-    try:
-        source = raw.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise _ToolFailure(f"file is not valid UTF-8: {display_path}") from exc
-    return ast_tools.extract_signature(source, symbol)
-
-
-async def _get_signature(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
-    raw_path = args["path"]
-    if not raw_path.strip() or "\x00" in raw_path:
-        raise _ToolFailure("get_signature path must be a non-empty path")
-    path = _confined_path(ctx, raw_path)
-
-    symbol = args["symbol"]
-    if not symbol.isidentifier() or keyword.iskeyword(symbol):
-        raise _ToolFailure("get_signature symbol must be a Python identifier")
-
-    display_path = _display_path(ctx, path)
-    executor = _DaemonSingleThreadExecutor()
-    try:
-        signature = await asyncio.wait_for(
-            asyncio.get_running_loop().run_in_executor(
-                executor, _read_and_extract_signature, ctx, path, display_path, symbol
-            ),
-            timeout=GET_SIGNATURE_READ_TIMEOUT_S,
-        )
-    except TimeoutError as exc:
-        raise _ToolFailure(
-            f"get_signature read timed out after {GET_SIGNATURE_READ_TIMEOUT_S}s: {display_path}"
-        ) from exc
-    except SyntaxError as exc:
-        location = f" at line {exc.lineno}" if exc.lineno is not None else ""
-        raise _ToolFailure(f"could not parse {display_path}{location}: {exc.msg}") from exc
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
-    if signature is None:
-        raise _ToolFailure(f"symbol not found: {symbol!r} in {display_path}")
-
-    result = {"path": display_path, **signature}
-    return _Outcome(ok=True, output=_serialize_signature_result(result))
 
 
 def _process_output(stdout: Any, stderr: Any) -> str:
@@ -828,81 +428,6 @@ async def _read_batch(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
     return _Outcome(ok=ok, output=output)
 
 
-def _bounded_json_output(value: Any) -> str:
-    try:
-        serialized = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-    except (TypeError, ValueError) as exc:
-        raise _ToolFailure(f"navigation result is not JSON serializable: {exc}") from exc
-    return _truncate_text(serialized, MAX_OUTPUT_BYTES, OUTPUT_TRUNCATION_MARKER)
-
-
-async def _search_symbols(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
-    try:
-        locations = await asyncio.to_thread(
-            code_index.search_symbols,
-            ctx.cwd,
-            args["query"],
-            exact=args.get("exact", False),
-            max_results=args.get("max_results", 50),
-        )
-    except ValueError as exc:
-        raise _ToolFailure(str(exc)) from exc
-    return _Outcome(
-        ok=True,
-        output=_truncate_text(
-            code_index.locations_json(locations), MAX_OUTPUT_BYTES, OUTPUT_TRUNCATION_MARKER
-        ),
-    )
-
-
-async def _find_references(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
-    try:
-        locations = await asyncio.to_thread(
-            code_index.find_references,
-            ctx.cwd,
-            args["symbol"],
-            max_results=args.get("max_results", 100),
-        )
-    except ValueError as exc:
-        raise _ToolFailure(str(exc)) from exc
-    return _Outcome(
-        ok=True,
-        output=_truncate_text(
-            code_index.locations_json(locations), MAX_OUTPUT_BYTES, OUTPUT_TRUNCATION_MARKER
-        ),
-    )
-
-
-async def _read_symbol(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
-    try:
-        window = await asyncio.to_thread(
-            code_index.read_symbol,
-            ctx.cwd,
-            args["path"],
-            args["line"],
-            context_lines=args.get("context_lines", 40),
-        )
-    except ValueError as exc:
-        raise _ToolFailure(str(exc)) from exc
-    return _Outcome(ok=True, output=_bounded_json_output(window))
-
-
-async def _query_lsp(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
-    try:
-        result = await asyncio.to_thread(
-            lsp_query.query_lsp,
-            ctx.cwd,
-            method=args["method"],
-            path=args["path"],
-            line=args.get("line", 1),
-            column=args.get("column", 1),
-            timeout_s=args.get("timeout_s", 8.0),
-        )
-    except (ValueError, lsp_query.LspQueryError) as exc:
-        raise _ToolFailure(str(exc)) from exc
-    return _Outcome(ok=True, output=_bounded_json_output(result))
-
-
 async def _delegate(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
     """Register one child proposal for supervisor validation.
 
@@ -925,16 +450,10 @@ TOOL_DISPATCH: dict[str, ToolImplementation] = {
     "read_batch": _read_batch,
     "write_file": _write_file,
     "edit_file": _edit_file,
-    "grep_code": _grep_code,
-    "get_signature": _get_signature,
-    "search_symbols": _search_symbols,
-    "find_references": _find_references,
-    "read_symbol": _read_symbol,
-    "query_lsp": _query_lsp,
     "git_op": _git_op,
     "run_shell": _run_shell,
 }
-_TOOL_PERMISSION_REQUIREMENTS = {"run_shell": "shell", "run_python": "python"}
+_TOOL_PERMISSION_REQUIREMENTS = {"run_shell": "shell"}
 
 
 async def _run_read_result(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
@@ -994,10 +513,10 @@ async def _emit_read_batch_event(
 async def run_read_batch(
     calls: Sequence[dict[str, Any]], ctx: ToolContext
 ) -> tuple[ToolResult, ...]:
-    """Validate and execute a batch of confined reads in one ``read_batch`` call.
+    """Validate and execute a batch of reads in one ``read_batch`` call.
 
-    Validation covers the complete input before any file is opened, including
-    every path's containment inside the worktree. Eligible reads run
+    Validation covers the complete input before any file is opened. Relative
+    paths use the worker cwd and absolute paths are allowed. Eligible reads run
     concurrently within a bounded limit, while results and completion events
     retain input order.
     """
@@ -1040,12 +559,6 @@ async def run_read_batch(
         raw_path = arguments.get("path")
         errors = validate_tool_call(schema, {"paths": [raw_path]})
         preflight_errors.extend(f"batch_index {batch_index}: {error}" for error in errors)
-        if errors:
-            continue
-        try:
-            _confined_path(ctx, cast(str, raw_path))
-        except _ToolFailure as exc:
-            preflight_errors.append(f"batch_index {batch_index}: {exc}")
     if preflight_errors:
         reason = "read_batch batch rejected atomically: " + "\n".join(preflight_errors)
         return _batch_failure_results(batch_size, reason)
@@ -1093,11 +606,10 @@ async def run_tool(name: str, args: dict[str, Any], ctx: ToolContext) -> ToolRes
                 error="\n".join(validation_errors),
                 duration_ms=_duration_ms(started_ns),
             )
-        required_permission = _TOOL_PERMISSION_REQUIREMENTS["run_python"]
-        if ctx.policy is not None and not getattr(ctx.policy, required_permission):
+        if ctx.policy is not None and not ctx.policy.python:
             return ToolResult(
                 ok=False,
-                error=f"permission_denied:{required_permission}",
+                error="permission_denied:python",
                 duration_ms=_duration_ms(started_ns),
             )
         code = args["code"]
