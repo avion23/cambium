@@ -6,11 +6,12 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
 import cambium.tui_screen as tui_screen
-from cambium.tui import _queued_prompt_notice
+from cambium.tui import _command_output, _queued_prompt_notice
 from cambium.tui_screen import (
     ActivityState,
     Cockpit,
@@ -57,6 +58,23 @@ def _snapshot():
         context=context,
         recent_events=(SimpleNamespace(kind="usage_event", detail="tokens=12345"),),
     )
+
+
+def _traffic_snapshot():
+    snapshot = _snapshot()
+    snapshot.active_agents = 2
+    snapshot.queued_agents = 1
+    snapshot.succeeded_agents = 4
+    snapshot.failed_agents = 1
+    snapshot.calls = 9
+    snapshot.summary_calls = 2
+    snapshot.input_tokens = 100_000
+    snapshot.output_tokens = 20_000
+    snapshot.cached_tokens = 75_000
+    snapshot.total_tokens = 120_000
+    snapshot.output_tokens_per_s = 12.5
+    snapshot.estimated_cost_usd = 0.123456
+    return snapshot
 
 
 def test_wide_cockpit_has_transcript_agents_context_and_input() -> None:
@@ -275,7 +293,7 @@ def test_transcript_labels_are_inline_and_separators_only_split_speakers() -> No
     assert values[6].startswith("SYSTEM ▸ operator note")
 
 
-def test_status_strip_is_one_row_and_hides_context_internals() -> None:
+def test_status_strip_has_one_detail_row_and_hides_context_internals_from_spinner() -> None:
     transcript = Transcript()
     snapshot = _snapshot()
     rows = _status_rows(
@@ -288,13 +306,82 @@ def test_status_strip_is_one_row_and_hides_context_internals() -> None:
         activity_line="⠇ WAITING · thinking… 12.0s",
     )
 
-    assert len(rows) == 2
+    assert len(rows) == 3
     assert all("\n" not in row for row in rows)
-    assert rows[-1].strip() == "⠇ thinking 12s · codex/gpt-5.6 · t2 · 1.1m tok"
+    assert rows[1].strip() == "⠇ thinking 12s · codex/gpt-5.6 · t2 · 1.1m tok"
     assert all(
-        value not in rows[-1]
-        for value in ("branch", "generation", "epoch", "session", "checkpoint")
+        value not in rows[1] for value in ("branch", "generation", "epoch", "session", "checkpoint")
     )
+
+
+def test_detail_row_reports_traffic_and_context() -> None:
+    rows = _status_rows(
+        _traffic_snapshot(),
+        Transcript(),
+        session_description="session=/tmp/run",
+        branch_line="branch: turn=2",
+        cumulative_line=(
+            "usage: calls=9 summaries=2 tokens=120000 (in=100000 out=20000 cached=75000) "
+            "out/s=12.5 cost=$0.123456"
+        ),
+        width=220,
+        activity_line="⠦ WAITING · thinking… 2.6s",
+    )
+
+    detail = rows[-1]
+    assert "agents active=2 queued=1 ok=4 failed=1" in detail
+    assert "cached=75k (75%)" in detail
+    assert "summaries=2" in detail
+    assert "context epoch=4 trunk≈9ktok segments=3" in detail
+
+
+def test_detail_command_hides_row_on_next_frame(monkeypatch) -> None:
+    class _Tty(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    monkeypatch.setattr(
+        tui_screen.shutil,
+        "get_terminal_size",
+        lambda _fallback: os.terminal_size((220, 24)),
+    )
+    stream = _Tty()
+    cockpit = Cockpit(stream)
+    snapshot = _traffic_snapshot()
+    cumulative_line = (
+        "usage: calls=9 summaries=2 tokens=120000 (in=100000 out=20000 cached=75000) "
+        "out/s=12.5 cost=$0.123456"
+    )
+
+    with cockpit:
+        cockpit.draw(
+            snapshot,
+            Transcript(),
+            session_description="session",
+            branch_line="branch",
+            cumulative_line=cumulative_line,
+        )
+        first = stream.getvalue()
+        assert "summaries=2" in first
+        assert (
+            _command_output(
+                "/detail",
+                session=cast(Any, SimpleNamespace()),
+                cumulative=cast(Any, SimpleNamespace()),
+                snapshot=cast(Any, snapshot),
+                cockpit=cockpit,
+            )
+            == "detail: hidden"
+        )
+        cockpit.draw(
+            snapshot,
+            Transcript(),
+            session_description="session",
+            branch_line="branch",
+            cumulative_line=cumulative_line,
+        )
+
+    assert "summaries=" not in stream.getvalue()[len(first) :]
 
 
 def test_tool_row_counts_failures_and_uses_compact_last_duration() -> None:
@@ -416,14 +503,15 @@ def test_status_line_deduplicates_fields_and_shortens_checkpoint_hash() -> None:
         cumulative_line="usage: calls=3 tokens=12345 out/s=47.5",
         width=120,
     )
-    tool_row, strip = lines[-2:]
+    tool_row, strip, detail = lines[-3:]
 
-    assert all(len(line) <= 120 for line in lines[-2:])
+    assert all(len(line) <= 120 for line in lines[-3:])
     assert "· 0 tools" in tool_row
     assert strip.count("codex/gpt-5.6") == 1
     assert "checkpoint=" not in strip
     assert "generation=" not in strip
     assert "12.3k tok" in strip
+    assert "cached=" in detail
 
 
 def test_primary_renderer_ends_with_compact_status_row() -> None:
@@ -442,10 +530,11 @@ def test_primary_renderer_ends_with_compact_status_row() -> None:
 
     assert "YOU" in "\n".join(lines)
     assert "CAMBIUM" in "\n".join(lines)
-    assert len(lines[-2:]) == 2
-    assert lines[-2].startswith(" · 0 tools")
-    assert lines[-1].startswith(" ⠋ thinking")
-    assert "12.3k tok" in lines[-1]
+    assert len(lines[-3:]) == 3
+    assert lines[-3].startswith(" · 0 tools")
+    assert lines[-2].startswith(" ⠋ thinking")
+    assert "12.3k tok" in lines[-2]
+    assert lines[-1].startswith(" agents active=")
 
 
 def test_cockpit_appends_to_primary_buffer_without_repainting() -> None:
@@ -693,8 +782,8 @@ def test_cockpit_replaces_failed_to_idle_status_in_place() -> None:
         cockpit.hide_cursor()
         cockpit.flush()
 
-    assert len(cockpit._last_status_rows) == 2
-    assert cockpit._last_status_rows[-1].startswith(" ⠋ idle")
+    assert len(cockpit._last_status_rows) == 3
+    assert cockpit._last_status_rows[-2].startswith(" ⠋ idle")
     assert stream.getvalue().count("┌ Cambium · conversation") == 2
 
 
@@ -777,7 +866,7 @@ def test_cockpit_updates_fixed_status_pane_in_place() -> None:
     delta = stream.getvalue()[len(first) :]
     second_delta = stream.getvalue()[len(second) :]
     assert "\x1b[s" in delta
-    assert "\x1b[2A" in delta
+    assert "\x1b[3A" in delta
     assert "last run_shell 1s" in delta
     assert "last run_shell 2s" in second_delta
     assert "┌ Cambium · conversation" not in delta
