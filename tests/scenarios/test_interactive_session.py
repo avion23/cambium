@@ -564,8 +564,7 @@ def test_tty_tui_reuses_checkpoint_on_second_prompt(monkeypatch, tmp_path: Path)
     assert seen_context_forks[1] is not None
     assert "tokens=250" in output.getvalue()
     rendered = output.getvalue()
-    assert "provider=provider-a" in rendered
-    assert "model=model-a" in rendered
+    assert "provider-a/model-a" in rendered
 
 
 def test_reset_excludes_prior_turns_from_restored_branch(tmp_path: Path) -> None:
@@ -712,7 +711,7 @@ def test_tui_reconnects_to_explicit_durable_interactive_session(
     assert "last_checkpoint=interactive-main/epoch-7-" in rendered
     assert "durable prompt" in rendered
     assert "durable answer" in rendered
-    assert "tokens=125" in rendered
+    assert "125 tok" in rendered
 
 
 def test_lock_acquisition_refreshes_state_before_contender_can_publish(

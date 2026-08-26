@@ -18,6 +18,7 @@ from cambium.tui_screen import (
     _bounded_markdown_lines,
     _display_width,
     _side_sections,
+    _status_rows,
     _transcript_lines,
     _visible,
     _wrap_markdown,
@@ -75,11 +76,11 @@ def test_wide_cockpit_has_transcript_agents_context_and_input() -> None:
     assert len(lines) == 32
     assert "YOU" in text
     assert "CAMBIUM" in text
-    assert "↳ Inspect the provider router" in text
-    assert "provider=codex · model=gpt-5.6" in text
-    assert "agents=1 active" in text
-    assert "cost=" in text
-    assert "checkpoint=" in text
+    assert "YOU ▸ Inspect the provider router" in text
+    assert "codex/gpt-5.6" in text
+    assert "agents=1 active" not in text
+    assert "cost=" not in text
+    assert "checkpoint=" not in text
     assert "│ input › " in text
     assert text.count("├") == 1
     assert lines[-1].startswith("└")
@@ -256,6 +257,70 @@ def test_transcript_blocks_are_dense_with_one_separator_and_no_trailing_blank() 
     assert values.count("") <= 1
 
 
+def test_transcript_labels_are_inline_and_separators_only_split_speakers() -> None:
+    transcript = Transcript()
+    transcript.user("first prompt")
+    transcript.user("second prompt")
+    transcript.assistant("first answer")
+    transcript.assistant("second answer")
+    transcript.system("operator note")
+
+    values = [_visible(value).rstrip() for _, value in _transcript_lines(transcript, 80, 100)]
+    assert values[0].startswith("YOU ▸ first prompt")
+    assert values[1].startswith("YOU ▸ second prompt")
+    assert values[2] == ""
+    assert values[3].startswith("CAMBIUM ▸ first answer")
+    assert values[4].startswith("CAMBIUM ▸ second answer")
+    assert values[5] == ""
+    assert values[6].startswith("SYSTEM ▸ operator note")
+
+
+def test_status_strip_is_one_row_and_hides_context_internals() -> None:
+    transcript = Transcript()
+    snapshot = _snapshot()
+    rows = _status_rows(
+        snapshot,
+        transcript,
+        session_description="session=/private/root turn=2 branch=3 checkpoint=secret",
+        branch_line="branch: generation=4 turn=2 epoch=9",
+        cumulative_line="usage: tokens=1100000",
+        width=80,
+        activity_line="⠇ WAITING · thinking… 12.0s",
+    )
+
+    assert len(rows) == 2
+    assert all("\n" not in row for row in rows)
+    assert rows[-1].strip() == "⠇ thinking 12s · codex/gpt-5.6 · t2 · 1.1m tok"
+    assert all(
+        value not in rows[-1]
+        for value in ("branch", "generation", "epoch", "session", "checkpoint")
+    )
+
+
+def test_tool_row_counts_failures_and_uses_compact_last_duration() -> None:
+    transcript = Transcript()
+    for ok, duration in ((True, 118215), (False, 1000), (False, 2395)):
+        transcript.observe_event(
+            {
+                "kind": "tool_event",
+                "payload": {"tool": "run_shell", "ok": ok, "duration_ms": duration},
+            }
+        )
+
+    rows = _status_rows(
+        _snapshot(),
+        transcript,
+        session_description="session=/tmp/run",
+        branch_line="branch: turn=2",
+        cumulative_line="usage: tokens=1100000",
+        width=80,
+        activity_line="⠇ WAITING · thinking… 12.0s",
+    )
+
+    assert rows[0].strip() == "✓ 3 tools · last run_shell 2.4s"
+    assert rows[1].strip().endswith("· err2")
+
+
 def test_activity_state_reports_waiting_streaming_done_error_and_cooldown() -> None:
     activity = ActivityState()
     activity.start(now=10.0)
@@ -304,7 +369,7 @@ def test_compact_cockpit_stays_bounded() -> None:
     assert len(lines) == 22
     assert all(len(line) == 72 for line in lines)
     assert "conversation · running" in "\n".join(lines)
-    assert "agents=1 active" in "\n".join(lines)
+    assert "⠋ thinking" in "\n".join(lines)
     assert lines[-1].startswith("└")
 
 
@@ -328,9 +393,9 @@ def test_long_words_wrap_without_clipping_content_or_frame_borders() -> None:
         activity_line="running " + "界" * 80 + "\ud800",
     )
     conversation = "".join(
-        value[3:]
+        "".join(value.split())
         for role, value in _transcript_lines(transcript, 46, 100)
-        if role == "assistant" and value.startswith("   ")
+        if role == "assistant"
     )
     assert long_word in conversation
     assert all(_display_width(line) <= 48 for line in lines)
@@ -351,14 +416,14 @@ def test_status_line_deduplicates_fields_and_shortens_checkpoint_hash() -> None:
         cumulative_line="usage: calls=3 tokens=12345 out/s=47.5",
         width=120,
     )
-    identity, usage, agents, context = lines[-4:]
+    tool_row, strip = lines[-2:]
 
-    assert all(len(line) <= 120 for line in lines[-4:])
-    assert identity.count("provider=codex · model=gpt-5.6") == 1
-    assert "checkpoint=aaaaaaaa" in context
-    assert "aaaaaaaaaaaaaaaa" not in context
-    assert "tokens=" in usage
-    assert "agents=" in agents
+    assert all(len(line) <= 120 for line in lines[-2:])
+    assert "· 0 tools" in tool_row
+    assert strip.count("codex/gpt-5.6") == 1
+    assert "checkpoint=" not in strip
+    assert "generation=" not in strip
+    assert "12.3k tok" in strip
 
 
 def test_primary_renderer_ends_with_compact_status_row() -> None:
@@ -377,8 +442,10 @@ def test_primary_renderer_ends_with_compact_status_row() -> None:
 
     assert "YOU" in "\n".join(lines)
     assert "CAMBIUM" in "\n".join(lines)
-    assert lines[-4].startswith(" provider=codex · model=gpt-5.6")
-    assert "tokens=" in lines[-3]
+    assert len(lines[-2:]) == 2
+    assert lines[-2].startswith(" · 0 tools")
+    assert lines[-1].startswith(" ⠋ thinking")
+    assert "12.3k tok" in lines[-1]
 
 
 def test_cockpit_appends_to_primary_buffer_without_repainting() -> None:
@@ -626,9 +693,8 @@ def test_cockpit_replaces_failed_to_idle_status_in_place() -> None:
         cockpit.hide_cursor()
         cockpit.flush()
 
-    agent_rows = [row for row in cockpit._last_status_rows if row.startswith(" agents=")]
-    assert len(agent_rows) == 1
-    assert agent_rows[0].endswith("state=IDLE")
+    assert len(cockpit._last_status_rows) == 2
+    assert cockpit._last_status_rows[-1].startswith(" ⠋ idle")
     assert stream.getvalue().count("┌ Cambium · conversation") == 2
 
 
@@ -682,7 +748,7 @@ def test_cockpit_forces_completed_frame_while_input_read_is_pending() -> None:
         assert "completed response" in after
         assert after.count("┌ Cambium · conversation") == 2
         assert "conversation · done" in after
-        assert "tokens=20k" in after
+        assert "20k tok" in after
         assert after != before
         assert stream.flush_count > flushes_before_completion
 
@@ -704,12 +770,16 @@ def test_cockpit_updates_fixed_status_pane_in_place() -> None:
             cumulative_line="usage: calls=0",
         )
         first = stream.getvalue()
-        cockpit.draw_activity("⠋ running run_shell")
+        cockpit.draw_activity("⠋ running run_shell 1.0s")
+        second = stream.getvalue()
+        cockpit.draw_activity("⠙ running run_shell 2.0s")
 
     delta = stream.getvalue()[len(first) :]
+    second_delta = stream.getvalue()[len(second) :]
     assert "\x1b[s" in delta
-    assert "\x1b[4A" in delta
-    assert "running run_shell" in delta
+    assert "\x1b[2A" in delta
+    assert "last run_shell 1s" in delta
+    assert "last run_shell 2s" in second_delta
     assert "┌ Cambium · conversation" not in delta
 
 
@@ -727,7 +797,7 @@ def test_short_terminal_falls_back_to_stream_rows() -> None:
     assert lines
     assert not any(line.startswith("┌") for line in lines)
     assert not any("─" in line for line in lines)
-    assert any("provider=codex" in line for line in lines)
+    assert any("codex/gpt-5.6" in line for line in lines)
 
 
 def test_live_cockpit_keeps_short_terminal_fallback(monkeypatch) -> None:
@@ -808,7 +878,7 @@ def test_assistant_deltas_render_in_the_active_tail_before_turn_completion() -> 
         height=22,
     )
 
-    assert "CAMBIUM · generating" in "\n".join(first)
+    assert "CAMBIUM ▸ Findings" in "\n".join(first)
     assert "Findings" in "\n".join(first)
     assert "The stream is live." in "\n".join(second)
     assert transcript.entries == ()
@@ -852,7 +922,7 @@ def test_message_events_switch_roles_and_keep_streaming_text_bounded() -> None:
         width=80,
         height=22,
     )
-    assert "CAMBIUM · generating" in "\n".join(lines)
+    assert "CAMBIUM ▸" in "\n".join(lines)
 
 
 def test_repeated_successful_tool_events_render_as_one_counter_line() -> None:
@@ -882,7 +952,7 @@ def test_repeated_successful_tool_events_render_as_one_counter_line() -> None:
 
     assert len(transcript.entries) == 4
     assert "✓ run_shell ×4 · last 2395ms" in text
-    assert text.count("run_shell") == 1
+    assert "✓ 4 tools · last run_shell 2.4s" in text
 
 
 def test_tool_detail_toggle_reveals_command_and_output_without_mutating_state() -> None:
@@ -954,9 +1024,10 @@ def test_failed_tool_event_is_one_compact_notice() -> None:
     )
 
     text = "\n".join(value for _, value in _transcript_lines(transcript, 80, 20))
-    assert text == " tool errors: 1 (last: run_shell …)"
+    assert "tool errors:" not in text
     assert "permission denied" not in text
     assert "cat protected.txt" not in text
+    assert transcript.tool_error_count == 1
 
 
 def test_failed_tool_event_breaks_runs_and_feeds_failure_context() -> None:
@@ -985,7 +1056,7 @@ def test_failed_tool_event_breaks_runs_and_feeds_failure_context() -> None:
     text = "\n".join(lines)
 
     assert "✓ run_shell 141ms" in text
-    assert "tool errors: 1 (last: run_shell …)" in text
+    assert "err1" in text
     assert "✓ run_shell 2395ms" in text
     assert "✗ run_shell 9273ms" not in text
     assert len(transcript.entries) == 3
@@ -1003,7 +1074,7 @@ def test_consecutive_failed_tool_events_collapse_to_one_notice() -> None:
 
     rows = _transcript_lines(transcript, 80, 20)
     text = "\n".join(value for _, value in rows)
-    assert text == " tool errors: 5 (last: run_shell …)"
+    assert "Waiting for a prompt" in text
     assert len(transcript.entries) == 1
     assert transcript.tool_error_count == 5
 
@@ -1263,7 +1334,7 @@ def test_activity_state_transitions_thinking_responding_tool_and_done() -> None:
         height=22,
         activity_line=running,
     )
-    assert any("running run_shell 1.5s" in line for line in frame)
+    assert any("last run_shell 1.5s" in line for line in frame)
 
     activity.observe_event(
         {

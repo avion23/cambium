@@ -112,10 +112,31 @@ def test_tui_operator_commands_render_without_provider_calls(tmp_path: Path) -> 
     assert "branches: none" in text
     assert "cannot fork: no successful checkpoint" in text
     assert "compact: no successful checkpoint" in text
-    assert "provider=auto" in text
-    assert "model=auto" in text
+    assert "auto/auto" in text
     assert "press Ctrl-C while a turn is running" in text
     assert "┌ Cambium" in text
+
+
+def test_status_command_keeps_dropped_context_fields_available(tmp_path: Path) -> None:
+    output = _Tty()
+    error = io.StringIO()
+
+    code = asyncio.run(
+        tui.run_tui(
+            OneShotConfig(repo=tmp_path, session_root=tmp_path / "interactive"),
+            input_stream=_Tty("/status\n/exit\n"),
+            output_stream=output,
+            error_stream=error,
+        )
+    )
+
+    text = output.getvalue()
+    assert code == 0
+    assert error.getvalue() == ""
+    assert "session=" in text
+    assert "branch=" in text and "generation=" not in text.split("SYSTEM ▸", 1)[0]
+    assert "epoch=" in text
+    assert "checkpoint=" in text
 
 
 def test_tui_quota_command_renders_seeded_ledger_rows(monkeypatch, tmp_path: Path) -> None:
