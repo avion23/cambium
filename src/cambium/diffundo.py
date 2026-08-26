@@ -1541,7 +1541,7 @@ class Diffundo:
         self,
         providers: Sequence[ProviderConfig],
         *,
-        call_budget_s: float = 60.0,
+        call_budget_s: float = 180.0,
         pause_timeout_s: float = 0.5,
         breaker_window_size: int = 20,
         breaker_failure_threshold: float = 0.5,
