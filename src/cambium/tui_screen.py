@@ -1371,25 +1371,27 @@ class ActivityState:
             tool_name, tool_started_at = tool
             tool_name = _sanitize(tool_name)
             tool_elapsed = max(0.0, current - tool_started_at)
+            # Fixed-width numerals keep the row byte-stable across magnitude
+            # changes (99.9->100.0) so no repaint ever leaves stale tails.
             label = (
-                f"{self._state} · running {tool_name} {tool_elapsed:.1f}s "
-                f"· turn {turn_elapsed:.1f}s · out/s={self._stream_rate:.1f}"
+                f"{self._state} · running {tool_name} {tool_elapsed:6.1f}s "
+                f"· turn {turn_elapsed:7.1f}s · out/s={self._stream_rate:5.1f}"
             )
         elif self._cooldown is not None:
             provider, retry_after = self._cooldown
-            suffix = f" · {retry_after:.1f}s" if retry_after is not None else ""
+            suffix = f" · {retry_after:6.1f}s" if retry_after is not None else ""
             owner = f" · {provider}" if provider else ""
-            label = f"COOLDOWN{owner}{suffix} · turn {turn_elapsed:.1f}s"
+            label = f"COOLDOWN{owner}{suffix} · turn {turn_elapsed:7.1f}s"
         elif self._state == "STREAMING" or self._responding:
             elapsed = max(0.001, current - self._turn_started_at)
             rate = self._stream_rate or self._stream_tokens / elapsed
-            label = f"STREAMING · responding… {turn_elapsed:.1f}s · out/s={rate:.1f}"
+            label = f"STREAMING · responding… {turn_elapsed:7.1f}s · out/s={rate:5.1f}"
         elif self._state == "DONE":
             return "✓ DONE"
         elif self._state == "ERROR":
             return "✗ ERROR"
         else:
-            label = f"WAITING · thinking… {turn_elapsed:.1f}s"
+            label = f"WAITING · thinking… {turn_elapsed:7.1f}s"
         return f"{_SPINNER_FRAMES[self._frame]} {label}"
 
     def tick(self, *, now: float | None = None) -> str:
