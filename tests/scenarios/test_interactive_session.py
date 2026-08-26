@@ -388,6 +388,44 @@ def test_tui_model_preference_is_validated_and_applies_to_next_turn(tmp_path: Pa
     assert turn.config.model == "model-b"
 
 
+def test_tui_model_preference_refusals_name_provider_config(monkeypatch, tmp_path: Path) -> None:
+    provider_config = _two_provider_config(tmp_path / "providers.json")
+    monkeypatch.setenv("CAMBIUM_PROVIDER_DEAD_ZEN_API_KEY", "offline")
+    session = InteractiveSession(
+        OneShotConfig(
+            repo=tmp_path,
+            session_root=tmp_path / "interactive",
+            provider="dead-zen",
+            model="zen-model",
+            provider_config_path=provider_config,
+        )
+    )
+    path = str(provider_config.resolve())
+
+    assert session.set_model_preference("dead-zen:missing") == (
+        f"model: 'missing' is not configured for provider 'dead-zen'; "
+        f"add/change the entry in {path} then rerun /model"
+    )
+
+    monkeypatch.delenv("CAMBIUM_PROVIDER_DEAD_ZEN_API_KEY")
+    assert session.set_model_preference("dead-zen:zen-model") == (
+        "model: provider 'dead-zen' is not eligible "
+        f"(disabled or credential unavailable); add/change the entry in {path} then rerun /model"
+    )
+
+    automatic = InteractiveSession(
+        OneShotConfig(
+            repo=tmp_path,
+            session_root=tmp_path / "automatic",
+            provider_config_path=provider_config,
+        )
+    )
+    assert automatic.set_model_preference("dead-zen") == (
+        "model: provider 'dead-zen' is not eligible "
+        f"(disabled or credential unavailable); add/change the entry in {path} then rerun /model"
+    )
+
+
 def test_resume_reselects_healthy_provider_and_reconciles_model(
     monkeypatch, tmp_path: Path
 ) -> None:

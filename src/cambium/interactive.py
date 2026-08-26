@@ -274,10 +274,7 @@ class _InteractiveSessionLock:
             self._fd = fd
             self._recovered_stale = existed and (
                 previous is None
-                or (
-                    not bool(previous.get("released"))
-                    and not _pid_alive(previous.get("pid"))
-                )
+                or (not bool(previous.get("released")) and not _pid_alive(previous.get("pid")))
             )
             self._write_metadata(self._metadata(released=False))
         except BaseException:
@@ -484,9 +481,7 @@ class InteractiveSession:
                 "interactive session path must stay under the repository session root"
             ) from exc
         if not cls._is_reconnectable(candidate, repo_path):
-            raise InteractiveSessionError(
-                f"no resumable interactive session found at {candidate}"
-            )
+            raise InteractiveSessionError(f"no resumable interactive session found at {candidate}")
         return candidate
 
     @classmethod
@@ -1008,6 +1003,12 @@ class InteractiveSession:
         except (OSError, ValueError) as exc:
             return f"model: provider config/auth unavailable ({exc})"
 
+        provider_config_path = "~/.config/cambium/providers.json"
+        try:
+            provider_config_path = str(oneshot._provider_config_path(self._base_config, self.repo))
+        except Exception:  # noqa: BLE001 - refusal guidance must never raise
+            pass
+
         if requested_model is None:
             provider_options = [
                 (provider, model) for provider, model in options if provider == requested_provider
@@ -1025,7 +1026,8 @@ class InteractiveSession:
                     if any(provider == requested_provider for provider, _model in configured):
                         return (
                             f"model: provider {requested_provider!r} is not eligible "
-                            "(disabled or credential unavailable)"
+                            f"(disabled or credential unavailable); add/change the entry in "
+                            f"{provider_config_path} then rerun /model"
                         )
                     return (
                         "model: expected an eligible provider or PROVIDER:MODEL "
@@ -1041,11 +1043,13 @@ class InteractiveSession:
             if not any(provider == requested_provider for provider, _model in options):
                 return (
                     f"model: provider {requested_provider!r} is not eligible "
-                    "(disabled or credential unavailable)"
+                    f"(disabled or credential unavailable); add/change the entry in "
+                    f"{provider_config_path} then rerun /model"
                 )
             return (
                 f"model: {requested_model!r} is not configured for provider "
-                f"{requested_provider!r}"
+                f"{requested_provider!r}; add/change the entry in {provider_config_path} "
+                "then rerun /model"
             )
 
         if self.provider == requested_provider and self.model == requested_model:
@@ -1053,8 +1057,7 @@ class InteractiveSession:
                 self._model_preferences[requested_provider] = requested_model
                 self._write_manifest()
             return (
-                f"model preference unchanged: provider={requested_provider} "
-                f"model={requested_model}"
+                f"model preference unchanged: provider={requested_provider} model={requested_model}"
             )
 
         self._provider_preference = requested_provider
@@ -1097,9 +1100,7 @@ class InteractiveSession:
                 checkpoint_root=checkpoint_root,
                 provider_env_keys=self._base_config.provider_env_keys,
             )
-            checkpoint = _load_epoch_checkpoint(
-                config, seed.checkpoint_ref, expect_task_id=False
-            )
+            checkpoint = _load_epoch_checkpoint(config, seed.checkpoint_ref, expect_task_id=False)
             trunk, raw_tail = partition_summary_trunk(checkpoint.full_messages)
             if raw_tail:
                 return (
@@ -1114,9 +1115,7 @@ class InteractiveSession:
             rolled_messages, _projection, _history = rollover_summary_trunk(trunk)
             cache_key = checkpoint.cache_key
             provider = cache_key.provider
-            provider_compat = {
-                provider: (cache_key.protocol, cache_key.reasoning_effort)
-            }
+            provider_compat = {provider: (cache_key.protocol, cache_key.reasoning_effort)}
             rolled = _write_epoch_checkpoint(
                 config,
                 turn=checkpoint.turn,
