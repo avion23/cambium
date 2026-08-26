@@ -121,7 +121,10 @@ def _parameters(properties: dict[str, dict[str, Any]], required: list[str]) -> d
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "write_file",
-        "description": "Write UTF-8 text content to a file inside the worker worktree.",
+        "description": (
+            "Write UTF-8 text content to a file. Relative paths resolve against cwd; "
+            "absolute paths may refer anywhere on the system."
+        ),
         "parameters": _parameters(
             {
                 "path": {"type": "string", "description": "Path to the file."},
@@ -132,7 +135,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
     {
         "name": "edit_file",
-        "description": "Replace exactly one occurrence of old_string in a worktree file.",
+        "description": (
+            "Replace exactly one occurrence of old_string in a file. Relative paths resolve "
+            "against cwd; absolute paths may refer anywhere on the system."
+        ),
         "parameters": _parameters(
             {
                 "path": {"type": "string", "description": "Path to the file."},
@@ -140,167 +146,6 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "new_string": {"type": "string", "description": "Replacement text."},
             },
             ["path", "old_string", "new_string"],
-        ),
-    },
-    {
-        "name": "grep_code",
-        "description": "Search worktree files for a pattern.",
-        "parameters": _parameters(
-            {
-                "pattern": {"type": "string", "description": "Pattern to search for."},
-                "path": {
-                    "anyOf": [{"type": "string"}, {"type": "null"}],
-                    "description": "File or directory to search; null searches the worktree.",
-                },
-            },
-            ["pattern"],
-        ),
-    },
-    {
-        "name": "get_signature",
-        "description": "Extract a Python function or class signature from a worktree file.",
-        "parameters": _parameters(
-            {
-                "path": {
-                    "type": "string",
-                    "minLength": 1,
-                    "description": "Path to the Python source file.",
-                },
-                "symbol": {
-                    "type": "string",
-                    "minLength": 1,
-                    "description": "Function or class name to inspect.",
-                },
-            },
-            ["path", "symbol"],
-        ),
-    },
-    {
-        "name": "search_symbols",
-        "description": "Search bounded source declarations by symbol name in the worktree.",
-        "parameters": _parameters(
-            {
-                "query": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 256,
-                    "description": "Case-insensitive symbol name or substring to search for.",
-                },
-                "exact": {
-                    "type": "boolean",
-                    "default": False,
-                    "description": "Require an exact symbol-name match.",
-                },
-                "max_results": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 500,
-                    "default": 50,
-                    "description": "Maximum number of locations to return.",
-                },
-            },
-            ["query"],
-        ),
-    },
-    {
-        "name": "find_references",
-        "description": "Find bounded exact-identifier references across source files.",
-        "parameters": _parameters(
-            {
-                "symbol": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 256,
-                    "pattern": r"^[A-Za-z_][A-Za-z0-9_]*$",
-                    "description": "One identifier whose source references should be located.",
-                },
-                "max_results": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 1000,
-                    "default": 100,
-                    "description": "Maximum number of locations to return.",
-                },
-            },
-            ["symbol"],
-        ),
-    },
-    {
-        "name": "read_symbol",
-        "description": "Read a bounded numbered source window around a line in the worktree.",
-        "parameters": _parameters(
-            {
-                "path": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 4096,
-                    "description": "Source path relative to the worktree.",
-                },
-                "line": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 10_000_000,
-                    "description": "One-based source line around which to read.",
-                },
-                "context_lines": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 200,
-                    "default": 40,
-                    "description": "Number of source lines in the returned window.",
-                },
-            },
-            ["path", "line"],
-        ),
-    },
-    {
-        "name": "query_lsp",
-        "description": (
-            "Run one bounded operator-configured language-server navigation query. "
-            "The server command comes from CAMBIUM_LSP_COMMAND."
-        ),
-        "parameters": _parameters(
-            {
-                "method": {
-                    "type": "string",
-                    "enum": [
-                        "definition",
-                        "references",
-                        "hover",
-                        "document_symbols",
-                        "diagnostics",
-                    ],
-                    "description": "LSP query operation.",
-                },
-                "path": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 4096,
-                    "description": "Source path relative to the worktree.",
-                },
-                "line": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 10_000_000,
-                    "default": 1,
-                    "description": "One-based source line for position queries.",
-                },
-                "column": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 10_000_000,
-                    "default": 1,
-                    "description": "One-based source column for position queries.",
-                },
-                "timeout_s": {
-                    "type": "number",
-                    "minimum": 0.001,
-                    "maximum": 60,
-                    "default": 8.0,
-                    "description": "Maximum language-server query time in seconds.",
-                },
-            },
-            ["method", "path"],
         ),
     },
     {
@@ -340,9 +185,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "read_batch",
         "description": (
-            "Read multiple UTF-8 text files inside the worker worktree in one call. "
-            "Reading files individually is not available; batch reads are the only "
-            "way to read files."
+            "Read multiple UTF-8 text files in one call. Relative paths resolve against cwd; "
+            "absolute paths may refer anywhere on the system. Reading files individually is "
+            "not available; batch reads are the only way to read files."
         ),
         "parameters": _parameters(
             {
@@ -476,9 +321,7 @@ def _validate_value(schema: dict[str, Any], value: Any, label: str) -> list[str]
         if isinstance(exclusive_minimum, bool):
             if exclusive_minimum and isinstance(minimum, int | float) and value <= minimum:
                 errors.append(f"validation failed: '{label}' must be > {minimum}")
-        elif isinstance(exclusive_minimum, int | float) and not isinstance(
-            exclusive_minimum, bool
-        ):
+        elif isinstance(exclusive_minimum, int | float) and not isinstance(exclusive_minimum, bool):
             if value <= exclusive_minimum:
                 errors.append(f"validation failed: '{label}' must be > {exclusive_minimum}")
         maximum = schema.get("maximum")
@@ -489,9 +332,7 @@ def _validate_value(schema: dict[str, Any], value: Any, label: str) -> list[str]
         if isinstance(exclusive_maximum, bool):
             if exclusive_maximum and isinstance(maximum, int | float) and value >= maximum:
                 errors.append(f"validation failed: '{label}' must be < {maximum}")
-        elif isinstance(exclusive_maximum, int | float) and not isinstance(
-            exclusive_maximum, bool
-        ):
+        elif isinstance(exclusive_maximum, int | float) and not isinstance(exclusive_maximum, bool):
             if value >= exclusive_maximum:
                 errors.append(f"validation failed: '{label}' must be < {exclusive_maximum}")
 
@@ -601,10 +442,10 @@ def validate_tool_call(schema: dict[str, Any], call: dict[str, Any]) -> list[str
 _RUN_PYTHON_SCHEMA_DIRECT = {
     "name": "run_python",
     "description": (
-        "Run a short trusted Python 3 snippet in the worktree for structured "
-        "data transformation, inspection, or calculations. Prefer read/search/edit "
-        "tools for ordinary repository operations. The process is isolated from "
-        "site packages and credential environment, but Cambium is not an OS sandbox."
+        "Run a short trusted Python 3 snippet in the current working directory for "
+        "structured data transformation, inspection, or calculations. Prefer file "
+        "tools for ordinary repository operations. The process is isolated from site "
+        "packages and credential environment, but has the user's normal OS authority."
     ),
     "parameters": {
         "type": "object",

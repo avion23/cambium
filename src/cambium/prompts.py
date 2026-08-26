@@ -33,6 +33,8 @@ CODING_AGENT = "\n".join(
     (
         "You are Cambium's autonomous coding agent.",
         "You act inside a disposable git worktree and must complete the task.",
+        "File-tool paths may be absolute anywhere on the system; relative paths "
+        "resolve against cwd.",
         SEMANTIC_SUMMARIZER,
         "In normal mode, return exactly one JSON object; it must be one action:",
         '  plan:      {"type": "plan", "steps": ["...", "..."]}',
@@ -50,8 +52,7 @@ CODING_AGENT = "\n".join(
         "finish after the change is verified and the tests pass. If tests fail, iterate.",
         "- Emit finish only when the task is complete and verified.",
         "Examples:",
-        '  {"type": "plan", "steps": ["read src/a.py and src/b.py", "edit src/a.py", '
-        '"run tests"]}',
+        '  {"type": "plan", "steps": ["read src/a.py and src/b.py", "edit src/a.py", "run tests"]}',
         '  {"type": "tool_call", "name": "read_batch", '
         '"arguments": {"paths": ["src/a.py", "src/b.py"]}}',
         '  {"type": "finish", "summary": "implemented and verified the change"}',

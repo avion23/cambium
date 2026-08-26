@@ -81,8 +81,9 @@ rolls an overgrown delta sequence into a deterministic K0 materialized view whil
 retaining an immutable rollover manifest outside the active prompt. Without
 context reuse, the legacy bounded transcript projection remains available.
 
-Tool calls execute inside the worktree (with shell/git permissions from
-``init.permissions``), emit ``tool_event`` messages, and persist
+Tool calls use the worktree as cwd (with shell/git permissions from
+``init.permissions``); file-tool paths may be absolute anywhere on the system
+and relative paths resolve against cwd. They emit ``tool_event`` messages and persist
 ``checkpoint`` state under ``$CAMBIUM_SESSION_ID/.cambium/checkpoints/``.
 Every router call also emits one redacted ``usage_event`` (implementation
 plan step 3): provider/model/turn, token fields, estimated cost, latency,
@@ -2472,6 +2473,8 @@ def _build_agent_prompt(
     system_lines = [
         "You are Cambium's autonomous coding agent.",
         "You act inside a disposable git worktree and must complete the task.",
+        "File-tool paths may be absolute anywhere on the system; relative paths "
+        "resolve against cwd.",
     ]
     if model_identity:
         system_lines.append(
@@ -2571,9 +2574,7 @@ def _canonical_action_message(action: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def _progress_signature(
-    content: str | None, action: Mapping[str, Any] | None = None
-) -> str:
+def _progress_signature(content: str | None, action: Mapping[str, Any] | None = None) -> str:
     """Return bounded state content used to decide whether an action is novel.
 
     Parsed actions intentionally omit the optional ``thought`` field: a model
@@ -2609,9 +2610,7 @@ class _ProgressDetector:
         self._recent_signatures: deque[str] = deque(maxlen=progress_window)
         self.no_progress_actions = 0
 
-    def observe(
-        self, content: str | None = None, action: Mapping[str, Any] | None = None
-    ) -> bool:
+    def observe(self, content: str | None = None, action: Mapping[str, Any] | None = None) -> bool:
         """Record one assistant result and return whether the loop is stalled."""
         signature = _progress_signature(content, action)
         novel = bool(signature) and signature not in self._recent_signatures
@@ -3099,10 +3098,7 @@ def _write_cast_rollover_manifest(
         config.checkpoint_root
         / safe_task
         / "rollovers"
-        / (
-            f"k0-{k0.through_turn:06d}-{k0.source_sha256[:16]}-"
-            f"{content_digest}.json"
-        )
+        / (f"k0-{k0.through_turn:06d}-{k0.source_sha256[:16]}-{content_digest}.json")
     )
     try:
         _create_epoch_checkpoint(path, content)
@@ -4116,9 +4112,7 @@ async def _run_agent_loop(
                         f"{detail}: {inner.__class__.__name__}: "
                         f"{_cap_utf8(inner_message, MAX_ENVELOPE_FIELD_CHARS)}"
                     )
-                raise ContextForkError(
-                    f"summary provider call failed: {detail}"
-                ) from exc
+                raise ContextForkError(f"summary provider call failed: {detail}") from exc
             if time.monotonic() >= wall_deadline:
                 raise ContextForkError("wall budget exceeded during summary flush")
             declared_summary_model = router.declared_model(summary_result.provider)
@@ -4294,12 +4288,8 @@ async def _run_agent_loop(
             )
         workspace_changed = resume["workspace_changed"]
         code_changed = resume_checkpoint.code_changed or workspace_changed
-        verified_after_change = (
-            resume_checkpoint.verified_after_change and not workspace_changed
-        )
-        verification_failed = (
-            False if workspace_changed else resume_checkpoint.verification_failed
-        )
+        verified_after_change = resume_checkpoint.verified_after_change and not workspace_changed
+        verification_failed = False if workspace_changed else resume_checkpoint.verification_failed
         no_progress_actions = resume_checkpoint.no_progress_actions
         progress_detector.no_progress_actions = no_progress_actions
         budget_new_tokens = resume_checkpoint.budget_new_tokens
