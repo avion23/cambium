@@ -474,6 +474,11 @@ def test_fork_cache_compatible_matrix() -> None:
     )
     assert not incompatible and "not authorized" in (reason or "")
 
+    # An empty authorized set is the "unrestricted" wire value (worker.py
+    # routing semantics), so it must not reject an otherwise-matching fork.
+    unrestricted, reason = worker._fork_cache_compatible(child, epoch, frozenset())
+    assert unrestricted and reason is None
+
     incompatible, reason = worker._fork_cache_compatible(
         {**child, "fanout_config": {"model": "other-model"}},
         epoch,

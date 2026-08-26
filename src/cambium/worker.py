@@ -2418,8 +2418,14 @@ def _fork_cache_compatible(
     if cache_key.get("redacted") is True:
         return False, "checkpoint redacted"
     provider = cache_key.get("provider")
-    if not isinstance(provider, str) or provider not in authorized_providers:
+    # An empty authorized set is the historical "unrestricted" wire value
+    # (worker routing treats it the same way); restriction applies only to a
+    # non-empty list. Rejecting on empty would downgrade every exact-fork
+    # candidate to semantic/fresh context despite matching boundaries.
+    if isinstance(provider, str) and authorized_providers and provider not in authorized_providers:
         return False, f"provider {provider!r} not authorized"
+    if not isinstance(provider, str) or not provider:
+        return False, "epoch cache_key has no provider"
     model = cache_key.get("model")
     fanout = child_spec.get("fanout_config") or {}
     if not isinstance(model, str) or model != fanout.get("model"):
