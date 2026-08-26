@@ -170,6 +170,7 @@ _HELP = """Commands:
   /quota      show provider quota-window state
   /compact    flush semantic context and check for a K0 rollover
   /dashboard  explain the visible live cockpit
+  /detail     toggle the compact agents/usage/context detail row
   /events     recent durable event summaries
   /new        start a fresh semantic branch; old turn artifacts remain
   /clear      clear the visible cockpit transcript
@@ -610,6 +611,7 @@ def _command_output(
     session: InteractiveSession,
     cumulative: _Cumulative,
     snapshot: SessionSnapshot,
+    cockpit: Cockpit | None = None,
 ) -> str | None:
     parts = command.split(maxsplit=1)
     name = parts[0] if parts else command
@@ -671,6 +673,11 @@ def _command_output(
         return session.compact()
     if name == "/dashboard" and not argument:
         return "The persistent cockpit is already the live dashboard."
+    if name == "/detail" and not argument:
+        if cockpit is None:
+            return "detail: unavailable"
+        state = "shown" if cockpit.toggle_detail() else "hidden"
+        return f"detail: {state}"
     if name in {"/events", "/tail"} and not argument:
         if not snapshot.recent_events:
             return "events: none"
@@ -863,6 +870,7 @@ async def _run_interactive(
                         session=session,
                         cumulative=cumulative,
                         snapshot=last_snapshot,
+                        cockpit=cockpit,
                     )
                     if output is None:
                         transcript.error(f"Unknown command: {command}. Type /help.")

@@ -2158,6 +2158,12 @@ def _format_cost(value: Any) -> str:
     return f"${rendered}"
 
 
+def _cache_rate(cached_tokens: int, input_tokens: int) -> float | None:
+    if cached_tokens > 0 and input_tokens > 0:
+        return min(1.0, cached_tokens / input_tokens)
+    return None
+
+
 def _usage_rows(snapshot: Any, cumulative_line: str, width: int) -> list[tuple[str, str]]:
     """Render cumulative usage as aligned, compact rows."""
 
@@ -2227,9 +2233,7 @@ def _usage_rows(snapshot: Any, cumulative_line: str, width: int) -> list[tuple[s
                 ]
             )
 
-    cache_rate = None
-    if cached_tokens > 0 and input_tokens > 0:
-        cache_rate = min(1.0, cached_tokens / input_tokens)
+    cache_rate = _cache_rate(cached_tokens, input_tokens)
 
     rows = [
         row("calls", str(calls)),
@@ -2796,10 +2800,72 @@ def _tool_activity_row(transcript: Transcript, activity_line: str, width: int) -
     return _status_row(parts, width)
 
 
+def _detail_status_line(snapshot: Any, cumulative_line: str, width: int) -> str:
+    """Render the one-line ambient agent, usage, and context summary."""
+
+    def field(key: str, snapshot_key: str) -> int:
+        return _usage_int(
+            _usage_field(cumulative_line, key),
+            _usage_int(getattr(snapshot, snapshot_key, 0)),
+        )
+
+    input_tokens = field("in", "input_tokens")
+    output_tokens = field("out", "output_tokens")
+    cached_tokens = field("cached", "cached_tokens")
+    total_tokens = field("tokens", "total_tokens")
+    calls = field("calls", "calls")
+    summaries = field("summaries", "summary_calls")
+    rate = _usage_float(
+        _usage_field(cumulative_line, "out/s"),
+        _usage_float(getattr(snapshot, "output_tokens_per_s", 0.0)),
+    )
+    cost_field = _usage_field(cumulative_line, "cost")
+    cost = (
+        cost_field
+        if cost_field in {"free", "subscription"}
+        else _format_cost(
+            _usage_float(cost_field, _usage_float(getattr(snapshot, "estimated_cost_usd", 0.0)))
+        )
+    )
+    cache_rate = _cache_rate(cached_tokens, input_tokens)
+    cache = f"{cache_rate:.0%}" if cache_rate is not None else "n/a"
+
+    agents = (
+        f"agents active={_usage_int(getattr(snapshot, 'active_agents', 0))} "
+        f"queued={_usage_int(getattr(snapshot, 'queued_agents', 0))} "
+        f"ok={_usage_int(getattr(snapshot, 'succeeded_agents', 0))} "
+        f"failed={_usage_int(getattr(snapshot, 'failed_agents', 0))}"
+    )
+    usage = (
+        f"usage in={_human_count(input_tokens)} out={_human_count(output_tokens)} "
+        f"cached={_human_count(cached_tokens)} ({cache}) "
+        f"total={_human_count(total_tokens)} calls={calls} summaries={summaries} "
+        f"out/s={rate:.1f} cost={cost}"
+    )
+    line = f"{agents} · {usage}"
+
+    context = getattr(snapshot, "context", None)
+    if context is not None:
+        trunk_prefix = "≈" if getattr(context, "approximate", False) else "="
+        context_line = (
+            f"context epoch={_usage_int(getattr(context, 'epoch', 0))} "
+            f"trunk{trunk_prefix}{_human_count(getattr(context, 'estimated_trunk_tokens', 0))}tok "
+            f"segments={_usage_int(getattr(context, 'summary_segments', 0))}"
+        )
+        candidate = f"{line} · {context_line}"
+        if _display_width(candidate) <= max(1, width):
+            line = candidate
+    return _status_row([line], width)
+
+
 _FIXED_MIN_HEIGHT = 12
-_STATUS_ROW_COUNT = 2
+_STATUS_ROW_COUNT = 3
 _BOTTOM_RESERVED_ROWS = 1 + _STATUS_ROW_COUNT + 1
 _FRAME_OVERHEAD = 2 + _BOTTOM_RESERVED_ROWS
+
+
+def _frame_overhead(show_detail: bool) -> int:
+    return _FRAME_OVERHEAD if show_detail else _FRAME_OVERHEAD - 1
 
 
 def _status_row(parts: list[str], width: int) -> str:
@@ -2816,10 +2882,11 @@ def _status_rows(
     cumulative_line: str,
     width: int,
     activity_line: str = "",
+    show_detail: bool = True,
 ) -> list[str]:
-    """Render the rolling tool row and one compact status strip."""
+    """Render the rolling tool row, status strip, and optional detail row."""
     width = max(1, width)
-    return [
+    rows = [
         _tool_activity_row(transcript, activity_line, width),
         _status_row(
             [
@@ -2836,6 +2903,9 @@ def _status_rows(
             width,
         ),
     ]
+    if show_detail:
+        rows.append(_detail_status_line(snapshot, cumulative_line, width))
+    return rows
 
 
 def _frame_inside(text: str, width: int) -> str:
@@ -2856,12 +2926,23 @@ def _cockpit_frame_lines(
     color: bool,
     input_label: str,
     activity_line: str,
+    show_detail: bool = True,
     primary_rows: tuple[tuple[str, str], ...] | None = None,
 ) -> list[str]:
     width = max(8, width)
     height = max(_FIXED_MIN_HEIGHT, height)
     inner = max(1, width - 2)
-    conversation_capacity = max(1, height - _FRAME_OVERHEAD)
+    status_rows = _status_rows(
+        snapshot,
+        transcript,
+        session_description=session_description,
+        branch_line=branch_line,
+        cumulative_line=cumulative_line,
+        width=inner,
+        activity_line=activity_line,
+        show_detail=show_detail,
+    )
+    conversation_capacity = max(1, height - _frame_overhead(show_detail))
     status = _sanitize(getattr(snapshot, "session_status", "idle"))
     lines = [_paint("┌" + _pad(f" Cambium · conversation · {status} ", inner) + "┐", _CYAN, color)]
     conversation = (
@@ -2881,15 +2962,7 @@ def _cockpit_frame_lines(
         lines.append(_frame_inside("", width))
 
     lines.append(_paint("├" + "─" * inner + "┤", _DIM_CYAN, color))
-    for text in _status_rows(
-        snapshot,
-        transcript,
-        session_description=session_description,
-        branch_line=branch_line,
-        cumulative_line=cumulative_line,
-        width=inner,
-        activity_line=activity_line,
-    ):
+    for text in status_rows:
         lines.append(_paint(_frame_inside(text, width), _DIM_CYAN, color))
     label = _clip(_sanitize(input_label).replace(chr(10), " "), max(1, inner - 8))
     lines.append(_paint(_frame_inside(f" input {label} ", width), _BLUE, color))
@@ -2907,6 +2980,7 @@ def render_primary(
     width: int,
     color: bool = False,
     activity_line: str = "",
+    show_detail: bool = True,
 ) -> list[str]:
     """Render conversation rows followed by the rolling tool/status rows."""
     width = max(8, width)
@@ -2924,6 +2998,7 @@ def render_primary(
             cumulative_line=cumulative_line,
             width=width,
             activity_line=activity_line,
+            show_detail=show_detail,
         )
     )
     return lines
@@ -2946,6 +3021,7 @@ def render_cockpit(
     color: bool = False,
     input_label: str = "›",
     activity_line: str = "",
+    show_detail: bool = True,
 ) -> list[str]:
     """Render one deterministic conversation/status frame without controls."""
     width = max(8, width)
@@ -2959,6 +3035,7 @@ def render_cockpit(
             width=width,
             color=color,
             activity_line=activity_line,
+            show_detail=show_detail,
         )
     return _cockpit_frame_lines(
         snapshot,
@@ -2971,6 +3048,7 @@ def render_cockpit(
         color=color,
         input_label=input_label,
         activity_line=activity_line,
+        show_detail=show_detail,
     )
 
 
@@ -3001,16 +3079,28 @@ class Cockpit:
         self._draw_in_flight = False
         self._last_primary_rows: tuple[tuple[str, str], ...] = ()
         self._last_status_line = ""
+        self._last_detail_line = ""
         self._last_status_fields: dict[str, str] | None = None
         self._last_status_rows: tuple[str, ...] = ()
         self._last_request: tuple[Any, Transcript, str, str, str, str, str] | None = None
         self._fixed_frame = False
         self._frame_size: os.terminal_size | None = None
+        self._frame_show_detail: bool | None = None
         self._activity_line = ""
+        self._show_detail = True
 
     @property
     def size(self) -> os.terminal_size:
         return self._last_size
+
+    @property
+    def show_detail(self) -> bool:
+        return self._show_detail
+
+    def toggle_detail(self) -> bool:
+        """Toggle the compact ambient detail row."""
+        self._show_detail = not self._show_detail
+        return self._show_detail
 
     def __enter__(self) -> Cockpit:
         if self.enabled:
@@ -3182,16 +3272,21 @@ class Cockpit:
                 cumulative_line=cumulative_line,
                 width=self._last_size.columns,
                 activity_line=activity_line,
+                show_detail=self._show_detail,
             )
         )
         if self._fixed_frame and (
-            self._frame_size != self._last_size or (force and rows != self._last_primary_rows)
+            self._frame_size != self._last_size
+            or self._frame_show_detail != self._show_detail
+            or (force and rows != self._last_primary_rows)
         ):
             # Leave the current input/status row before appending a fresh frame.
             self.stream.write("\x1b[1B\r\n")
             self._fixed_frame = False
         if not self._fixed_frame:
-            conversation_capacity = max(1, self._last_size.lines - _FRAME_OVERHEAD)
+            conversation_capacity = max(
+                1, self._last_size.lines - _frame_overhead(self._show_detail)
+            )
             hidden_rows = rows[:-conversation_capacity]
             if self._last_primary_rows:
                 if rows[: len(self._last_primary_rows)] != self._last_primary_rows:
@@ -3215,6 +3310,7 @@ class Cockpit:
                 color=self.color,
                 input_label=input_label,
                 activity_line=activity_line,
+                show_detail=self._show_detail,
                 primary_rows=rows,
             )
             self.stream.write("\n".join(lines))
@@ -3222,6 +3318,7 @@ class Cockpit:
             self.stream.flush()
             self._fixed_frame = True
             self._frame_size = self._last_size
+            self._frame_show_detail = self._show_detail
             self._last_primary_rows = rows
             self._last_status_rows = status_rows
             return
@@ -3250,16 +3347,18 @@ class Cockpit:
             branch_line=branch_line,
             cumulative_line=cumulative_line,
         )
-        status_line = _primary_status_line(
+        status_rows = _status_rows(
             snapshot,
+            transcript,
             session_description=session_description,
             branch_line=branch_line,
             cumulative_line=cumulative_line,
             width=self._last_size.columns,
-            previous=self._last_status_fields,
-            transcript=transcript,
             activity_line=request[-1],
+            show_detail=self._show_detail,
         )
+        status_line = status_rows[1]
+        detail_line = status_rows[2] if self._show_detail else ""
 
         if rows[: len(self._last_primary_rows)] == self._last_primary_rows:
             new_rows = rows[len(self._last_primary_rows) :]
@@ -3269,16 +3368,24 @@ class Cockpit:
             # by marking the refreshed view instead of repainting history.
             new_rows = (("dim", "··· transcript view refreshed ···"), *rows)
 
-        if new_rows or status_line != self._last_status_line:
+        if (
+            new_rows
+            or status_line != self._last_status_line
+            or detail_line != self._last_detail_line
+        ):
             for role, text in new_rows:
                 self.stream.write(_paint(text, _ROLE_COLORS.get(role, ""), self.color))
                 self.stream.write("\n")
             self.stream.write(_paint(status_line, _DIM_CYAN, self.color))
             self.stream.write("\n")
+            if detail_line:
+                self.stream.write(_paint(detail_line, _DIM_CYAN, self.color))
+                self.stream.write("\n")
             self.stream.flush()
 
         self._last_primary_rows = rows
         self._last_status_line = status_line
+        self._last_detail_line = detail_line
         self._last_status_fields = current_status_fields
 
     def _redraw_bottom(
@@ -3333,6 +3440,9 @@ class Cockpit:
             return
         self._activity_line = _sanitize(activity_line).replace(chr(10), " ")
         request = (*self._last_request[:6], self._activity_line)
+        if self._frame_show_detail != self._show_detail:
+            self._draw_live_now(request, force=True)
+            return
         snapshot, transcript, session_description, branch_line, cumulative_line, _, _ = request
         status_rows = tuple(
             _status_rows(
@@ -3343,6 +3453,7 @@ class Cockpit:
                 cumulative_line=cumulative_line,
                 width=self._last_size.columns,
                 activity_line=self._activity_line,
+                show_detail=self._show_detail,
             )
         )
         self._redraw_bottom(request, status_rows)
