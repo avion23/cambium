@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import signal
 import sqlite3
 import subprocess
@@ -161,11 +162,7 @@ def _assert_no_task_worktree(session_dir: Path, repo: Path, branch: str, worktre
     assert not worktree.exists()
     assert _worktree_paths(repo) == [repo.resolve()]
     assert not _branch_exists(repo, branch)
-    assert not [
-        path
-        for path in session_dir.glob("wt-*")
-        if path.is_dir()
-    ]
+    assert not [path for path in session_dir.glob("wt-*") if path.is_dir()]
 
 
 @pytest.mark.parametrize("mode", ["cancelled", "wall"])
@@ -205,7 +202,10 @@ def test_terminal_turn_prunes_worktree_and_reaps_worker(tmp_path: Path, mode: st
                 await run
         else:
             result = await asyncio.wait_for(run, timeout=45.0)
-            assert result.results[0].reason == "max_restarts (0): wall"
+            reason = result.results[0].reason or ""
+            assert reason.startswith("max_restarts (0): wall (timeout: wall (elapsed=")
+            assert re.search(r"elapsed=\d+(?:\.\d+)?s", reason)
+            assert "budget=5s, restarts=0))" in reason
 
     asyncio.run(run_and_cancel())
     assert worker_pid is not None

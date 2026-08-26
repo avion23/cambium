@@ -819,6 +819,11 @@ def _stdin_deadline(wall_deadline: float) -> float:
     return min(wall_deadline, loop.time() + _stdin_write_timeout_s())
 
 
+def _wall_timeout_detail(wall_budget: float, wall_deadline: float, restarts: int) -> str:
+    elapsed = max(0.0, time.monotonic() - (wall_deadline - wall_budget))
+    return f"timeout: wall (elapsed={elapsed:g}s > budget={wall_budget:g}s, restarts={restarts})"
+
+
 @dataclass(frozen=True, slots=True)
 class SliceResult:
     """Outcome of one supervised worker run."""
@@ -4186,12 +4191,14 @@ class _Runtime:
                 if deadline is None:
                     deadline = time.monotonic() + wall_budget
                 if deadline - time.monotonic() <= 0:
-                    reason = "wall budget exhausted"
+                    detail = _wall_timeout_detail(wall_budget, deadline, restarts)
+                    reason = f"wall ({detail})"
                     await self.emit(
                         "timeout",
                         task_id=task_id,
                         generation=generation,
                         phase="wall",
+                        detail=detail,
                     )
                     self._results[task_id] = TaskResult(
                         task_id=task_id,
@@ -4216,6 +4223,14 @@ class _Runtime:
                     if outcome.clean:
                         self._last_envelope = sanitized_envelope
                         self._task_envelopes[task_id] = sanitized_envelope
+                wall_detail = (
+                    _wall_timeout_detail(wall_budget, deadline, restarts)
+                    if outcome.timeout_phase == "wall"
+                    else None
+                )
+                generation_reason = (
+                    f"wall ({wall_detail})" if wall_detail is not None else outcome.reason
+                )
                 if outcome.clean:
                     envelope_status = (
                         outcome.envelope.get("status") if outcome.envelope is not None else None
@@ -4279,7 +4294,8 @@ class _Runtime:
                         )
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
-                            reason = "wall budget exhausted before resume"
+                            detail = _wall_timeout_detail(wall_budget, deadline, restarts)
+                            reason = f"wall ({detail})"
                             await self.emit(
                                 "context_resume_failed",
                                 task_id=task_id,
@@ -4509,18 +4525,20 @@ class _Runtime:
                         task_id=task_id,
                         status="failed",
                         exit_code=1,
-                        reason=outcome.reason,
+                        reason=generation_reason,
                         restarts=restarts,
                         summary=worker_summary,
                     )
                     return
-                reason = outcome.reason or "crash"
+                reason = generation_reason or "crash"
                 if outcome.timeout_phase:
+                    timeout_payload = {"detail": wall_detail} if wall_detail is not None else {}
                     await self.emit(
                         "timeout",
                         task_id=task_id,
                         generation=generation,
                         phase=outcome.timeout_phase,
+                        **timeout_payload,
                     )
                 if restarts >= max_restarts:
                     await self.emit(
