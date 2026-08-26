@@ -1797,7 +1797,7 @@ def _wrap_markdown(text: str, width: int) -> list[str]:
             width=line_width,
             replace_whitespace=False,
             drop_whitespace=True,
-            break_long_words=True,
+            break_long_words=False,
             break_on_hyphens=False,
         ) or [""]
         output_lines: list[str] = []
@@ -1911,11 +1911,17 @@ def _entry_lines(
                 for line in _dense_rendered_lines(detail_lines)
             )
     else:
-        lines = (
-            _bounded_markdown_lines(entry.text, body_width, detail_limit, color=color)
-            if detail_limit is not None
-            else render_markdown_lines(entry.text, body_width, color=color)
+        long_field = any(
+            "=" in word and _display_width(word) > body_width for word in entry.text.split()
         )
+        if entry.role == "system" and detail_limit is None and long_field:
+            lines = _wrap_markdown(entry.text, body_width)
+        else:
+            lines = (
+                _bounded_markdown_lines(entry.text, body_width, detail_limit, color=color)
+                if detail_limit is not None
+                else render_markdown_lines(entry.text, body_width, color=color)
+            )
         lines = _dense_rendered_lines(lines)
         rendered = [(entry.role, _clip(label_prefix + (lines[0] if lines else ""), width))]
         for line in lines[1:]:
@@ -3228,11 +3234,13 @@ class Cockpit:
         force: bool = False,
     ) -> None:
         input_text = self._input_line_text()
-        if self._input_active and not self._fixed_frame:
-            self.stream.write("\r\n")
         self._draw_in_flight = True
         try:
-            self._draw_now(request, force=force)
+            self._draw_now(
+                request,
+                force=force,
+                preserve_input=self._input_active and not self._fixed_frame,
+            )
         finally:
             self._draw_in_flight = False
         self._restore_input_line(input_text)
@@ -3243,6 +3251,7 @@ class Cockpit:
         request: tuple[Any, Transcript, str, str, str, str, str],
         *,
         force: bool = False,
+        preserve_input: bool = False,
     ) -> None:
         (
             snapshot,
@@ -3259,10 +3268,12 @@ class Cockpit:
             if self._fixed_frame:
                 self.stream.write("\x1b[1B\r\n")
                 self._fixed_frame = False
-            self._draw_stream_now(request)
+                preserve_input = False
+            self._draw_stream_now(request, preserve_input=preserve_input)
             return
 
-        rows = tuple(_primary_rows(transcript, self._last_size.columns, color=self.color))
+        content_width = max(8, self._last_size.columns - 2)
+        rows = tuple(_primary_rows(transcript, content_width, color=self.color))
         status_rows = tuple(
             _status_rows(
                 snapshot,
@@ -3270,7 +3281,7 @@ class Cockpit:
                 session_description=session_description,
                 branch_line=branch_line,
                 cumulative_line=cumulative_line,
-                width=self._last_size.columns,
+                width=content_width,
                 activity_line=activity_line,
                 show_detail=self._show_detail,
             )
@@ -3284,6 +3295,8 @@ class Cockpit:
             self.stream.write("\x1b[1B\r\n")
             self._fixed_frame = False
         if not self._fixed_frame:
+            if preserve_input:
+                self.stream.write("\r\n")
             conversation_capacity = max(
                 1, self._last_size.lines - _frame_overhead(self._show_detail)
             )
@@ -3338,6 +3351,8 @@ class Cockpit:
     def _draw_stream_now(
         self,
         request: tuple[Any, Transcript, str, str, str, str, str],
+        *,
+        preserve_input: bool = False,
     ) -> None:
         snapshot, transcript, session_description, branch_line, cumulative_line, _, _ = request
         rows = tuple(_primary_rows(transcript, self._last_size.columns, color=self.color))
@@ -3373,6 +3388,8 @@ class Cockpit:
             or status_line != self._last_status_line
             or detail_line != self._last_detail_line
         ):
+            if preserve_input:
+                self.stream.write("\r\n")
             for role, text in new_rows:
                 self.stream.write(_paint(text, _ROLE_COLORS.get(role, ""), self.color))
                 self.stream.write("\n")
@@ -3408,7 +3425,7 @@ class Cockpit:
             if changed:
                 self.stream.write(f"\r{_CLEAR_LINE}{line}")
             if index < len(rendered_rows) - 1:
-                self.stream.write("\n")
+                self.stream.write("\x1b[1B\r")
         self.stream.write("\x1b[u")
         self.stream.flush()
 
@@ -3478,8 +3495,9 @@ class Cockpit:
         if self.enabled:
             if commit:
                 if self._fixed_frame:
-                    self.stream.write("\n\n")
-                    self._fixed_frame = False
+                    self.stream.write(f"\r{_CLEAR_LINE}")
+                    if self._last_request is not None:
+                        self._redraw_bottom(self._last_request, self._last_status_rows)
                 else:
                     self.stream.write("\n")
             self.stream.flush()
