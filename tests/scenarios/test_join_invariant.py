@@ -27,9 +27,7 @@ class _Store:
 
 
 def _git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", *args], cwd=str(cwd), capture_output=True, text=True, check=check
-    )
+    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, check=check)
 
 
 def _rev(cwd: Path, ref: str = "HEAD") -> str:
@@ -206,9 +204,7 @@ def test_private_child_waits_for_parent_publication(tmp_path: Path) -> None:
     _git(parent_worktree, "commit", "-m", "parent suspension snapshot")
     snapshot = _rev(parent_worktree)
     child_worktree = tmp_path / "child"
-    child_tip = _branch_commit(
-        repo, snapshot, "child", child_worktree, "child.txt", "child\n"
-    )
+    child_tip = _branch_commit(repo, snapshot, "child", child_worktree, "child.txt", "child\n")
 
     store = _Store()
     runtime = _runtime(session, store)
@@ -453,8 +449,6 @@ def test_resolver_rechecks_parent_join_before_publication(tmp_path: Path) -> Non
     assert result is None
     assert _rev(repo, "main") == integration_head
     assert _rev(parent_worktree) != integration_head
-    join_failures = [
-        event for event in store.records if event["kind"] == "join_invariant_failed"
-    ]
+    join_failures = [event for event in store.records if event["kind"] == "join_invariant_failed"]
     assert join_failures
     assert not [event for event in store.records if event["kind"] == "resolver_succeeded"]

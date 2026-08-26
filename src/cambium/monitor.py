@@ -74,7 +74,10 @@ def _human_bytes(value: int) -> str:
 def _duration(value: float | None) -> str:
     if value is None:
         return "?"
-    seconds = max(0, int(value))
+    try:
+        seconds = max(0, int(value))
+    except (TypeError, ValueError, OverflowError):
+        return "?"
     hours, remainder = divmod(seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
     if hours:
@@ -85,9 +88,7 @@ def _duration(value: float | None) -> str:
 
 
 def _model(agent: AgentSnapshot) -> str:
-    provider = (
-        sanitize_terminal_text(agent.provider, single_line=True) if agent.provider else ""
-    )
+    provider = sanitize_terminal_text(agent.provider, single_line=True) if agent.provider else ""
     model = sanitize_terminal_text(agent.model, single_line=True) if agent.model else ""
     if provider and model:
         return f"{provider}/{model}"
@@ -388,11 +389,7 @@ def _latest_session(repo: Path | None) -> Path | None:
     for root in roots:
         if not root.is_dir():
             continue
-        candidates.extend(
-            path
-            for path in root.iterdir()
-            if path.is_dir() and has_event_log(path)
-        )
+        candidates.extend(path for path in root.iterdir() if path.is_dir() and has_event_log(path))
     if not candidates:
         return None
     return max(

@@ -550,9 +550,7 @@ def test_quarantine_redacts_secret_shaped_values_but_keeps_reason_and_structure(
     assert entry["name"] == "broken"
     assert entry["annotations"]["benign"] == "keep this field"
     assert entry["annotations"]["apiToken"].startswith("<redacted:")
-    assert records[0]["reason"] == (
-        "provider config providers[0]: unknown field(s): 'annotations'"
-    )
+    assert records[0]["reason"] == ("provider config providers[0]: unknown field(s): 'annotations'")
 
 
 def test_symlinked_quarantine_sidecar_is_not_followed(

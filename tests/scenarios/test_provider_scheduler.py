@@ -161,7 +161,8 @@ def test_busy_reservation_fails_structured_after_bounded_backoff(
 
     monkeypatch.setattr(
         provider_state.time,
-        "sleep", record_sleep,
+        "sleep",
+        record_sleep,
     )
 
     started = time.monotonic()

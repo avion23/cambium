@@ -38,9 +38,12 @@ DEFAULT_THRESHOLD = 0.8
 
 
 def _number(value: object) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, int | float):
         return None
-    number = float(value)
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
     return number if math.isfinite(number) else None
 
 
@@ -114,7 +117,7 @@ class _BucketStats:
         cache_hit = payload.get("provider_cache_hit")
         if isinstance(cache_hit, bool):
             self.cache_known += 1
-            self.cache_hits += int(cache_hit)
+            self.cache_hits += int(bool(cache_hit))
         prefix = payload.get("prompt_prefix_bytes")
         if isinstance(prefix, int) and not isinstance(prefix, bool) and prefix >= 0:
             self.prefix_bytes.add(prefix)
@@ -192,7 +195,7 @@ def _nonnegative_int(source: dict[str, Any], field: str) -> int | None:
 
 
 def _nonnegative_number(value: object) -> int | float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, int | float):
         return None
     if isinstance(value, float) and not math.isfinite(value):
         return None
@@ -204,9 +207,7 @@ def _usage_mapping(payload: dict[str, Any]) -> dict[str, Any]:
     return usage if isinstance(usage, dict) else {}
 
 
-def _usage_value(
-    usage: dict[str, Any], field: str
-) -> int | float | None:
+def _usage_value(usage: dict[str, Any], field: str) -> int | float | None:
     return _nonnegative_number(usage.get(field))
 
 
@@ -260,9 +261,7 @@ def _boundary_turn(payload: dict[str, Any]) -> int | None:
     return _positive_int(payload, "turn")
 
 
-def _epoch_transitions(
-    events: list[dict[str, Any]], session: str
-) -> list[dict[str, Any]]:
+def _epoch_transitions(events: list[dict[str, Any]], session: str) -> list[dict[str, Any]]:
     """Derive deterministic transition evidence from one replayed event list."""
     ordered = _ordered_events(events)
     usage_by_stream: dict[tuple[str, int | None], list[tuple[int, dict[str, Any]]]] = {}
@@ -304,13 +303,15 @@ def _epoch_transitions(
         boundary_turn = _boundary_turn(payload)
         same_stream_usage = usage_by_stream.get(stream, [])
         before_event = next(
-            (usage for usage_position, usage in reversed(same_stream_usage)
-             if usage_position < position),
+            (
+                usage
+                for usage_position, usage in reversed(same_stream_usage)
+                if usage_position < position
+            ),
             None,
         )
         after_event = next(
-            (usage for usage_position, usage in same_stream_usage
-             if usage_position > position),
+            (usage for usage_position, usage in same_stream_usage if usage_position > position),
             None,
         )
         before = _usage_evidence(before_event) if before_event is not None else None
@@ -328,12 +329,8 @@ def _epoch_transitions(
             "turn": boundary_turn,
             "prefix_bytes": prefix_bytes,
             "prefix_sha256": prefix_sha256,
-            "prefix_bytes_before": (
-                before["prompt_prefix_bytes"] if before is not None else None
-            ),
-            "prefix_bytes_after": (
-                after["prompt_prefix_bytes"] if after is not None else None
-            ),
+            "prefix_bytes_before": (before["prompt_prefix_bytes"] if before is not None else None),
+            "prefix_bytes_after": (after["prompt_prefix_bytes"] if after is not None else None),
             "usage_before": before,
             "usage_after": after,
             "boundary_metadata_missing": sorted(set(metadata_missing)),
@@ -361,14 +358,20 @@ def _aggregate(
             all_events = _session_usage_events(session_dir)
         usage_events = (
             [event for event in all_events if event.get("kind") == "usage_event"]
-            if all_events is not None else None
+            if all_events is not None
+            else None
         )
         if all_events is None or usage_events is None:
             warnings.append(f"{session_dir}: no event DB; skipped")
-            sessions.append({
-                "dir": str(session_dir), "usage_events": 0,
-                "usable_events": 0, "skipped": True, "missing_db": True,
-            })
+            sessions.append(
+                {
+                    "dir": str(session_dir),
+                    "usage_events": 0,
+                    "usable_events": 0,
+                    "skipped": True,
+                    "missing_db": True,
+                }
+            )
             continue
         transitions = _epoch_transitions(all_events or [], str(session_dir))
         usable = _classify_events(usage_events, str(session_dir))
@@ -379,22 +382,24 @@ def _aggregate(
             )
             provider_buckets[bucket].record(payload, str(session_dir))
         session_record: dict[str, Any] = {
-            "dir": str(session_dir), "usage_events": len(usage_events),
-            "usable_events": len(usable), "skipped": not bool(usable),
+            "dir": str(session_dir),
+            "usage_events": len(usage_events),
+            "usable_events": len(usable),
+            "skipped": not bool(usable),
             "missing_db": False,
         }
         if transitions:
             session_record["epoch_transitions"] = transitions
-            missing = sorted({
-                f"seq={transition['seq']}: {field}"
-                for transition in transitions
-                for field in transition["boundary_metadata_missing"]
-            })
+            missing = sorted(
+                {
+                    f"seq={transition['seq']}: {field}"
+                    for transition in transitions
+                    for field in transition["boundary_metadata_missing"]
+                }
+            )
             if missing:
                 session_record["boundary_metadata_missing"] = missing
-                warnings.append(
-                    f"{session_dir}: boundary metadata missing: {', '.join(missing)}"
-                )
+                warnings.append(f"{session_dir}: boundary metadata missing: {', '.join(missing)}")
         sessions.append(session_record)
     return providers, sessions, warnings
 
@@ -432,9 +437,7 @@ def _relative_rate(bucket: _BucketStats, baseline: _BucketStats) -> float | None
     return bucket_rate / baseline_rate
 
 
-def _comparison_json(
-    buckets: dict[str, _BucketStats], threshold: float
-) -> dict[str, Any]:
+def _comparison_json(buckets: dict[str, _BucketStats], threshold: float) -> dict[str, Any]:
     baseline = buckets["baseline"]
     baseline_rate = _cache_rate(baseline)
     result: dict[str, Any] = {
@@ -446,9 +449,7 @@ def _comparison_json(
         result[name] = {
             "cache_hit_rate": _cache_rate(buckets[name]),
             "relative_to_baseline": relative,
-            "meets_threshold": (
-                None if relative is None else relative >= threshold
-            ),
+            "meets_threshold": (None if relative is None else relative >= threshold),
         }
     return result
 
@@ -460,11 +461,7 @@ def _report(
     threshold: float,
 ) -> dict[str, Any]:
     transitions = sorted(
-        (
-            transition
-            for session in sessions
-            for transition in session.get("epoch_transitions", [])
-        ),
+        (transition for session in sessions for transition in session.get("epoch_transitions", [])),
         key=lambda transition: (
             transition["session"],
             transition["seq"] is None,
@@ -472,9 +469,7 @@ def _report(
         ),
     )
     sessions_lacking_boundary_metadata = sorted(
-        session["dir"]
-        for session in sessions
-        if session.get("boundary_metadata_missing")
+        session["dir"] for session in sessions if session.get("boundary_metadata_missing")
     )
     return {
         "measurement": {
@@ -496,10 +491,7 @@ def _report(
         },
         "providers": {
             provider: {
-                "buckets": {
-                    bucket: _bucket_json(stats)
-                    for bucket, stats in buckets.items()
-                },
+                "buckets": {bucket: _bucket_json(stats) for bucket, stats in buckets.items()},
                 "comparison": _comparison_json(buckets, threshold),
             }
             for provider, buckets in sorted(providers.items())
@@ -524,10 +516,7 @@ def _print_text(report: dict[str, Any]) -> None:
     for provider, details in report["providers"].items():
         comparison = details["comparison"]
         print(f"provider: {provider}")
-        print(
-            "  baseline cache rate: "
-            f"{_fmt_rate(comparison['baseline_cache_hit_rate'])}"
-        )
+        print(f"  baseline cache rate: {_fmt_rate(comparison['baseline_cache_hit_rate'])}")
         for bucket in ("fork_first", "resume_first"):
             item = comparison[bucket]
             status = item["meets_threshold"]
@@ -559,12 +548,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("sessions", nargs="*", help="session dir(s) to read")
     parser.add_argument(
-        "--repo", action="append", default=[], metavar="PATH",
+        "--repo",
+        action="append",
+        default=[],
+        metavar="PATH",
         help="repo whose .cambium/sessions/* are read (repeatable)",
     )
     parser.add_argument("--json", action="store_true", help="emit JSON")
     parser.add_argument(
-        "--threshold", type=float, default=DEFAULT_THRESHOLD,
+        "--threshold",
+        type=float,
+        default=DEFAULT_THRESHOLD,
         help="minimum contextual hit-rate fraction relative to baseline (default: 0.8)",
     )
     args = parser.parse_args(argv)

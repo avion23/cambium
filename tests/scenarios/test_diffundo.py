@@ -428,9 +428,9 @@ def test_terminal_endpoint_death_is_skipped_until_a_new_router(monkeypatch) -> N
         # Once ordinary cooldown has elapsed, terminal-death memory still
         # excludes the dead lane while a healthy sibling can serve.
         router._runtime("p_terminal_dead").cooldown_until = time.monotonic() - 1.0
-        assert [
-            provider.name for provider in router._candidates(ProviderTier.FAST, None)
-        ] == ["p_terminal_healthy"]
+        assert [provider.name for provider in router._candidates(ProviderTier.FAST, None)] == [
+            "p_terminal_healthy"
+        ]
         second = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
         assert second.provider == "p_terminal_healthy"
         assert len(dead.calls) == 1
@@ -443,9 +443,9 @@ def test_terminal_endpoint_death_is_skipped_until_a_new_router(monkeypatch) -> N
             primary_provider="p_terminal_dead",
             pause_timeout_s=0.01,
         )
-        assert [
-            provider.name for provider in fresh._candidates(ProviderTier.FAST, None)
-        ][0] == "p_terminal_dead"
+        assert [provider.name for provider in fresh._candidates(ProviderTier.FAST, None)][
+            0
+        ] == "p_terminal_dead"
         recovered = asyncio.run(fresh.call(ProviderTier.FAST, PROMPT))
         assert recovered.provider == "p_terminal_dead"
         assert recovered.content == "fresh router"

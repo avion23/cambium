@@ -39,7 +39,7 @@ def _number(value: Any, default: float = 0.0) -> float:
     if isinstance(value, int | float) and not isinstance(value, bool):
         try:
             parsed = float(value)
-        except (OverflowError, ValueError):
+        except (OverflowError, ValueError, TypeError):
             return default
         if math.isfinite(parsed):
             return max(0.0, parsed)
@@ -66,28 +66,40 @@ def quality_score(
     if not isinstance(requests, int) or isinstance(requests, bool) or requests <= 0:
         return None
     last_seen = _field(entry, "last_seen", None)
-    if (
-        isinstance(last_seen, bool)
-        or not isinstance(last_seen, int | float)
-        or not math.isfinite(float(last_seen))
-        or now - float(last_seen) > weights.stale_after_s
-    ):
+    last_seen_f: float | None = None
+    if isinstance(last_seen, int | float) and not isinstance(last_seen, bool):
+        try:
+            candidate = float(last_seen)
+            if math.isfinite(candidate):
+                last_seen_f = candidate
+        except (OverflowError, ValueError, TypeError):
+            pass
+    if last_seen_f is None or now - last_seen_f > weights.stale_after_s:
         return None
 
-    failures = min(requests, int(_number(_field(entry, "failed_requests", 0))))
+    def _bounded_int(value: Any, limit: int) -> int:
+        parsed = _number(value)
+        if not math.isfinite(parsed):
+            return 0
+        return max(0, min(limit, int(parsed)))
+
+    failures = _bounded_int(_field(entry, "failed_requests", 0), requests)
     successes = requests - failures
     failure_probability = failures / requests
 
-    latency_count = int(_number(_field(entry, "latency_count", 0)))
+    latency_count = _bounded_int(_field(entry, "latency_count", 0), requests)
     latency = 0.0
     if latency_count:
         latency = _number(_field(entry, "latency_total_s", 0.0)) / latency_count
     latency_ratio = latency / weights.latency_slo_s if weights.latency_slo_s > 0 else latency
-    slo_miss = int(latency_count > 0 and latency > weights.latency_slo_s)
+    slo_miss = 1 if latency_count > 0 and latency > weights.latency_slo_s else 0
 
     cost = _number(_field(entry, "cost", 0.0))
-    expected_cost = cost / successes if cost > 0.0 and successes else float("inf")
-    cache_hits = min(requests, int(_number(_field(entry, "cache_hit_count", 0))))
+    if cost > 0.0 and successes > 0:
+        expected_cost = cost / successes
+    else:
+        expected_cost = float(math.inf)
+    cache_hits = _bounded_int(_field(entry, "cache_hit_count", 0), requests)
     cache_fraction = cache_hits / requests
     # ``tokens_per_s`` is folded by routing.ProviderDebt from the existing
     # usage-event output-token and latency fields.  Keep it in the final
@@ -97,9 +109,7 @@ def quality_score(
     # neutral (zero) and therefore cannot demote a provider by itself.
     throughput = _number(_field(entry, "tokens_per_s", 0.0))
     tie_break = (
-        weights.latency_weight * latency_ratio
-        - weights.cache_weight * cache_fraction
-        - throughput
+        weights.latency_weight * latency_ratio - weights.cache_weight * cache_fraction - throughput
     )
     return (failure_probability, slo_miss, expected_cost, tie_break)
 
@@ -119,9 +129,7 @@ def _quality_entry(
     # A declared hint is only a fallback for providers without fresh usage
     # evidence. Observed DebtStore evidence always wins and remains the source
     # of truth for measured routing quality.
-    hint = _number(
-        _field(candidate, "tokens_per_s", _field(candidate, "throughput_hint_tps", 0.0))
-    )
+    hint = _number(_field(candidate, "tokens_per_s", _field(candidate, "throughput_hint_tps", 0.0)))
     if hint <= 0:
         return None
     return quality_score(

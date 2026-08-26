@@ -42,9 +42,12 @@ UNKNOWN_PROVIDER = "<unknown>"
 
 def _number(value: object) -> float | None:
     """One numeric field value, or None for missing/non-numeric values."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, int | float):
         return None
-    return float(value)
+    try:
+        return float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def _prompt_completion_tokens(usage: object) -> float | None:
@@ -101,7 +104,7 @@ def _record_event(stats: _ProviderStats, payload: dict[str, Any], session: str) 
     cache_hit = payload.get("provider_cache_hit")
     if isinstance(cache_hit, bool):
         stats.cache_known += 1
-        stats.cache_hits += int(cache_hit)
+        stats.cache_hits += int(bool(cache_hit))
     prefix = payload.get("prompt_prefix_bytes")
     if isinstance(prefix, int) and not isinstance(prefix, bool):
         stats.prefix_values.add(prefix)

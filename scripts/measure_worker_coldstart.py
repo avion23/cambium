@@ -119,12 +119,14 @@ def _seed_clone(source: Path, clone: Path) -> None:
     # publication contract.
     rev = subprocess.run(
         ["git", "-C", str(clone), "rev-parse", "--verify", "origin/main"],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     main_target = "origin/main" if rev.returncode == 0 else "HEAD"
     r = subprocess.run(
         ["git", "-C", str(clone), "checkout", "-B", "main", main_target],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     if r.returncode != 0:
         _fail(f"git checkout -B main {main_target} failed: {r.stderr.strip()[:256]}")
@@ -144,9 +146,7 @@ def _read_phase_monos(session_dir: Path) -> dict[str, int]:
     conn = sqlite3.connect(db)
     try:
         conn.execute("PRAGMA busy_timeout=5000")
-        rows = conn.execute(
-            "SELECT kind, monotonic_ms FROM events ORDER BY seq"
-        ).fetchall()
+        rows = conn.execute("SELECT kind, monotonic_ms FROM events ORDER BY seq").fetchall()
     finally:
         conn.close()
     monos: dict[str, int] = {}
@@ -212,8 +212,14 @@ def _run_one(
     plan_path.write_text(json.dumps(plan) + "\n", encoding="utf-8")
 
     cmd = [
-        python, "-u", "-m", "cambium.supervisor",
-        "--session-dir", str(session_dir), "--plan", str(plan_path),
+        python,
+        "-u",
+        "-m",
+        "cambium.supervisor",
+        "--session-dir",
+        str(session_dir),
+        "--plan",
+        str(plan_path),
     ]
     env = dict(os.environ)
     env["PYTHONPATH"] = pythonpath
@@ -291,18 +297,22 @@ def _print_summary(records: list[dict]) -> None:
     print("=" * 72)
     print("COLD vs WARM (cold = run 0; warm = median of runs 1..N-1)")
     print("=" * 72)
-    cold_spawn = cold.get('spawn_to_ready_ms')
-    delta = (cold_spawn - warm_spawn
-             if warm_spawn is not None and cold_spawn is not None else None)
-    print(f"  spawn_to_ready  cold={_fmt_ms(cold_spawn)} ms"
-          f"  warm={_fmt_ms(warm_spawn)} ms"
-          f"  delta={_fmt_ms(delta)} ms")
-    print(f"  init_to_ready   cold={_fmt_ms(cold.get('init_to_ready_ms'))} ms"
-          f"  warm={_fmt_ms(warm_init)} ms")
-    print(f"  plan wall       cold={_fmt_ms(cold.get('wall_ms'))} ms"
-          f"  warm={_fmt_ms(warm_wall)} ms")
-    print(f"  setup (assigned->ready) cold={_fmt_ms(cold.get('setup_ms'))} ms"
-          f"  warm={_fmt_ms(warm_setup)} ms")
+    cold_spawn = cold.get("spawn_to_ready_ms")
+    delta = cold_spawn - warm_spawn if warm_spawn is not None and cold_spawn is not None else None
+    print(
+        f"  spawn_to_ready  cold={_fmt_ms(cold_spawn)} ms"
+        f"  warm={_fmt_ms(warm_spawn)} ms"
+        f"  delta={_fmt_ms(delta)} ms"
+    )
+    print(
+        f"  init_to_ready   cold={_fmt_ms(cold.get('init_to_ready_ms'))} ms"
+        f"  warm={_fmt_ms(warm_init)} ms"
+    )
+    print(f"  plan wall       cold={_fmt_ms(cold.get('wall_ms'))} ms  warm={_fmt_ms(warm_wall)} ms")
+    print(
+        f"  setup (assigned->ready) cold={_fmt_ms(cold.get('setup_ms'))} ms"
+        f"  warm={_fmt_ms(warm_setup)} ms"
+    )
 
     # Setup fraction: share of the supervised task wall consumed before the
     # worker begins actual work. The rest is work + merge + prune.
@@ -315,9 +325,11 @@ def _print_summary(records: list[dict]) -> None:
     warm_frac = frac(warm_setup, _median([r.get("total_task_ms") for r in warm_records]) or 0)
     print()
     print("SETUP FRACTION of supervised task wall (task_assigned -> ready / -> session_ended):")
-    print(f"  cold: {frac(cold.get('setup_ms'), cold.get('total_task_ms'))!s:>6} %"
-          if cold_frac is None else
-          f"  cold: {cold_frac:6.1f} %")
+    print(
+        f"  cold: {frac(cold.get('setup_ms'), cold.get('total_task_ms'))!s:>6} %"
+        if cold_frac is None
+        else f"  cold: {cold_frac:6.1f} %"
+    )
     if warm_frac is not None:
         print(f"  warm: {warm_frac:6.1f} %")
     else:
@@ -342,14 +354,15 @@ def _print_reuse_projection(records: list[dict]) -> None:
     print(f"    warm spawn_to_ready   = {marker_warm:7.1f} ms")
     print(f"    reuse floor (IPC)     = {REUSE_IPC_FLOOR_MS:7.1f} ms")
     pct = (100.0 * marker_saving / marker_warm) if marker_warm else 0.0
-    print(f"    saving per task       = {marker_saving:7.1f} ms"
-          f"  ({pct:5.1f} % of spawn_to_ready)")
+    print(f"    saving per task       = {marker_saving:7.1f} ms  ({pct:5.1f} % of spawn_to_ready)")
     print("  provider-loop task (projected from docs/research/worker-coldstart.md):")
     print(f"    dspy spawn_to_ready   = {DSPY_SPAWN_TO_READY_MS:7.1f} ms")
     dspy_saving = max(0.0, DSPY_SPAWN_TO_READY_MS - REUSE_IPC_FLOOR_MS)
     print(f"    reuse floor (IPC)     = {REUSE_IPC_FLOOR_MS:7.1f} ms")
-    print(f"    saving per task       = {dspy_saving:7.1f} ms"
-          f"  ({(100.0 * dspy_saving / DSPY_SPAWN_TO_READY_MS):5.1f} % of spawn_to_ready)")
+    print(
+        f"    saving per task       = {dspy_saving:7.1f} ms"
+        f"  ({(100.0 * dspy_saving / DSPY_SPAWN_TO_READY_MS):5.1f} % of spawn_to_ready)"
+    )
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -357,25 +370,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="Measure Cambium worker spawn/cold-start cost vs reuse.",
     )
     parser.add_argument(
-        "--repo", required=True,
+        "--repo",
+        required=True,
         help="throwaway clone path (created fresh; the repo the marker task edits)",
     )
     parser.add_argument(
-        "--tasks", type=int, default=3,
+        "--tasks",
+        type=int,
+        default=3,
         help="number of sequential one-task plans to run (default 3)",
     )
     parser.add_argument(
-        "--source", default=str(REAL),
+        "--source",
+        default=str(REAL),
         help=f"source repo to clone (default {REAL})",
     )
     parser.add_argument(
-        "--python", default=DEFAULT_PYTHON,
+        "--python",
+        default=DEFAULT_PYTHON,
         help=f"interpreter for the supervisor subprocess (default {DEFAULT_PYTHON})",
     )
     parser.add_argument(
-        "--pythonpath", default=os.environ.get("PYTHONPATH", str(REAL / "src")),
+        "--pythonpath",
+        default=os.environ.get("PYTHONPATH", str(REAL / "src")),
         help="harness src PYTHONPATH for the supervisor subprocess "
-             "(default $PYTHONPATH or <script>/../src)",
+        "(default $PYTHONPATH or <script>/../src)",
     )
     args = parser.parse_args(argv)
     if args.tasks < 1:
@@ -405,8 +424,11 @@ def main(argv: list[str] | None = None) -> int:
     records: list[dict] = []
     for index in range(args.tasks):
         record = _run_one(
-            index=index, clone=clone, session_root=session_root,
-            python=args.python, pythonpath=args.pythonpath,
+            index=index,
+            clone=clone,
+            session_root=session_root,
+            python=args.python,
+            pythonpath=args.pythonpath,
         )
         records.append(record)
         print(

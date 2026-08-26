@@ -293,11 +293,7 @@ def _debt_from_mapping(entry: Mapping[str, Any]) -> ProviderDebt:
     if isinstance(disable_reason, str) and disable_reason:
         debt.disable_reason = disable_reason
     disable_at = entry.get("disable_at")
-    if (
-        isinstance(disable_at, int | float)
-        and not isinstance(disable_at, bool)
-        and disable_at >= 0
-    ):
+    if isinstance(disable_at, int | float) and not isinstance(disable_at, bool) and disable_at >= 0:
         try:
             parsed_disable_at = float(disable_at)
         except (OverflowError, ValueError):
@@ -389,9 +385,7 @@ class DebtStore:
         updates: dict[str, Any] = {}
         for field_name in (*int_fields, *float_fields):
             before = getattr(baseline, field_name, 0) if baseline is not None else 0
-            updates[field_name] = (
-                getattr(base, field_name) + getattr(local, field_name) - before
-            )
+            updates[field_name] = getattr(base, field_name) + getattr(local, field_name) - before
 
         # Quarantine record: the most recent event wins. A config/auth error
         # this session sets it; a success this session clears it (a success
@@ -836,9 +830,7 @@ class LaneState:
         """Return the integer request-token capacity after 429 pressure."""
         return max(1, int(self.effective_request_rate(retry_after_count)))
 
-    def has_request_slot(
-        self, retry_after_count: int = 0, *, now: float | None = None
-    ) -> bool:
+    def has_request_slot(self, retry_after_count: int = 0, *, now: float | None = None) -> bool:
         """Whether one request token is available without consuming it."""
         if self.request_slots is None:
             return True

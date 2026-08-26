@@ -1137,9 +1137,7 @@ async def _run_tui(args: argparse.Namespace) -> int:
                 raise ValueError("--continue cannot be combined with --session-dir")
             from .interactive import InteractiveSession
 
-            session_root = InteractiveSession.resolve_continue_session(
-                args.repo, continue_session
-            )
+            session_root = InteractiveSession.resolve_continue_session(args.repo, continue_session)
     except ValueError as exc:
         print(f"cambium tui: {exc}", file=sys.stderr)
         return 2

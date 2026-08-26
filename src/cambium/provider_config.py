@@ -276,9 +276,7 @@ MAX_QUARANTINE_RECORD_BYTES = 64 * 1024
 MAX_QUARANTINE_SIDECAR_BYTES = 1024 * 1024
 _MAX_QUARANTINE_ENTRY_DEPTH = 128
 _MAX_QUARANTINE_ENTRY_NODES = 100_000
-_QUARANTINE_SECRET_KEY_RE = re.compile(
-    r"(?:key|token|secret|credential)", re.IGNORECASE
-)
+_QUARANTINE_SECRET_KEY_RE = re.compile(r"(?:key|token|secret|credential)", re.IGNORECASE)
 _QUARANTINE_LONG_ALNUM_RE = re.compile(r"[A-Za-z0-9]{60,}")
 _QUARANTINE_SECRET_PREFIXES = ("sk-", "ghp_", "AKIA")
 _QUARANTINE_MARKER_RE = re.compile(r"<(?:redacted:\d+|oversized: \d+ bytes)>")
@@ -438,9 +436,7 @@ def _sanitize_quarantine_entry(entry: object) -> object:
                     (
                         child,
                         safe_child,
-                        iter(child.items())
-                        if isinstance(child, dict)
-                        else iter(enumerate(child)),
+                        iter(child.items()) if isinstance(child, dict) else iter(enumerate(child)),
                         depth + 1,
                         id(child),
                     )
@@ -530,11 +526,7 @@ def _read_quarantine_sidecar(path: Path) -> tuple[list[object], bool]:
     if not stat.S_ISREG(path_stat.st_mode):
         raise OSError(f"provider quarantine path is not a file: {path}")
 
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_NONBLOCK", 0)
-    )
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     descriptor: int | None = None
     try:
         try:
@@ -604,8 +596,7 @@ def _append_quarantine(source: Path, records: Sequence[dict[str, object]]) -> Pa
     if sidecar_limited:
         return path
     existing = [
-        _sanitize_quarantine_record(item) if isinstance(item, dict) else item
-        for item in existing
+        _sanitize_quarantine_record(item) if isinstance(item, dict) else item for item in existing
     ]
     safe_records = tuple(_sanitize_quarantine_record(record) for record in records)
 

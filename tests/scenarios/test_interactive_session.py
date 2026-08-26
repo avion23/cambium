@@ -529,9 +529,7 @@ def test_serving_reconciliation_preserves_per_provider_model_choices(
     )
 
     manifest = json.loads(
-        (tmp_path / "interactive" / ".cambium" / "interactive.json").read_text(
-            encoding="utf-8"
-        )
+        (tmp_path / "interactive" / ".cambium" / "interactive.json").read_text(encoding="utf-8")
     )
     assert manifest["model_preferences"] == {
         "dead-zen": "zen-model",
@@ -778,9 +776,7 @@ def test_lock_acquisition_refreshes_state_before_contender_can_publish(
             third,
             {"kind": "usage_event", "payload": {"provider": "provider-a", "model": "model-a"}},
         )
-        manifest = json.loads(
-            (root / ".cambium" / "interactive.json").read_text(encoding="utf-8")
-        )
+        manifest = json.loads((root / ".cambium" / "interactive.json").read_text(encoding="utf-8"))
         assert manifest["turn"] == 2
     finally:
         contender.release()

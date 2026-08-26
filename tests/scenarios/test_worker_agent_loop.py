@@ -109,9 +109,7 @@ class _SummaryFlushRouter:
             if isinstance(messages, list) and messages and isinstance(messages[-1], dict)
             else None
         )
-        if isinstance(last_content, str) and last_content.startswith(
-            "<cambium-summary-control>\n"
-        ):
+        if isinstance(last_content, str) and last_content.startswith("<cambium-summary-control>\n"):
             if not allow_model_substitution:
                 raise AssertionError("summary calls must authorize model substitution")
             if self.all_providers_dead:

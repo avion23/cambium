@@ -481,8 +481,7 @@ def test_codex_stream_model_not_found_quarantines_provider() -> None:
 
 def test_codex_completed_stream_with_refusal_like_text_passes_through() -> None:
     content = (
-        "A policy guide explains when to refuse; a provider cannot assist with "
-        "prohibited work."
+        "A policy guide explains when to refuse; a provider cannot assist with prohibited work."
     )
     server = CodexServer([(200, _ok_stream(text=content), 0.0)])
     router = _router(server)

@@ -63,9 +63,10 @@ class CodexOAuthFixture:
 
 
 def _mutation_enabled() -> bool:
-    return os.environ.get(ALLOW_MUTATION_ENV) == "1" or os.environ.get(
-        LEGACY_ALLOW_MUTATION_ENV
-    ) == "1"
+    return (
+        os.environ.get(ALLOW_MUTATION_ENV) == "1"
+        or os.environ.get(LEGACY_ALLOW_MUTATION_ENV) == "1"
+    )
 
 
 def _read_json(path: Path) -> object:
@@ -109,9 +110,7 @@ def _pi_oauth_doc(raw: Mapping[str, object], provider: str) -> OAuthDoc:
     # pi stores OAuth expiry in milliseconds.  Accept seconds as well so an
     # operator can use a compatible exported store without editing a token.
     expires_at = (
-        float(expires) / 1000.0
-        if abs(float(expires)) > 100_000_000_000
-        else float(expires)
+        float(expires) / 1000.0 if abs(float(expires)) > 100_000_000_000 else float(expires)
     )
     return OAuthDoc(provider, access_token, refresh_token, expires_at, account_id)
 
@@ -222,13 +221,11 @@ def build_codex_oauth_fixtures(
 
 
 def _source_path() -> Path:
-    configured = os.environ.get(CODEX_SOURCE_ENV, "").strip() or os.environ.get(
-        PI_AUTH_ENV, ""
-    ).strip()
+    configured = (
+        os.environ.get(CODEX_SOURCE_ENV, "").strip() or os.environ.get(PI_AUTH_ENV, "").strip()
+    )
     return (
-        Path(configured).expanduser()
-        if configured
-        else Path.home() / ".pi" / "agent" / "auth.json"
+        Path(configured).expanduser() if configured else Path.home() / ".pi" / "agent" / "auth.json"
     )
 
 

@@ -233,7 +233,7 @@ def _fake_issuer():
     try:
         yield server
     finally:
-            server.close()
+        server.close()
 
 
 def _use_fast_device_polling(flow: DeviceFlow, monkeypatch: pytest.MonkeyPatch) -> None:

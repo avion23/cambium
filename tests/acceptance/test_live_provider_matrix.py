@@ -318,10 +318,15 @@ def _default_provider_name(provider_env: str, entries: list[dict[str, object]]) 
             )
             if provider_env == OPENROUTER_FREE_PROVIDER_ENV and is_free:
                 candidates.append(entry)
-            elif provider_env == OPENROUTER_PAID_PROVIDER_ENV and billing in {
-                "metered",
-                "subscription",
-            } and not is_free:
+            elif (
+                provider_env == OPENROUTER_PAID_PROVIDER_ENV
+                and billing
+                in {
+                    "metered",
+                    "subscription",
+                }
+                and not is_free
+            ):
                 candidates.append(entry)
         if candidates:
             name = candidates[0].get("name")
@@ -366,9 +371,7 @@ def _synthesize_zai_provider_config(
     """
 
     config_entry = dict(context.config_entry)
-    config_entry["quota_windows"] = [
-        dict(window) for window in _ZAI_STANDARD_QUOTA_WINDOWS
-    ]
+    config_entry["quota_windows"] = [dict(window) for window in _ZAI_STANDARD_QUOTA_WINDOWS]
     config_path = destination / "zai-acceptance-providers.json"
     try:
         config_path.write_text(
@@ -377,10 +380,7 @@ def _synthesize_zai_provider_config(
         )
         providers = load_providers(config_path)
     except (OSError, ValueError) as exc:
-        pytest.fail(
-            f"synthesized z.ai acceptance config is invalid: "
-            f"{type(exc).__name__}: {exc}"
-        )
+        pytest.fail(f"synthesized z.ai acceptance config is invalid: {type(exc).__name__}: {exc}")
     provider = next((item for item in providers if item.name == context.provider.name), None)
     if provider is None:
         pytest.fail("synthesized z.ai acceptance config lost the selected provider")
@@ -603,12 +603,11 @@ def _assert_provider_result(result: Any, provider: ProviderConfig) -> None:
 
 
 def _allow_oauth_mutation() -> None:
-    if os.environ.get(ALLOW_MUTATION_ENV) != "1" and os.environ.get(
-        ALLOW_OAUTH_MUTATIONS_ENV
-    ) != "1":
-        pytest.skip(
-            f"set {ALLOW_MUTATION_ENV}=1 only with disposable copied OAuth stores/accounts"
-        )
+    if (
+        os.environ.get(ALLOW_MUTATION_ENV) != "1"
+        and os.environ.get(ALLOW_OAUTH_MUTATIONS_ENV) != "1"
+    ):
+        pytest.skip(f"set {ALLOW_MUTATION_ENV}=1 only with disposable copied OAuth stores/accounts")
 
 
 def _fixture_root() -> Path:

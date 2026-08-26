@@ -321,10 +321,7 @@ class CastConfig:
             raise ValueError("active_trunk_tokens must be a non-negative integer")
         return bool(
             (self.max_segments and segment_count > self.max_segments)
-            or (
-                self.max_active_trunk_tokens
-                and active_trunk_tokens > self.max_active_trunk_tokens
-            )
+            or (self.max_active_trunk_tokens and active_trunk_tokens > self.max_active_trunk_tokens)
         )
 
     def rollover_decision(
@@ -347,6 +344,7 @@ class CastConfig:
             cache_capability=cache_capability,
             cache_expired=cache_expired,
         )
+
 
 @dataclass(frozen=True, slots=True)
 class RolloverDecision:
@@ -697,8 +695,7 @@ class QuotaLedger:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise QuotaLedgerBusyError(
-                            f"quota ledger {operation} remained busy for "
-                            f"{_BUSY_RETRY_S}s"
+                            f"quota ledger {operation} remained busy for {_BUSY_RETRY_S}s"
                         ) from exc
                     time.sleep(min(delay, remaining))
                     delay = min(delay * 2, _BUSY_RETRY_MAX_SLEEP_S)
@@ -823,6 +820,7 @@ class QuotaLedger:
         if not math.isfinite(timestamp):
             raise ValueError("quota reservation time must be finite")
         reservation_id = uuid.uuid4().hex
+
         def reserve_transaction(connection: sqlite3.Connection) -> QuotaReservation | None:
             self._prune_reconciled(connection, timestamp - _RESERVATION_RETENTION_S)
             normalized: list[tuple[QuotaWindowSpec, float, int, int]] = []
@@ -905,6 +903,7 @@ class QuotaLedger:
         timestamp = time.time() if now is None else float(now)
         if not math.isfinite(timestamp):
             raise ValueError("quota reconciliation time must be finite")
+
         def reconcile_transaction(connection: sqlite3.Connection) -> None:
             row = connection.execute(
                 "SELECT estimated_tokens,reconciled FROM quota_reservations "
@@ -1006,6 +1005,7 @@ class QuotaLedger:
                     timestamp,
                 ),
             )
+
         self._run_transaction("observe", observe_transaction)
 
     def snapshots(self, provider: str | None = None) -> tuple[QuotaWindowSnapshot, ...]:

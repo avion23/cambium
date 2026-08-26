@@ -643,9 +643,7 @@ def _read_database(
             if _repo_matches(session, repo_filters)
         }
         field_relevant = {
-            session_id
-            for session_id in matching_sessions
-            if sessions[session_id].relevant
+            session_id for session_id in matching_sessions if sessions[session_id].relevant
         }
         content_relevant: set[str] = set()
         segments = list(_iter_segments(connection, start_ms=start_ms, end_ms=end_ms))
@@ -677,9 +675,7 @@ def _read_database(
                     )
                 )
     candidates = [
-        candidate
-        for raw in raw_candidates
-        if (candidate := _redact_candidate(raw)) is not None
+        candidate for raw in raw_candidates if (candidate := _redact_candidate(raw)) is not None
     ]
     summary = DatabaseSummary(
         database=path.name,
@@ -692,9 +688,7 @@ def _read_database(
         unsafe_records=len(raw_candidates) - len(candidates),
         repo_counts=dict(Counter(candidate.repo or "unknown" for candidate in candidates)),
         tool_counts=dict(Counter(candidate.tool or "unknown" for candidate in candidates)),
-        time_counts=dict(
-            Counter(_time_day(candidate.time_created_ms) for candidate in candidates)
-        ),
+        time_counts=dict(Counter(_time_day(candidate.time_created_ms) for candidate in candidates)),
     )
     return candidates, summary
 

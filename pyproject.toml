@@ -105,3 +105,5 @@ max-complexity = 15
 "src/cambium/tui.py" = ["C901"]
 "src/cambium/tui_screen.py" = ["C901"]
 "src/cambium/worker.py" = ["C901"]
+"scripts/extract_pi.py" = ["C901"]
+"scripts/check_dataset_v1.py" = ["C901"]

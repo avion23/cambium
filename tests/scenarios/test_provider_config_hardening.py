@@ -32,9 +32,7 @@ def _assert_config_error(path: Path, match: str) -> None:
     assert type(raised.value) is ValueError
 
 
-def _assert_quarantined(
-    path: Path, match: str, caplog: pytest.LogCaptureFixture
-) -> None:
+def _assert_quarantined(path: Path, match: str, caplog: pytest.LogCaptureFixture) -> None:
     """Assert an invalid provider entry is dropped, recorded, and warned about."""
 
     caplog.set_level(logging.WARNING, logger="cambium.provider_config")
@@ -69,9 +67,7 @@ def test_missing_required_provider_fields_are_quarantined(
     value = _provider()
     del value[missing]
 
-    _assert_quarantined(
-        _write(tmp_path / "providers.json", {"providers": [value]}), match, caplog
-    )
+    _assert_quarantined(_write(tmp_path / "providers.json", {"providers": [value]}), match, caplog)
 
 
 def test_missing_root_providers_field_fails_closed(tmp_path: Path) -> None:
@@ -105,9 +101,7 @@ def test_unknown_top_level_fields_remain_structural_failure(tmp_path: Path) -> N
     )
 
 
-def test_unknown_auth_mode_is_quarantined(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_unknown_auth_mode_is_quarantined(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     _assert_quarantined(
         _write(tmp_path / "providers.json", {"providers": [_provider(auth="unknown")]}),
         r"providers\[0\]\.auth: invalid auth mode 'unknown'; expected api_key, codex_chatgpt",

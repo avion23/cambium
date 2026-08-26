@@ -139,11 +139,11 @@ def test_early_worker_failure_preserves_exit_code_and_stderr_tail(tmp_path, monk
     reason = result.results[0].reason or ""
     assert "worker_exit_7" in reason
     assert "stderr: worker bootstrap failed: provider setup exploded" in reason
-    root_result = json.loads(
-        (session_dir / ".cambium" / "result.json").read_text(encoding="utf-8")
-    )
+    root_result = json.loads((session_dir / ".cambium" / "result.json").read_text(encoding="utf-8"))
     assert root_result["failure_reason"] == reason
-    failed_events = [event for event in read_events(session_dir) if event["kind"] == "worker_failed"]
+    failed_events = [
+        event for event in read_events(session_dir) if event["kind"] == "worker_failed"
+    ]
     assert failed_events
     assert reason.endswith(failed_events[-1]["payload"]["reason"])
 
@@ -183,9 +183,7 @@ def test_failed_worker_stderr_tail_is_redacted_in_failure_reason(tmp_path, monke
     reason = result.results[0].reason or ""
     assert reason == "worker rejected task; stderr: ***"
     assert secret not in reason
-    root_result = json.loads(
-        (session_dir / ".cambium" / "result.json").read_text(encoding="utf-8")
-    )
+    root_result = json.loads((session_dir / ".cambium" / "result.json").read_text(encoding="utf-8"))
     assert root_result["failure_reason"] == reason
     assert secret not in json.dumps(root_result)
 

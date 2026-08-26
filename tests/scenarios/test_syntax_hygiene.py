@@ -29,7 +29,6 @@ def test_python_sources_are_syntax_hygienic() -> None:
             syntax_errors.append(f"{relative_path}:{error.lineno or '?'}: {error.msg}")
 
     assert not offending_handlers, (
-        "Unparenthesized multiple-exception handlers found:\n"
-        + "\n".join(offending_handlers)
+        "Unparenthesized multiple-exception handlers found:\n" + "\n".join(offending_handlers)
     )
     assert not syntax_errors, "Python syntax errors found:\n" + "\n".join(syntax_errors)

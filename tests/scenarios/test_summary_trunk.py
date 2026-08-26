@@ -166,7 +166,7 @@ def test_summary_response_non_object_is_rejected_cleanly() -> None:
     _request, expectation = build_summary_request(HEAD, TAIL_1, through_turn=2)
 
     with pytest.raises(SummaryTrunkError, match="exactly one JSON object"):
-        parse_summary_response("[\"not an object\"]", expectation)
+        parse_summary_response('["not an object"]', expectation)
 
 
 def test_summary_response_is_strict_and_bounded() -> None:
@@ -285,9 +285,7 @@ def test_scalar_list_field_is_wrapped_not_fatal() -> None:
         ("verification_results", [{"nested": "\ud800"}]),
     ],
 )
-def test_summary_response_lone_surrogates_are_backslash_escaped(
-    field: str, value: object
-) -> None:
+def test_summary_response_lone_surrogates_are_backslash_escaped(field: str, value: object) -> None:
     """Model-owned surrogate text must not escape the SummaryTrunkError boundary."""
     _, expectation = build_summary_request(HEAD, TAIL_1, through_turn=3)
     decoded = json.loads(_response(expectation, label="one"))
@@ -315,6 +313,8 @@ def test_summary_response_ten_thousand_nested_objects_is_bounded_or_rejected() -
         return
 
     assert entry.verification_results == ("<deep:unrepresentable>",)
+
+
 def test_oversize_list_item_is_truncated_with_a_visible_marker() -> None:
     _, expectation = build_summary_request(HEAD, TAIL_1, through_turn=3)
     decoded = json.loads(_response(expectation, label="one"))
@@ -325,14 +325,17 @@ def test_oversize_list_item_is_truncated_with_a_visible_marker() -> None:
     item = entry.verification_results[0]
     assert SUMMARY_TRUNCATION_MARKER in item
     assert len(item.encode("utf-8")) <= SUMMARY_MAX_TEXT_BYTES
-    assert len(
-        json.dumps(
-            entry_mapping(entry),
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ) <= SUMMARY_MAX_ENTRY_BYTES
+    assert (
+        len(
+            json.dumps(
+                entry_mapping(entry),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        <= SUMMARY_MAX_ENTRY_BYTES
+    )
 
 
 def test_oversize_total_trims_low_priority_lists_before_core_fields() -> None:
@@ -350,14 +353,17 @@ def test_oversize_total_trims_low_priority_lists_before_core_fields() -> None:
     assert entry.decisions_added == ("decision one",)
     assert entry.objective == "objective one"
     assert entry.outcome == "outcome one"
-    assert len(
-        json.dumps(
-            entry_mapping(entry),
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ) <= SUMMARY_MAX_ENTRY_BYTES
+    assert (
+        len(
+            json.dumps(
+                entry_mapping(entry),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        <= SUMMARY_MAX_ENTRY_BYTES
+    )
 
 
 def test_rendered_entry_revalidation_uses_tolerant_field_bounds() -> None:

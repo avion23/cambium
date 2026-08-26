@@ -221,7 +221,7 @@ def count_events_file(
                 return 0
         conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
         try:
-            conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+            conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
             return int(conn.execute("SELECT COUNT(*) FROM events").fetchone()[0])
         finally:
             conn.close()
@@ -387,9 +387,7 @@ def _read_jsonl_events(path: Path, max_rows: int) -> list[dict[str, Any]]:
                 except (TypeError, ValueError) as exc:
                     raise _event_store_error(path, str(exc), line_no) from exc
                 if len(events) >= max_rows:
-                    raise StoreError(
-                        f"event store {path} exceeds the {max_rows}-row read cap"
-                    )
+                    raise StoreError(f"event store {path} exceeds the {max_rows}-row read cap")
                 events.append(event)
     except OSError as exc:
         raise StoreError(f"cannot read event store {path}: {exc}") from exc
@@ -407,7 +405,7 @@ def _read_sqlite_events(
     conn = None
     try:
         conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
-        conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+        conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
         rows = conn.execute(_SELECT_AFTER, (after_seq, row_limit + 1))
         events = _events_from_rows(rows, path, row_limit)
     except (OSError, sqlite3.Error) as exc:
@@ -936,7 +934,7 @@ class EventStore:
         conn = sqlite3.connect(self._path, isolation_level=None, timeout=0.0)
         try:
             timeout_ms = max(int((deadline - time.monotonic()) * 1000), 0)
-            conn.execute(f"PRAGMA busy_timeout={timeout_ms}").fetchall()
+            conn.execute(f"PRAGMA busy_timeout={int(timeout_ms)}").fetchall()
             conn.execute("PRAGMA synchronous=FULL").fetchall()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -945,7 +943,7 @@ class EventStore:
                     "critical append deadline"
                 )
             timeout_ms = int(remaining * 1000)
-            conn.execute(f"PRAGMA busy_timeout={timeout_ms}").fetchall()
+            conn.execute(f"PRAGMA busy_timeout={int(timeout_ms)}").fetchall()
             cursor = conn.execute(_UPDATE_NEXT_SEQ, (next_seq,))
             if cursor.rowcount != 1:
                 raise StoreError("event store sequence counter is missing")

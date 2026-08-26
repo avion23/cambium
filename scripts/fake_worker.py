@@ -70,8 +70,13 @@ def do_work(run: dict) -> tuple[str, str | None, list[str], list[str], str]:
 
     session_root = scratch.parent
     if not worktree.is_relative_to(session_root):
-        return ("failed", f"worktree_path {worktree} outside session scratch root {session_root}",
-                [], [], "")
+        return (
+            "failed",
+            f"worktree_path {worktree} outside session scratch root {session_root}",
+            [],
+            [],
+            "",
+        )
     target = (worktree / target_file).resolve()
     if not target.is_relative_to(worktree):
         return ("failed", f"target_file {target_file!r} escapes the worktree", [], [], "")
@@ -80,9 +85,7 @@ def do_work(run: dict) -> tuple[str, str | None, list[str], list[str], str]:
         git("worktree", "remove", "--force", str(worktree), cwd=scratch)
     git("branch", "-D", branch, cwd=scratch)
     base_ref = run.get("base_commit") or "main"
-    rc, _out, err = git(
-        "worktree", "add", "-b", branch, str(worktree), base_ref, cwd=scratch
-    )
+    rc, _out, err = git("worktree", "add", "-b", branch, str(worktree), base_ref, cwd=scratch)
     if rc != 0:
         return ("failed", f"worktree add failed: {err}", [], [], "")
     if not write_marker:
@@ -143,13 +146,27 @@ def main() -> int:
             sys.stdout.flush()
             time.sleep(0.01)
 
-    send({"type": "ready", "request_id": init_rid, "task_id": task_id,
-          "pid": os.getpid(), "generation": init.get("generation", 1), "proto": 1})
+    send(
+        {
+            "type": "ready",
+            "request_id": init_rid,
+            "task_id": task_id,
+            "pid": os.getpid(),
+            "generation": init.get("generation", 1),
+            "proto": 1,
+        }
+    )
 
     run = read_msg()
     if run is None or run.get("type") != "run_task":
-        send({"type": "exit_message", "task_id": task_id,
-              "generation": init.get("generation", 1), "reason": "crash"})
+        send(
+            {
+                "type": "exit_message",
+                "task_id": task_id,
+                "generation": init.get("generation", 1),
+                "reason": "crash",
+            }
+        )
         return 1
     run_rid = run["request_id"]
 
@@ -157,13 +174,28 @@ def main() -> int:
 
     result_rid = run_rid if MODE != "badrid" else "00000000-deadbeef-rid"
     if MODE != "noresult":
-        send({"type": "result_envelope", "request_id": result_rid, "task_id": task_id,
-              "generation": init.get("generation", 1), "status": status,
-              "commits": commits, "files_changed": files_changed, "diff": diff,
-              "failure_reason": failure_reason})
+        send(
+            {
+                "type": "result_envelope",
+                "request_id": result_rid,
+                "task_id": task_id,
+                "generation": init.get("generation", 1),
+                "status": status,
+                "commits": commits,
+                "files_changed": files_changed,
+                "diff": diff,
+                "failure_reason": failure_reason,
+            }
+        )
     if MODE != "noexit":
-        send({"type": "exit_message", "task_id": task_id,
-              "generation": init.get("generation", 1), "reason": "done"})
+        send(
+            {
+                "type": "exit_message",
+                "task_id": task_id,
+                "generation": init.get("generation", 1),
+                "reason": "done",
+            }
+        )
     return 5 if MODE == "exit5" else 0
 
 
