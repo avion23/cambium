@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Mapping
+from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from hashlib import sha256
@@ -55,11 +56,11 @@ from .supervisor import (
 # test suite) while wall/token budgets and --max-turns still bound the loop.
 DEFAULT_MAX_TURNS = 50
 
-# Interactive turns are deliberately more patient than a normal one-shot
-# only when their provider has demonstrated that it needs the time.  The
-# fallback remains the supervisor's historical five-minute budget; a first
-# turn can use the provider's static ``throughput_hint_tps`` and later turns
-# use the durable usage events from the current interactive branch.
+# Interactive turns are deliberately more patient than a normal one-shot.
+# Their 1,800-second floor protects fresh sessions, while a first turn can use
+# the provider's static ``throughput_hint_tps`` and later turns use the durable
+# usage events from the current interactive branch.  Non-interactive turns
+# retain the supervisor's historical five-minute fallback.
 DEFAULT_INTERACTIVE_ESTIMATED_OUTPUT_TOKENS = 12_000
 DEFAULT_INTERACTIVE_THROUGHPUT_SAFETY_FACTOR = 2.0
 # No-hint, no-history fallback for fresh interactive sessions.  A multi-turn
@@ -162,7 +163,7 @@ class OneShotConfig:
     interactive_throughput_safety_factor: float = DEFAULT_INTERACTIVE_THROUGHPUT_SAFETY_FACTOR
     max_tokens: int = DEFAULT_MAX_TOKENS
     max_turns: int = DEFAULT_MAX_TURNS
-    max_restarts: int = 0
+    max_restarts: int | None = None
     target_file: str | None = None
     marker: str | None = None
     # Deprecated boolean alias for ``routing_mode``; cli.py is migrated in a
@@ -311,7 +312,7 @@ def _interactive_history_dirs(session_dir: str | Path | None) -> tuple[Path, ...
         if type(value) is int and value >= 0:
             branch_start_turn = value
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        pass
+        branch_start_turn = 0
     turns: list[tuple[int, Path]] = []
     try:
         children = tuple(root.iterdir())
@@ -405,11 +406,11 @@ def _interactive_wall_budget_s(
     """Resolve the effective wall budget for a one-shot or interactive turn.
 
     Explicit ``max_wall_s`` and ``interactive_wall_budget_s`` values win.  An
-    interactive default starts at the historical 300 seconds and grows when
-    either the selected provider's configured throughput hint or the current
-    branch's measured output rate says that the estimated output would need
-    longer.  The factor is never allowed below two, protecting slow providers
-    from a deadline that is merely their nominal generation time.
+    interactive default starts at the 1,800-second floor and grows when either
+    the selected provider's configured throughput hint or the current branch's
+    measured output rate says that the estimated output would need longer.  The
+    factor is never allowed below two, protecting slow providers from a
+    deadline that is merely their nominal generation time.
     """
     if config.max_wall_s is not None:
         return float(config.max_wall_s)
@@ -464,7 +465,7 @@ def _interactive_wall_budget_s(
     scaled = (
         estimated_output / throughput * max(2.0, float(config.interactive_throughput_safety_factor))
     )
-    return max(DEFAULT_WALL_BUDGET_S, scaled)
+    return max(DEFAULT_INTERACTIVE_WALL_BUDGET_S, scaled)
 
 
 def _apply_interactive_wall_budget(
@@ -745,10 +746,8 @@ def allocate_session_dir(repo: str | Path) -> Path:
     """Allocate a fresh session leaf under the repository's session root."""
     root = default_session_root(repo)
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    try:
+    with suppress(OSError):
         os.chmod(root, 0o700)
-    except OSError:
-        pass
     return Path(tempfile.mkdtemp(prefix="run-", dir=root))
 
 
@@ -780,6 +779,9 @@ def build_plan(
         config,
         session_dir=target_session,
     )
+    max_restarts = config.max_restarts
+    if max_restarts is None:
+        max_restarts = 1 if config.interactive else 0
     task_id = config.task_id or "oneshot"
     worktree = (
         Path(config.worktree_path).expanduser().resolve()
@@ -798,7 +800,7 @@ def build_plan(
         "max_wall_s": effective_wall_s,
         "max_tokens": int(config.max_tokens),
         "max_turns": int(config.max_turns),
-        "max_restarts": config.max_restarts,
+        "max_restarts": max_restarts,
         "routing_mode": config.routing_mode.value,
         "session_mode": config.session_mode.value,
     }

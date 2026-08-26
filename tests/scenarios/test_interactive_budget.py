@@ -14,7 +14,7 @@ from cambium import oneshot
 from cambium.oneshot import OneShotConfig, _interactive_wall_budget_s
 from cambium.supervisor import PlanResult, TaskResult
 
-DEFAULT_BUDGET_S = oneshot.DEFAULT_WALL_BUDGET_S
+INTERACTIVE_FLOOR_S = oneshot.DEFAULT_INTERACTIVE_WALL_BUDGET_S
 
 
 def _provider(
@@ -42,6 +42,33 @@ def test_non_interactive_default_remains_five_minutes() -> None:
     assert oneshot._interactive_wall_budget_s(config) == oneshot.DEFAULT_WALL_BUDGET_S
 
 
+def test_interactive_plan_uses_resilient_defaults(tmp_path: Path) -> None:
+    plan = oneshot.build_plan(
+        oneshot.OneShotConfig(prompt="check", repo=tmp_path, interactive=True),
+        repo=tmp_path,
+        session_dir=tmp_path / "session",
+    )
+    spec = plan["tasks"][0]
+
+    assert spec["max_wall_s"] >= oneshot.DEFAULT_INTERACTIVE_WALL_BUDGET_S
+    assert spec["max_restarts"] == 1
+
+
+def test_interactive_plan_preserves_explicit_zero_restarts(tmp_path: Path) -> None:
+    plan = oneshot.build_plan(
+        oneshot.OneShotConfig(
+            prompt="check",
+            repo=tmp_path,
+            interactive=True,
+            max_restarts=0,
+        ),
+        repo=tmp_path,
+        session_dir=tmp_path / "session",
+    )
+
+    assert plan["tasks"][0]["max_restarts"] == 0
+
+
 def test_interactive_slow_provider_scales_from_static_hint() -> None:
     config = oneshot.OneShotConfig(
         prompt="check",
@@ -52,7 +79,7 @@ def test_interactive_slow_provider_scales_from_static_hint() -> None:
 
     budget = oneshot._interactive_wall_budget_s(config, [_provider(throughput_hint_tps=20.0)])
 
-    assert budget == pytest.approx(1_200.0)
+    assert budget == pytest.approx(INTERACTIVE_FLOOR_S)
 
 
 def test_observed_rate_replaces_fast_static_hint(tmp_path: Path, monkeypatch) -> None:
@@ -108,11 +135,11 @@ def test_explicit_max_wall_s_wins_over_everything() -> None:
 
 
 def test_fast_provider_falls_back_to_default_floor() -> None:
-    # A fast provider's nominal generation fits inside the default; the
-    # budget must never drop below it.
+    # A fast provider's nominal generation fits inside the interactive floor;
+    # the budget must never drop below it.
     config = _config(provider="fast", max_tokens=500)
     providers = [_provider("fast", throughput_hint_tps=400.0)]
-    assert _interactive_wall_budget_s(config, providers) == DEFAULT_BUDGET_S
+    assert _interactive_wall_budget_s(config, providers) == INTERACTIVE_FLOOR_S
 
 
 def test_cascade_uses_slowest_candidate_hint() -> None:
@@ -122,8 +149,8 @@ def test_cascade_uses_slowest_candidate_hint() -> None:
         _provider("slow", throughput_hint_tps=10.0),
     ]
     budget = _interactive_wall_budget_s(config, providers)
-    # Slowest hint governs: 2000/10*2 = 400s.
-    assert budget == 400.0
+    # Slowest hint yields 400s, below the interactive floor.
+    assert budget == INTERACTIVE_FLOOR_S
 
 
 def test_selected_provider_hint_beats_unrelated_candidates() -> None:
@@ -133,9 +160,9 @@ def test_selected_provider_hint_beats_unrelated_candidates() -> None:
         _provider("chosen", throughput_hint_tps=50.0),
     ]
     budget = _interactive_wall_budget_s(config, providers)
-    # The selected provider is fast, so the floor applies despite the slow
-    # sibling candidate.
-    assert budget == DEFAULT_BUDGET_S
+    # The selected provider is fast, so the interactive floor applies despite
+    # the slow sibling candidate.
+    assert budget == INTERACTIVE_FLOOR_S
 
 
 def test_interactive_run_plan_receives_computed_wall_budget(
@@ -212,3 +239,10 @@ def test_provider_config_budget_override_is_loaded(tmp_path: Path) -> None:
 
     assert provider.interactive_wall_budget_s == 1_111.0
     assert provider.throughput_hint_tps == 1.0
+    assert (
+        oneshot._interactive_wall_budget_s(
+            OneShotConfig(prompt="check", provider="slow", interactive=True),
+            [provider],
+        )
+        == 1_111.0
+    )
