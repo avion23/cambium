@@ -1891,15 +1891,11 @@ def _entry_lines(
     label_prefix = f"{_ROLE_LABELS[entry.role]} ▸ "
     body_width = max(1, width - _display_width(label_prefix))
     if entry.tool_name is not None:
-        summary_lines = _dense_rendered_lines(
-            _wrap_markdown(_tool_line(entry), body_width)
-        )
+        summary_lines = _dense_rendered_lines(_wrap_markdown(_tool_line(entry), body_width))
         rendered = [
             (entry.role, _clip(label_prefix + (summary_lines[0] if summary_lines else ""), width))
         ]
-        rendered.extend(
-            (entry.role, _clip("    " + line, width)) for line in summary_lines[1:]
-        )
+        rendered.extend((entry.role, _clip("    " + line, width)) for line in summary_lines[1:])
         summary = f"{entry.tool_name}: "
         detail = entry.text
         if detail.startswith(summary):
@@ -1921,9 +1917,7 @@ def _entry_lines(
             else render_markdown_lines(entry.text, body_width, color=color)
         )
         lines = _dense_rendered_lines(lines)
-        rendered = [
-            (entry.role, _clip(label_prefix + (lines[0] if lines else ""), width))
-        ]
+        rendered = [(entry.role, _clip(label_prefix + (lines[0] if lines else ""), width))]
         for line in lines[1:]:
             role = (
                 "dim"
@@ -2042,9 +2036,7 @@ def _stream_lines(
             _clip(label_prefix + (lines[0] if lines else "generating…"), width),
         )
     ]
-    rendered.extend(
-        (transcript.streaming_role, _clip("    " + line, width)) for line in lines[1:]
-    )
+    rendered.extend((transcript.streaming_role, _clip("    " + line, width)) for line in lines[1:])
     return rendered[-max(1, capacity) :]
 
 
@@ -2069,12 +2061,7 @@ def _transcript_lines(
             color=color,
         ):
             kind = _transcript_block_kind(block)
-            if (
-                history
-                and kind != previous_kind
-                and kind != "tool"
-                and previous_kind != "tool"
-            ):
+            if history and kind != previous_kind and kind != "tool" and previous_kind != "tool":
                 history.append(("system", ""))
             history.extend(block)
             previous_kind = kind
