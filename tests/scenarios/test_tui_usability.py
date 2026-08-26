@@ -21,6 +21,16 @@ class _Tty(io.StringIO):
         return True
 
 
+class _ChunkedTty(_Tty):
+    def __init__(self, *chunks: str) -> None:
+        super().__init__()
+        self._chunks = iter(chunks)
+
+    def readline(self, size: int = -1) -> str:
+        del size
+        return next(self._chunks, "")
+
+
 class _History:
     def __init__(self) -> None:
         self.read: Path | None = None
@@ -347,6 +357,18 @@ def test_tty_bracketed_paste_preserves_embedded_newlines() -> None:
     assert tui._read_prompt(source, output) == "line one\nline two"
     assert tui._BRACKETED_PASTE_ENABLE in output.getvalue()
     assert tui._BRACKETED_PASTE_DISABLE in output.getvalue()
+
+
+def test_tty_bracketed_paste_reassembles_markers_split_across_reads() -> None:
+    source = _ChunkedTty("\x1b[2", "00~hello\x1b[20", "1~\n")
+
+    assert tui._read_prompt(source, _Tty()) == "hello"
+
+
+def test_tty_bracketed_paste_keeps_text_after_paste_markers() -> None:
+    source = _Tty("before \x1b[200~hello\x1b[201~ after\n")
+
+    assert tui._read_prompt(source, _Tty()) == "before hello after"
 
 
 def test_tty_trailing_backslash_continues_until_next_line() -> None:

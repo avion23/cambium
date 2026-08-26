@@ -220,24 +220,50 @@ def _bracketed_paste_mode(source: TextIO, out: TextIO) -> Iterator[None]:
         out.flush()
 
 
+def _trailing_incomplete_csi(value: str) -> str:
+    """Return a trailing CSI prefix that needs the next input chunk."""
+    escape = value.rfind("\x1b")
+    if escape < 0:
+        return ""
+    suffix = value[escape:]
+    if suffix == "\x1b":
+        return suffix
+    if not suffix.startswith("\x1b["):
+        return ""
+    return suffix if all("0" <= char <= "?" for char in suffix[2:]) else ""
+
+
+def _strip_bracketed_paste_markers(value: str) -> str:
+    """Remove every complete terminal paste marker from ``value``."""
+    return value.replace(_BRACKETED_PASTE_START, "").replace(_BRACKETED_PASTE_END, "")
+
+
 def _unframe_bracketed_paste(value: str, source: TextIO) -> str:
     """Remove terminal paste framing while retaining newlines in the payload."""
     if not _is_tty(source):
         return value.rstrip("\r\n")
-    start = value.find(_BRACKETED_PASTE_START)
-    if start < 0:
-        return value.rstrip("\r\n")
 
-    prefix = value[:start]
-    payload = value[start + len(_BRACKETED_PASTE_START) :]
+    accumulated = value
     while True:
-        end = payload.find(_BRACKETED_PASTE_END)
-        if end >= 0:
-            return prefix + payload[:end]
+        pending = _trailing_incomplete_csi(accumulated)
+        if pending:
+            accumulated = accumulated[: -len(pending)]
+        start = accumulated.find(_BRACKETED_PASTE_START)
+        end = (
+            accumulated.find(_BRACKETED_PASTE_END, start + len(_BRACKETED_PASTE_START))
+            if start >= 0
+            else -1
+        )
+        if end >= 0 and not pending:
+            suffix = accumulated[end + len(_BRACKETED_PASTE_END) :].rstrip("\r\n")
+            return _strip_bracketed_paste_markers(accumulated[:end] + suffix)
+        if start < 0 and not pending:
+            return _strip_bracketed_paste_markers(accumulated).rstrip("\r\n")
+
         line = source.readline()
         if line == "":
-            return prefix + payload.rstrip("\r\n")
-        payload += line
+            return _strip_bracketed_paste_markers(accumulated).rstrip("\r\n")
+        accumulated += pending + line
 
 
 def _input_line(source: TextIO, out: TextIO, prompt: str, *, native: bool) -> str | None:
@@ -253,7 +279,7 @@ def _input_line(source: TextIO, out: TextIO, prompt: str, *, native: bool) -> st
             line = source.readline()
             if line == "":
                 return None
-    return _unframe_bracketed_paste(line, source)
+        return _unframe_bracketed_paste(line, source)
 
 
 def _read_multiline(value: str, read_next: Callable[[], str | None]) -> str | None:
