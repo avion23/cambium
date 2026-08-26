@@ -423,7 +423,7 @@ def test_activity_state_reports_waiting_streaming_done_error_and_cooldown() -> N
     )
     assert activity.state == "STREAMING"
     assert "STREAMING" in activity.render(now=11.0)
-    assert "out/s=12.5" in activity.render(now=11.0)
+    assert "out/s= 12.5" in activity.render(now=11.0)  # fixed-width field
 
     activity.observe_event(
         {"kind": "usage_event", "payload": {"request_rate_status": "cooldown", "retry_after_s": 4}},
@@ -1418,14 +1418,14 @@ def test_activity_state_transitions_thinking_responding_tool_and_done() -> None:
 
     thinking = activity.render(now=10.0)
     assert thinking.startswith("⠋ ")
-    assert "thinking… 0.0s" in thinking
+    assert "thinking…     0.0s" in thinking
     assert activity.tick(now=10.1).startswith("⠙ ")
 
     activity.observe_event(
         {"kind": "assistant_delta", "payload": {"delta": "I will inspect this."}},
         now=11.0,
     )
-    assert "responding… 2.0s" in activity.render(now=12.0)
+    assert "responding…     2.0s" in activity.render(now=12.0)
 
     activity.observe_event(
         {
@@ -1435,8 +1435,8 @@ def test_activity_state_transitions_thinking_responding_tool_and_done() -> None:
         now=13.0,
     )
     running = activity.render(now=14.5)
-    assert "running run_shell 1.5s" in running
-    assert "turn 4.5s" in running
+    assert "running run_shell    1.5s" in running
+    assert "turn     4.5s" in running
     frame = render_cockpit(
         _snapshot(),
         Transcript(),
@@ -1461,7 +1461,7 @@ def test_activity_state_transitions_thinking_responding_tool_and_done() -> None:
         },
         now=15.0,
     )
-    assert "thinking… 5.0s" in activity.render(now=15.0)
+    assert "thinking…     5.0s" in activity.render(now=15.0)
 
     activity.stop()
     assert activity.render(now=16.0) == ""
