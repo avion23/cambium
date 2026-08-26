@@ -21,6 +21,16 @@ class _Tty(io.StringIO):
         return True
 
 
+class _ChunkedTty(_Tty):
+    def __init__(self, *chunks: str) -> None:
+        super().__init__()
+        self._chunks = iter(chunks)
+
+    def readline(self, size: int = -1) -> str:
+        del size
+        return next(self._chunks, "")
+
+
 class _History:
     def __init__(self) -> None:
         self.read: Path | None = None
@@ -171,9 +181,7 @@ def test_tui_quota_command_renders_seeded_ledger_rows(monkeypatch, tmp_path: Pat
     assert "zai/five-hour: 700/1000 tok, 8/10 req" in text
 
 
-def test_model_lists_ready_targets_and_marks_current(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_model_lists_ready_targets_and_marks_current(monkeypatch, tmp_path: Path) -> None:
     provider_config = _provider_config(tmp_path / "providers.json")
     monkeypatch.setenv("CAMBIUM_PROVIDER_READY_A_API_KEY", "test-key-a-not-output")
     monkeypatch.setenv("CAMBIUM_PROVIDER_READY_B_API_KEY", "test-key-b-not-output")
@@ -227,9 +235,7 @@ def test_model_switch_persists_for_subsequent_turns(monkeypatch, tmp_path: Path)
     assert reloaded.provider == "ready-b"
     assert reloaded.model == "model-b"
     manifest = json.loads(
-        (tmp_path / "interactive" / ".cambium" / "interactive.json").read_text(
-            encoding="utf-8"
-        )
+        (tmp_path / "interactive" / ".cambium" / "interactive.json").read_text(encoding="utf-8")
     )
     assert manifest["provider_preference"] == "ready-b"
     assert manifest["model_preference"] == "model-b"
@@ -330,14 +336,17 @@ def test_v_toggles_tool_details_without_submitting_a_prompt(monkeypatch, tmp_pat
     monkeypatch.setattr(tui.Transcript, "toggle_tool_details", toggle)
     source = _Tty("v\n/exit\n")
 
-    assert asyncio.run(
-        tui.run_tui(
-            OneShotConfig(repo=tmp_path, session_root=tmp_path / "interactive"),
-            input_stream=source,
-            output_stream=_Tty(),
-            error_stream=io.StringIO(),
+    assert (
+        asyncio.run(
+            tui.run_tui(
+                OneShotConfig(repo=tmp_path, session_root=tmp_path / "interactive"),
+                input_stream=source,
+                output_stream=_Tty(),
+                error_stream=io.StringIO(),
+            )
         )
-    ) == 0
+        == 0
+    )
     assert toggles == [False]
 
 
@@ -348,6 +357,18 @@ def test_tty_bracketed_paste_preserves_embedded_newlines() -> None:
     assert tui._read_prompt(source, output) == "line one\nline two"
     assert tui._BRACKETED_PASTE_ENABLE in output.getvalue()
     assert tui._BRACKETED_PASTE_DISABLE in output.getvalue()
+
+
+def test_tty_bracketed_paste_reassembles_markers_split_across_reads() -> None:
+    source = _ChunkedTty("\x1b[2", "00~hello\x1b[20", "1~\n")
+
+    assert tui._read_prompt(source, _Tty()) == "hello"
+
+
+def test_tty_bracketed_paste_keeps_text_after_paste_markers() -> None:
+    source = _Tty("before \x1b[200~hello\x1b[201~ after\n")
+
+    assert tui._read_prompt(source, _Tty()) == "before hello after"
 
 
 def test_tty_trailing_backslash_continues_until_next_line() -> None:
