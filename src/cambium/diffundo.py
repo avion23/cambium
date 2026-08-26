@@ -2032,7 +2032,15 @@ class Diffundo:
             eligible = live
         if model is None:
             return self._order_candidates(eligible)
-        strict = [provider for provider in eligible if provider.model == model]
+        # A terminally-dead lane must never anchor a pinned model partition:
+        # a 404-dead strict match would keep winning selection (and burning
+        # the call) even though its death is already proven. Drop dead lanes
+        # from the strict set so an empty strict list triggers exactly-pinned
+        # relaxation instead of re-dialing a corpse.
+        strict_live = [
+            provider for provider in eligible if provider.name not in self._terminal_death_providers
+        ]
+        strict = [provider for provider in strict_live if provider.model == model]
         fallback = [provider for provider in eligible if provider.model != model]
         if strict:
             return self._order_candidates(strict) + self._order_candidates(fallback)

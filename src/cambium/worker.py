@@ -4065,6 +4065,7 @@ async def _run_agent_loop(
             try:
                 summary_caller = getattr(router, "summary_call", None)
                 if callable(summary_caller):
+                    assert summary_caller is not None
                     summary_result = await summary_caller(
                         tier,
                         summary_prompt,

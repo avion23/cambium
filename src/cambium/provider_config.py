@@ -713,9 +713,16 @@ def _require_string(value: object, location: str) -> str:
 def _require_number(value: object, location: str) -> float:
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise _error(location, "must be a number")
-    if not math.isfinite(value):
+    try:
+        finite = math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        raise _error(location, "must be a number") from None
+    if not finite:
         raise _error(location, "must be a finite number")
-    return float(value)
+    try:
+        return float(value)
+    except (TypeError, ValueError, OverflowError):  # pragma: no cover - double guard
+        raise _error(location, "must be a number") from None
 
 
 def _require_integer(value: object, location: str) -> int:
