@@ -22,7 +22,6 @@ import threading
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from enum import Enum
 from os import PathLike
-from pathlib import Path
 from typing import Any, cast
 
 __all__ = [
@@ -1599,10 +1598,9 @@ def _sanitize_oauth_node(node: object, redactor: Redactor) -> object:
     return node
 
 
-# Explicitly safe runtime variable names.  Their values are constructed by
-# build_worker_env, not copied from the host environment.  Provider variables
-# are never inherited merely because they do not look secret; they must be
-# named in ``allowlist``.
+# Runtime names controlled or reserved by build_worker_env are not copied from
+# the host environment. Provider variables are never inherited merely because
+# they do not look secret; they must be named in ``allowlist``.
 NON_SECRET_BASICS = frozenset(
     {
         "PATH",
@@ -1633,10 +1631,10 @@ def build_worker_env(
     """Build a strict worker environment from *base*.
 
     ``base`` supplies values for explicitly allowlisted provider names only.
-    The runtime base is deterministic: ``PATH`` uses :data:`os.defpath`,
-    ``PYTHONUNBUFFERED`` is ``"1"``, and ``HOME`` is scoped below ``worktree``
-    when supplied.  Cambium task, generation, and session IDs may be set
-    explicitly with ``overrides``.  Host runtime values are never copied.
+    The runtime base is deterministic: ``PATH`` uses :data:`os.defpath` and
+    ``PYTHONUNBUFFERED`` is ``"1"``. Cambium task, generation, and session IDs
+    may be set explicitly with ``overrides``. Host runtime values are never
+    copied.
     """
 
     if not isinstance(base, Mapping):
@@ -1662,14 +1660,12 @@ def build_worker_env(
         "PATH": os.defpath,
         "PYTHONUNBUFFERED": "1",
     }
-    if worktree is not None:
-        env["HOME"] = str(Path(worktree).resolve() / ".cambium" / "home")
 
     if overrides is not None:
         env.update(overrides)
 
-    # HOME, PATH, and PYTHONUNBUFFERED are controlled above, even if a caller
-    # mistakenly includes them in the provider allowlist.
+    # Reserved runtime names are omitted even if a caller includes them in the
+    # provider allowlist.
     for name in requested - NON_SECRET_BASICS:
         if name not in base:
             continue

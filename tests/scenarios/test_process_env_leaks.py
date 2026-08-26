@@ -78,6 +78,6 @@ def test_subprocess_environment_rejects_credential_shaped_inheritance(
     assert environment["LC_ALL"] == "C"
     assert environment["GIT_TERMINAL_PROMPT"] == "0"
     assert environment["GIT_CONFIG_NOSYSTEM"] == "1"
-    assert environment["HOME"] == str(worktree.resolve() / ".cambium" / "home")
+    assert "HOME" not in environment
     assert environment["TMPDIR"] == "/host/tmp"
     assert environment["EMPTY_ALLOWED"] == ""

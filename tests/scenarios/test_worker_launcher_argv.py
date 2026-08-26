@@ -147,7 +147,7 @@ def _spawned(events: list[dict]) -> list[dict]:
 
 
 @pytest.mark.slow
-def test_script_worker_spawns_exact_argv_and_confined_env(tmp_path, monkeypatch) -> None:
+def test_script_worker_spawns_exact_argv_and_strict_env(tmp_path, monkeypatch) -> None:
     script = _write_dump_worker(tmp_path)
     argv_dump = tmp_path / "argv.json"
     env_dump = tmp_path / "env.json"

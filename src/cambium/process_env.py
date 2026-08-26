@@ -101,11 +101,6 @@ def build_subprocess_env(
         "GIT_CONFIG_KEY_0": "core.hooksPath",
         "GIT_CONFIG_VALUE_0": "/dev/null",
     }
-    if worktree is not None:
-        # Do not expose or use the supervisor user's HOME in a child.  Git
-        # configuration for managed repositories is local to the repository.
-        env["HOME"] = str(Path(worktree).resolve() / ".cambium" / "home")
-
     for name in names:
         if name in _PROTECTED_NAMES:
             continue
