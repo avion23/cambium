@@ -305,11 +305,9 @@ IPC is bounded and correlated by request ID (generation is not enforced for
 Provider credentials are allowlisted environment values. They must not enter
 task specs, prompts persisted as events, logs, or result
 artifacts. Worktree and process-group isolation is not an OS sandbox.
-`approval.py` and `resources.py` are deleted; `tools.py`
-`run_shell`/`git_op` execute without `ApprovalGate` or `CompileGate`. The
-navigation tools use the same schema/dispatch boundary as all worker tools;
-`run_python` requires the separate `python` permission key and is not granted
-by `shell`.
+`approval.py` and `resources.py` are deleted; `tools.py` exposes the six
+dispatch tools (`delegate`, `read_batch`, `write_file`, `edit_file`, `git_op`,
+and `run_shell`) without `ApprovalGate` or `CompileGate`.
 
 Live-use blockers were removed by product decision; this is a local development
 tool run directly from source.
@@ -386,7 +384,7 @@ hierarchy remain targets; approval and containment were removed by decision.
 | Context/CAST | `src/cambium/summary_trunk.py`, `src/cambium/provider_scheduler.py`, `src/cambium/interactive.py` | Immutable summary entries, K0 projection/rollover, cache-horizon and CAST thresholds, and interactive epoch publication |
 | Tree/planner | `tasktree.py`, `architectus.py`, `orchestrator.py` | Pure tree/core; `build_tree`/`ready_tasks`/`topological_order` wired into `run_plan` for static waves; dynamic child admission wired through the injected decision port (`ArchitectusCore` or `aggregate`/`step` adapter) with conversation persistence, exposed by `Orchestrator.run` and `cambium supervisor --conversations` |
 | Store/merge | `store.py`, `merge.py`, `results.py`, `fencing.py` | Current event, result, and ref-publication boundaries |
-| Controls | `src/cambium/tools.py`, `src/cambium/schemas.py`, `src/cambium/code_index.py`, `src/cambium/lsp_query.py`, `redact.py` | `run_shell`/`git_op` run without `ApprovalGate`/`CompileGate`; `search_symbols` (symbol search), `find_references` (references), `read_symbol` (bounded source window), and `query_lsp` (LSP queries) are wired into `TOOL_SCHEMAS` and `run_tool`; `run_python` holds a `python` permission key separate from shell; `approval.py` and `resources.py` are deleted |
+| Controls | `src/cambium/tools.py`, `src/cambium/schemas.py`, `redact.py` | Six tools are wired through `TOOL_SCHEMAS` and `TOOL_DISPATCH`; `run_shell`/`git_op` run without `ApprovalGate`/`CompileGate`; `approval.py` and `resources.py` are deleted |
 | Diagnostics/evaluation | `doctor.py`, `module_conformance.py`, `bench.py`, `modules/example/`, `modules/should_review/` | CLI diagnostics and module evaluation exist |
 | Optimization/training data | `src/cambium/optimize.py`, `src/cambium/cli.py`, `src/cambium/modules/base.py`, `src/cambium/modules/example/`, `src/cambium/modules/should_review/`, `src/cambium/opencode.py`, `scripts/extract_pi.py`, `artifacts/optimization/first-real-extraction/train_queue_v2.jsonl` | Zero-shot/bootstrap/GEPA and `eval` driver, manifest-selected DSPy programs with label-aware evaluation, read-only OpenCode/pi extraction, review-gated candidate admission, and the 34-record reviewed snapshot |
 

@@ -367,7 +367,6 @@ def test_strict_worker_env_requires_explicit_nonbasic_names(tmp_path) -> None:
 
     assert set(safe_default) == {
         "PATH",
-        "HOME",
         "PYTHONUNBUFFERED",
         "CAMBIUM_TASK_ID",
         "CAMBIUM_GENERATION",
@@ -375,7 +374,7 @@ def test_strict_worker_env_requires_explicit_nonbasic_names(tmp_path) -> None:
     }
     assert set(explicit) == set(safe_default) | {"OPENAI_API_KEY", "DATABASE_URL"}
     assert safe_default["PATH"] == os.defpath
-    assert safe_default["HOME"] == str(worktree.resolve() / ".cambium" / "home")
+    assert "HOME" not in explicit
     assert safe_default["PYTHONUNBUFFERED"] == "1"
     assert safe_default["CAMBIUM_TASK_ID"] == "task-1"
     assert explicit["OPENAI_API_KEY"] == "provider-secret"
@@ -396,7 +395,6 @@ def test_worker_env_does_not_mutate_base_and_rejects_string_allowlist() -> None:
     assert build_worker_env(base, allowlist=set(), worktree=worktree) == {
         "PATH": os.defpath,
         "PYTHONUNBUFFERED": "1",
-        "HOME": "/tmp/cambium-test-worktree/.cambium/home",
     }
     assert base == snapshot
     with pytest.raises(TypeError):

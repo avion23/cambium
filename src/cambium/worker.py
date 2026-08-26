@@ -81,8 +81,9 @@ rolls an overgrown delta sequence into a deterministic K0 materialized view whil
 retaining an immutable rollover manifest outside the active prompt. Without
 context reuse, the legacy bounded transcript projection remains available.
 
-Tool calls execute inside the worktree (with shell/git permissions from
-``init.permissions``), emit ``tool_event`` messages, and persist
+Tool calls use the worktree as cwd (with shell/git permissions from
+``init.permissions``); file-tool paths may be absolute anywhere on the system
+and relative paths resolve against cwd. They emit ``tool_event`` messages and persist
 ``checkpoint`` state under ``$CAMBIUM_SESSION_ID/.cambium/checkpoints/``.
 Every router call also emits one redacted ``usage_event`` (implementation
 plan step 3): provider/model/turn, token fields, estimated cost, latency,
@@ -1152,7 +1153,6 @@ class AgentConfig:
     max_wall_s: float
     checkpoint_root: Path | None
     cast_policy: CastPolicy = dataclass_field(default_factory=CastPolicy)
-    python_permission: bool = False
     requirements: dict[str, Any] | None = None
     max_transcript_chars: int = MAX_TRANSCRIPT_CHARS
     # Supervisor-level admission balancing (solution C): the provider this
@@ -1228,12 +1228,10 @@ class AgentConfig:
             permissions = {}
         shell_permission = permissions.get("shell", False)
         network_permission = permissions.get("network", False)
-        python_permission = permissions.get("python", False)
         if not all(
-            isinstance(permission, bool)
-            for permission in (shell_permission, network_permission, python_permission)
+            isinstance(permission, bool) for permission in (shell_permission, network_permission)
         ):
-            raise ValueError("init permissions.shell/network/python must be strict booleans")
+            raise ValueError("init permissions.shell/network must be strict booleans")
         heartbeat = init.get("heartbeat")
         heartbeat_interval_s = heartbeat.get("interval_s") if isinstance(heartbeat, dict) else None
         budget = init.get("budget")
@@ -1287,7 +1285,6 @@ class AgentConfig:
             max_tokens=_positive_int(init.get("max_tokens"), "init max_tokens", DEFAULT_MAX_TOKENS),
             shell_permission=shell_permission,
             network_permission=network_permission,
-            python_permission=python_permission,
             heartbeat_interval_s=_positive_float(
                 heartbeat_interval_s, "init heartbeat.interval_s", HEARTBEAT_INTERVAL_S
             ),
@@ -1391,7 +1388,6 @@ def _merge_task_config(
         max_tokens=max_tokens,
         shell_permission=config.shell_permission,
         network_permission=config.network_permission,
-        python_permission=config.python_permission,
         heartbeat_interval_s=config.heartbeat_interval_s,
         max_wall_s=max_wall_s,
         checkpoint_root=config.checkpoint_root,
@@ -1450,7 +1446,6 @@ def _config_from_run(run: dict[str, Any]) -> AgentConfig:
         max_tokens=_positive_int(run.get("max_tokens"), "run_task max_tokens", DEFAULT_MAX_TOKENS),
         shell_permission=False,
         network_permission=False,
-        python_permission=False,
         heartbeat_interval_s=HEARTBEAT_INTERVAL_S,
         max_wall_s=_positive_float(
             run.get("max_wall_s"), "run_task max_wall_s", DEFAULT_MAX_WALL_S
@@ -1612,16 +1607,12 @@ _ALL_TOOL_NAMES = frozenset(schema["name"] for schema in TOOL_SCHEMAS)
 
 
 def _exposed_tool_schemas(config: AgentConfig) -> list[dict[str, Any]]:
-    """Schemas offered to the model; process permissions are filtered."""
+    """Schemas offered to the model; shell permission is filtered."""
     schemas: list[dict[str, Any]] = []
     for schema in TOOL_SCHEMAS:
         name = schema["name"]
         if name == "run_shell":
             if config.shell_permission:
-                schemas.append(schema)
-            continue
-        if name == "run_python":
-            if config.python_permission:
                 schemas.append(schema)
             continue
         if name == "git_op":
@@ -2472,6 +2463,8 @@ def _build_agent_prompt(
     system_lines = [
         "You are Cambium's autonomous coding agent.",
         "You act inside a disposable git worktree and must complete the task.",
+        "File-tool paths may be absolute anywhere on the system; relative paths "
+        "resolve against cwd.",
     ]
     if model_identity:
         system_lines.append(
@@ -2571,9 +2564,7 @@ def _canonical_action_message(action: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def _progress_signature(
-    content: str | None, action: Mapping[str, Any] | None = None
-) -> str:
+def _progress_signature(content: str | None, action: Mapping[str, Any] | None = None) -> str:
     """Return bounded state content used to decide whether an action is novel.
 
     Parsed actions intentionally omit the optional ``thought`` field: a model
@@ -2609,9 +2600,7 @@ class _ProgressDetector:
         self._recent_signatures: deque[str] = deque(maxlen=progress_window)
         self.no_progress_actions = 0
 
-    def observe(
-        self, content: str | None = None, action: Mapping[str, Any] | None = None
-    ) -> bool:
+    def observe(self, content: str | None = None, action: Mapping[str, Any] | None = None) -> bool:
         """Record one assistant result and return whether the loop is stalled."""
         signature = _progress_signature(content, action)
         novel = bool(signature) and signature not in self._recent_signatures
@@ -3099,10 +3088,7 @@ def _write_cast_rollover_manifest(
         config.checkpoint_root
         / safe_task
         / "rollovers"
-        / (
-            f"k0-{k0.through_turn:06d}-{k0.source_sha256[:16]}-"
-            f"{content_digest}.json"
-        )
+        / (f"k0-{k0.through_turn:06d}-{k0.source_sha256[:16]}-{content_digest}.json")
     )
     try:
         _create_epoch_checkpoint(path, content)
@@ -4116,9 +4102,7 @@ async def _run_agent_loop(
                         f"{detail}: {inner.__class__.__name__}: "
                         f"{_cap_utf8(inner_message, MAX_ENVELOPE_FIELD_CHARS)}"
                     )
-                raise ContextForkError(
-                    f"summary provider call failed: {detail}"
-                ) from exc
+                raise ContextForkError(f"summary provider call failed: {detail}") from exc
             if time.monotonic() >= wall_deadline:
                 raise ContextForkError("wall budget exceeded during summary flush")
             declared_summary_model = router.declared_model(summary_result.provider)
@@ -4294,12 +4278,8 @@ async def _run_agent_loop(
             )
         workspace_changed = resume["workspace_changed"]
         code_changed = resume_checkpoint.code_changed or workspace_changed
-        verified_after_change = (
-            resume_checkpoint.verified_after_change and not workspace_changed
-        )
-        verification_failed = (
-            False if workspace_changed else resume_checkpoint.verification_failed
-        )
+        verified_after_change = resume_checkpoint.verified_after_change and not workspace_changed
+        verification_failed = False if workspace_changed else resume_checkpoint.verification_failed
         no_progress_actions = resume_checkpoint.no_progress_actions
         progress_detector.no_progress_actions = no_progress_actions
         budget_new_tokens = resume_checkpoint.budget_new_tokens
@@ -4734,7 +4714,6 @@ async def _run_agent_loop(
                 policy=ToolPermissionPolicy(
                     shell=config.shell_permission,
                     network=config.network_permission,
-                    python=config.python_permission,
                 ),
             ) as ctx:
                 tool_result = await run_tool(name, arguments, ctx)

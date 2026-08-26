@@ -5,22 +5,6 @@ from pathlib import Path
 
 from cambium.diffundo import Diffundo, ProviderConfig, ProviderTier
 from cambium.provider_config import load_providers
-from cambium.schemas import TOOL_SCHEMAS
-
-
-def _tool_names() -> set[str]:
-    names = set()
-    for item in TOOL_SCHEMAS:
-        function = item.get("function") if isinstance(item, dict) else None
-        if isinstance(function, dict):
-            names.add(function.get("name"))
-        elif isinstance(item, dict):
-            names.add(item.get("name"))
-    return {name for name in names if isinstance(name, str)}
-
-
-def test_run_python_is_a_portable_structured_tool() -> None:
-    assert "run_python" in _tool_names()
 
 
 def test_provider_config_loads_subscription_resource_dimensions(tmp_path: Path) -> None:

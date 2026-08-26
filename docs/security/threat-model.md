@@ -12,7 +12,7 @@ execute with the operating-system authority of the user running Cambium,
 subject only to ordinary process credentials and any external host/container
 controls.
 
-A worktree, path allowlist, tool schema, approval policy, read-only copy, or
+A worktree, tool schema, approval policy, read-only copy, or
 redactor can prevent specific mistakes; none is equivalent to kernel-enforced
 containment. Cambium must not describe these mechanisms as a sandbox.
 
@@ -143,10 +143,9 @@ but do not contain an allowed shell command.
 **Paths:** `../`, absolute paths, symlink swaps, alternate worktrees, Git config
 or hook indirection, subprocess working-directory changes.
 
-**Controls:** resolve paths at the point of use; compare against intended root;
-use descriptor-relative APIs where possible; reject symlink/path identity
-changes across validation/use; publish only expected refs with expected-old
-CAS; preserve existing worktree-confinement and repository-integrity checks.
+**Controls:** file tools resolve relative paths against the worker cwd and allow
+absolute paths. Repository publication still uses expected refs with
+expected-old CAS and existing repository-integrity checks.
 Any executed repository code can still access other user-readable paths.
 
 ### T4. Stale/duplicate worker publication
@@ -271,7 +270,7 @@ operator.
 - OAuth refresh tokens never enter worker environments;
 - malicious stdout JSON cannot impersonate another request/generation;
 - stale/duplicate child and worker results cannot publish refs or epochs;
-- path/symlink race cases fail the existing worktree boundary;
+- invalid worktree/ref state fails the existing repository-integrity boundary;
 - child context projections omit excluded secrets and unrelated siblings;
 - compaction preserves unresolved constraints and evidence references;
 - unknown cache fields remain unknown in routing evidence;

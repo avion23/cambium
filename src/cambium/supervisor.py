@@ -863,17 +863,12 @@ def _pool_env_key(env: dict[str, str]) -> frozenset[tuple[str, str]]:
 
     ``_worker_environment`` stamps values a rebind cannot change (the child's
     env is fixed at spawn): a pooled worker may only serve a task whose
-    remaining env matches exactly. Three stamped values are excluded because
+    remaining env matches exactly. Two stamped values are excluded because
     they are per-task/per-worktree by construction and rebinding re-sends the
     full init:
 
     - ``CAMBIUM_TASK_ID`` / ``CAMBIUM_GENERATION``: per-task identity, rebuilt
       from the rebind init.
-    - ``HOME``: the supervisor injects ``<worktree>/.cambium/home`` so the
-      value differs for every worktree. A pooled worker's stale HOME is
-      benign (worker git ops use repo-local config and ``GIT_CONFIG_NOSYSTEM``
-      is set), so HOME must not block rebinding.
-
     ``CAMBIUM_SESSION_ID``, ``CAMBIUM_PROVIDERS``, and the allowlisted
     provider credentials remain in the key: a worker whose env cannot serve
     the new task (different session, provider config, or credentials) is
@@ -882,7 +877,7 @@ def _pool_env_key(env: dict[str, str]) -> frozenset[tuple[str, str]]:
     return frozenset(
         (name, value)
         for name, value in env.items()
-        if name not in ("CAMBIUM_TASK_ID", "CAMBIUM_GENERATION", "HOME")
+        if name not in ("CAMBIUM_TASK_ID", "CAMBIUM_GENERATION")
     )
 
 
@@ -1707,9 +1702,7 @@ def _read_interactive_events(session_dir: Path, after_seq: int) -> list[dict[str
     return [event for event in merged if event["seq"] > after_seq]
 
 
-def read_events(
-    session_dir: Path | str, after_seq: int | EventCursor = 0
-) -> list[dict[str, Any]]:
+def read_events(session_dir: Path | str, after_seq: int | EventCursor = 0) -> list[dict[str, Any]]:
     """Replay durable events; use :class:`EventCursor` for interactive polling.
 
     Passing an ``int`` preserves the historical public replay contract.
@@ -3346,9 +3339,7 @@ class _Runtime:
             "workspace_changed": workspace_changed,
         }
 
-    async def _await_suspend_children(
-        self, parent_task_id: str, remaining: float
-    ) -> None:
+    async def _await_suspend_children(self, parent_task_id: str, remaining: float) -> None:
         """Await the suspended parent's children, bounded by the wall budget.
 
         Each child is awaited under a shield so a resume-timeout never cancels
@@ -4250,10 +4241,11 @@ class _Runtime:
                         # Snapshot isolation: the worker owns the suspension
                         # commit; children integrate privately; only the
                         # resumed and verified parent may publish to main.
-                        snapshot_head, snapshot_error = (
-                            await self._accept_parent_suspension_snapshot(
-                                spec, worktree, generation
-                            )
+                        (
+                            snapshot_head,
+                            snapshot_error,
+                        ) = await self._accept_parent_suspension_snapshot(
+                            spec, worktree, generation
                         )
                         if snapshot_error is not None or snapshot_head is None:
                             reason = snapshot_error or "parent_snapshot_failed"
@@ -4429,9 +4421,7 @@ class _Runtime:
                             summary=worker_summary,
                         )
                         return
-                    if head == spec["base_commit"] and bool(
-                        spec.get("_base_is_published", True)
-                    ):
+                    if head == spec["base_commit"] and bool(spec.get("_base_is_published", True)):
                         await self._admit_generation_children(
                             spec,
                             parent_envelope,
@@ -6413,6 +6403,7 @@ class _Runtime:
             elif attempt == max_attempts:
                 self._resolver_failures[spec["task_id"]] = "resolver_attempts_exhausted"
         return None
+
     async def _integrate_child_into_suspended_parent(
         self, spec: dict[str, Any], handle: WorkerHandle
     ) -> str | None:
@@ -6569,9 +6560,7 @@ class _Runtime:
                     await asyncio.to_thread(seq.cleanup_staging, repo)
             except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
                 cleanup_failed = True
-                emitted = await self._flush_sequencer_events(
-                    seq, deferred_observers=deferred
-                )
+                emitted = await self._flush_sequencer_events(seq, deferred_observers=deferred)
                 if integrated_persisted and "merge_staging_cleanup_failed" not in emitted:
                     await self.emit(
                         "merge_staging_cleanup_failed",

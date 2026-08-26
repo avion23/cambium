@@ -196,6 +196,6 @@ def test_worker_env_drops_api_key_names_and_controls_path(tmp_path: Path) -> Non
     )
     assert "TEST_API_KEY_DEMO" not in env
     assert env["PATH"] == os.defpath
-    assert env["HOME"] == str((tmp_path / "worker").resolve() / ".cambium" / "home")
+    assert "HOME" not in env
     assert "/host/bin" not in env.values()
     assert "/home/host" not in env.values()
