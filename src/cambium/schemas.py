@@ -437,34 +437,3 @@ def validate_tool_call(schema: dict[str, Any], call: dict[str, Any]) -> list[str
         return errors
     errors.extend(_validate_object(parameters, arguments))
     return errors
-
-
-_RUN_PYTHON_SCHEMA_DIRECT = {
-    "name": "run_python",
-    "description": (
-        "Run a short trusted Python 3 snippet in the current working directory for "
-        "structured data transformation, inspection, or calculations. Prefer file "
-        "tools for ordinary repository operations. The process is isolated from site "
-        "packages and credential environment, but has the user's normal OS authority."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {"code": {"type": "string", "maxLength": 32768}},
-        "required": ["code"],
-        "additionalProperties": False,
-    },
-}
-_RUN_PYTHON_SCHEMA = (
-    {"type": "function", "function": _RUN_PYTHON_SCHEMA_DIRECT}
-    if TOOL_SCHEMAS and isinstance(TOOL_SCHEMAS[0], dict) and "function" in TOOL_SCHEMAS[0]
-    else _RUN_PYTHON_SCHEMA_DIRECT
-)
-if not any(
-    isinstance(item, dict)
-    and (
-        item.get("name") == "run_python"
-        or (isinstance(item.get("function"), dict) and item["function"].get("name") == "run_python")
-    )
-    for item in TOOL_SCHEMAS
-):
-    TOOL_SCHEMAS = type(TOOL_SCHEMAS)([*TOOL_SCHEMAS, _RUN_PYTHON_SCHEMA])

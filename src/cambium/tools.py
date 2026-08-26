@@ -13,7 +13,6 @@ import shlex
 import signal
 import stat
 import subprocess
-import sys
 import tempfile
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -40,7 +39,6 @@ ToolEventSink = Callable[[dict[str, Any]], Awaitable[None] | None]
 class ToolPermissionPolicy:
     shell: bool = True
     network: bool = True
-    python: bool = True
 
 
 @dataclass(slots=True)
@@ -587,49 +585,6 @@ async def run_read_batch(
 
 
 async def run_tool(name: str, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
-    if name == "run_python":
-        started_ns = time.monotonic_ns()
-        schema = next(
-            (schema for schema in TOOL_SCHEMAS if schema.get("name") == "run_python"),
-            None,
-        )
-        if schema is None:
-            return ToolResult(
-                ok=False,
-                error="unknown tool: 'run_python'",
-                duration_ms=_duration_ms(started_ns),
-            )
-        validation_errors = validate_tool_call(schema, args)
-        if validation_errors:
-            return ToolResult(
-                ok=False,
-                error="\n".join(validation_errors),
-                duration_ms=_duration_ms(started_ns),
-            )
-        if ctx.policy is not None and not ctx.policy.python:
-            return ToolResult(
-                ok=False,
-                error="permission_denied:python",
-                duration_ms=_duration_ms(started_ns),
-            )
-        code = args["code"]
-        if len(code.encode("utf-8")) > 32768:
-            return ToolResult(
-                ok=False,
-                error="validation failed: 'code' exceeds 32768 bytes",
-                duration_ms=_duration_ms(started_ns),
-            )
-        if not code.strip():
-            code = "raise SystemExit('run_python requires non-empty code')"
-        return await _run_tool_without_python(
-            "run_shell",
-            {"cmd": [sys.executable, "-I", "-S", "-c", code]},
-            ctx,
-        )
-    return await _run_tool_without_python(name, args, ctx)
-
-
-async def _run_tool_without_python(name: str, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     """Validate and execute one named worker tool."""
     started_ns = time.monotonic_ns()
     schema_by_name = {schema["name"]: schema for schema in TOOL_SCHEMAS}
