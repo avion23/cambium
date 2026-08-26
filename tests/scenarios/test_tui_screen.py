@@ -646,6 +646,30 @@ def test_cockpit_coalesces_draws_while_input_line_is_active() -> None:
     assert "deferred output" in stream.getvalue()
 
 
+def test_cockpit_commits_native_input_without_leaving_fixed_frame() -> None:
+    class _Tty(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    stream = _Tty()
+    cockpit = Cockpit(stream)
+    with cockpit:
+        cockpit.draw(
+            _snapshot(),
+            Transcript(),
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+        )
+        cockpit.move_to_input(native=True)
+        before_hide = stream.getvalue()
+        cockpit.hide_cursor(commit=True)
+        after_hide = stream.getvalue()
+        assert cockpit._fixed_frame
+
+    assert "\n\n" not in after_hide[len(before_hide) :]
+
+
 def test_cockpit_paints_mid_turn_tool_tick_while_input_is_pending() -> None:
     class _Tty(io.StringIO):
         def isatty(self) -> bool:
