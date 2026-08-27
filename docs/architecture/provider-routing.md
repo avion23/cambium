@@ -1,253 +1,40 @@
 # Provider routing
 
-**Status:** current production contract.
+## Problems
 
-Cambium has one admission policy, one attempt-ordering primitive, and one
-quota/lease state boundary. There is no second scheduler actor and no alternate
-provider-policy stack.
+1. Providers fail heterogeneously: authentication, quota, configuration, stalls, overload, and content policy require different responses; naive retries treat them alike, burn budget, or lose tasks.
 
-## Ownership
+2. Every provider eventually has an outage, so single-provider operation is unacceptable for work that must complete.
 
-| Concern | Owner | Mutability |
-| --- | --- | --- |
-| Task admission and provider/model assignment | `cambium.routing` | Pure selectors over injected debt and lane snapshots; `DebtStore` owns durable usage debt |
-| Equal-priority quality ordering | `cambium.selection` | Pure, clock-injected ordering function shared by admission and Diffundo |
-| Per-call health, retry, cooldown, and cascade execution | `cambium.diffundo` | One router instance owns transport health and request-rate buckets |
-| Provider/model trunk affinity | `cambium.provider_scheduler.ProviderLease` | Immutable value bound once per semantic trunk |
-| Token/request quota reservations | `cambium.provider_scheduler.QuotaLedger` | SQLite transactions shared safely across processes |
-| Provider configuration | `cambium.provider_config` | Validated records with per-entry schema quarantine; document structure stays fatal; secrets remain environment references |
-| Cache/CAST policy | `cambium.provider_scheduler.CacheHorizonConfig` / `CastConfig` | Provider-neutral breakpoint and K0 rollover thresholds |
-| Supervisor lane reservations | `cambium.supervisor` | Session-owned counters around admitted tasks |
+3. Switching providers invalidates prompt-cache affinity and may fork context unless task identity and progress move with the switch.
 
-`provider_scheduler.py` keeps its historical import path because
-`provider_config`, `Diffundo`, and the quota CLI already consume its domain
-values. It intentionally contains no `ProviderScheduler` class, ranking API,
-mailbox, or concurrency ownership. Admission belongs only to `routing.py`.
+4. Large code contexts can trigger moderation false positives on benign tasks, turning a provider-specific interpretation into an avoidable task failure.
 
-## Admission flow
+5. Deep-reasoning calls legitimately exceed naive timeouts, so a fixed short deadline mistakes slow useful work for failure.
 
-1. The supervisor loads and authorizes provider configuration.
-2. A task with `model_candidates` reaches `routing.resolve_assignment` only
-   after it owns an admission slot.
-3. The selector applies hard filters first: authorization, enabled state,
-   requested model, optional tier, declared task requirements, and current lane
-   capacity. Request-rate tokens and `max_in_flight` are independent lane
-   dimensions; legacy `rpm`/`max_concurrency` aliases remain accepted.
-4. Without explicit quality requirements, `select_lane` balances normalized
-   usage debt and in-flight lane load. With requirements, `score_providers`
-   applies the capability boundary and delegates equal-priority quality order
-   to `selection.order_candidates`.
-5. The supervisor writes the chosen provider, model, and tier into the task
-   specification and increments exactly that provider's lane.
-6. The worker receives a pinned assignment. Diffundo keeps that primary
-   association while it is live. Only terminal provider death can open a
-   fallback, and then only inside the authorized provider set; same-tier
-   candidates precede other tiers and the serving provider becomes the new
-   sticky association.
-7. Every provider call emits redacted usage evidence. The supervisor folds that
-   evidence into `DebtStore`, and later admissions see the updated snapshot.
-8. The lane is released when the task leaves the worker phase, including
-   failure and cancellation paths.
+6. Credential-less lanes waste attempts and pollute health statistics when missing credentials are discovered only during a call.
 
-This split is intentional. Admission chooses ownership; Diffundo executes the
-owned call while enforcing health and retry policy. They share evidence and the
-same pure quality-ordering primitive, but they do not compete for scheduling
-ownership.
+## Design
 
-## Hard constraints
+- Admission constructs an ordered cascade with a fast tier followed by a core tier. It filters by task capabilities, model constraints, lane capacity, and credential feasibility before dispatch; credential feasibility is decided at admission, never at call time.
+- Each lane uses an evidence-based health state machine: open admits work, cooldown withholds transiently, half-open probe permits one test, and disable quarantines proven auth/config failures. Direct success, quota, stall, overload, transport, and endpoint evidence drive distinct transitions; health is never inferred from another lane's result.
+- A typed failure taxonomy separates auth, configuration, quota, transient stall/overload, timeout, terminal endpoint death, and content-policy flag. Auth/config failures quarantine; quota and transient failures use bounded jittered backoff and then cascade; content flags cascade without health damage and return a caller-recoverable signal.
+- A provider lease pins a semantic task branch to its provider/model for cache affinity. Release it only on terminal death or timeout; failover carries the stable cache identity and latest checkpoint, preserves a pinned model, and permits model substitution only when the caller explicitly allows it.
+- Each attempt receives an effort-aware deadline derived from remaining time under a hard task wall; reasoning effort can lengthen an attempt, but backoff and retries can never overrun the wall. Budget charging is uncached-only: count fresh input and newly generated output, not reused cached work.
+- Persist checkpoints at safe progress boundaries and resume from the latest checkpoint after a stall or failover, so completed work is not replayed and side effects are not duplicated.
 
-The following are feasibility checks, not weighted preferences:
+## Invariants
 
-- provider is enabled and authorized;
-- configured model is one of the task's candidates;
-- a pinned tier matches;
-- `quality: high` requires a strong provider tier;
-- `min_context_window` requires a declared capacity at least that large;
-- the provider lane has spare capacity;
-- a strict `ProviderLease` matches provider and model exactly;
-- a quota reservation fits every configured token/request window;
-- malformed or unknown requirement fields fail closed.
+- Provider health changes only on direct evidence.
+- Content flags never damage health.
+- Pinned-model tasks never silently switch model on transient failure.
+- Every failover preserves task progress via checkpoints.
+- Admission never spawns a lane that cannot authenticate.
 
-No score may reintroduce a provider removed by those checks.
+## Violations this design prevents
 
-## Pinned-provider fallback
-
-One-shot resolution in `oneshot._resolve_provider` carries the selected
-provider as the pinned primary and hands the worker only the enabled,
-credential-ready authorization set. `Diffundo.call` may leave that pin only
-after the attempt has terminal endpoint-death evidence. The decision is the
-narrow `diffundo.ProviderError.is_real_death` predicate, not the broad
-"request failed" outcome:
-
-- `AUTH_ERROR` with HTTP 401, or with HTTP 403 after the classifier identifies
-  a key-level credential failure, is terminal for the pinned endpoint;
-- any HTTP 5xx response is terminal endpoint-unavailable evidence;
-- connection refusal/unreachable errors, DNS resolution failures, and TLS/SSL
-  handshake or certificate failures are terminal transport evidence.
-
-After terminal death, `_real_death_fallback_candidates` searches enabled,
-capability-compatible providers in the original tier first and then the other
-tiers, excluding providers already tried. A successful substitution records
-the serving provider and `fell_back_from` in the call/result provenance and
-keeps the new association for later calls; it does not bounce back to the
-dead pin or preserve the old model as an implicit requirement.
-
-429/quota pressure, including `Retry-After`, does not qualify. Neither do
-WAF/network-block 403s, model-entitlement/configuration 403s, policy/content
-refusals, malformed responses, or an ordinary timeout. Those paths retain the
-existing same-provider retry/cooldown, disable, or untouched-health behavior;
-they cannot cause a pinned provider to be replaced merely because a request
-failed.
-
-### Provider leases
-
-`provider_scheduler.ProviderLease` is the immutable provider/model ownership
-record for one semantic trunk. After a successful result,
-`worker._bind_router_provider` calls `Diffundo.bind_provider`, which validates
-the enabled configured provider/model and stores a lease (or reuses an
-inherited lease, preserving its `root_task_id` and `cache_identity`). With a
-lease, `Diffundo._routing_request` carries it into `routing.RoutingRequest`;
-`Diffundo._candidates` and `routing.provider_satisfies_request` therefore
-admit only the exact leased provider/model. A healthy, eligible incumbent is
-sticky: ordinary ordering, a sibling's better score, and transient health
-pressure do not move the branch. `bind_provider` also rejects a live bind to a
-different provider/model.
-
-The terminal-death branch in `Diffundo.call` uses
-`ProviderError.is_real_death`. When the failed lane matches the lease, it
-clears `_provider_lease` before calling `_real_death_fallback_candidates`;
-`_pinned_provider`, `_fallback_origin`, and `_terminal_death_providers` remain
-so provenance and dead-lane avoidance survive. The explicit
-`clear_provider_lease` remains the warm-worker task reset, not a
-failure-triggered fallback.
-
-Once the incumbent has real-death evidence, `_real_death_fallback_candidates`
-clones the request with `lease=None`, an empty model, and model substitution
-enabled before asking `_candidates_unleased` for candidates. This deliberately
-drops the strict lease/model filter while retaining
-`routing.provider_satisfies_request`'s capability, billing, tool, and context
-checks, `_candidates_unleased`'s live health/bucket checks, the router's
-authorized provider set, and tried-provider exclusions. It walks the original
-tier first and then other tiers. If a candidate serves, `Diffundo.call`
-records `_fallback_origin` and `fell_back_from`, and the worker binds the
-successful provider/model as the new lease. If no `primary_provider` was
-assigned initially, `bind_provider` first sets `_pinned_provider` to that
-incumbent, so a later real death still has a fallback origin.
-
-A 429, including one carrying `Retry-After`, is `ProviderOutcome.QUOTA`, not
-`ProviderError.is_real_death`; `_record_failure` applies cooldown and preserves
-the lease. A timeout is `ProviderOutcome.TIMEOUT` and follows the same
-failure/cooldown path without being real death. Thus neither transient case
-admits the fallback candidates or releases a lease; a live but cooling
-incumbent may leave the call with `AllProvidersFailed` rather than silently
-switching providers.
-
-## Ordering
-
-Configured `priority` is the first policy class and is never crossed by
-measured quality. Inside one equal-priority run, `selection.order_candidates`
-uses current evidence in this order:
-
-1. failure probability;
-2. latency-SLO compliance;
-3. expected cost per successful turn;
-4. normalized throughput/latency/cache tie-break. Measured output
-   `tokens_per_s` comes from redacted usage events; configured
-   `throughput_hint_tps` is only a fallback when fresh evidence is absent.
-
-Missing or stale evidence is a barrier that keeps configuration order. Root
-incumbency moves a provider only to the front of its own equal-priority run.
-Deterministic rotation applies only where no current evidence exists.
-
-The simpler max-min admission path ranks by normalized token debt, then current
-lane load, request count, and configuration order. A provider under 429
-pressure receives a smaller effective request-rate allowance before ranking;
-its in-flight capacity is not silently conflated with RPM.
-
-## Quota and debt state
-
-Two stores represent different facts and must not be merged:
-
-- `DebtStore` is a compact redacted usage history used for balancing and
-  quality evidence. It contains counters, cost, latency, cache hits, retry
-  pressure, and quarantine metadata; never credentials or prompt content.
-- `QuotaLedger` is transactional reservation state for declared or observed
-  token/request windows. One reservation succeeds for every window or for none
-  of them, and reconciliation replaces the estimate with actual usage exactly
-  once.
-- `CacheHorizonConfig` batches immutable cache breakpoints by pending tokens or
-  elapsed horizon without claiming a provider retained a cache. `CastConfig`
-  adds `max_segments` and `max_active_trunk_tokens`; when an interactive
-  summary-only trunk is due, the semantic history is materialized as one CAST
-  K0 entry in a new immutable epoch.
-
-`cambium quota observe` records trusted provider/header/dashboard evidence;
-`cambium quota status` displays the content-free snapshot. Providers without a
-configured quota window continue to use the debt-balancing allowance rather
-than inventing a provider contract.
-
-## HTTP failure classification
-
-Provider HTTP failures pass through one classifier in `cambium.diffundo`.
-`429` responses are quota pressure: bounded `Retry-After` evidence, lane
-cooldown, and full-jitter retry within the call deadline. Plain `403` responses
-are not auth errors by default. Body markers distinguish five operational
-classes:
-
-- invalid credentials -> `AUTH_ERROR`; disable the provider and quarantine the
-  credential fingerprint. It is re-admitted only after the credential identity
-  changes, and a pinned run may use a fallback because 401/key-level 403 is
-  terminal endpoint evidence;
-- missing model entitlement -> `CONFIG_ERROR`; disable that provider/model
-  configuration without treating it as bad credentials;
-- quota or billing exhaustion -> `QUOTA`; honor bounded reset/`Retry-After`
-  evidence and hold the provider in cooldown until it is eligible again;
-- policy/content refusal -> `REFUSAL`; fail the request and leave provider
-  health untouched;
-- WAF/browser/network block -> transient `ERROR` with bounded retry/cooldown;
-  it does not quarantine the credential or trigger pinned fallback;
-- HTTP 5xx -> `ERROR` with the response status retained as terminal
-  endpoint-unavailable evidence after the provider attempt's retry sequence;
-  this is the other HTTP class that can open pinned fallback.
-
-An unlabelled `403` remains fail-closed as authentication and therefore is
-terminal for pinned fallback. Network connection/DNS/TLS errors remain
-retryable `ERROR` attempts until their configured retry sequence is exhausted,
-then qualify as terminal transport evidence; ordinary timeouts instead retain
-the timeout/cooldown path. Malformed responses fail closed but are not terminal
-death. The classification is retained in redacted usage/failure evidence,
-never in prompt or credential material.
-
-## Removed alternatives
-
-The following parallel implementations are intentionally gone:
-
-- the unused asyncio `ProviderScheduler` mailbox and its separate
-  `ProviderPolicy`/`RoutingRequest` rank;
-- `provider_policy.py` and its second billing/quota/affinity model;
-- `dispatch_policy.py`, which adapted configuration into the unused actor;
-- `provider_resources.py`, whose budget/header layer was reachable only through
-  the alternate stack;
-- materialization/fix scripts that generated those files.
-
-`selection.py` remains because it is a single shared pure primitive, not a
-second admission engine.
-
-## Validation
-
-This project does not use GitHub Actions or hosted continuous integration.
-Changes are validated from source with local commands, for example:
-
-```bash
-PYTHONPATH=src python -m pytest -q
-PYTHONPATH=src python -m ruff check src tests
-PYTHONPATH=src python -m cambium doctor
-```
-
-A helper's existence is never integration evidence. The authoritative path is
-`supervisor -> routing -> pinned worker -> Diffundo`, with usage flowing back to
-`DebtStore` and quota state flowing through `QuotaLedger`. Interactive wall
-budgets use an explicit operator value when supplied; otherwise they can scale
-from the selected provider's throughput hint and the current branch's measured
-output rate, with a safety margin, while ordinary one-shot runs retain their
-fixed default.
+- **Problems 1–2:** Typed outcomes, the ordered tiered cascade, and evidence-only health transitions replace blind retry and single-provider dependence.
+- **Problem 3:** Lease/cache identity and checkpoint preservation uphold the pinned-model and failover-progress invariants, so switching serves the same branch instead of forking it.
+- **Problem 4:** Caller-recoverable content flags never damage health, preventing benign code context from quarantining a provider or ending the task.
+- **Problem 5:** Effort-aware deadlines inside a hard task wall distinguish legitimate slow reasoning from an overrun; direct-evidence health rules prevent timeout guesses from changing health.
+- **Problem 6:** The admission-auth invariant excludes credential-less lanes before dispatch, so missing credentials create no attempts and no misleading health data.
