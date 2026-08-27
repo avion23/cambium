@@ -207,6 +207,13 @@ def test_content_flagged_summary_retries_once_with_redacted_tail(
         assert _SECRET in first_text
         assert _SECRET not in retry_text
         assert "***" in retry_text
+        assert calls[1]["messages"] != calls[0]["messages"]
+        assert calls[1]["messages"][:2] == calls[0]["messages"][:2]
+        assert calls[1]["messages"][-1] == calls[0]["messages"][-1]
+        assert calls[1]["messages"][-2]["content"].startswith('{"summary":"***')
+        assert len(calls[1]["messages"][-2]["content"]) < len(
+            calls[0]["messages"][-2]["content"]
+        )
         assert len(server.calls) == 3
         assert router.summary_failure_health == [HealthState.HEALTHY]
         assert router.health("p_summary") is HealthState.HEALTHY
@@ -219,6 +226,30 @@ def test_content_flagged_summary_retries_once_with_redacted_tail(
         )
     finally:
         server.close()
+
+
+def test_content_flagged_transform_preserves_trunk_and_earlier_tail() -> None:
+    control = (
+        "<cambium-summary-control>\n{}\n"
+        "</cambium-summary-control>"
+    )
+    prompt = {
+        "messages": [
+            {"role": "system", "content": "stable system"},
+            {"role": "user", "content": "stable task"},
+            {"role": "assistant", "content": "earlier raw content"},
+            {"role": "user", "content": "safe prefix\nflagged tail"},
+            {"role": "user", "content": control},
+        ]
+    }
+
+    retry = worker._transform_content_flagged_summary_prompt(prompt, None)
+
+    assert retry["messages"][:3] == prompt["messages"][:3]
+    assert retry["messages"][-1] == prompt["messages"][-1]
+    assert retry["messages"][-2]["content"] == "safe prefix\n*** [redacted]"
+    assert "flagged tail" not in retry["messages"][-2]["content"]
+    assert prompt["messages"][-2]["content"] == "safe prefix\nflagged tail"
 
 
 def test_content_flagged_summary_retry_fails_without_health_damage(
@@ -255,7 +286,11 @@ def test_content_flagged_summary_retry_fails_without_health_damage(
             "compaction_failed: summary flagged by provider content filter"
         )
         assert len(server.calls) == 3
-        assert len(_summary_calls(server)) == 2
+        calls = _summary_calls(server)
+        assert len(calls) == 2
+        assert calls[1]["messages"][:2] == calls[0]["messages"][:2]
+        assert calls[1]["messages"][-1] == calls[0]["messages"][-1]
+        assert calls[1]["messages"][-2] != calls[0]["messages"][-2]
         assert router.summary_failure_health == [HealthState.HEALTHY, HealthState.HEALTHY]
         assert router.health("p_summary") is HealthState.HEALTHY
         assert router.status("p_summary") is ProviderStatus.AVAILABLE
