@@ -79,6 +79,7 @@ def main() -> int:
     file.write_text(text.rstrip("\n") + "\n" + marker + "\n")
     git("add", "-A", cwd=worktree)
     git("commit", "-m", f"crash-worker: {task_id} (gen {generation})", cwd=worktree)
+    _rc, commit, _err = git("rev-parse", "HEAD", cwd=worktree)
 
     if generation == 1:
         return 3  # crash mid-edit: no result_envelope, no exit_message
@@ -90,7 +91,7 @@ def main() -> int:
             "task_id": task_id,
             "generation": generation,
             "status": "succeeded",
-            "commits": [],
+            "commits": [commit],
             "files_changed": [file.name],
             "diff": "",
         }

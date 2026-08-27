@@ -51,6 +51,7 @@ def main() -> int:
     target.write_text(target.read_text().rstrip("\n") + "\n" + marker + "\n")
     git("add", run["target_file"], cwd=worktree)
     git("commit", "-m", f"crash-once: {task_id}", cwd=worktree)
+    _rc, commit, _err = git("rev-parse", "HEAD", cwd=worktree)
 
     sentinel = worktree.parent / ".cambium" / "crash-once"
     if not sentinel.exists():
@@ -65,7 +66,7 @@ def main() -> int:
             "task_id": task_id,
             "generation": generation,
             "status": "succeeded",
-            "commits": [],
+            "commits": [commit],
             "files_changed": [run["target_file"]],
             "diff": "",
         }

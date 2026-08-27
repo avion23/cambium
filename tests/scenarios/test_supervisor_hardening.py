@@ -912,8 +912,10 @@ def test_empty_success_envelope_cannot_bypass_merge_for_advanced_head(
     result = asyncio.run(run_plan(session_dir, {"tasks": [task]}))
     events = read_events(session_dir)
 
-    assert result.results[0].status == "succeeded"
-    assert result.results[0].merge_sha is not None
+    assert result.exit_code != 0
+    assert result.results[0].status == "failed"
+    assert result.results[0].reason == "success invariant violated"
+    assert result.results[0].merge_sha is None
     assert (
         subprocess.run(
             ["git", "-C", str(repo), "rev-parse", "refs/heads/main"],
@@ -921,19 +923,19 @@ def test_empty_success_envelope_cannot_bypass_merge_for_advanced_head(
             capture_output=True,
             text=True,
         ).stdout.strip()
-        != base
+        == base
     )
     assert (
         "// advanced-head"
-        in subprocess.run(
+        not in subprocess.run(
             ["git", "-C", str(repo), "show", "refs/heads/main:hello.txt"],
             check=True,
             capture_output=True,
             text=True,
         ).stdout
     )
-    assert _kinds(events, "merge_started")
-    assert _kinds(events, "merge_committed")
+    assert not _kinds(events, "merge_started")
+    assert not _kinds(events, "merge_committed")
 
 
 @pytest.mark.parametrize("proto", [999, None])
@@ -1023,8 +1025,10 @@ def test_tool_event_worker_controlled_fields_are_type_validated_before_persist(
         "cwd=run['worktree_path'], check=True)\n"
         "    subprocess.run(['git', 'commit', '-m', 'tool event validation'], "
         "cwd=run['worktree_path'], check=True, capture_output=True)\n"
+        "    commit = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=run['worktree_path'], "
+        "check=True, capture_output=True, text=True).stdout.strip()\n"
         "    send({'type': 'result_envelope', 'request_id': run['request_id'], "
-        "'status': 'succeeded'})\n"
+        "'status': 'succeeded', 'commits': [commit]})\n"
         "    send({'type': 'exit_message', 'reason': 'done'})\n",
         encoding="utf-8",
     )

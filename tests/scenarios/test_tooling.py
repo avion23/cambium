@@ -161,7 +161,7 @@ def test_doctor_fails_on_missing_required_provider_key(tmp_path, monkeypatch) ->
     assert re.search(r"Summary: .* [1-9]\d* fail", result.stdout)
 
 
-def test_doctor_fails_on_invalid_provider_config(tmp_path, monkeypatch) -> None:
+def test_doctor_quarantines_invalid_provider_config(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
     monkeypatch.delenv("CAMBIUM_PROVIDER_TEST_PROVIDER_API_KEY", raising=False)
     invalid = _provider()
@@ -172,10 +172,10 @@ def test_doctor_fails_on_invalid_provider_config(tmp_path, monkeypatch) -> None:
 
     result = _run_doctor(cwd=tmp_path)
 
-    assert result.returncode == 1, result.stdout + result.stderr
-    assert "provider config validation failed" in result.stdout
-    assert "required" in result.stdout
-    assert "1 fail" in result.stdout
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "provider config warning: quarantined 1 invalid provider entry" in result.stderr
+    assert config.with_name(config.name + ".quarantine").is_file()
+    assert "0 fail" in result.stdout
 
 
 def test_doctor_exits_zero_on_healthy_session_artifacts(tmp_path, monkeypatch) -> None:
