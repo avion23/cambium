@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 from typing import Any, cast
 
 import pytest
@@ -19,6 +20,7 @@ from cambium.diffundo import (
     ProviderError,
     ProviderOutcome,
     ProviderTier,
+    _attempt_budget,
     _codex_stream_error,
 )
 
@@ -33,6 +35,17 @@ def _codex_provider() -> ProviderConfig:
         auth=AuthMode.CODEX_CHATGPT,
         protocol=Protocol.CODEX_RESPONSES,
     )
+
+
+@pytest.mark.parametrize(
+    ("reasoning_effort", "expected"),
+    [(None, 180.0), ("high", 180.0), ("max", 360.0)],
+)
+def test_attempt_budget_scales_max_reasoning_effort(
+    reasoning_effort: str | None, expected: float
+) -> None:
+    provider = replace(_codex_provider(), reasoning_effort=reasoning_effort)
+    assert _attempt_budget(180.0, provider) == expected
 
 
 @pytest.mark.parametrize(

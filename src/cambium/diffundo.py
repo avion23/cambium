@@ -161,6 +161,7 @@ _URL_CREDENTIALS_RE = re.compile(
 _REDACTED = "[REDACTED]"
 MAX_PROVIDER_RESPONSE_BYTES = 4 * 1024 * 1024
 DEFAULT_SUMMARY_CALL_BUDGET_S = 120.0
+_REASONING_EFFORT_MULTIPLIERS = {"max": 2.0}
 _CLOUDFLARE_1010_RE = re.compile(
     r"(?=.*\b1010\b)(?=.*(?:cloudflare|cf[- ]error|"
     r"error\s*(?:code\s*)?[:#-]?\s*1010|browser(?:['’]s)?\s+signature))",
@@ -689,6 +690,11 @@ class ProviderConfig:
             "_independent_capacity_model",
             explicit_rate or explicit_in_flight or self.max_concurrency != 1,
         )
+
+
+def _attempt_budget(base: float, provider: ProviderConfig) -> float:
+    """Return the per-attempt budget for a provider's reasoning effort."""
+    return base * _REASONING_EFFORT_MULTIPLIERS.get(provider.reasoning_effort, 1.0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2043,7 +2049,12 @@ class Diffundo:
             while pending:
                 provider = pending.pop(0)
                 try:
-                    result = await self._attempt(provider, prompt, deadline=deadline)
+                    attempt_deadline = min(
+                        deadline,
+                        time.monotonic()
+                        + _attempt_budget(float(effective_call_budget_s), provider),
+                    )
+                    result = await self._attempt(provider, prompt, deadline=attempt_deadline)
                 except ProviderError as exc:
                     if exc.probe_already_in_flight:
                         probe_rejected = True
