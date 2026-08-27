@@ -380,9 +380,7 @@ _INVALID_PROMPT_POLICY_MARKERS = frozenset(
         "violation",
     }
 )
-_STRUCTURED_POLICY_FLAG_CODES = frozenset(
-    {"content_policy_violation", "content_filter_violation"}
-)
+_STRUCTURED_POLICY_FLAG_CODES = frozenset({"content_policy_violation", "content_filter_violation"})
 _STRUCTURED_CODEX_OUTCOMES = {
     "model_not_found": ProviderOutcome.CONFIG_ERROR,
     "unsupported_model": ProviderOutcome.CONFIG_ERROR,
@@ -511,9 +509,7 @@ def _structured_error_outcome(
     if tokens is None:
         return None
     objects = _error_body_objects(body)
-    prompt_flagged = (
-        objects is not None if not strict_prompt_flag else _codex_prompt_flagged(body)
-    )
+    prompt_flagged = objects is not None if not strict_prompt_flag else _codex_prompt_flagged(body)
     if any(token in _CODEX_CONFIG_CODES for token in tokens):
         return ProviderOutcome.CONFIG_ERROR
     if strict_prompt_flag and prompt_flagged:
@@ -1855,9 +1851,7 @@ def _classify_http_403(
     # An unlabelled 403 remains fail-closed as an auth failure. Known
     # provider/WAF, entitlement, quota, and policy shapes above avoid
     # damaging provider health for their respective non-auth causes.
-    return ProviderError(
-        provider.name, ProviderOutcome.AUTH_ERROR, f"HTTP 403: {message}", cause
-    )
+    return ProviderError(provider.name, ProviderOutcome.AUTH_ERROR, f"HTTP 403: {message}", cause)
 
 
 # --------------------------------------------------------------------------- #
