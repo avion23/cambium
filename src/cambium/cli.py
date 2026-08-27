@@ -1034,6 +1034,8 @@ def _run_module_test(args: argparse.Namespace) -> int:
         "--strict-config",
         "--strict-markers",
         "-q",
+        "-o",
+        "addopts=",
         str(tests_dir.resolve()),
     ]
     with module_conformance.module_offline_environment() as env:
