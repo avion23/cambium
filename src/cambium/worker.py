@@ -2938,7 +2938,9 @@ def _strip_finalization_directive(messages: Sequence[dict[str, Any]]) -> list[di
 
 
 def _phase_failure(reason: str, *, final_synthesis: bool) -> str:
-    """Name a terminal synthesis failure without relabeling normal failures."""
+    """Name a terminal synthesis failure without masking a budget failure."""
+    if "token budget exceeded" in reason:
+        return "token budget exceeded"
     return f"final synthesis failed: {reason}" if final_synthesis else reason
 
 
@@ -5246,6 +5248,12 @@ async def _run_agent_loop(
                     prompt=sent_prompt,
                     call_kind="agent",
                 )
+                budget_failure = final_synthesis_call and budget_new_tokens >= soft_cap
+                failure_reason = (
+                    "token budget exceeded"
+                    if budget_failure
+                    else _provider_call_failure_reason(exc)
+                )
                 partial_content_flag = (
                     final_synthesis_call
                     and _is_content_flagged(exc)
@@ -5253,7 +5261,9 @@ async def _run_agent_loop(
                 )
                 if final_synthesis_call and not partial_content_flag:
                     failure_event["failure_reason"] = _phase_failure(
-                        str(failure_event.get("failure_reason", "provider call failed")),
+                        failure_reason
+                        if budget_failure
+                        else str(failure_event.get("failure_reason", "provider call failed")),
                         final_synthesis=True,
                     )
                 if writer is not None:
@@ -5280,10 +5290,7 @@ async def _run_agent_loop(
                 return _loop_result(
                     outcome,
                     "failed",
-                    _phase_failure(
-                        _provider_call_failure_reason(exc),
-                        final_synthesis=final_synthesis_call,
-                    ),
+                    _phase_failure(failure_reason, final_synthesis=final_synthesis_call),
                     turn - 1,
                     cumulative_usage,
                     transcript,
