@@ -12,7 +12,7 @@ Live operator TUI — [`src/cambium/tui_screen.py`](src/cambium/tui_screen.py), 
 - Checkpoint-bound stall resume and `salvage/<task>/<gen>/workspace.diff` — [`src/cambium/supervisor.py`](src/cambium/supervisor.py).
 - Credential-feasible admission and the success invariant, including `requires_commit` — [`src/cambium/supervisor.py`](src/cambium/supervisor.py), [`src/cambium/worker.py`](src/cambium/worker.py).
 - Operator rail with lineage glyphs and fold ticks — [`src/cambium/tui_screen.py`](src/cambium/tui_screen.py), [`src/cambium/observability.py`](src/cambium/observability.py).
-- Integer-only duration stats — [`src/cambium/tools.py`](src/cambium/tools.py), [`src/cambium/worker.py`](src/cambium/worker.py), [`src/cambium/tui_screen.py`](src/cambium/tui_screen.py).
+- Integer-only duration stats — [`src/cambium/tui_screen.py`](src/cambium/tui_screen.py).
 - Plan-mode parallel workers — [`src/cambium/supervisor.py`](src/cambium/supervisor.py), [`src/cambium/cli.py`](src/cambium/cli.py).
 
 ## INSTALL
@@ -49,7 +49,7 @@ Providers use `~/.config/cambium/providers.json`; API-key entries use the
 `api_key_env` convention `CAMBIUM_PROVIDER_<NAME>_API_KEY`; Codex OAuth uses
 `cambium auth oauth login PROVIDER` — [`src/cambium/provider_config.py`](src/cambium/provider_config.py), [`src/cambium/cli.py`](src/cambium/cli.py), [`src/cambium/oauth.py`](src/cambium/oauth.py).
 
-OPERATIONS: details in `docs/architecture/operations.md` (missing in this checkout); caching internals: [`docs/architecture/cast.md`](docs/architecture/cast.md) + [`docs/architecture/context-engine.md`](docs/architecture/context-engine.md).
+OPERATIONS: [`docs/architecture/operations.md`](docs/architecture/operations.md); caching internals: [`docs/architecture/cast.md`](docs/architecture/cast.md) + [`docs/architecture/context-engine.md`](docs/architecture/context-engine.md).
 
 ## LIMITS
 
