@@ -39,6 +39,7 @@ from cambium.diffundo import (
     ProviderStatus,
     ProviderTier,
     _RawResponse,
+    _codex_usage,
     prompt_prefix_bytes,
     prompt_prefix_estimate_tokens,
     validate_prompt_structure,
@@ -1713,6 +1714,58 @@ def test_usage_metric_fields_follow_provider_reports(tmp_path, monkeypatch) -> N
         assert r3.request_rate_status == "available"
     finally:
         server.close()
+
+
+def test_codex_usage_preserves_unknown_token_counts() -> None:
+    normalized = _codex_usage(
+        {
+            "response": {
+                "usage": {
+                    "output_tokens": 5,
+                    "input_tokens_details": {"cached_tokens": 2},
+                }
+            }
+        }
+    )
+
+    assert normalized == {
+        "prompt_tokens": None,
+        "completion_tokens": 5,
+        "prompt_tokens_details": {"cached_tokens": 2},
+        "input_tokens_details": {"cached_tokens": 2},
+        "cached_tokens": 2,
+    }
+
+
+def test_codex_usage_preserves_explicit_zero_token_counts() -> None:
+    assert _codex_usage({"response": {"usage": {"input_tokens": 0, "output_tokens": 0}}}) == {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+    }
+
+
+def test_codex_usage_normalizes_full_usage_unchanged() -> None:
+    assert _codex_usage(
+        {
+            "response": {
+                "usage": {
+                    "input_tokens": 12,
+                    "input_tokens_details": {"cached_tokens": 7},
+                    "output_tokens": 5,
+                    "output_tokens_details": {"reasoning_tokens": 2},
+                    "total_tokens": 17,
+                }
+            }
+        }
+    ) == {
+        "prompt_tokens": 12,
+        "completion_tokens": 5,
+        "prompt_tokens_details": {"cached_tokens": 7},
+        "input_tokens_details": {"cached_tokens": 7},
+        "output_tokens_details": {"reasoning_tokens": 2},
+        "total_tokens": 17,
+        "cached_tokens": 7,
+    }
 
 
 def test_chat_response_larger_than_provider_cap_is_rejected(monkeypatch) -> None:

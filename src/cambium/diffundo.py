@@ -1646,8 +1646,8 @@ def _codex_usage(completed: dict[str, Any]) -> dict[str, Any] | None:
         return None
     cached_tokens = _cached_tokens(usage)
     normalized: dict[str, Any] = {
-        "prompt_tokens": usage.get("input_tokens") or 0,
-        "completion_tokens": usage.get("output_tokens") or 0,
+        "prompt_tokens": usage.get("input_tokens"),
+        "completion_tokens": usage.get("output_tokens"),
     }
     input_details = usage.get("input_tokens_details")
     if isinstance(input_details, dict):
