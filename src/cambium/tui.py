@@ -10,6 +10,7 @@ import os
 import signal
 import sqlite3
 import sys
+import threading
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
@@ -790,17 +791,42 @@ async def _run_interactive(
     loop = asyncio.get_running_loop()
     pending_prompts: deque[str] = deque()
     input_task: asyncio.Task[str | None] | None = None
+    reader_threads: set[threading.Thread] = set()
     input_eof = False
     input_closing = False
 
     async def _read_line_source() -> str | None:
         """Read a prompt without stopping live turn events or input steering."""
-        return await asyncio.to_thread(
-            _read_cockpit_prompt,
-            source,
-            cockpit,
-            native=native_input,
-        )
+        result: asyncio.Future[str | None] = loop.create_future()
+
+        def deliver(value: str | None = None, error: BaseException | None = None) -> None:
+            if result.done():
+                return
+            if error is None:
+                result.set_result(value)
+            else:
+                result.set_exception(error)
+
+        def read() -> None:
+            try:
+                value = _read_cockpit_prompt(source, cockpit, native=native_input)
+            except BaseException as exc:
+                try:
+                    loop.call_soon_threadsafe(deliver, None, exc)
+                except RuntimeError:
+                    pass
+            else:
+                try:
+                    loop.call_soon_threadsafe(deliver, value)
+                except RuntimeError:
+                    pass
+            finally:
+                reader_threads.discard(threading.current_thread())
+
+        reader = threading.Thread(target=read, name="cambium-tui-input", daemon=True)
+        reader_threads.add(reader)
+        reader.start()
+        return await result
 
     def _start_input_read() -> None:
         nonlocal input_task
@@ -817,8 +843,8 @@ async def _run_interactive(
         if input_task is None:
             return None
         task = input_task
-        input_task = None
         prompt = await task
+        input_task = None
         cockpit.flush()
         if prompt is None:
             input_eof = True
@@ -829,14 +855,15 @@ async def _run_interactive(
         nonlocal input_task
         task = input_task
         input_task = None
-        if task is None:
-            return
-        if not task.done():
-            task.cancel()
-        try:
-            await task
-        except BaseException:
-            pass
+        if task is not None:
+            if not task.done():
+                task.cancel()
+            try:
+                await task
+            except BaseException:
+                pass
+        for reader in tuple(reader_threads):
+            reader.join(timeout=0.05)
 
     def _draw_final(snapshot: SessionSnapshot, *, activity_line: str = "") -> None:
         cockpit.draw(
@@ -1046,7 +1073,7 @@ async def _run_interactive(
                             "turn cancelled; the previous successful checkpoint "
                             "remains the branch head."
                         )
-                        _draw_final(snapshot, activity_line=activity.status_line())
+                        _draw_final(snapshot)
                         continue
 
                     session.observe_result(turn, response)

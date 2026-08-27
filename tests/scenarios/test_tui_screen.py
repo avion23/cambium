@@ -4,6 +4,7 @@ import io
 import os
 import subprocess
 import sys
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -20,9 +21,12 @@ from cambium.tui_screen import (
     _bounded_markdown_lines,
     _compact_rail_rows,
     _display_width,
+    _frame_content_width,
+    _rail_depth,
     _rail_rows,
     _side_sections,
     _status_rows,
+    _style_kind,
     _transcript_lines,
     _visible,
     _wrap_markdown,
@@ -649,6 +653,20 @@ def test_activity_state_reports_waiting_streaming_done_error_and_cooldown() -> N
     activity.observe_event({"kind": "turn_failed", "payload": {"reason": "provider"}}, now=21.0)
     assert activity.state == "ERROR"
     assert activity.status_line() == "✗ ERROR"
+
+
+def test_suspended_activity_stays_live_and_has_distinct_status() -> None:
+    activity = ActivityState()
+    activity.start(now=0.0)
+    activity.observe_event(
+        {"kind": "result", "payload": {"status": "suspended"}},
+        now=1.0,
+    )
+
+    assert activity.active
+    assert activity.state == "SUSPENDED"
+    assert "SUSPENDED" in activity.render(now=1.0)
+    assert activity.status_line() != "✓ DONE"
 
 
 def test_compact_cockpit_stays_bounded() -> None:
@@ -1684,6 +1702,91 @@ def test_activity_redraw_is_silent_for_non_tty() -> None:
     cockpit.draw_activity("⠋ thinking… 1.0s")
 
     assert stream.getvalue() == ""
+
+
+def test_activity_resize_repaints_frame_and_restores_input_prompt(monkeypatch) -> None:
+    class _Tty(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    sizes = iter(
+        (
+            os.terminal_size((110, 24)),
+            os.terminal_size((90, 24)),
+            os.terminal_size((70, 24)),
+        )
+    )
+    monkeypatch.setattr(tui_screen.shutil, "get_terminal_size", lambda _fallback: next(sizes))
+    stream = _Tty()
+    cockpit = Cockpit(stream)
+    with cockpit:
+        cockpit.draw(
+            _snapshot(),
+            Transcript(),
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+        )
+        cockpit.move_to_input()
+        for activity_line in ("⠋ thinking… 1.0s", "⠙ thinking… 2.0s"):
+            before = stream.getvalue()
+            cockpit.draw_activity(activity_line)
+            assert stream.getvalue()[len(before) :].endswith("› ")
+
+    assert cockpit.size.columns == 70
+
+
+def test_frame_status_rows_use_the_left_content_width(monkeypatch) -> None:
+    seen: list[int] = []
+    render_status_rows = tui_screen._status_rows
+
+    def capture(*args: Any, **kwargs: Any) -> list[str]:
+        seen.append(kwargs["width"])
+        return render_status_rows(*args, **kwargs)
+
+    monkeypatch.setattr(tui_screen, "_status_rows", capture)
+    render_cockpit(
+        _snapshot(),
+        Transcript(),
+        session_description="session",
+        branch_line="branch",
+        cumulative_line="usage: calls=0",
+        width=120,
+        height=24,
+    )
+
+    assert seen == [_frame_content_width(120)]
+
+
+def test_style_kind_ignores_unhashable_state_values() -> None:
+    assert _style_kind({"state": "active"}) == ""
+
+
+def test_rail_depth_memo_avoids_rewalking_parent_chain() -> None:
+    class _Parents(Mapping[str, str | None]):
+        lookups = 0
+
+        def __init__(self, values: dict[str, str | None]) -> None:
+            self._data = values
+
+        def __getitem__(self, key: str) -> str | None:
+            self.lookups += 1
+            return self._data[key]
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(self._data)
+
+        def __len__(self) -> int:
+            return len(self._data)
+
+    parents = _Parents(
+        {f"task-{index}": (f"task-{index - 1}" if index else None) for index in range(2000)}
+    )
+    depths: dict[str, int] = {}
+    for index in range(2000):
+        assert _rail_depth(f"task-{index}", parents, depths) == index
+
+    assert parents.lookups == 2000
 
 
 def test_activity_keeps_tool_in_flight_until_matching_end() -> None:
