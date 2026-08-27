@@ -159,6 +159,7 @@ from cambium.provider_config import AuthMode, load_providers
 from cambium.redact import Redactor, build_session_redactor
 from cambium.schemas import TOOL_SCHEMAS
 from cambium.summary_trunk import (
+    SUMMARY_CONTROL_OPEN,
     SUMMARY_PROTOCOL_LINES,
     SummaryEntry,
     SummaryTrunkError,
@@ -2500,14 +2501,53 @@ def _render_rolling_compaction(
     return [{"role": "user", "content": content}]
 
 
-def _compaction_retry_tail(
-    raw_tail: list[dict[str, Any]], redactor: Redactor | None
-) -> list[dict[str, str]]:
-    """Make one bounded, redacted summary retry payload from a raw tail."""
-    retry_tail = copy.deepcopy(raw_tail)
-    if redactor is not None:
-        retry_tail = cast(list[dict[str, Any]], redactor.redact_mapping(retry_tail))
-    return _render_rolling_compaction(retry_tail, MAX_OBSERVATION_BYTES)
+_CONTENT_FLAGGED_RETRY_MARKER = "\n*** [redacted]"
+
+
+def _transform_content_flagged_summary_prompt(
+    prompt: dict[str, Any], redactor: Redactor | None
+) -> dict[str, Any]:
+    """Redact the final raw-tail message while retaining summary bookkeeping.
+
+    The summary control block remains unchanged, as does the stable trunk and
+    every earlier raw message.  Only the message immediately before the
+    control block is transformed: known secrets are retained only through
+    their redaction marker; otherwise the message is cut at its final line or
+    halfway through a single-line payload.
+    """
+    retry_prompt = copy.deepcopy(prompt)
+    messages = retry_prompt.get("messages")
+    if not isinstance(messages, list) or len(messages) < 3:
+        return retry_prompt
+    control = messages[-1]
+    flagged = messages[-2]
+    if (
+        not isinstance(control, dict)
+        or control.get("role") != "user"
+        or not isinstance(control.get("content"), str)
+        or not control["content"].startswith(SUMMARY_CONTROL_OPEN)
+        or not isinstance(flagged, dict)
+    ):
+        return retry_prompt
+    content = flagged.get("content")
+    if not isinstance(content, str):
+        return retry_prompt
+    redacted = redactor.redact(content) if redactor is not None else content
+    prefix_end = -1
+    if redactor is not None and redacted != content and redactor.replacement:
+        marker_start = redacted.find(redactor.replacement)
+        if marker_start >= 0:
+            prefix_end = marker_start + len(redactor.replacement)
+    if prefix_end < 0:
+        final_line = redacted.rfind("\n")
+        if final_line > 0:
+            prefix = redacted[:final_line]
+        else:
+            prefix = _cap_utf8(redacted, len(redacted.encode("utf-8")) // 2)
+    else:
+        prefix = redacted[:prefix_end]
+    flagged["content"] = prefix + _CONTENT_FLAGGED_RETRY_MARKER
+    return retry_prompt
 
 
 def _parent_envelope_lines(parent_envelope: dict[str, Any]) -> str:
@@ -4793,14 +4833,10 @@ async def _run_agent_loop(
                             epoch=usage_epoch,
                             fork_of=usage_fork_of,
                         )
-                    content_flagged = isinstance(exc, AllProvidersFailed) and _is_content_flagged(
-                        exc
-                    )
+                    content_flagged = _is_content_flagged(exc)
                     if content_flagged and summary_attempt == 0:
-                        summary_prompt, expectation = build_summary_request(
-                            trunk_messages,
-                            _compaction_retry_tail(raw_tail, config.redactor),
-                            through_turn=summary_through_turn,
+                        summary_prompt = _transform_content_flagged_summary_prompt(
+                            summary_prompt, config.redactor
                         )
                         continue
                     if content_flagged:
