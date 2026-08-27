@@ -110,6 +110,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import inspect
 import json
 import logging
 import math
@@ -131,6 +132,7 @@ from enum import IntEnum, StrEnum
 from pathlib import Path
 from typing import Any, TypeGuard, cast
 
+from cambium import diffundo as _diffundo_module
 from cambium.auth import oauth_env_suffix, scrub_environment
 from cambium.context_policy import CastPolicy
 from cambium.diffundo import (
@@ -169,10 +171,13 @@ from cambium.summary_trunk import (
     summary_entries,
     summary_trunk_tokens,
 )
+from cambium.terminal import sanitize_terminal_text
 from cambium.tools import ToolContext, ToolPermissionPolicy, ToolResult, run_tool
 
 PROTO = 1
 HEARTBEAT_INTERVAL_S = 1.0
+PHASE_HEARTBEAT_INTERVAL_S = 1.0
+PHASE_TAIL_MAX_CHARS = 120
 INIT_TIMEOUT_S = 30.0
 IDLE_TIMEOUT_S = 300.0
 MAX_SUMMARY_CHARS = 2_000
@@ -1565,12 +1570,186 @@ def _config_from_run(run: dict[str, Any]) -> AgentConfig:
 class AgentProgress:
     """Current turn/tool/status shared with the heartbeat loop."""
 
-    __slots__ = ("turn", "tool", "status")
+    __slots__ = ("turn", "tool", "status", "phase", "tail", "_phase_lock", "_phase_revision")
 
     def __init__(self) -> None:
         self.turn = 0
         self.tool: str | None = None
         self.status = "working"
+        self.phase: str | None = None
+        self.tail: str | None = None
+        self._phase_lock = threading.Lock()
+        self._phase_revision = 0
+
+    def begin_provider_call(self) -> None:
+        """Publish the waiting state before a provider request starts."""
+        self._set_phase("waiting", None)
+
+    def observe_delta(self, phase: str, fragment: str) -> None:
+        """Publish one sanitized provider reasoning or output-text delta."""
+        tail = _phase_tail(fragment)
+        if phase not in {"thinking", "streaming"} or not tail:
+            return
+        self._set_phase(phase, tail)
+
+    def phase_snapshot(self) -> tuple[str | None, str | None, int]:
+        """Return the phase state and revision for the heartbeat publisher."""
+        with self._phase_lock:
+            return self.phase, self.tail, self._phase_revision
+
+    def _set_phase(self, phase: str, tail: str | None) -> None:
+        with self._phase_lock:
+            self.phase = phase
+            self.tail = tail
+            self._phase_revision += 1
+
+
+def _phase_tail(fragment: str) -> str:
+    """Return a safe, single-line, bounded provider delta tail."""
+    clean = sanitize_terminal_text(fragment, single_line=True).strip()
+    if len(clean) <= PHASE_TAIL_MAX_CHARS:
+        return clean
+    return clean[: PHASE_TAIL_MAX_CHARS - 1] + "…"
+
+
+def _delta_phase(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    kind = value.casefold().replace("-", "_")
+    if "reason" in kind or "think" in kind:
+        return "thinking"
+    if kind in {"text", "content", "output", "output_text", "streaming"} or (
+        "text" in kind and "delta" in kind
+    ):
+        return "streaming"
+    return None
+
+
+def _progress_delta_callback(progress: AgentProgress) -> Callable[..., None]:
+    """Adapt common provider delta callback shapes to ``AgentProgress``."""
+
+    def _on_delta(*args: Any, **kwargs: Any) -> None:
+        event_type: Any = kwargs.get("type") or kwargs.get("kind") or kwargs.get("phase")
+        fragment: Any = kwargs.get("delta") or kwargs.get("text") or kwargs.get("content")
+        values = list(args)
+        if values and isinstance(values[0], Mapping):
+            event = values[0]
+            event_type = event.get("type") or event.get("kind") or event_type
+            fragment = event.get("delta") or event.get("text") or event.get("content")
+        elif values:
+            if len(values) > 1 and _delta_phase(values[0]) is not None:
+                event_type, fragment = values[0], values[1]
+            elif len(values) > 1 and _delta_phase(values[1]) is not None:
+                event_type, fragment = values[1], values[0]
+            elif len(values) == 1:
+                fragment = values[0]
+            else:
+                event_type, fragment = values[0], values[1]
+        phase = "thinking" if kwargs.get("reasoning") is True else _delta_phase(event_type)
+        if phase is None and event_type is None:
+            phase = "streaming"
+        if phase is not None and isinstance(fragment, str):
+            progress.observe_delta(phase, fragment)
+
+    return _on_delta
+
+
+def _delta_callback_keyword(caller: Callable[..., Any]) -> str | None:
+    try:
+        parameters = inspect.signature(caller).parameters.values()
+    except (TypeError, ValueError):
+        return None
+    names = {parameter.name for parameter in parameters}
+    for name in ("on_delta", "on_stream_delta", "delta_callback"):
+        if name in names:
+            return name
+    if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters):
+        return "on_delta"
+    return None
+
+
+async def _call_provider(
+    caller: Callable[..., Any], progress: AgentProgress, *args: Any, **kwargs: Any
+) -> Any:
+    progress.begin_provider_call()
+    callback_keyword = _delta_callback_keyword(caller)
+    if callback_keyword is not None:
+        kwargs[callback_keyword] = _progress_delta_callback(progress)
+    return await caller(*args, **kwargs)
+
+
+def _observe_sse_line(line: bytes, on_delta: Callable[[str, str], None]) -> None:
+    if not line.startswith(b"data:"):
+        return
+    data = line[len(b"data:") :].strip()
+    if not data or data == b"[DONE]":
+        return
+    try:
+        event = json.loads(data)
+    except json.JSONDecodeError:
+        return
+    if not isinstance(event, Mapping):
+        return
+    phase = _delta_phase(event.get("type"))
+    delta = event.get("delta")
+    if phase is not None and isinstance(delta, str):
+        on_delta(phase, delta)
+
+
+def _read_provider_response_with_progress(
+    response: Any, provider: str, on_delta: Callable[[str, str], None]
+) -> bytes:
+    """Read SSE in chunks so Codex deltas can update worker progress live."""
+    limit = _diffundo_module.MAX_PROVIDER_RESPONSE_BYTES
+    body = bytearray()
+    line = bytearray()
+    read_chunk = getattr(response, "read1", None)
+    if not callable(read_chunk):
+        read_chunk = response.read
+    while True:
+        chunk = cast(bytes, read_chunk(min(16 * 1024, limit + 1 - len(body))))
+        if not chunk:
+            break
+        body.extend(chunk)
+        if len(body) > limit:
+            raise _diffundo_module.ProviderError(
+                provider,
+                _diffundo_module.ProviderOutcome.ERROR,
+                f"response exceeds {limit} byte limit",
+            )
+        line.extend(chunk)
+        while b"\n" in line:
+            index = line.index(b"\n")
+            _observe_sse_line(bytes(line[:index]).rstrip(b"\r"), on_delta)
+            del line[: index + 1]
+    if line:
+        _observe_sse_line(bytes(line).rstrip(b"\r"), on_delta)
+    return bytes(body)
+
+
+def _install_codex_progress_observer(router: Any, progress: AgentProgress) -> None:
+    """Observe buffered Codex SSE reads without changing Diffundo's API."""
+    if not isinstance(router, Diffundo):
+        return
+    codex_post = getattr(router, "_codex_post_sync", None)
+    if not callable(codex_post):
+        return
+
+    def _observed_codex_post(provider: Any, prompt: dict[str, Any], timeout_s: float) -> Any:
+        original_reader = _diffundo_module._read_provider_response
+
+        def _read(response: Any, provider_name: str) -> bytes:
+            return _read_provider_response_with_progress(
+                response, provider_name, progress.observe_delta
+            )
+
+        _diffundo_module._read_provider_response = _read
+        try:
+            return codex_post(provider, prompt, timeout_s)
+        finally:
+            _diffundo_module._read_provider_response = original_reader
+
+    router._codex_post_sync = _observed_codex_post
 
 
 def _cap_utf8(text: str, limit: int) -> str:
@@ -4332,6 +4511,7 @@ async def _run_agent_loop(
     turn_checkpoint_resumed = False
     provider_compat = provider_compat or {}
     provider_boundaries = provider_boundaries or {}
+    _install_codex_progress_observer(router, progress)
 
     def _sync_context_transcript() -> None:
         nonlocal transcript
@@ -4480,7 +4660,9 @@ async def _run_agent_loop(
                     summary_caller = getattr(router, "summary_call", None)
                     if callable(summary_caller):
                         assert summary_caller is not None
-                        summary_result = await cast(Callable[..., Any], summary_caller)(
+                        summary_result = await _call_provider(
+                            cast(Callable[..., Any], summary_caller),
+                            progress,
                             tier,
                             summary_prompt,
                             model=model,
@@ -4492,7 +4674,9 @@ async def _run_agent_loop(
                             allow_model_substitution=True,
                         )
                     else:
-                        summary_result = await router.call(
+                        summary_result = await _call_provider(
+                            router.call,
+                            progress,
                             tier,
                             summary_prompt,
                             model=model,
@@ -4940,7 +5124,14 @@ async def _run_agent_loop(
             # the epoch must describe the exact object Cambium submitted.
             sent_prompt = copy.deepcopy(prompt)
             try:
-                result = await router.call(tier, prompt, model=model, budget_usd=budget_usd)
+                result = await _call_provider(
+                    router.call,
+                    progress,
+                    tier,
+                    prompt,
+                    model=model,
+                    budget_usd=budget_usd,
+                )
             except Exception as exc:
                 failure_event = _failure_usage_event(
                     exc,
@@ -5855,33 +6046,62 @@ async def _heartbeat_loop(
     progress: AgentProgress | None = None,
     interval_s: float = HEARTBEAT_INTERVAL_S,
 ) -> None:
+    next_heartbeat = 0.0
+    published_phase: str | None = None
+    published_tail: str | None = None
+    published_revision = 0
+    last_phase_emit = float("-inf")
     while not stop.is_set():
+        now = time.monotonic()
+        heartbeat_due = now >= next_heartbeat
+        phase_due = False
+        if progress is not None:
+            phase, tail, revision = progress.phase_snapshot()
+            phase_due = (
+                phase is not None
+                and revision > published_revision
+                and (
+                    (phase != published_phase and heartbeat_due)
+                    or now - last_phase_emit >= PHASE_HEARTBEAT_INTERVAL_S
+                )
+            )
+            if phase_due:
+                published_phase, published_tail = phase, tail
+                published_revision = revision
+                last_phase_emit = now
+        if not heartbeat_due and not phase_due:
+            await asyncio.sleep(min(0.05, next_heartbeat - now))
+            continue
         turn = progress.turn if progress is not None else 0
         tool = progress.tool if progress is not None else None
         status = progress.status if progress is not None else "working"
+        heartbeat: dict[str, Any] = {
+            "type": "heartbeat",
+            "task_id": task_id,
+            "generation": generation,
+            "turn": turn,
+            "tool": tool,
+            "status": status,
+            "monotonic_ms": _monotonic_ms(),
+        }
+        if published_phase is not None:
+            heartbeat["phase"] = published_phase
+            if published_tail:
+                heartbeat["tail"] = published_tail
         await send(
             writer,
-            {
-                "type": "heartbeat",
-                "task_id": task_id,
-                "generation": generation,
-                "turn": turn,
-                "tool": tool,
-                "status": status,
-                "monotonic_ms": _monotonic_ms(),
-            },
+            heartbeat,
         )
+        if heartbeat_due:
+            next_heartbeat = time.monotonic() + interval_s
         if stop.is_set():
             # Observed the stop flag right after this send: exit at the safe
             # point (between iterations) instead of starting another send.
             break
         # Sleep in short slices so stop is observed promptly even when the
         # configured interval is large; the send cadence stays ~interval_s.
-        remaining = interval_s
-        while remaining > 0 and not stop.is_set():
-            step = min(0.05, remaining)
-            await asyncio.sleep(step)
-            remaining -= step
+        if heartbeat_due:
+            await asyncio.sleep(min(0.05, max(0.0, next_heartbeat - time.monotonic())))
 
 
 async def _emit_proposed_children(
