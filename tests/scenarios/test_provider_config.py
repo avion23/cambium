@@ -93,6 +93,15 @@ def test_valid_config_loads_without_key_in_environment(tmp_path: Path) -> None:
     assert providers[0].api_key_env == "CAMBIUM_PROVIDER_OPENAI_API_KEY"
 
 
+def test_enabled_defaults_to_true_when_omitted(tmp_path: Path) -> None:
+    entry = _provider()
+    del entry["enabled"]
+
+    providers = load_providers(_write(tmp_path / "providers.json", [entry]))
+
+    assert providers[0].enabled is True
+
+
 def test_explicit_source_overrides_environment_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
