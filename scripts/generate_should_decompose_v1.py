@@ -1355,7 +1355,7 @@ def neutral_decide(task: str, context: str) -> dict[str, object]:
     if not isinstance(output.get("reason"), str):
         raise SystemExit("module CLI returned no string 'reason'")
     confidence = output.get("confidence")
-    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+    if isinstance(confidence, bool) or not isinstance(confidence, int | float):
         raise SystemExit("module CLI returned no numeric 'confidence'")
     return output
 

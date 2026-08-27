@@ -242,7 +242,7 @@ def check_module(manifest) -> None:
             assert isinstance(exp.get(label), bool), f"{rid}: expected.{label}"
             assert isinstance(exp.get("reason"), str), f"{rid}: reason"
             assert (
-                isinstance(r["expected_confidence"], (int, float))
+                isinstance(r["expected_confidence"], int | float)
                 and 0 <= r["expected_confidence"] <= 1
             )
             assert isinstance(r["rationale_keywords"], list) and r["rationale_keywords"]
@@ -259,7 +259,7 @@ def check_module(manifest) -> None:
                 assert (
                     isinstance(rng, list)
                     and len(rng) == 2
-                    and all(isinstance(x, (int, float)) for x in rng)
+                    and all(isinstance(x, int | float) for x in rng)
                 )
     print(
         "envelope + module-schema checks passed "
