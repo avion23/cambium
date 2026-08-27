@@ -338,6 +338,11 @@ def _pad(text: str, width: int) -> str:
     return clean + " " * max(0, width - _display_width(clean))
 
 
+def _fmt_secs(seconds: float) -> str:
+    """Whole-second duration label; durations never render decimal delimiters."""
+    return f"{int(seconds)}s"
+
+
 def _human_count(value: int) -> str:
     if value < 1_000:
         return str(value)
@@ -1382,26 +1387,26 @@ class ActivityState:
             # Fixed-width numerals keep the row byte-stable across magnitude
             # changes (99.9->100.0) so no repaint ever leaves stale tails.
             label = (
-                f"{self._state} · running {tool_name} {tool_elapsed:6.1f}s "
-                f"· turn {turn_elapsed:7.1f}s · out/s={self._stream_rate:5.1f}"
+                f"{self._state} · running {tool_name} {_fmt_secs(tool_elapsed)} "
+                f"· turn {_fmt_secs(turn_elapsed)} · out/s={self._stream_rate:5.1f}"
             )
         elif self._cooldown is not None:
             provider, retry_after = self._cooldown
-            suffix = f" · {retry_after:6.1f}s" if retry_after is not None else ""
+            suffix = f" · {_fmt_secs(retry_after)}" if retry_after is not None else ""
             owner = f" · {provider}" if provider else ""
-            label = f"COOLDOWN{owner}{suffix} · turn {turn_elapsed:7.1f}s"
+            label = f"COOLDOWN{owner}{suffix} · turn {_fmt_secs(turn_elapsed)}"
         elif self._state == "STREAMING" or self._responding:
             elapsed = max(0.001, current - self._turn_started_at)
             rate = self._stream_rate or self._stream_tokens / elapsed
-            label = f"STREAMING · responding… {turn_elapsed:7.1f}s · out/s={rate:5.1f}"
+            label = f"STREAMING · responding… {_fmt_secs(turn_elapsed)} · out/s={rate:5.1f}"
         elif self._state == "DONE":
             return "✓ DONE"
         elif self._state == "ERROR":
             return "✗ ERROR"
         elif self._state == "SUSPENDED":
-            label = f"SUSPENDED · waiting… {turn_elapsed:7.1f}s"
+            label = f"SUSPENDED · waiting… {_fmt_secs(turn_elapsed)}"
         else:
-            label = f"WAITING · thinking… {turn_elapsed:7.1f}s"
+            label = f"WAITING · thinking… {_fmt_secs(turn_elapsed)}"
         return f"{_SPINNER_FRAMES[self._frame]} {label}"
 
     def tick(self, *, now: float | None = None) -> str:

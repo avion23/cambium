@@ -517,7 +517,7 @@ def test_status_strip_has_one_detail_row_and_hides_context_internals_from_spinne
         branch_line="branch: generation=4 turn=2 epoch=9",
         cumulative_line="usage: tokens=1100000",
         width=80,
-        activity_line="⠇ WAITING · thinking… 12.0s",
+        activity_line="⠇ WAITING · thinking… 12s",
     )
 
     assert len(rows) == 3
@@ -539,7 +539,7 @@ def test_detail_row_reports_traffic_and_context() -> None:
             "out/s=12.5 cost=$0.123456"
         ),
         width=220,
-        activity_line="⠦ WAITING · thinking… 2.6s",
+        activity_line="⠦ WAITING · thinking… 2s",
     )
 
     detail = rows[-1]
@@ -615,7 +615,7 @@ def test_tool_row_counts_failures_and_uses_compact_last_duration() -> None:
         branch_line="branch: turn=2",
         cumulative_line="usage: tokens=1100000",
         width=80,
-        activity_line="⠇ WAITING · thinking… 12.0s",
+        activity_line="⠇ WAITING · thinking… 12s",
     )
 
     assert rows[0].strip() == "✓ 3 tools · last run_shell 2.4s"
@@ -1646,14 +1646,14 @@ def test_activity_state_transitions_thinking_responding_tool_and_done() -> None:
 
     thinking = activity.render(now=10.0)
     assert thinking.startswith("⠋ ")
-    assert "thinking…     0.0s" in thinking
+    assert "thinking… 0s" in thinking
     assert activity.tick(now=10.1).startswith("⠙ ")
 
     activity.observe_event(
         {"kind": "assistant_delta", "payload": {"delta": "I will inspect this."}},
         now=11.0,
     )
-    assert "responding…     2.0s" in activity.render(now=12.0)
+    assert "responding… 2s" in activity.render(now=12.0)
 
     activity.observe_event(
         {
@@ -1663,8 +1663,8 @@ def test_activity_state_transitions_thinking_responding_tool_and_done() -> None:
         now=13.0,
     )
     running = activity.render(now=14.5)
-    assert "running run_shell    1.5s" in running
-    assert "turn     4.5s" in running
+    assert "running run_shell 1s" in running
+    assert "turn 4s" in running
     frame = render_cockpit(
         _snapshot(),
         Transcript(),
