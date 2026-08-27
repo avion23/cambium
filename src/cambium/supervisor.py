@@ -1353,7 +1353,7 @@ def _worker_environment(
         worktree=worktree,
         overrides=overrides,
     )
-    if spec.get("fanout_config"):
+    if spec.get("fanout_config") is not None:
         env["CAMBIUM_PROVIDERS"] = _provider_config_path(source, spec)
     if redactor is not None:
         for value in oauth_access_values:
@@ -2925,7 +2925,7 @@ class _Runtime:
         }
         if isinstance(spec.get("requirements"), dict) and spec["requirements"]:
             payload["requirements"] = dict(spec["requirements"])
-        if not spec.get("fanout_config"):
+        if spec.get("fanout_config") is None:
             write_marker = spec.get("write_marker", True)
             if not isinstance(write_marker, bool):
                 raise ValueError(f"task {spec['task_id']} write_marker must be a boolean")
@@ -3050,7 +3050,12 @@ class _Runtime:
         context limited to its own spec plus the parent's envelope — never
         sibling context or a parent transcript.
         """
-        request_id = proposal.get("request_id")
+        # The worker's run request identifies the whole model turn, so several
+        # delegate calls can legitimately carry the same wire id.  Admission
+        # is the durable identity boundary: allocate one supervisor id for
+        # every proposal that crosses it, including rejected revisions.
+        proposal = {**proposal, "request_id": self._next_rid()}
+        request_id = proposal["request_id"]
         parent_task_id = parent_spec["task_id"]
         child_task_id = proposal["child_task_id"]
         kind = proposal["kind"]
@@ -3519,7 +3524,12 @@ class _Runtime:
         return cast(dict[str, Any], redacted)
 
     async def _admit_port_proposals(
-        self, parent_spec: dict[str, Any], parent_envelope: dict[str, Any]
+        self,
+        parent_spec: dict[str, Any],
+        parent_envelope: dict[str, Any],
+        *,
+        failure_reason: str | None = None,
+        admit_proposals: bool = True,
     ) -> list[str]:
         """Feed one admitted parent's envelope to the decision port and admit its proposals.
 
@@ -3530,6 +3540,9 @@ class _Runtime:
         ``child_rejected`` and spawns nothing. A finished task outside the
         port's decision domain (unknown to its tree) yields no wave: the port
         has nothing to propose for it. Returns the admitted child task ids.
+        ``failure_reason`` is decision-only metadata and never widens the
+        strict envelope passed to ``aggregate``. Failure observations set
+        ``admit_proposals`` false so they cannot spawn after a failed parent.
         """
         parent_task_id = parent_spec["task_id"]
         malformed: str | None = None
@@ -3539,13 +3552,16 @@ class _Runtime:
                 self._admission_port.aggregate(parent_task_id, parent_envelope)
             except ValueError:
                 return []
+            decision_payload = dict(parent_envelope)
+            if failure_reason is not None:
+                decision_payload["failure_reason"] = failure_reason
             try:
                 proposals = await self._admission_port.step(
                     [
                         {
                             "kind": "child_result",
                             "task_id": parent_task_id,
-                            "payload": dict(parent_envelope),
+                            "payload": decision_payload,
                         }
                     ]
                 )
@@ -3561,6 +3577,8 @@ class _Runtime:
                 reason="MalformedProposal",
                 message=f"decision port error: {malformed}"[:512],
             )
+            return []
+        if not admit_proposals:
             return []
         admitted: list[str] = []
         for proposal in proposals:
@@ -3593,6 +3611,7 @@ class _Runtime:
     ) -> None:
         """Durably reject proposals that cannot cross a terminal boundary."""
         for proposal in proposals:
+            proposal = {**proposal, "request_id": self._next_rid()}
             child_task_id = _wire_str(proposal.get("child_task_id"))
             child_kind = _wire_str(proposal.get("kind"))
             await self.emit(
@@ -3623,6 +3642,7 @@ class _Runtime:
         proposals: Sequence[dict[str, Any]],
         *,
         include_port: bool,
+        failure_reason: str | None = None,
         private_integration_base: str | None = None,
     ) -> list[str]:
         """Admit proposals after the permitted parent lifecycle verdict."""
@@ -3637,7 +3657,13 @@ class _Runtime:
                 )
             )
         if include_port and self._admission_port is not None:
-            admitted.extend(await self._admit_port_proposals(parent_spec, parent_envelope))
+            admitted.extend(
+                await self._admit_port_proposals(
+                    parent_spec,
+                    parent_envelope,
+                    failure_reason=failure_reason,
+                )
+            )
         return admitted
 
     async def _admit_port_proposal(
@@ -3661,6 +3687,7 @@ class _Runtime:
             return []
         invalid_fields = _invalid_propose_child_fields(proposal)
         if invalid_fields:
+            proposal = {**proposal, "request_id": self._next_rid()}
             await self.emit(
                 "child_rejected",
                 task_id=parent_task_id,
@@ -3679,6 +3706,7 @@ class _Runtime:
             )
             return []
         if proposal.get("parent_task_id") != parent_task_id:
+            proposal = {**proposal, "request_id": self._next_rid()}
             await self.emit(
                 "child_rejected",
                 task_id=parent_task_id,
@@ -4242,6 +4270,9 @@ class _Runtime:
                         if outcome.envelope is not None
                         else {}
                     )
+                    decision_failure_reason = _envelope_text(
+                        sanitized_envelope, "failure_reason"
+                    )
                     if envelope_status == "suspended" and not self._context_reuse:
                         # Fail closed: without the flag a suspended verdict is
                         # an unsupported status, never a resume loop.
@@ -4363,6 +4394,13 @@ class _Runtime:
                             or _envelope_text(sanitized_envelope, "failure_reason")
                             or "worker_verdict_failed"
                         )
+                        if self._admission_port is not None:
+                            await self._admit_port_proposals(
+                                spec,
+                                parent_envelope,
+                                failure_reason=decision_failure_reason or failure_reason,
+                                admit_proposals=False,
+                            )
                         await self._reject_child_proposals(
                             task_id,
                             outcome.proposals,
@@ -4443,6 +4481,7 @@ class _Runtime:
                             parent_envelope,
                             outcome.proposals,
                             include_port=True,
+                            failure_reason=decision_failure_reason,
                         )
                         if spec.get("parent_task_id") is not None:
                             self._capture_child_result(
@@ -4480,6 +4519,7 @@ class _Runtime:
                             parent_envelope,
                             outcome.proposals,
                             include_port=True,
+                            failure_reason=decision_failure_reason,
                         )
                         if spec.get("parent_task_id") is not None:
                             self._capture_child_result(
@@ -4735,7 +4775,7 @@ class _Runtime:
             # accepts a rebind init instead of exiting. 0 disables the pool
             # and keeps the single-init worker behavior unchanged.
             init_msg["worker_reuse"] = True
-        if spec.get("fanout_config"):
+        if spec.get("fanout_config") is not None:
             init_msg["fanout_config"] = spec["fanout_config"]
             init_msg["provider_env_keys"] = sorted(_provider_env_keys(spec))
         if isinstance(spec.get("assigned_provider"), str):
