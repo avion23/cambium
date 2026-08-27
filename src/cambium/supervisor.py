@@ -2821,18 +2821,11 @@ class _Runtime:
         if not isinstance(task_id, str) or not task_id:
             return None
         directory = (
-            self._session_dir.resolve()
-            / ".cambium"
-            / "checkpoints"
-            / _safe_task_id(task_id)
+            self._session_dir.resolve() / ".cambium" / "checkpoints" / _safe_task_id(task_id)
         )
         try:
             candidates = sorted(
-                (
-                    path
-                    for path in directory.iterdir()
-                    if path.is_file() and not path.is_symlink()
-                ),
+                (path for path in directory.iterdir() if path.is_file() and not path.is_symlink()),
                 key=lambda path: int(path.stem.removeprefix("turn-"))
                 if re.fullmatch(r"turn-[0-9]+", path.stem)
                 else -1,
@@ -3044,9 +3037,7 @@ class _Runtime:
 
                 handle = self._handles.get(task_id)
                 cleanup_generation = (
-                    handle.generation
-                    if handle is not None
-                    else read_generation(worktree)
+                    handle.generation if handle is not None else read_generation(worktree)
                 )
                 await self._salvage_worktree(
                     spec,
@@ -4612,9 +4603,7 @@ class _Runtime:
                         if outcome.envelope is not None
                         else {}
                     )
-                    decision_failure_reason = _envelope_text(
-                        sanitized_envelope, "failure_reason"
-                    )
+                    decision_failure_reason = _envelope_text(sanitized_envelope, "failure_reason")
                     if envelope_status == "suspended" and not self._context_reuse:
                         # Fail closed: without the flag a suspended verdict is
                         # an unsupported status, never a resume loop.

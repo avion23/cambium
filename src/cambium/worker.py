@@ -232,6 +232,8 @@ def _join_checkpoint_payload(data: dict[str, Any]) -> dict[str, Any]:
     joined["schema"] = data.get("schema", CHECKPOINT_EPOCH_SCHEMA)
     joined.update(data.get("content") or {})
     return joined
+
+
 # Start synthesis before the hard ceiling so a bounded terminal response can
 # still be produced instead of discarding the action that crossed the edge.
 SOFT_TOKEN_CAP_RATIO = 0.9

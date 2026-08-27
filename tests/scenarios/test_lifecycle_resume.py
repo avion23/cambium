@@ -22,9 +22,7 @@ TEST_RESOURCE_THRESHOLDS = {
 def _make_repo(repo: Path) -> str:
     subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
     subprocess.run(["git", "-C", str(repo), "config", "user.name", "lifecycle-test"], check=True)
-    subprocess.run(
-        ["git", "-C", str(repo), "config", "user.email", "lifecycle@test"], check=True
-    )
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "lifecycle@test"], check=True)
     (repo / "state.txt").write_text("base\n", encoding="utf-8")
     subprocess.run(["git", "-C", str(repo), "add", "state.txt"], check=True)
     subprocess.run(
