@@ -287,25 +287,3 @@ the active projection (`src/cambium/summary_trunk.py:670-735`,
 segment/token bounds and resets the prompt baseline. `k0_rollover_decision`
 computes an economic break-even decision, but it is a library-only path; the
 live worker uses thresholds (`src/cambium/summary_trunk.py:769-818`).
-
-## 8. Current Cambium implementation
-
-Implemented:
-
-- append-only, disjoint semantic summary segments;
-- runtime-stamped segment identity;
-- durable raw history and immutable checkpoints;
-- exact-context-eligible child forks, with provider hits reported separately;
-- cold cross-provider semantic-summary forks;
-- thresholded K0 rollover with a durable source manifest;
-- a persistent interactive TUI branch composed from isolated supervisor leaves;
-- per-agent usage, throughput, provider/model, trunk, tail, epoch, and lineage
-  views (`src/cambium/tui_screen.py:2325-2341`,
-  `src/cambium/tui_screen.py:2447-2457`).
-
-Still empirical or future work:
-
-- provider-specific cache-block calibration;
-- adaptive `K0` break-even selection and held-out quality canaries;
-- structured automatic resolver children for every Git conflict class;
-- workload-specific measurement of the library-only break-even policy.
