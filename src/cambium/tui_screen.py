@@ -4013,24 +4013,6 @@ class Cockpit:
             return
         snapshot, transcript, session_description, branch_line, cumulative_line, _, _ = request
         conversation_width = _frame_content_width(self._last_size.columns)
-        conversation_rows = tuple(
-            _primary_rows(transcript, conversation_width, color=self.color)
-        )
-        conversation_capacity = max(1, self._last_size.lines - _frame_overhead(self._show_detail))
-        rail_width = _rail_width(self._last_size.columns)
-        rail_rows = (
-            tuple(
-                _rail_rows(
-                    snapshot,
-                    rail_width,
-                    conversation_capacity,
-                    activity_line=self._activity_line,
-                )
-            )
-            if rail_width
-            else ()
-        )
-        self._redraw_rail(conversation_rows, rail_rows)
         status_rows = tuple(
             _status_rows(
                 snapshot,
@@ -4045,10 +4027,7 @@ class Cockpit:
         )
         self._redraw_bottom(request, status_rows)
         self._last_request = request
-        self._last_primary_rows = _primary_request_rows(conversation_rows, rail_rows)
-        self._last_conversation_rows = conversation_rows
         self._last_status_rows = status_rows
-        self._last_rail_rows = rail_rows
 
     def move_to_input(self, *, label: str = "›", native: bool = False) -> None:
         if not self.enabled:
