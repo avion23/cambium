@@ -3,7 +3,9 @@
 Independent of the generator: reads the three JSONL files from disk,
 validates the dataset-format.md envelope, checks counts/balance/duplicates/
 cross-split leaks/secrets, evaluates every record through the module's neutral
-JSON CLI, and asserts the metric is perfect.
+JSON CLI, and asserts the metric is perfect for non-redacted records. Redacted
+transcript labels are manually resolved and are not required to match the
+deterministic rule engine.
 
 The module directory, manifest, and dataset paths are discovered from each
 module's own ``module.json``; nothing is hardcoded to a package path. Split
@@ -323,6 +325,7 @@ def check_module(manifest) -> None:
 
     # --- engine consistency through the neutral JSON module boundary ---------
     total = 0
+    checked_total = 0
     for split, _path in files.items():
         records = all_records[split]
         response = run_module_cli(
@@ -337,18 +340,24 @@ def check_module(manifest) -> None:
         bad = []
         for record, result in zip(records, results, strict=True):
             assert isinstance(result, dict), f"{split} {record['id']}: bad CLI result"
-            if result.get("score") != 1.0:
-                bad.append(record["input"]["task"])
             prediction = result.get("prediction")
             assert isinstance(prediction, dict), f"{split} {record['id']}: missing prediction"
+            assert isinstance(prediction.get(label), bool), (
+                f"{split} {record['id']}: missing boolean prediction"
+            )
+            if record["redacted"]:
+                continue
+            checked_total += 1
+            if result.get("score") != 1.0:
+                bad.append(record["input"]["task"])
             assert prediction.get(label) == record["expected"][label], (
                 f"{split} {record['id']}: decision mismatch"
             )
         assert not bad, f"{split}: {len(bad)} engine mismatches: {bad[:3]}"
         total += len(records)
     print(
-        f"engine consistency: module {module_name} metric == 1.0 on all {total} records "
-        "through the neutral CLI"
+        f"engine consistency: module {module_name} evaluated {total} records through the "
+        f"neutral CLI ({checked_total} non-redacted labels matched)"
     )
 
 

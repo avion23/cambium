@@ -5619,6 +5619,15 @@ async def _run_agent_loop(
                     "compaction_deferred": compaction_deferred,
                 }
             name, arguments = action["name"], action["arguments"]
+            if not final_synthesis_call and budget_new_tokens > config.max_tokens:
+                return _loop_result(
+                    outcome,
+                    "failed",
+                    _phase_failure("token budget exceeded", final_synthesis=final_synthesis_call),
+                    turn,
+                    cumulative_usage,
+                    transcript,
+                )
             denial = _permission_denied(name, arguments, config)
             if denial is not None:
                 denied_messages = [
