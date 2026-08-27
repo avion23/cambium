@@ -217,7 +217,7 @@ def _write_restart_worker(path: Path, wire_log: Path, prompt_log: Path, init_log
             def append(path, value):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 with path.open("a", encoding="utf-8") as stream:
-                    stream.write(json.dumps(value, sort_keys=True) + "\n")
+                    stream.write(json.dumps(value, sort_keys=True) + "\\n")
 
             class Writer:
                 def write(self, data):
@@ -270,7 +270,7 @@ def _write_restart_worker(path: Path, wire_log: Path, prompt_log: Path, init_log
                 async def call(self, _tier, prompt, **_kwargs):
                     last = prompt["messages"][-1].get("content", "")
                     is_summary = isinstance(last, str) and last.startswith(
-                        "<cambium-summary-control>\n"
+                        "<cambium-summary-control>\\n"
                     )
                     append(PROMPTS, {
                         "generation": self.generation,
@@ -282,8 +282,8 @@ def _write_restart_worker(path: Path, wire_log: Path, prompt_log: Path, init_log
                         if self.generation == 1:
                             return Result("{}{}")
                         control = json.loads(
-                            last.removeprefix("<cambium-summary-control>\n").removesuffix(
-                                "\n</cambium-summary-control>"
+                            last.removeprefix("<cambium-summary-control>\\n").removesuffix(
+                                "\\n</cambium-summary-control>"
                             )
                         )
                         return Result(summary(control))
@@ -316,7 +316,7 @@ def _write_restart_worker(path: Path, wire_log: Path, prompt_log: Path, init_log
                 configured["rolling_compact_threshold_high"] = 1
                 configured["rolling_compact_threshold_low"] = 1
                 config = worker.AgentConfig.from_init(configured)
-                config = worker._merge_task_config(config, init, run)
+                config = worker._merge_task_config(config, configured, run)
                 outcome = await worker._run_agent_loop(
                     config=config,
                     router=Router(generation),
@@ -354,13 +354,6 @@ def _write_restart_worker(path: Path, wire_log: Path, prompt_log: Path, init_log
     )
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "source gap: worker.py:3278-3286 does not checkpoint deferred state and "
-        "worker.py:4902-4921 restores only the turn transcript"
-    ),
-)
 def test_deferred_compaction_survives_stall_restart_and_later_folds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -408,7 +401,7 @@ def test_deferred_compaction_survives_stall_restart_and_later_folds(
         "worker": str(restart_worker),
         "provider_env_keys": [],
         "heartbeat_interval_s": 0.02,
-        "heartbeat_timeout_s": 0.12,
+        "heartbeat_timeout_s": 1.0,
         "ready_timeout_s": 2.0,
         "max_wall_s": 10.0,
         "max_restarts": 1,
@@ -422,6 +415,16 @@ def test_deferred_compaction_survives_stall_restart_and_later_folds(
     deferred = [message for message in wire if message.get("type") == "compaction_deferred"]
     assert len(deferred) == 1
     assert len(deferred[0]["reason"].encode()) <= worker.MAX_ENVELOPE_FIELD_CHARS
+    checkpoint = json.loads(
+        (
+            session
+            / ".cambium"
+            / "checkpoints"
+            / "compaction-resume"
+            / "turn-001.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert checkpoint["compaction_deferred"] is True
 
     inits = [json.loads(line) for line in init_log.read_text(encoding="utf-8").splitlines()]
     assert len(inits) == 2
