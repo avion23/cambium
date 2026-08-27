@@ -177,6 +177,8 @@ _TOOL_ERROR_PREFIX = "tool errors:"
 _LIVE_DRAW_INTERVAL = 0.1
 
 _SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+_ACTIVITY_PHASE_GLYPHS = {"thinking": "◌", "streaming": "▸", "waiting": "…"}
+_ACTIVITY_TAIL_MAX_CHARS = 120
 _FIRST_TOKEN_KINDS = frozenset(
     {
         "assistant_first_token",
@@ -266,6 +268,13 @@ def _is_tty(stream: Any) -> bool:
 
 def _sanitize(value: Any) -> str:
     return sanitize_terminal_text(value)
+
+
+def _activity_tail(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    clean = sanitize_terminal_text(value, single_line=True).strip()
+    return _clip(clean, _ACTIVITY_TAIL_MAX_CHARS) if clean else ""
 
 
 def _safe_rendered(text: Any) -> str:
@@ -547,11 +556,14 @@ def _tool_line(
     glyph = "✓" if entry.tool_ok else "✗" if entry.tool_ok is not None else "•"
     name = entry.tool_name or "?"
     if count > 1:
-        line = f"{glyph} {name} ×{count}"
-        duration = _format_duration(last_duration_ms)
-        return f"{line} · last {duration}" if duration else line
-    duration = _format_duration(entry.duration_ms)
-    return f"{glyph} {name} {duration}".rstrip() if duration else f"{glyph} {name}"
+        duration = (
+            _format_duration(last_duration_ms) if _usage_float(last_duration_ms) > 0 else ""
+        )
+        prefix = f"{duration:>7} " if duration else ""
+        return f"{prefix}{glyph} {name} ×{count}"
+    duration = _format_duration(entry.duration_ms) if _usage_float(entry.duration_ms) > 0 else ""
+    prefix = f"{duration:>7} " if duration else ""
+    return f"{prefix}{glyph} {name}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1120,6 +1132,8 @@ class ActivityState:
         self._cooldown: tuple[str | None, float | None] | None = None
         self._next_tool_id = 0
         self._tools: dict[str, tuple[str, float]] = {}
+        self._heartbeat_phase: str | None = None
+        self._heartbeat_tail = ""
 
     @property
     def active(self) -> bool:
@@ -1143,6 +1157,8 @@ class ActivityState:
         self._cooldown = None
         self._next_tool_id = 0
         self._tools.clear()
+        self._heartbeat_phase = None
+        self._heartbeat_tail = ""
 
     def stop(self) -> None:
         """Stop the line without leaving stale tool state for a later turn."""
@@ -1320,6 +1336,19 @@ class ActivityState:
             elapsed = max(0.001, event_now - self._turn_started_at)
             self._stream_rate = self._stream_tokens / elapsed
 
+    def _observe_heartbeat(self, data: Mapping[str, Any]) -> bool:
+        phase = data.get("phase")
+        if not isinstance(phase, str):
+            return False
+        phase = phase.casefold().replace("_", "-")
+        if phase not in _ACTIVITY_PHASE_GLYPHS:
+            return False
+        self._heartbeat_phase = phase
+        self._heartbeat_tail = _activity_tail(data.get("tail")) if phase != "waiting" else ""
+        self._state = "STREAMING" if phase == "streaming" else "WAITING"
+        self._responding = phase == "streaming"
+        return True
+
     def observe_event(self, record: Mapping[str, Any], *, now: float | None = None) -> None:
         """Fold one synthetic or durable event into the activity view."""
         if not self._active:
@@ -1361,6 +1390,9 @@ class ActivityState:
             self._tools.clear()
             return
 
+        if kind == "heartbeat" and self._observe_heartbeat(data):
+            return
+
         if self._is_tool_start(kind, data):
             self._start_tool(data, event_now)
             return
@@ -1384,6 +1416,12 @@ class ActivityState:
             self._frame = (self._frame + 1) % len(_SPINNER_FRAMES)
         current = time.monotonic() if now is None else now
         turn_elapsed = max(0.0, current - self._turn_started_at)
+        if self._heartbeat_phase is not None:
+            line = f"{_ACTIVITY_PHASE_GLYPHS[self._heartbeat_phase]} {self._heartbeat_phase} "
+            line += _fmt_secs(turn_elapsed)
+            if self._heartbeat_tail:
+                line += f" · {self._heartbeat_tail}"
+            return line
         tool = next(
             (self._tools[key] for key in reversed(self._tools)),
             None,
@@ -2033,16 +2071,11 @@ def _transcript_block_kind(block: list[tuple[str, str]]) -> str:
     if not block:
         return ""
     role, text = block[0]
-    if role == "tool" or text.lstrip().startswith(("✓ ", "✗ ", "• ", _TOOL_ERROR_PREFIX)):
+    if role in {"tool", "dim"} or text.lstrip().startswith(
+        ("✓ ", "✗ ", "• ", _TOOL_ERROR_PREFIX)
+    ):
         return "tool"
     return role
-
-
-def _rendered_row_is_tool(row: tuple[str, str]) -> bool:
-    role, text = row
-    return role == "tool" or _visible(text).lstrip().startswith(
-        ("✓ ", "✗ ", "• ", _TOOL_ERROR_PREFIX)
-    )
 
 
 def _stream_lines(
@@ -2092,7 +2125,7 @@ def _transcript_lines(
             color=color,
         ):
             kind = _transcript_block_kind(block)
-            if history and kind != previous_kind and kind != "tool" and previous_kind != "tool":
+            if history and kind == "tool" and previous_kind != "tool":
                 history.append(("system", ""))
             history.extend(block)
             previous_kind = kind
@@ -2102,14 +2135,6 @@ def _transcript_lines(
             except StopIteration:
                 break
         rendered = history[-remaining:]
-    if (
-        active
-        and rendered
-        and rendered[-1][0] != active[0][0]
-        and not _rendered_row_is_tool(rendered[-1])
-        and not _rendered_row_is_tool(active[0])
-    ):
-        rendered.append(("system", ""))
     rendered.extend(active)
     if not rendered:
         rendered = [("system", _clip(" Waiting for a prompt. Type /help for commands.", width))]
@@ -2964,7 +2989,18 @@ def _primary_status_line(
 
 def _activity_status(snapshot: Any, activity_line: str) -> str:
     """Reduce the verbose activity ticker to a single state-and-duration pair."""
-    clean = _side_clean(activity_line).strip()
+    clean = sanitize_terminal_text(activity_line, single_line=True).strip()
+    phase_match = re.match(
+        r"^[◌▸…]\s+(thinking|streaming|waiting)\s+(\d+(?:\.\d+)?)s(?:\s+·\s*(.*))?$",
+        clean,
+        re.IGNORECASE,
+    )
+    if phase_match is not None:
+        phase = phase_match.group(1).casefold()
+        line = f"{_ACTIVITY_PHASE_GLYPHS[phase]} {phase} "
+        line += _fmt_secs(_usage_float(phase_match.group(2)))
+        tail = _activity_tail(phase_match.group(3)) if phase != "waiting" else ""
+        return f"{line} · {tail}" if tail else line.rstrip()
     spinner = next((frame for frame in _SPINNER_FRAMES if clean.startswith(frame)), "⠋")
     upper = clean.upper()
     if "✗" in clean or "ERROR" in upper:
