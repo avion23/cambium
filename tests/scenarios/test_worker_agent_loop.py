@@ -37,6 +37,9 @@ class _FakeWriter:
     async def drain(self) -> None:
         pass
 
+    def messages(self) -> list[dict[str, Any]]:
+        return [json.loads(line) for line in self.lines if line.strip()]
+
 
 class _FakeCallResult:
     def __init__(
@@ -54,6 +57,12 @@ class _FakeCallResult:
         self.usage = usage or {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
         self.provider = provider
         self.latency_s = latency_s
+        self.estimated_cost_usd = 0.0
+        self.retry_after_s: float | None = None
+        self.request_rate_status: str | None = None
+        self.account_quota_owner: str | None = None
+        self.prompt_prefix_bytes: int | None = None
+        self.provider_cache_hit: bool | None = None
         self.fell_back_from = fell_back_from
 
 
@@ -104,8 +113,20 @@ class _UsageScriptedRouter(_ScriptedRouter):
 class _SummaryFlushRouter:
     """Router double that requires substitution authorization for summaries."""
 
-    def __init__(self, *, all_providers_dead: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        all_providers_dead: bool = False,
+        malformed_summaries: int = 0,
+        responses: list[str] | None = None,
+    ) -> None:
         self.all_providers_dead = all_providers_dead
+        self.malformed_summaries = malformed_summaries
+        self.responses = (
+            list(responses)
+            if responses is not None
+            else ['{"type":"finish","summary":"done"}']
+        )
         self.prompts: list[dict[str, Any]] = []
         self.allow_model_substitution: list[bool] = []
 
@@ -135,6 +156,14 @@ class _SummaryFlushRouter:
                 raise AssertionError("summary calls must authorize model substitution")
             if self.all_providers_dead:
                 raise RuntimeError("all summary providers failed")
+            if self.malformed_summaries:
+                self.malformed_summaries -= 1
+                return _FakeCallResult(
+                    "{}{}",
+                    model="healthy-model",
+                    provider="healthy-substitute",
+                    fell_back_from="dead-primary",
+                )
             control = json.loads(
                 last_content.removeprefix("<cambium-summary-control>\n").removesuffix(
                     "\n</cambium-summary-control>"
@@ -163,8 +192,10 @@ class _SummaryFlushRouter:
                 provider="healthy-substitute",
                 fell_back_from="dead-primary",
             )
+        if not self.responses:
+            raise AssertionError("router call with no scripted response")
         return _FakeCallResult(
-            '{"type":"finish","summary":"done"}',
+            self.responses.pop(0),
             model="dead-model",
             provider="dead-primary",
         )
@@ -224,7 +255,11 @@ def _agent_config(worktree: Path, **overrides: Any) -> worker.AgentConfig:
 
 
 async def _drive_loop(
-    config: worker.AgentConfig, worktree: Path, router: _ScriptedRouter
+    config: worker.AgentConfig,
+    worktree: Path,
+    router: _ScriptedRouter,
+    writer: _FakeWriter | None = None,
+    run_request_id: str | None = None,
 ) -> dict[str, Any]:
     return await worker._run_agent_loop(
         config=config,
@@ -232,9 +267,10 @@ async def _drive_loop(
         tier=ProviderTier.FAST,
         model="loopback-model",
         worktree=worktree,
-        writer=None,
+        writer=writer,  # type: ignore[arg-type]
         stop=threading.Event(),
         progress=worker.AgentProgress(),
+        run_request_id=run_request_id,
     )
 
 
@@ -279,6 +315,92 @@ def test_summary_flush_all_providers_dead_fails_cleanly(tmp_path: Path) -> None:
         "compaction_failed: summary provider call failed: RuntimeError"
     )
     assert router.allow_model_substitution == [False, True]
+
+
+def test_malformed_summary_defers_and_task_completes(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = _make_worktree(repo)
+    config = _agent_config(
+        worktree,
+        context_reuse=True,
+        rolling_compact=True,
+        rolling_compact_threshold_high=1,
+        rolling_compact_threshold_low=1,
+        checkpoint_root=tmp_path / "checkpoints",
+        max_turns=10,
+    )
+    writer = _FakeWriter()
+    router = _SummaryFlushRouter(
+        malformed_summaries=1,
+        responses=[
+            '{"type":"plan","steps":["continue"]}',
+            '{"type":"finish","summary":"done"}',
+        ],
+    )
+
+    outcome = asyncio.run(
+        _drive_loop(config, worktree, router, writer, "deferred-once")  # type: ignore[arg-type]
+    )
+
+    assert outcome["status"] == "succeeded"
+    deferred = [
+        message for message in writer.messages() if message["type"] == "compaction_deferred"
+    ]
+    assert deferred == [
+        {
+            "type": "compaction_deferred",
+            "request_id": "deferred-once",
+            "task_id": "loop-agent",
+            "generation": 1,
+            "epoch": 1,
+            "reason": "summary response must be exactly one JSON object",
+        }
+    ]
+    assert not any(message["type"] == "compaction_failed" for message in writer.messages())
+
+
+def test_two_malformed_summaries_fail_on_the_third_fold_attempt(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = _make_worktree(repo)
+    config = _agent_config(
+        worktree,
+        context_reuse=True,
+        rolling_compact=True,
+        rolling_compact_threshold_high=1,
+        rolling_compact_threshold_low=1,
+        checkpoint_root=tmp_path / "checkpoints",
+        max_turns=10,
+    )
+    writer = _FakeWriter()
+    router = _SummaryFlushRouter(
+        malformed_summaries=3,
+        responses=[
+            '{"type":"plan","steps":["first"]}',
+            '{"type":"plan","steps":["second"]}',
+            '{"type":"plan","steps":["third"]}',
+        ],
+    )
+
+    outcome = asyncio.run(
+        _drive_loop(config, worktree, router, writer, "deferred-twice")  # type: ignore[arg-type]
+    )
+
+    assert outcome["status"] == "failed"
+    assert outcome["failure_reason"] == (
+        "compaction_failed: summary response must be exactly one JSON object"
+    )
+    messages = writer.messages()
+    assert len([message for message in messages if message["type"] == "compaction_deferred"]) == 2
+    assert len([message for message in messages if message["type"] == "compaction_failed"]) == 1
+    assert len(
+        [
+            prompt
+            for prompt in router.prompts
+            if str(prompt["messages"][-1].get("content", "")).startswith(
+                "<cambium-summary-control>\n"
+            )
+        ]
+    ) == 3
 
 
 # ---------------------------------------------------------------------------

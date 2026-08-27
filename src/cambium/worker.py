@@ -179,6 +179,8 @@ MAX_SUMMARY_CHARS = 2_000
 # Consecutive non-novel actions (valid plans, tool calls, and
 # invalid/unparseable actions) before the agent loop fails fast.
 MAX_NO_PROGRESS_ACTIONS = 2
+# Do not retry a provider that keeps returning invalid semantic summaries.
+MAX_CONSECUTIVE_COMPACTION_DEFERRALS = 2
 DEFAULT_PROGRESS_WINDOW = 3
 MAX_DIFF_BYTES = 64 * 1024  # 64 KiB bounded upward diff envelope.
 DEFAULT_MAX_TURNS = 50
@@ -2735,6 +2737,23 @@ class _ProgressDetector:
             and self.no_progress_actions >= self.max_no_progress_actions
         )
 
+    def restore(self, messages: Sequence[Mapping[str, Any]]) -> None:
+        """Seed recent assistant signatures from a resumed checkpoint."""
+        for message in messages:
+            if message.get("role") != "assistant":
+                continue
+            content = message.get("content")
+            if not isinstance(content, str):
+                continue
+            try:
+                action = _parse_agent_action(content)
+            except ValueError:
+                signature = _progress_signature(content)
+            else:
+                signature = _progress_signature(None, action=action)
+            if signature:
+                self._recent_signatures.append(signature)
+
 
 def _context_state_message(
     *,
@@ -3525,6 +3544,31 @@ async def _emit_compaction_failed(
     )
 
 
+async def _emit_compaction_deferred(
+    writer: asyncio.StreamWriter,
+    config: AgentConfig,
+    *,
+    request_id: str,
+    epoch: int,
+    reason: str,
+) -> None:
+    safe_reason = _cap_utf8(reason, MAX_ENVELOPE_FIELD_CHARS)
+    if config.redactor is not None:
+        safe_reason = config.redactor.redact_escaped(safe_reason)
+        safe_reason = _cap_utf8(safe_reason, MAX_ENVELOPE_FIELD_CHARS)
+    await send(
+        writer,
+        {
+            "type": "compaction_deferred",
+            "request_id": request_id,
+            "task_id": config.task_id,
+            "generation": config.generation,
+            "epoch": epoch,
+            "reason": safe_reason,
+        },
+    )
+
+
 def _load_epoch_checkpoint(
     config: AgentConfig, checkpoint_ref: str, *, expect_task_id: bool
 ) -> ContextCheckpoint:
@@ -4081,6 +4125,7 @@ async def _run_agent_loop(
     epoch_count = 0
     current_epoch_checkpoint: ContextCheckpoint | None = None
     compaction_armed = True
+    consecutive_compaction_deferrals = 0
     usage_epoch: int | None = None
     usage_fork_of: str | None = None
     first_turn = 1
@@ -4163,6 +4208,7 @@ async def _run_agent_loop(
         nonlocal epoch_count, compaction_armed, usage_epoch, cumulative_usage
         nonlocal budget_new_tokens, previous_prompt_tokens
         nonlocal previous_usage_source
+        nonlocal consecutive_compaction_deferrals
 
         if base_messages is None:
             return False, None
@@ -4340,7 +4386,22 @@ async def _run_agent_loop(
                         "token budget exceeded during summary flush", final_synthesis=True
                     )
                 )
-            summary_entry = parse_summary_response(summary_result.content, expectation)
+            try:
+                summary_entry = parse_summary_response(summary_result.content, expectation)
+            except SummaryTrunkError as exc:
+                if consecutive_compaction_deferrals >= MAX_CONSECUTIVE_COMPACTION_DEFERRALS:
+                    raise
+                consecutive_compaction_deferrals += 1
+                deferred_reason = str(exc).strip() or exc.__class__.__name__
+                if writer is not None:
+                    await _emit_compaction_deferred(
+                        writer,
+                        config,
+                        request_id=request_id,
+                        epoch=max(1, prior_epoch),
+                        reason=deferred_reason,
+                    )
+                return False, None
             new_trunk = append_summary_entry(trunk_messages, summary_entry)
             before_entries = summary_entries(new_trunk)
             before_tokens = summary_trunk_tokens(new_trunk)
@@ -4416,6 +4477,7 @@ async def _run_agent_loop(
         epoch_count = checkpoint.epoch
         usage_epoch = checkpoint.epoch
         compaction_armed = True
+        consecutive_compaction_deferrals = 0
         _sync_context_transcript()
         if writer is not None:
             if local_checkpoint:
@@ -4473,6 +4535,7 @@ async def _run_agent_loop(
         verified_after_change = resume_checkpoint.verified_after_change and not workspace_changed
         verification_failed = False if workspace_changed else resume_checkpoint.verification_failed
         no_progress_actions = resume_checkpoint.no_progress_actions
+        progress_detector.restore(resume_checkpoint.full_messages)
         progress_detector.no_progress_actions = no_progress_actions
         budget_new_tokens = resume_checkpoint.budget_new_tokens
         previous_prompt_tokens = resume_checkpoint.previous_prompt_tokens
