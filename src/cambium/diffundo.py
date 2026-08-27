@@ -46,9 +46,11 @@ Provider health transitions implemented here are: UNKNOWN -> HEALTHY on first
 success; UNKNOWN/HEALTHY -> COOLDOWN on retryable failure; COOLDOWN (probe) ->
 OPEN on probe failure; OPEN -> HALF_OPEN after the open interval; HALF_OPEN ->
 HEALTHY on probe success / OPEN on probe failure; any state -> DISABLED on a
-non-retryable auth/config error, first call included. Refusals are request-level
-fall-throughs that never drive health transitions. The **probe path is the
-primary OPEN trip** (a failed probe after a cooldown or on a half-open probe);
+non-retryable auth/config error, first call included. Refusals and content
+flags are request-level fall-throughs that never drive health transitions. A
+content flag is separately surfaced so the caller can transform context once
+before allowing normal cascade failover. The **probe path is the primary OPEN
+trip** (a failed probe after a cooldown or on a half-open probe);
 the sliding-window failure-rate escalation is a secondary safety net that only
 fires once the window is full.
 
@@ -308,7 +310,10 @@ class ProviderStatus(Enum):
 class ProviderOutcome(Enum):
     """Outcome classes that decide fall-through and health transitions (§1.2).
 
-    ``CONFIG_ERROR`` is the non-retryable configuration class: an unsupported
+    ``CONTENT_FLAGGED`` is a request-level, caller-recoverable policy signal;
+    unlike ``REFUSAL`` it is not a terminal semantic refusal and never changes
+    provider health. ``CONFIG_ERROR`` is the non-retryable configuration class:
+    an unsupported
     model/parameter or a machine-readable model/parameter 400 quarantines the
     provider exactly like ``AUTH_ERROR`` (disable, never retry), it just names
     the cause (codex responses adapter).
@@ -318,8 +323,216 @@ class ProviderOutcome(Enum):
     ERROR = "error"
     QUOTA = "quota"
     REFUSAL = "refusal"
+    CONTENT_FLAGGED = "content_flagged"
     AUTH_ERROR = "auth_error"
     CONFIG_ERROR = "config_error"
+
+
+_STRUCTURED_CONTENT_FLAG_CODES = frozenset(
+    {
+        "invalid_prompt",
+        "invalid_prompt_error",
+        "prompt_flagged",
+        "prompt_blocked",
+        "blocked_prompt",
+        "content_policy_violation",
+        "content_filter_violation",
+    }
+)
+_STRUCTURED_POLICY_REFUSAL_CODES = frozenset(
+    {
+        "content_policy",
+        "content_policy_error",
+        "content_policy_violation",
+        "content_filter",
+        "content_filter_error",
+        "content_filter_violation",
+    }
+)
+_INVALID_PROMPT_POLICY_TYPES = frozenset(
+    {
+        "invalid_request_error",
+        "invalid_request",
+        "content_policy",
+        "content_policy_error",
+        "content_filter",
+        "content_filter_error",
+        "policy_error",
+        "policy_violation",
+        "prompt_policy_error",
+        "safety_error",
+    }
+)
+_INVALID_PROMPT_POLICY_MARKERS = ("usage policy", "disallowed", "safety")
+_STRUCTURED_CODEX_OUTCOMES = {
+    "model_not_found": ProviderOutcome.CONFIG_ERROR,
+    "unsupported_model": ProviderOutcome.CONFIG_ERROR,
+    "invalid_parameter": ProviderOutcome.CONFIG_ERROR,
+    "unsupported_parameter": ProviderOutcome.CONFIG_ERROR,
+    "service_unavailable_error": ProviderOutcome.ERROR,
+    "server_is_overloaded": ProviderOutcome.ERROR,
+    "server_error": ProviderOutcome.ERROR,
+}
+_CODEX_CONFIG_CODES = frozenset(
+    {
+        "model_not_found",
+        "unsupported_model",
+        "invalid_parameter",
+        "unsupported_parameter",
+    }
+)
+_STRUCTURED_HTTP_OUTCOMES = {
+    "invalid_api_key": ProviderOutcome.AUTH_ERROR,
+    "invalid_api_token": ProviderOutcome.AUTH_ERROR,
+    "invalid_token": ProviderOutcome.AUTH_ERROR,
+    "authentication_error": ProviderOutcome.AUTH_ERROR,
+    "unauthorized": ProviderOutcome.AUTH_ERROR,
+    "insufficient_quota": ProviderOutcome.QUOTA,
+    "quota_exceeded": ProviderOutcome.QUOTA,
+    "rate_limit_error": ProviderOutcome.QUOTA,
+    "billing_hard_limit": ProviderOutcome.QUOTA,
+    "payment_required": ProviderOutcome.QUOTA,
+    "model_not_found": ProviderOutcome.CONFIG_ERROR,
+    "model_not_allowed": ProviderOutcome.CONFIG_ERROR,
+    "model_not_available": ProviderOutcome.CONFIG_ERROR,
+    "model_not_enabled": ProviderOutcome.CONFIG_ERROR,
+    "model_access_denied": ProviderOutcome.CONFIG_ERROR,
+    "model_not_entitled": ProviderOutcome.CONFIG_ERROR,
+}
+
+
+def _error_body_objects(body: str | Mapping[str, Any]) -> tuple[Mapping[str, Any], ...] | None:
+    """Return the JSON error envelope and nested error object, if present."""
+    if isinstance(body, Mapping):
+        payload: Any = body
+    else:
+        try:
+            payload = json.loads(body)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+    if not isinstance(payload, Mapping):
+        return None
+    nested = payload.get("error")
+    if isinstance(nested, Mapping):
+        return (payload, nested)
+    return (payload,)
+
+
+def _error_tokens(body: str | Mapping[str, Any]) -> tuple[str, ...] | None:
+    """Extract normalized type/code/status values without scanning messages."""
+    objects = _error_body_objects(body)
+    if objects is None:
+        return None
+    tokens: list[str] = []
+    for field_name in ("code", "type", "status"):
+        for item in objects:
+            value = item.get(field_name)
+            if isinstance(value, str):
+                token = _ERROR_TOKEN_RE.sub("_", value.casefold()).strip("_")
+            elif type(value) is int:
+                token = str(value)
+            else:
+                token = ""
+            if token:
+                tokens.append(token)
+    return tuple(tokens)
+
+
+def _error_message_text(body: str | Mapping[str, Any]) -> str:
+    """Return only freeform message text for the legacy marker fallback."""
+    objects = _error_body_objects(body)
+    if objects is None:
+        return str(body)
+    messages = [
+        value
+        for item in objects
+        for key in ("message", "detail")
+        if isinstance(value := item.get(key), str)
+    ]
+    return " ".join(messages)
+
+
+def _codex_prompt_flagged(error: Mapping[str, Any]) -> bool:
+    """Require the narrow policy evidence for a recoverable codex prompt flag."""
+    objects = _error_body_objects(error)
+    if objects is None:
+        return False
+    codes = {
+        _ERROR_TOKEN_RE.sub("_", value.casefold()).strip("_")
+        for item in objects
+        for value in (item.get("code"),)
+        if isinstance(value, str)
+    }
+    types = {
+        _ERROR_TOKEN_RE.sub("_", value.casefold()).strip("_")
+        for item in objects
+        for value in (item.get("type"),)
+        if isinstance(value, str)
+    }
+    if "invalid_prompt" not in codes or not types.issubset(_INVALID_PROMPT_POLICY_TYPES):
+        return False
+    message = " ".join(
+        value for item in objects if isinstance(value := item.get("message"), str)
+    ).casefold()
+    return any(marker in message for marker in _INVALID_PROMPT_POLICY_MARKERS)
+
+
+def _structured_error_outcome(
+    body: str | Mapping[str, Any],
+    *,
+    policy_outcome: ProviderOutcome,
+    strict_prompt_flag: bool = False,
+) -> ProviderOutcome | None:
+    """Classify known structured fields before looking at freeform text."""
+    tokens = _error_tokens(body)
+    if tokens is None:
+        return None
+    objects = _error_body_objects(body)
+    prompt_flagged = objects is not None and (
+        not strict_prompt_flag or _codex_prompt_flagged(objects[0])
+    )
+    for token in tokens:
+        if token in _STRUCTURED_CONTENT_FLAG_CODES:
+            if not strict_prompt_flag and prompt_flagged:
+                return ProviderOutcome.CONTENT_FLAGGED
+            if token == "invalid_prompt" and prompt_flagged:
+                return ProviderOutcome.CONTENT_FLAGGED
+            if token in _STRUCTURED_POLICY_REFUSAL_CODES:
+                return policy_outcome
+            continue
+        outcome = _STRUCTURED_CODEX_OUTCOMES.get(token)
+        if outcome is not None:
+            return outcome
+        if token in _STRUCTURED_POLICY_REFUSAL_CODES:
+            return policy_outcome
+    return None
+
+
+def _structured_http_outcome(body: str | Mapping[str, Any]) -> ProviderOutcome | None:
+    """Map known HTTP error codes without searching serialized JSON text."""
+    tokens = _error_tokens(body)
+    if tokens is None:
+        return None
+    return next(
+        (
+            outcome
+            for token in tokens
+            if (outcome := _STRUCTURED_HTTP_OUTCOMES.get(token)) is not None
+        ),
+        None,
+    )
+
+
+def _keyword_codex_outcome(text: str) -> ProviderOutcome:
+    """Apply legacy markers only to unstructured/freeform error text."""
+    lowered = text.casefold()
+    if any(marker in lowered for marker in _RETRYABLE_CODEX_ERROR_MARKERS):
+        return ProviderOutcome.ERROR
+    if any(marker in lowered for marker in _CONFIG_CODEX_ERROR_MARKERS):
+        return ProviderOutcome.CONFIG_ERROR
+    if any(marker in lowered for marker in _REFUSAL_CODEX_ERROR_MARKERS):
+        return ProviderOutcome.REFUSAL
+    return ProviderOutcome.ERROR
 
 
 @dataclass(frozen=True, slots=True)
@@ -1254,8 +1467,9 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 # In-stream error-event classification (probed live against
 # https://chatgpt.com/backend-api/codex/responses): service outages are
 # retryable (existing cooldown machinery); model/parameter problems are
-# permanent config errors (disable the provider, never retry); content
-# refusals fall through like any other refusal.
+# permanent config errors (disable the provider, never retry); a narrowly
+# evidenced invalid_prompt policy flag is caller-recoverable, while ordinary
+# content refusals fall through like any other refusal.
 _RETRYABLE_CODEX_ERROR_MARKERS = (
     "service_unavailable",
     "server_is_overloaded",
@@ -1266,12 +1480,28 @@ _RETRYABLE_CODEX_ERROR_MARKERS = (
 )
 _CONFIG_CODEX_ERROR_MARKERS = (
     "model_not_found",
+    "model not found",
     "not found",
-    "unsupported",
-    "invalid",
-    "parameter",
+    "unsupported_model",
+    "unsupported model",
+    "unknown model",
+    "unsupported_parameter",
+    "unsupported parameter",
+    "invalid_parameter",
+    "invalid parameter",
+)
+_CODEX_CONFIG_TEXT_MARKERS = (
+    "model_not_found",
+    "model not found",
+    "not found",
+    "model does not exist",
+    "unsupported model",
+    "unknown model",
+    "unsupported parameter",
+    "invalid parameter",
 )
 _REFUSAL_CODEX_ERROR_MARKERS = ("content_policy", "refus")
+_ERROR_TOKEN_RE = re.compile(r"[^a-z0-9]+")
 
 
 def _codex_input_item(message: Mapping[str, Any]) -> dict[str, Any]:
@@ -1408,16 +1638,14 @@ def _codex_stream_error(
     provider: ProviderConfig, error: Mapping[str, Any], access_token: str
 ) -> ProviderError:
     """Classify one in-stream codex error object into a ProviderError."""
-    text = json.dumps(error)
-    lowered = text.lower()
-    if any(marker in lowered for marker in _RETRYABLE_CODEX_ERROR_MARKERS):
-        outcome = ProviderOutcome.ERROR
-    elif any(marker in lowered for marker in _CONFIG_CODEX_ERROR_MARKERS):
-        outcome = ProviderOutcome.CONFIG_ERROR
-    elif any(marker in lowered for marker in _REFUSAL_CODEX_ERROR_MARKERS):
-        outcome = ProviderOutcome.REFUSAL
-    else:
-        outcome = ProviderOutcome.ERROR
+    text = json.dumps(error, default=str)
+    outcome = _structured_error_outcome(
+        error,
+        policy_outcome=ProviderOutcome.REFUSAL,
+        strict_prompt_flag=True,
+    )
+    if outcome is None:
+        outcome = _keyword_codex_outcome(_error_message_text(error))
     return ProviderError(
         provider.name,
         outcome,
@@ -1487,36 +1715,18 @@ def _parse_codex_sse(
 
 
 def _codex_config_400(message: str) -> bool:
-    """True when a codex HTTP 400 body is machine-readable and names a
-    model/parameter problem.
+    """True when structured codex 400 fields name a model/parameter problem.
 
-    The live endpoint returns both ``{"error": {...}}`` and ``{"detail": "..."}``
-    envelopes, so the whole payload is scanned. Only narrow markers count:
-    model-not-found/unsupported-model, and explicit parameter rejections. Bare
-    "invalid" is deliberately NOT a marker — generic request-shape errors
-    (``{"detail": "Stream must be set to true"}``) are request-level, not
-    provider config problems, and keep the generic content-refusal
-    fall-through.
+    Generic ``invalid``/``parameter`` words are not configuration evidence:
+    only normalized machine-readable codes can quarantine a provider here.
     """
-    try:
-        payload = json.loads(message)
-    except (json.JSONDecodeError, ValueError):
+    tokens = _error_tokens(message)
+    if tokens is None:
         return False
-    if not isinstance(payload, dict):
-        return False
-    lowered = json.dumps(payload).lower()
-    return any(
-        marker in lowered
-        for marker in (
-            "model_not_found",
-            "model not found",
-            "model does not exist",
-            "unsupported model",
-            "unknown model",
-            "unsupported parameter",
-            "invalid parameter",
-        )
-    )
+    if any(token in _CODEX_CONFIG_CODES for token in tokens):
+        return True
+    lowered = _error_message_text(message).casefold()
+    return any(marker in lowered for marker in _CODEX_CONFIG_TEXT_MARKERS)
 
 
 # --------------------------------------------------------------------------- #
@@ -1652,8 +1862,10 @@ class Diffundo:
     ) -> CallResult:
         """Ordered cascade over tier-matching providers (arch §9.2).
 
-        Falls through on timeout/error/quota/refusal; providers in cooldown,
-        OPEN, DISABLED, or rate-limited are skipped by the selection filter.
+        Falls through on timeout/error/quota/refusal/content-flagged outcomes;
+        content flags remain request-level signals for the caller and do not
+        alter provider health. Providers in cooldown, OPEN, DISABLED, or
+        rate-limited are skipped by the selection filter.
         A pinned ``model`` is strict unless this request explicitly sets
         ``allow_model_substitution``; provider configuration alone never
         authorizes a task to switch models. When every tier provider is
@@ -2326,7 +2538,9 @@ class Diffundo:
         Returns a ``CallResult`` on success; raises ``ProviderError`` otherwise.
         Health transitions follow cascade-design §2.4: retryable exhaustion moves
         the provider to COOLDOWN (or OPEN for a failed probe), auth/config errors
-        disable it, refusals leave it untouched.
+        disable it, and refusals/content flags leave it untouched. A content
+        flag is not retried here; the caller owns its one context-transform
+        retry before normal cascade failover.
 
         When ``deadline`` is given it bounds the whole attempt: the per-attempt
         HTTP timeout is capped at the remaining budget, retry backoff is skipped
@@ -2395,6 +2609,11 @@ class Diffundo:
                             last_retry_after = exc.retry_after_s
                         if exc.account_quota_owner is not None:
                             last_quota_owner = exc.account_quota_owner
+                        if exc.outcome is ProviderOutcome.CONTENT_FLAGGED:
+                            # The caller may shrink/transform the context once;
+                            # this outcome is request-level and must not alter
+                            # provider health or consume retry backoff.
+                            break
                         if exc.outcome is ProviderOutcome.REFUSAL:
                             break
                         if exc.outcome in (
@@ -2431,6 +2650,7 @@ class Diffundo:
                     return replace(result, request_rate_status=request_rate_status)
                 assert last_exc is not None
                 if last_exc.outcome in (
+                    ProviderOutcome.CONTENT_FLAGGED,
                     ProviderOutcome.REFUSAL,
                     ProviderOutcome.AUTH_ERROR,
                     ProviderOutcome.CONFIG_ERROR,
@@ -2796,6 +3016,13 @@ class Diffundo:
         retry_after_s: float | None = None,
         account_quota_owner: str | None = None,
     ) -> ProviderError:
+        structured = _structured_error_outcome(
+            message,
+            policy_outcome=ProviderOutcome.CONTENT_FLAGGED,
+            strict_prompt_flag=True,
+        )
+        structured_http = _structured_http_outcome(message)
+        content_flagged = structured is ProviderOutcome.CONTENT_FLAGGED
         if status in (301, 302, 303, 307, 308):
             # Reached only via _NoRedirectHandler: a completion endpoint that
             # redirects is a contract violation that could replay the
@@ -2830,8 +3057,10 @@ class Diffundo:
                     cause,
                     retry_after_s=retry_after_s,
                 )
-            lowered = message.casefold()
-            if any(marker in lowered for marker in _HTTP_403_QUOTA_MARKERS):
+            lowered = _error_message_text(message).casefold()
+            if structured_http is ProviderOutcome.QUOTA or any(
+                marker in lowered for marker in _HTTP_403_QUOTA_MARKERS
+            ):
                 return ProviderError(
                     provider.name,
                     ProviderOutcome.QUOTA,
@@ -2840,11 +3069,27 @@ class Diffundo:
                     retry_after_s=retry_after_s,
                     account_quota_owner=account_quota_owner,
                 )
-            if any(marker in lowered for marker in _HTTP_403_MODEL_MARKERS):
+            if structured_http is ProviderOutcome.CONFIG_ERROR or any(
+                marker in lowered for marker in _HTTP_403_MODEL_MARKERS
+            ):
                 return ProviderError(
                     provider.name,
                     ProviderOutcome.CONFIG_ERROR,
                     f"HTTP 403 model entitlement: {message}",
+                    cause,
+                )
+            if content_flagged:
+                return ProviderError(
+                    provider.name,
+                    ProviderOutcome.CONTENT_FLAGGED,
+                    f"HTTP 403 policy/content flag: {message}",
+                    cause,
+                )
+            if structured_http is ProviderOutcome.AUTH_ERROR:
+                return ProviderError(
+                    provider.name,
+                    ProviderOutcome.AUTH_ERROR,
+                    f"HTTP 403 credential rejected: {message}",
                     cause,
                 )
             if any(marker in lowered for marker in _HTTP_403_REFUSAL_MARKERS):
@@ -2869,6 +3114,13 @@ class Diffundo:
                 provider.name, ProviderOutcome.AUTH_ERROR, f"HTTP {status}: {message}", cause
             )
         if status == 400:
+            if content_flagged:
+                return ProviderError(
+                    provider.name,
+                    ProviderOutcome.CONTENT_FLAGGED,
+                    f"HTTP 400 prompt/content flag: {message}",
+                    cause,
+                )
             # Codex split (review requirement): a machine-readable 400 naming a
             # model/parameter problem is a permanent CONFIG error that
             # quarantines the provider, NOT a content refusal. The generic
@@ -2888,6 +3140,13 @@ class Diffundo:
             # drives a health transition.
             return ProviderError(
                 provider.name, ProviderOutcome.REFUSAL, f"HTTP 400: {message}", cause
+            )
+        if content_flagged:
+            return ProviderError(
+                provider.name,
+                ProviderOutcome.CONTENT_FLAGGED,
+                f"HTTP {status} prompt/content flag: {message}",
+                cause,
             )
         return ProviderError(
             provider.name, ProviderOutcome.ERROR, f"HTTP {status}: {message}", cause
