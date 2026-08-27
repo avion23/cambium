@@ -103,6 +103,15 @@ as conversation, live status, and input:
 └───────────────────────────────────┘
 ```
 
+At 100 or more columns, the frame keeps a 32-column operator rail on the right;
+the conversation pane uses the remaining width after its two borders and the
+one pane separator. The rail has one tree row per observed agent, followed by
+the existing context facts and fold ticks. At 80–99 columns it collapses to
+six-column glyph rows; below 80 columns, and on short terminals, it is hidden.
+Lane glyphs are `●` active, `○` queued, `◐` starting, `↻` restarting/merging,
+`✓` done, and `✗` failed. Lineage prefixes are `=` exact, `~` semantic, `∅`
+fresh, and `?` unknown; `!` marks a failed compaction fold.
+
 The status pane reports provider/model, turn, tokens (including input/output
 and cached counts when available), throughput, cost, active agents and their
 states, the collapsed tool-error count, session/checkpoint identity, and

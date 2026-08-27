@@ -11,13 +11,16 @@ from typing import Any, cast
 import pytest
 
 import cambium.tui_screen as tui_screen
+from cambium.observability import ObservabilityState, RecentEvent, snapshot_from_events
 from cambium.tui import _command_output, _queued_prompt_notice
 from cambium.tui_screen import (
     ActivityState,
     Cockpit,
     Transcript,
     _bounded_markdown_lines,
+    _compact_rail_rows,
     _display_width,
+    _rail_rows,
     _side_sections,
     _status_rows,
     _transcript_lines,
@@ -75,6 +78,213 @@ def _traffic_snapshot():
     snapshot.output_tokens_per_s = 12.5
     snapshot.estimated_cost_usd = 0.123456
     return snapshot
+
+
+def test_context_fork_lineage_is_explicit() -> None:
+    events = (
+        {
+            "seq": 1,
+            "kind": "context_fork",
+            "task_id": "root",
+            "payload": {
+                "parent_task_id": "root",
+                "child_task_id": "exact-child",
+                "compatible": True,
+            },
+        },
+        {
+            "seq": 2,
+            "kind": "context_fork",
+            "task_id": "root",
+            "payload": {
+                "parent_task_id": "root",
+                "child_task_id": "semantic-child",
+                "compatible": False,
+                "semantic_reuse": True,
+            },
+        },
+        {
+            "seq": 3,
+            "kind": "context_fork_skipped",
+            "task_id": "root",
+            "payload": {"parent_task_id": "root", "child_task_id": "fresh-child"},
+        },
+        {
+            "seq": 4,
+            "kind": "context_fork",
+            "task_id": "root",
+            "payload": {"parent_task_id": "root", "child_task_id": "unknown-child"},
+        },
+    )
+
+    snapshot = snapshot_from_events(events)
+    lineages = {agent.task_id: agent.lineage for agent in snapshot.agents}
+
+    assert lineages == {
+        "root": "",
+        "exact-child": "exact",
+        "semantic-child": "semantic",
+        "fresh-child": "fresh",
+        "unknown-child": "",
+    }
+
+
+def test_full_operator_rail_rows_have_stable_golden_strings() -> None:
+    snapshot = _snapshot()
+    snapshot.agents = (
+        SimpleNamespace(
+            task_id="root",
+            parent_task_id=None,
+            state="active",
+            lineage="exact",
+            epoch=3,
+        ),
+        SimpleNamespace(
+            task_id="child",
+            parent_task_id="root",
+            state="failed",
+            lineage="fresh",
+            epoch=3,
+        ),
+    )
+    snapshot.context.summary_segments = 2
+    snapshot.context.estimated_trunk_tokens = 2_000
+    snapshot.context.summary_trunk_bytes = 8_192
+    snapshot.context.estimated_raw_tail_tokens = 1_000
+    snapshot.context.raw_tail_bytes = 4_096
+    snapshot.context.checkpoint_ref = "root/epoch-0003.json"
+    snapshot.recent_events = (
+        RecentEvent(seq=8, kind="context_epoch_advanced", task_id="root", detail=""),
+        RecentEvent(seq=9, kind="compaction_failed", task_id="root", detail="provider"),
+    )
+
+    rows = _rail_rows(snapshot, 32, 32)
+
+    assert [text for _, text in rows] == [
+        " LANES",
+        "└●= root E3",
+        "  └✗∅ child E3",
+        " CONTEXT",
+        " epoch e4 · segments 2",
+        " trunk ≈2k tok",
+        " 8KiB serialized",
+        " raw ≈1k tok",
+        " 4KiB tail bytes",
+        " checkpoint root/epoch-0003.json",
+        " │ context_epoch_advanced e4",
+        " ! compaction_failed · provider",
+    ]
+
+
+def test_compact_operator_rail_rows_keep_glyphs_and_epoch() -> None:
+    snapshot = _snapshot()
+    snapshot.context.epoch = 3
+    snapshot.agents = (
+        SimpleNamespace(
+            task_id="root",
+            parent_task_id=None,
+            state="active",
+            lineage="",
+            epoch=3,
+        ),
+        SimpleNamespace(
+            task_id="child",
+            parent_task_id="root",
+            state="active",
+            lineage="semantic",
+            epoch=3,
+        ),
+    )
+
+    assert [text for _, text in _compact_rail_rows(snapshot)] == [
+        "└●=?E3",
+        "├●=~E3",
+    ]
+
+
+def test_operator_rail_is_hidden_below_eighty_columns() -> None:
+    snapshot = _snapshot()
+    transcript = Transcript()
+    kwargs = {
+        "session_description": "session",
+        "branch_line": "branch",
+        "cumulative_line": "usage: calls=0",
+        "width": 70,
+        "height": 20,
+    }
+    expected = render_cockpit(snapshot, transcript, **kwargs)
+
+    original = tui_screen._rail_rows
+    tui_screen._rail_rows = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError())
+    try:
+        assert render_cockpit(snapshot, transcript, **kwargs) == expected
+    finally:
+        tui_screen._rail_rows = original
+
+
+def test_operator_rail_change_uses_a_fresh_frame(monkeypatch) -> None:
+    class _Tty(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    monkeypatch.setattr(
+        tui_screen.shutil,
+        "get_terminal_size",
+        lambda _fallback: os.terminal_size((110, 24)),
+    )
+    stream = _Tty()
+    snapshot = _snapshot()
+    cockpit = Cockpit(stream)
+    with cockpit:
+        cockpit.draw(
+            snapshot,
+            Transcript(),
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+        )
+        first = stream.getvalue()
+        snapshot.agents[0].lineage = "exact"
+        cockpit.draw(
+            snapshot,
+            Transcript(),
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+        )
+
+    delta = stream.getvalue()[len(first) :]
+    assert "┌ Cambium · conversation" in delta
+    assert "\x1b[s" not in delta
+
+
+def test_replaying_events_after_snapshot_is_idempotent() -> None:
+    events = (
+        {
+            "seq": 1,
+            "kind": "spawned",
+            "task_id": "root",
+            "payload": {"epoch": 2},
+        },
+        {
+            "seq": 2,
+            "kind": "context_fork",
+            "task_id": "root",
+            "payload": {
+                "parent_task_id": "root",
+                "child_task_id": "child",
+                "compatible": False,
+                "semantic_reuse": True,
+                "epoch": 2,
+            },
+        },
+    )
+    state = ObservabilityState()
+    state.extend(events)
+    before = state.snapshot()
+    state.extend(events)
+
+    assert state.snapshot() == before
 
 
 def test_wide_cockpit_has_transcript_agents_context_and_input() -> None:

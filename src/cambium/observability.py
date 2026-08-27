@@ -65,6 +65,7 @@ class AgentSnapshot:
     estimated_cost_usd: float
     last_seq: int
     last_kind: str | None
+    lineage: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +124,7 @@ class _Agent:
     task_id: str
     parent_task_id: str | None = None
     state: str = "queued"
+    lineage: str = ""
     generation: int = 0
     turn: int = 0
     epoch: int = 0
@@ -258,6 +260,18 @@ def _set_state(agent: _Agent, state: str) -> None:
         return
     if _STATE_PRIORITY.get(state, 0) >= _STATE_PRIORITY.get(agent.state, 0):
         agent.state = state
+
+
+def _context_lineage(kind: str, payload: Mapping[str, Any]) -> str | None:
+    if kind == "context_fork_skipped":
+        return "fresh"
+    if kind != "context_fork":
+        return None
+    if payload.get("compatible") is True:
+        return "exact"
+    if payload.get("semantic_reuse") is True:
+        return "semantic"
+    return ""
 
 
 def _message_bytes(messages: Sequence[Mapping[str, Any]]) -> int:
@@ -409,6 +423,18 @@ class ObservabilityState:
             child = self._ensure_agent(child_id)
             if parent_id is not None:
                 child.parent_task_id = parent_id
+            child_epoch = payload.get("epoch")
+            if (
+                (kind in _CONTEXT_EVENT_KINDS or kind == "context_fork_skipped")
+                and type(child_epoch) is int
+                and child_epoch >= 0
+            ):
+                child.epoch = max(child.epoch, child_epoch)
+        lineage = _context_lineage(kind, payload)
+        if lineage is not None:
+            lineage_task_id = child_id or task_id
+            if lineage_task_id is not None:
+                self._ensure_agent(lineage_task_id).lineage = lineage
         if task_id is not None:
             agent = self._ensure_agent(task_id)
             if parent_id is not None and task_id != parent_id:
@@ -560,6 +586,7 @@ class ObservabilityState:
                     parent_task_id=agent.parent_task_id,
                     role=role,
                     state=agent.state,
+                    lineage=agent.lineage,
                     generation=agent.generation,
                     turn=agent.turn,
                     epoch=agent.epoch,
