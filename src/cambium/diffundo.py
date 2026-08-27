@@ -363,7 +363,7 @@ _INVALID_PROMPT_POLICY_TYPES = frozenset(
         "safety_error",
     }
 )
-_INVALID_PROMPT_POLICY_MARKERS = ("usage policy", "disallowed", "safety")
+_INVALID_PROMPT_POLICY_MARKERS = ("usage policy", "usage policies", "disallowed", "safety")
 _STRUCTURED_CODEX_OUTCOMES = {
     "model_not_found": ProviderOutcome.CONFIG_ERROR,
     "unsupported_model": ProviderOutcome.CONFIG_ERROR,

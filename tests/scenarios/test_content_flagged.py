@@ -92,6 +92,24 @@ def test_codex_stream_error_classification_table(
     assert "codex stream error:" in classified.message
 
 
+def test_plural_usage_policies_is_content_flagged_on_http_and_sse() -> None:
+    error = {
+        "type": "invalid_request_error",
+        "code": "invalid_prompt",
+        "message": "Prompt was blocked by the usage policies",
+    }
+    assert (
+        _codex_stream_error(_codex_provider(), error, "access-token").outcome
+        is ProviderOutcome.CONTENT_FLAGGED
+    )
+
+    router = Diffundo(())
+    http_error = router._classify_http(
+        _codex_provider(), 400, json.dumps({"error": error})
+    )
+    assert http_error.outcome is ProviderOutcome.CONTENT_FLAGGED
+
+
 @pytest.mark.parametrize(
     ("body", "expected"),
     [
