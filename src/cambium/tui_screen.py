@@ -449,7 +449,8 @@ def _stream_update(
             return None
         return "assistant", text, False, None
     if kind == "tool_event" or kind in _ASSISTANT_STREAM_KINDS or kind in _TOOL_STREAM_KINDS:
-        if kind == "tool_event" and _tool_status(data) is False:
+        tool_status = _tool_status(data)
+        if kind == "tool_event" and tool_status is not None and not tool_status:
             return None
         role = _message_role(kind, data)
         if role is None:
@@ -458,9 +459,9 @@ def _stream_update(
         if not text:
             return None
         append = kind in _STREAM_DELTA_KINDS
-        if data.get("cumulative") is True or data.get("replace") is True:
+        if data.get("cumulative") or data.get("replace"):
             append = False
-        if data.get("append") is True:
+        if data.get("append"):
             append = True
         message_id = data.get("message_id") or data.get("id")
         return role, text, append, message_id if isinstance(message_id, str) else None
@@ -513,7 +514,7 @@ def _tool_entry_text(
     ok: bool | None,
     duration_ms: int | float | None,
 ) -> str:
-    state = "ok" if ok is True else "failed" if ok is False else "done"
+    state = "ok" if ok else "failed" if ok is not None else "done"
     duration = f" · {_format_duration(duration_ms)}" if duration_ms is not None else ""
     lines = [f"{tool}: {state}{duration}"]
     for key in _TOOL_DETAIL_KEYS:
@@ -524,11 +525,17 @@ def _tool_entry_text(
 
 
 def _format_duration(duration_ms: int | float | None) -> str:
+    """Format milliseconds as integer milliseconds or truncated seconds.
+
+    Durations at or above one second intentionally truncate fractional seconds
+    (for example, ``1500ms`` renders as ``1s``).
+    """
     if duration_ms is None:
         return ""
-    if isinstance(duration_ms, float) and duration_ms.is_integer():
-        return f"{int(duration_ms)}ms"
-    return f"{duration_ms}ms"
+    milliseconds = max(0.0, _usage_float(duration_ms))
+    if milliseconds < 1_000:
+        return f"{int(milliseconds)}ms"
+    return f"{int(milliseconds / 1_000)}s"
 
 
 def _tool_line(
@@ -537,7 +544,7 @@ def _tool_line(
     count: int = 1,
     last_duration_ms: int | float | None = None,
 ) -> str:
-    glyph = "✓" if entry.tool_ok is True else "✗" if entry.tool_ok is False else "•"
+    glyph = "✓" if entry.tool_ok else "✗" if entry.tool_ok is not None else "•"
     name = entry.tool_name or "?"
     if count > 1:
         line = f"{glyph} {name} ×{count}"
@@ -583,7 +590,8 @@ def _event_turn(data: Mapping[str, Any]) -> int | None:
 
 def _failure_context_line(kind: str, data: Mapping[str, Any]) -> str | None:
     """Return a short, safe line for a failure's preceding-event context."""
-    if kind == "tool_event" and _tool_status(data) is False:
+    tool_status = _tool_status(data)
+    if kind == "tool_event" and tool_status is not None and not tool_status:
         tool = data.get("tool")
         if not isinstance(tool, str) or not tool:
             return "tool failed"
@@ -1045,7 +1053,7 @@ class Transcript:
             ok = _tool_status(data)
             duration = _duration_ms(data.get("duration_ms"))
             self._remember_tool_activity(tool, duration)
-            if ok is False:
+            if ok is not None and not ok:
                 context_line = _failure_context_line(kind, data)
                 if context_line is not None:
                     self._remember_failure_context(task_id, turn, context_line)
@@ -1995,7 +2003,7 @@ def _transcript_blocks(
             index += 1
             continue
 
-        if entry.tool_ok is not True:
+        if not entry.tool_ok:
             blocks.append(_entry_lines(entry, width, color=color))
             index += 1
             continue
@@ -2005,7 +2013,7 @@ def _transcript_blocks(
             end < len(entries)
             and entries[end].role == "tool"
             and entries[end].tool_name == entry.tool_name
-            and entries[end].tool_ok is True
+            and entries[end].tool_ok
         ):
             end += 1
         last = entries[end - 1]
@@ -2954,14 +2962,6 @@ def _primary_status_line(
     return _clip(" · ".join(parts), width)
 
 
-def _compact_seconds(value: Any) -> str:
-    number = _usage_float(value)
-    if number <= 0:
-        return "0s"
-    rendered = f"{number:.1f}".rstrip("0").rstrip(".")
-    return f"{rendered}s"
-
-
 def _activity_status(snapshot: Any, activity_line: str) -> str:
     """Reduce the verbose activity ticker to a single state-and-duration pair."""
     clean = _side_clean(activity_line).strip()
@@ -3003,23 +3003,15 @@ def _activity_status(snapshot: Any, activity_line: str) -> str:
         )
         if match is not None:
             duration = match.group(1)
-    return f"{spinner} {verb}{f' {_compact_seconds(duration)}' if duration is not None else ''}"
+    duration_text = (
+        f" {_format_duration(_usage_float(duration) * 1000)}" if duration is not None else ""
+    )
+    return f"{spinner} {verb}{duration_text}"
 
 
 def _short_model(value: Any) -> str:
     model = _side_clean(value).strip() or "?"
     return model.replace("/", "-")
-
-
-def _format_tool_seconds(duration_ms: int | float | None) -> str:
-    if duration_ms is None:
-        return ""
-    seconds = _usage_float(duration_ms) / 1000
-    if seconds <= 0:
-        return "0s"
-    if seconds >= 10:
-        return f"{seconds:.0f}s"
-    return _compact_seconds(seconds)
 
 
 def _running_tool(activity_line: str) -> tuple[str, str] | None:
@@ -3030,14 +3022,18 @@ def _running_tool(activity_line: str) -> tuple[str, str] | None:
     )
     if match is None:
         return None
-    duration = _compact_seconds(match.group(2)) if match.group(2) is not None else ""
+    duration = (
+        _format_duration(_usage_float(match.group(2)) * 1000)
+        if match.group(2) is not None
+        else ""
+    )
     return _sanitize(match.group(1)), duration
 
 
 def _tool_activity_row(transcript: Transcript, activity_line: str, width: int) -> str:
     count = transcript.tool_count
     name = transcript.last_tool_name
-    duration = _format_tool_seconds(transcript.last_tool_duration_ms)
+    duration = _format_duration(transcript.last_tool_duration_ms)
     running = _running_tool(activity_line)
     if running is not None:
         count += 1
