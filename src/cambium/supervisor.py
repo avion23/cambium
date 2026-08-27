@@ -5030,6 +5030,7 @@ class _Runtime:
             "permissions": {"shell": True, "network": False},
             "provider_env_keys": list(spec.get("provider_env_keys", ())),
             "authorized_providers": list(spec.get("authorized_providers", ())),
+            "authorized_providers_explicit": bool(spec.get("authorized_providers_explicit")),
         }
         if isinstance(spec.get("requirements"), dict) and spec["requirements"]:
             # Keep the validated task contract on the worker init message; the
