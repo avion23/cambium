@@ -80,17 +80,48 @@ PYTHONPATH=src python -m cambium tui \
   --auto
 ```
 
-On a sufficiently tall TTY, the cockpit keeps the conversation pane on top,
-the live status pane at the bottom, and an input row inside a fixed frame in
-the normal terminal buffer. The status pane shows provider/model, turn,
-tokens, cost, agents, tool-error counters, activity, and checkpoint. The
-activity state is `WAITING`, `STREAMING`, or `IDLE` while the turn is live;
-completion reports `DONE` or `ERROR`. Markdown rendering includes tables,
-bold text, and fenced code blocks, with conversation content wrapped within
-the pane width. Routine tool failures collapse into per-turn counters. A
-short terminal falls back to width-bounded conversation rows followed by
-status rows without the bordered frame; completion still forces the final
-frame draw and flush when input is pending.
+## Cockpit contract
+
+On a TTY with at least twelve rows, `Cockpit` paints a fixed two-pane frame in
+the normal primary buffer: conversation, status, and input on the left, with
+the side sections `LANES`, `CONTEXT`, `USAGE`, `QUOTA`, and `RECENT` assembled
+as bounded rows by `_side_sections` (`src/cambium/tui_screen.py:2727-2763`; its
+width safety is proved at `tests/scenarios/test_tui_screen.py:1591-1640`).
+The framed layout is implemented by `_cockpit_frame_lines`
+(`src/cambium/tui_screen.py:3188-3308`); it is not a single-column dashboard.
+
+The right side is the `OPERATOR RAIL`:
+
+- `>=100` columns: a 32-column tree of lanes and context;
+- `80-99` columns: a six-column, compact glyph-only rail;
+- `<80` columns: the rail is hidden.
+
+`_rail_width` and `_rail_rows` own those breakpoints and rows
+(`src/cambium/tui_screen.py:2325-2575`). Full rows use lineage glyphs `=`
+(exact), `~` (semantic), `∅` (fresh), and `?` (unknown), plus lane-state glyphs
+`●○◐↻✓✗`. The lineage value is carried by `AgentSnapshot.lineage` and set from
+fork events (`src/cambium/observability.py:46-70,285-295,463-467`).
+Fold ticks for `context_epoch_advanced` and `compaction_failed` stay in
+`RECENT` (including the `!` failure tick; `src/cambium/tui_screen.py:2511-2530`).
+
+### ACTIVITY ticker
+
+The heartbeat wire contract requires `phase` ∈ `{waiting, thinking, streaming}`
+and `tail`, the latest delta capped at 120 characters. The ticker is one
+sanitized line: a heartbeat replaces the prior tail rather than appending
+unbounded text. Worker emission and cockpit rendering own the contract
+(`src/cambium/worker.py:5850-5873`; `src/cambium/tui_screen.py:341-343,2965-3006`).
+
+All displayed durations are integers: `Nms` below one second and whole `Ns`
+at or above one second; rates retain one decimal (`12.5 out/s`). `_fmt_secs`
+is the duration formatter for the ticker. A resize invalidates geometry and
+forces a full-frame repaint, restoring the input row afterward
+(`src/cambium/tui_screen.py:3600-3688,3798-3836`; executable proof:
+`tests/scenarios/test_tui_live_pty.py:212-238`). A terminal shorter than twelve
+rows uses unframed, width-bounded conversation/status rows. Idle Ctrl-C has a
+bounded shutdown path: the PTY proof requires clean exit within three seconds
+(`tests/scenarios/test_tui_live_pty.py:247-262`), and the blocked-reader unit
+proof completes within two (`tests/scenarios/test_tui_shutdown.py:22-56`).
 
 ## Commands
 
