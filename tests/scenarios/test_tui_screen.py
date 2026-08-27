@@ -618,8 +618,16 @@ def test_tool_row_counts_failures_and_uses_compact_last_duration() -> None:
         activity_line="⠇ WAITING · thinking… 12s",
     )
 
-    assert rows[0].strip() == "✓ 3 tools · last run_shell 2.4s"
+    assert rows[0].strip() == "✓ 3 tools · last run_shell 2s"
     assert rows[1].strip().endswith("· err2")
+
+
+@pytest.mark.parametrize(
+    ("duration_ms", "expected"),
+    [(83, "83ms"), (1000, "1s"), (1500, "1s"), (24411, "24s")],
+)
+def test_duration_formatter_uses_integer_units(duration_ms: int, expected: str) -> None:
+    assert tui_screen._format_duration(duration_ms) == expected
 
 
 def test_activity_state_reports_waiting_streaming_done_error_and_cooldown() -> None:
@@ -932,7 +940,7 @@ def test_cockpit_paints_mid_turn_tool_tick_while_input_is_pending() -> None:
         )
 
         live_output = stream.getvalue()
-        assert "✓ run_shell 118215ms" in live_output
+        assert "✓ run_shell 118s" in live_output
         assert live_output.endswith("› ")
         assert cockpit._input_active
 
@@ -1292,8 +1300,8 @@ def test_repeated_successful_tool_events_render_as_one_counter_line() -> None:
     text = "\n".join(lines)
 
     assert len(transcript.entries) == 4
-    assert "✓ run_shell ×4 · last 2395ms" in text
-    assert "✓ 4 tools · last run_shell 2.4s" in text
+    assert "✓ run_shell ×4 · last 2s" in text
+    assert "✓ 4 tools · last run_shell 2s" in text
 
 
 def test_tool_detail_toggle_reveals_command_and_output_without_mutating_state() -> None:
@@ -1398,8 +1406,8 @@ def test_failed_tool_event_breaks_runs_and_feeds_failure_context() -> None:
 
     assert "✓ run_shell 141ms" in text
     assert "err1" in text
-    assert "✓ run_shell 2395ms" in text
-    assert "✗ run_shell 9273ms" not in text
+    assert "✓ run_shell 2s" in text
+    assert "✗ run_shell 9s" not in text
     assert len(transcript.entries) == 3
 
 
@@ -1478,8 +1486,8 @@ def test_mixed_successful_tools_do_not_collapse_across_each_other() -> None:
     text = "\n".join(lines)
 
     assert "✓ git_op 141ms" in text
-    assert "✓ run_shell 9273ms" in text
-    assert "✓ git_op 2395ms" in text
+    assert "✓ run_shell 9s" in text
+    assert "✓ git_op 2s" in text
     assert "×" not in text
 
 
@@ -1675,7 +1683,7 @@ def test_activity_state_transitions_thinking_responding_tool_and_done() -> None:
         height=22,
         activity_line=running,
     )
-    assert any("last run_shell 1.5s" in line for line in frame)
+    assert any("last run_shell 1s" in line for line in frame)
 
     activity.observe_event(
         {
@@ -1689,7 +1697,7 @@ def test_activity_state_transitions_thinking_responding_tool_and_done() -> None:
         },
         now=15.0,
     )
-    assert "thinking…     5.0s" in activity.render(now=15.0)
+    assert "thinking… 5s" in activity.render(now=15.0)
 
     activity.stop()
     assert activity.render(now=16.0) == ""
