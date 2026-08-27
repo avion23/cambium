@@ -1220,6 +1220,8 @@ def _measure_module_timings(pkg_name: str) -> dict[str, float]:
                     "-m",
                     "pytest",
                     "-q",
+                    "-o",
+                    "addopts=",
                     "-p",
                     "cambium.bench",
                     "--bench=report",
