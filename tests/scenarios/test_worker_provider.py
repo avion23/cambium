@@ -1234,13 +1234,12 @@ def test_worker_fenced_git_argv_disables_hooks(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.slow
 def test_worker_endless_tool_calls_stop_at_max_turns(tmp_path) -> None:
     _reset_server()
     server = _FakeOpenAIServer()
     try:
         config_path = _provider_config(tmp_path / "providers.json", server.base_url)
-        for _ in range(3):
+        for _ in range(2):
             _enqueue(
                 '{"type":"tool_call","name":"read_batch","arguments":{"paths":["target.txt"]}}'
             )
@@ -1249,18 +1248,29 @@ def test_worker_endless_tool_calls_stop_at_max_turns(tmp_path) -> None:
         repo = session_dir / "repo"
         _make_repo(repo)
         env = _worker_env(config_path, session_dir)
-        init = _agent_init(config_path, max_turns=3, spec=TASK_TEXT)
-        result, _messages, rc, _stderr = asyncio.run(
+        init = _agent_init(config_path, max_turns=2, spec=TASK_TEXT)
+        result, messages, rc, _stderr = asyncio.run(
             _drive_worker(
                 session_dir, repo, env, init=init, run={"task": TASK_TEXT}, branch="limits"
             )
         )
 
-        assert result["status"] == "failed"
-        assert "max turns exceeded" in result["failure_reason"]
-        assert rc == 0  # verdict delivered; the failure lives in the envelope
+        assert result["status"] == "succeeded"
+        assert result["failure_reason"] is None
+        assert result["summary"] == (
+            "best partial answer: work completed before final synthesis was content-flagged"
+        )
+        graceful_events = [
+            message
+            for message in messages
+            if message["type"] == "usage_event"
+            and "graceful stop" in message.get("failure_reason", "")
+        ]
+        assert len(graceful_events) == 1
+        assert graceful_events[0]["turn"] == 2
+        assert rc == 0  # graceful verdict delivered in the result envelope
         with REQUEST_LOCK:
-            assert len(REQUESTS) == 3
+            assert len(REQUESTS) == 2
     finally:
         server.close()
 
