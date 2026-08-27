@@ -46,11 +46,12 @@ Provider health transitions implemented here are: UNKNOWN -> HEALTHY on first
 success; UNKNOWN/HEALTHY -> COOLDOWN on retryable failure; COOLDOWN (probe) ->
 OPEN on probe failure; OPEN -> HALF_OPEN after the open interval; HALF_OPEN ->
 HEALTHY on probe success / OPEN on probe failure; any state -> DISABLED on a
-non-retryable auth/config error, first call included. Refusals and content
-flags are request-level fall-throughs that never drive health transitions. A
-content flag is separately surfaced so the caller can transform context once
-before allowing normal cascade failover. The **probe path is the primary OPEN
-trip** (a failed probe after a cooldown or on a half-open probe);
+non-retryable auth/config error, first call included. Refusals, content flags,
+and sandbox restrictions are request-level fall-throughs that never drive
+health transitions. A content flag is separately surfaced so the caller can
+transform context once before allowing normal cascade failover. The **probe
+path is the primary OPEN trip** (a failed probe after a cooldown or on a
+half-open probe);
 the sliding-window failure-rate escalation is a secondary safety net that only
 fires once the window is full.
 
@@ -317,7 +318,9 @@ class ProviderOutcome(Enum):
     an unsupported
     model/parameter or a machine-readable model/parameter 400 quarantines the
     provider exactly like ``AUTH_ERROR`` (disable, never retry), it just names
-    the cause (codex responses adapter).
+    the cause (codex responses adapter). ``SANDBOX_RESTRICTED`` is an
+    environment-level, caller-recoverable signal and never changes provider
+    health.
     """
 
     TIMEOUT = "timeout"
@@ -325,6 +328,7 @@ class ProviderOutcome(Enum):
     QUOTA = "quota"
     REFUSAL = "refusal"
     CONTENT_FLAGGED = "content_flagged"
+    SANDBOX_RESTRICTED = "sandbox_restricted"
     AUTH_ERROR = "auth_error"
     CONFIG_ERROR = "config_error"
 
@@ -419,6 +423,42 @@ _STRUCTURED_HTTP_OUTCOMES = {
     "model_not_entitled": ProviderOutcome.CONFIG_ERROR,
 }
 
+_SANDBOX_RESTRICTION_RE = re.compile(
+    r"(?:\bsandbox(?:ed|ing)?\b|"
+    r"\bpermission(?:\s+(?:denied|blocked|restricted)|error)\b|"
+    r"\boperation\s+not\s+permitted\b|\b(?:eacces|eperm)\b|"
+    r"\berrno\s*(?:=|:)?\s*(?:1|13)\b|"
+    r"\b(?:tool|network|worktree)"
+    r"(?:\s+(?:access|connection|creation|execution|use))?"
+    r"(?:\s+is)?\s+(?:blocked|denied|restricted|disabled)\b|"
+    r"\b(?:exit(?:ed)?|status|return(?:ed)?|rc)"
+    r"(?:\s+(?:with\s+)?(?:code|status))?\s*(?:=|:)?\s*(?:126|127)\b|"
+    r"\bcode\s*(?:=|:)?\s*(?:126|127)\b|"
+    r"\b(?:126|127)\s+(?:exit|status|return(?:ed)?)\b)",
+    re.IGNORECASE,
+)
+_SANDBOX_RESTRICTION_TOKENS = frozenset(
+    {
+        "sandbox",
+        "sandboxed",
+        "sandboxing",
+        "sandbox_error",
+        "sandbox_denied",
+        "sandbox_restricted",
+        "sandbox_violation",
+        "permission_denied",
+        "permission_error",
+        "operation_not_permitted",
+        "eacces",
+        "eperm",
+        "tool_blocked",
+        "network_restricted",
+        "worktree_restricted",
+        "126",
+        "127",
+    }
+)
+
 
 def _error_body_objects(body: str | Mapping[str, Any]) -> tuple[Mapping[str, Any], ...] | None:
     """Return the JSON error envelope and nested error object, if present."""
@@ -473,6 +513,39 @@ def _error_message_text(body: str | Mapping[str, Any]) -> str:
     return json.dumps(body, default=str) if isinstance(body, Mapping) else str(body)
 
 
+def _sandbox_restriction_detected(
+    body: str | Mapping[str, Any], cause: BaseException | None = None
+) -> bool:
+    """Recognize environment/OS restrictions without treating them as outages."""
+    text = _error_message_text(body)
+    normalized_text = text.replace("_", " ").replace("-", " ")
+    if _SANDBOX_RESTRICTION_RE.search(text) or _SANDBOX_RESTRICTION_RE.search(
+        normalized_text
+    ):
+        return True
+    tokens = _error_tokens(body)
+    if tokens is not None and _SANDBOX_RESTRICTION_TOKENS.intersection(tokens):
+        return True
+    seen: set[int] = set()
+    while cause is not None and id(cause) not in seen:
+        seen.add(id(cause))
+        if getattr(cause, "errno", None) in (errno.EACCES, errno.EPERM):
+            return True
+        if any(
+            type(getattr(cause, field_name, None)) is int
+            and getattr(cause, field_name) in (126, 127)
+            for field_name in ("returncode", "exit_code")
+        ):
+            return True
+        if _SANDBOX_RESTRICTION_RE.search(str(cause)):
+            return True
+        if isinstance(cause, urllib.error.URLError) and isinstance(cause.reason, BaseException):
+            cause = cause.reason
+        else:
+            cause = cause.__cause__
+    return False
+
+
 def _codex_prompt_flagged(error: str | Mapping[str, Any]) -> bool:
     """Require the narrow policy evidence for a recoverable codex prompt flag."""
     objects = _error_body_objects(error)
@@ -506,6 +579,8 @@ def _structured_error_outcome(
     strict_prompt_flag: bool = False,
 ) -> ProviderOutcome | None:
     """Classify known structured fields before looking at freeform text."""
+    if _sandbox_restriction_detected(body):
+        return ProviderOutcome.SANDBOX_RESTRICTED
     tokens = _error_tokens(body)
     if tokens is None:
         return None
@@ -536,6 +611,8 @@ def _structured_error_outcome(
 
 def _structured_http_outcome(body: str | Mapping[str, Any]) -> ProviderOutcome | None:
     """Map known HTTP error codes without searching serialized JSON text."""
+    if _sandbox_restriction_detected(body):
+        return ProviderOutcome.SANDBOX_RESTRICTED
     tokens = _error_tokens(body)
     if tokens is None:
         return None
@@ -551,6 +628,8 @@ def _structured_http_outcome(body: str | Mapping[str, Any]) -> ProviderOutcome |
 
 def _keyword_codex_outcome(text: str) -> ProviderOutcome:
     """Apply legacy markers only to unstructured/freeform error text."""
+    if _sandbox_restriction_detected(text):
+        return ProviderOutcome.SANDBOX_RESTRICTED
     lowered = text.casefold()
     if any(marker in lowered for marker in _RETRYABLE_CODEX_ERROR_MARKERS):
         return ProviderOutcome.ERROR
@@ -774,6 +853,8 @@ class ProviderError(DiffundoError):
         probe_already_in_flight: bool = False,
         http_status: int | None = None,
     ) -> None:
+        if _sandbox_restriction_detected(message, cause):
+            outcome = ProviderOutcome.SANDBOX_RESTRICTED
         super().__init__(f"provider {provider!r} {outcome.value}: {message}".rstrip())
         self.provider = provider
         self.outcome = outcome
@@ -811,6 +892,8 @@ class ProviderError(DiffundoError):
             cause = cause.__cause__
         if self.outcome is ProviderOutcome.AUTH_ERROR and status in (401, 403):
             return True
+        if self.outcome is ProviderOutcome.SANDBOX_RESTRICTED:
+            return False
         if type(status) is int and 500 <= status <= 599:
             return True
         if self.outcome is not ProviderOutcome.ERROR:
@@ -1670,7 +1753,9 @@ def _codex_stream_error(
 ) -> ProviderError:
     """Classify one in-stream codex error object into a ProviderError."""
     text = json.dumps(error, default=str)
-    if _codex_config_400(error):
+    if _sandbox_restriction_detected(error):
+        outcome = ProviderOutcome.SANDBOX_RESTRICTED
+    elif _codex_config_400(error):
         outcome = ProviderOutcome.CONFIG_ERROR
     else:
         outcome = _structured_error_outcome(
@@ -1993,9 +2078,10 @@ class Diffundo:
     ) -> CallResult:
         """Ordered cascade over tier-matching providers (arch §9.2).
 
-        Falls through on timeout/error/quota/refusal/content-flagged outcomes;
-        content flags remain request-level signals for the caller and do not
-        alter provider health. Providers in cooldown, OPEN, DISABLED, or
+        Falls through on timeout/error/quota/refusal/content-flagged/
+        sandbox-restricted outcomes; content flags and sandbox restrictions
+        remain request-level signals for the caller and do not alter provider
+        health. Providers in cooldown, OPEN, DISABLED, or
         rate-limited are skipped by the selection filter.
         A pinned ``model`` is strict unless this request explicitly sets
         ``allow_model_substitution``; provider configuration alone never
@@ -2693,9 +2779,9 @@ class Diffundo:
         Returns a ``CallResult`` on success; raises ``ProviderError`` otherwise.
         Health transitions follow cascade-design §2.4: retryable exhaustion moves
         the provider to COOLDOWN (or OPEN for a failed probe), auth/config errors
-        disable it, and refusals/content flags leave it untouched. A content
-        flag is not retried here; the caller owns its one context-transform
-        retry before normal cascade failover.
+        disable it, and refusals/content flags/sandbox restrictions leave it
+        untouched. A content flag is not retried here; the caller owns its one
+        context-transform retry before normal cascade failover.
 
         When ``deadline`` is given it bounds the whole attempt: the per-attempt
         HTTP timeout is capped at the remaining budget, retry backoff is skipped
@@ -2769,6 +2855,10 @@ class Diffundo:
                             # this outcome is request-level and must not alter
                             # provider health or consume retry backoff.
                             break
+                        if exc.outcome is ProviderOutcome.SANDBOX_RESTRICTED:
+                            # The restriction belongs to the harness
+                            # environment, not the provider lane.
+                            break
                         if exc.outcome is ProviderOutcome.REFUSAL:
                             break
                         if exc.outcome in (
@@ -2806,6 +2896,7 @@ class Diffundo:
                 assert last_exc is not None
                 if last_exc.outcome in (
                     ProviderOutcome.CONTENT_FLAGGED,
+                    ProviderOutcome.SANDBOX_RESTRICTED,
                     ProviderOutcome.REFUSAL,
                     ProviderOutcome.AUTH_ERROR,
                     ProviderOutcome.CONFIG_ERROR,
@@ -3183,6 +3274,13 @@ class Diffundo:
         )
         structured_http = _structured_http_outcome(message)
         content_flagged = structured is ProviderOutcome.CONTENT_FLAGGED
+        if structured is ProviderOutcome.SANDBOX_RESTRICTED:
+            return ProviderError(
+                provider.name,
+                ProviderOutcome.SANDBOX_RESTRICTED,
+                f"HTTP {status} sandbox restriction: {message}",
+                cause,
+            )
         if status in (301, 302, 303, 307, 308):
             # Reached only via _NoRedirectHandler: a completion endpoint that
             # redirects is a contract violation that could replay the

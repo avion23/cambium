@@ -1728,6 +1728,14 @@ def _worker_failure_reason(
     return f"{reason}; {detail}" if reason else detail
 
 
+def _sandbox_usage_reason(value: Any) -> str | None:
+    """Return a worker usage reason that carries the sandbox outcome."""
+    if not isinstance(value, str):
+        return None
+    lowered = value.casefold()
+    return value if "sandbox_restricted" in lowered else None
+
+
 def _finite_metric_score(value: Any) -> int | float | None:
     """Return a JSON-safe metric score, never a non-finite number."""
     if isinstance(value, bool):
@@ -5223,6 +5231,7 @@ class _Runtime:
         protocol_reason: str | None = None
         protocol_failure: str | None = None
         timeout_phase: str | None = "stdin" if not init_written else None
+        sandbox_failure_reason: str | None = None
         # Eval-3 ADOPT: set when the worker reported reuse-ready; the process
         # is kept alive and returned to the session pool instead of being
         # waited on and reaped as a terminal worker.
@@ -5505,6 +5514,11 @@ class _Runtime:
                     )
                     accepted = correlated and identity_note is None and envelope is None
                     if accepted:
+                        if (
+                            sandbox_failure_reason is not None
+                            and msg.get("status") != "succeeded"
+                        ):
+                            msg = {**msg, "failure_reason": sandbox_failure_reason}
                         envelope = msg
                     # Proposals are retained until this generation returns.
                     # In particular, a correlated worker ``succeeded`` envelope
@@ -5787,6 +5801,9 @@ class _Runtime:
                                 fields=invalid_fields,
                             )
                         else:
+                            sandbox_failure_reason = _sandbox_usage_reason(
+                                msg.get("failure_reason")
+                            )
                             forwarded = {
                                 field: msg[field]
                                 for field in _USAGE_EVENT_FORWARD_FIELDS
@@ -5934,7 +5951,11 @@ class _Runtime:
         elif protocol_reason is not None:
             reason = protocol_reason
         elif exit_code != 0:
-            reason = f"worker_exit_{exit_code}"
+            reason = sandbox_failure_reason or (
+                f"sandbox_restricted: worker_exit_{exit_code}"
+                if exit_code in (126, 127)
+                else f"worker_exit_{exit_code}"
+            )
         elif exit_reason is None:
             reason = "missing_exit_message"
         elif envelope is None:
