@@ -2307,6 +2307,229 @@ def _agent_rows(agents: tuple[Any, ...], width: int) -> list[tuple[str, str]]:
     return rows
 
 
+_RAIL_FULL_WIDTH = 32
+_RAIL_COMPACT_WIDTH = 6
+_RAIL_STATE_GLYPHS = {
+    "active": "●",
+    "queued": "○",
+    "admitted": "○",
+    "starting": "◐",
+    "restarting": "↻",
+    "merging": "↻",
+    "succeeded": "✓",
+    "done": "✓",
+    "exited": "✓",
+    "failed": "✗",
+    "cancelled": "✗",
+}
+_RAIL_LINEAGE_GLYPHS = {"exact": "=", "semantic": "~", "fresh": "∅", "": "?"}
+
+
+def _rail_width(columns: int) -> int:
+    if columns >= 100:
+        return _RAIL_FULL_WIDTH
+    if columns >= 80:
+        return _RAIL_COMPACT_WIDTH
+    return 0
+
+
+def _frame_content_width(columns: int) -> int:
+    rail_width = _rail_width(columns)
+    separator = 1 if rail_width else 0
+    return max(8, columns - 2 - rail_width - separator)
+
+
+def _rail_state_glyph(state: Any) -> str:
+    value = _side_clean(state).strip().casefold()
+    return _RAIL_STATE_GLYPHS.get(value, "○")
+
+
+def _rail_parent_id(agent: Any) -> str | None:
+    value = getattr(agent, "parent_task_id", None)
+    if value is None:
+        return None
+    return _side_clean(value).strip() or None
+
+
+def _rail_lineage_glyph(lineage: Any) -> str:
+    value = _side_clean(lineage).strip().casefold()
+    return _RAIL_LINEAGE_GLYPHS.get(value, "?")
+
+
+def _rail_depth(task_id: str, parents: Mapping[str, str | None]) -> int:
+    depth = 0
+    current = task_id
+    seen: set[str] = set()
+    while (parent := parents.get(current)) is not None and current not in seen:
+        seen.add(current)
+        current = parent
+        depth += 1
+    return depth
+
+
+def _rail_tree_order(agents: tuple[Any, ...]) -> tuple[Any, ...]:
+    tasks = [
+        _side_clean(getattr(agent, "task_id", "?")).strip() or "?" for agent in agents
+    ]
+    parents = {
+        task: _rail_parent_id(agent)
+        for agent, task in zip(agents, tasks, strict=True)
+    }
+    order = sorted(
+        range(len(agents)),
+        key=lambda index: (_rail_depth(tasks[index], parents), index),
+    )
+    return tuple(agents[index] for index in order)
+
+
+def _rail_lane_rows(agents: tuple[Any, ...], width: int) -> list[tuple[str, str]]:
+    panel_width = max(1, width)
+    if not agents:
+        return [_side_row("dim", " no agents yet", panel_width)]
+    agents = _rail_tree_order(agents)
+
+    tasks = [
+        _side_clean(getattr(agent, "task_id", "?")).strip() or "?" for agent in agents
+    ]
+    parents: dict[str, str | None] = {}
+    children: dict[str | None, list[str]] = {}
+    for agent, task in zip(agents, tasks, strict=True):
+        parent = _rail_parent_id(agent)
+        parents[task] = parent
+        children.setdefault(parent, []).append(task)
+
+    rows: list[tuple[str, str]] = []
+    for agent, task in zip(agents, tasks, strict=True):
+        parent = parents.get(task)
+        siblings = children.get(parent, ())
+        connector = "└" if not siblings or task == siblings[-1] else "├"
+        indent = "  " * _rail_depth(task, parents)
+        state = _side_clean(getattr(agent, "state", "queued")).strip().casefold() or "queued"
+        lineage = _rail_lineage_glyph(getattr(agent, "lineage", ""))
+        prefix = f"{indent}{connector}{_rail_state_glyph(state)}{lineage} "
+        suffix = f" E{_usage_int(getattr(agent, 'epoch', 0))}"
+        name_width = max(1, panel_width - _display_width(prefix) - _display_width(suffix))
+        rows.append(_side_row(state, prefix + _clip(task, name_width) + suffix, panel_width))
+    return rows
+
+
+def _context_rows(
+    snapshot: Any,
+    width: int,
+    *,
+    compact_epoch: bool = False,
+) -> list[tuple[str, str]]:
+    panel_width = max(1, width)
+    context = getattr(snapshot, "context", None)
+    if context is None:
+        return [_side_row("dim", " unavailable", panel_width)]
+    approx = "≈" if getattr(context, "approximate", False) else ""
+    epoch = _usage_int(getattr(context, "epoch", 0))
+    epoch_text = f"e{epoch}" if compact_epoch else str(epoch)
+    return [
+        _side_row(
+            "normal",
+            f" epoch {epoch_text} · segments {getattr(context, 'summary_segments', 0)}",
+            panel_width,
+        ),
+        _side_row(
+            "normal",
+            " trunk "
+            f"{approx}{_human_count(getattr(context, 'estimated_trunk_tokens', 0))} tok",
+            panel_width,
+        ),
+        _side_row(
+            "dim",
+            f" {_human_bytes(getattr(context, 'summary_trunk_bytes', 0))} serialized",
+            panel_width,
+        ),
+        _side_row(
+            "normal",
+            " raw "
+            f"{approx}{_human_count(getattr(context, 'estimated_raw_tail_tokens', 0))} tok",
+            panel_width,
+        ),
+        _side_row(
+            "dim",
+            f" {_human_bytes(getattr(context, 'raw_tail_bytes', 0))} tail bytes",
+            panel_width,
+        ),
+        _side_row(
+            "dim",
+            " checkpoint "
+            + _side_clean(getattr(context, "checkpoint_ref", None) or "none"),
+            panel_width,
+        ),
+    ]
+
+
+def _rail_fold_rows(snapshot: Any, width: int) -> list[tuple[str, str]]:
+    panel_width = max(1, width)
+    context = getattr(snapshot, "context", None)
+    epoch = _usage_int(getattr(context, "epoch", 0)) if context is not None else 0
+    rows: list[tuple[str, str]] = []
+    for event in tuple(getattr(snapshot, "recent_events", ())):
+        kind = _side_clean(getattr(event, "kind", "")).strip()
+        if kind not in {"context_epoch_advanced", "compaction_failed"}:
+            continue
+        detail = _side_clean(getattr(event, "detail", "")).strip()
+        if kind == "context_epoch_advanced":
+            text = f" │ {kind} e{epoch}"
+            row_kind = "active"
+        else:
+            text = f" ! {kind}"
+            row_kind = "failed"
+        if detail:
+            text += f" · {detail}"
+        rows.append(_side_row(row_kind, text, panel_width))
+    return rows[-4:]
+
+
+def _compact_rail_rows(
+    snapshot: Any,
+    width: int = _RAIL_COMPACT_WIDTH,
+    capacity: int = 32,
+) -> list[tuple[str, str]]:
+    panel_width = max(1, width)
+    agents = _rail_tree_order(tuple(getattr(snapshot, "agents", ())))
+    rows: list[tuple[str, str]] = []
+    for agent in agents:
+        parent = _rail_parent_id(agent)
+        connector = "├" if parent is not None else "└"
+        state = _rail_state_glyph(getattr(agent, "state", "queued"))
+        lineage = _side_clean(getattr(agent, "lineage", "")).strip().casefold()
+        lineage_suffix = "" if lineage == "exact" else _rail_lineage_glyph(lineage)
+        text = f"{connector}{state}={lineage_suffix}E{_usage_int(getattr(agent, 'epoch', 0))}"
+        rows.append(_side_row(getattr(agent, "state", "queued"), text, panel_width))
+    if not rows:
+        context = getattr(snapshot, "context", None)
+        epoch = _usage_int(getattr(context, "epoch", 0)) if context is not None else 0
+        rows.append(_side_row("dim", f"└○=?E{epoch}", panel_width))
+    else:
+        context = getattr(snapshot, "context", None)
+        epoch = _usage_int(getattr(context, "epoch", 0)) if context is not None else 0
+    for kind, _ in _rail_fold_rows(snapshot, panel_width):
+        tick = "!" if kind == "failed" else "│"
+        rows.append(_side_row(kind, "├" + tick + "E" + str(epoch), panel_width))
+    return rows[: max(1, capacity)]
+
+
+def _rail_rows(
+    snapshot: Any,
+    width: int = _RAIL_FULL_WIDTH,
+    capacity: int = 32,
+) -> list[tuple[str, str]]:
+    panel_width = max(1, width)
+    if panel_width <= _RAIL_COMPACT_WIDTH:
+        return _compact_rail_rows(snapshot, panel_width, capacity)
+    lines = [_side_row("heading", " LANES", panel_width)]
+    lines.extend(_rail_lane_rows(tuple(getattr(snapshot, "agents", ())), panel_width))
+    lines.append(_side_row("heading", " CONTEXT", panel_width))
+    lines.extend(_context_rows(snapshot, panel_width, compact_epoch=True))
+    lines.extend(_rail_fold_rows(snapshot, panel_width))
+    return lines[: max(1, capacity)]
+
+
 def _recent_rows(event: Any, width: int) -> list[tuple[str, str]]:
     """Keep each recent event attached to its detail or omit that detail."""
     panel_width = max(1, width)
@@ -2469,45 +2692,8 @@ def _side_sections(
     else:
         lines.extend(_agent_rows(agents[-6:], panel_width))
 
-    context = getattr(snapshot, "context", None)
     lines.append(_side_row("heading", " CONTEXT", panel_width))
-    if context is None:
-        lines.append(_side_row("dim", " unavailable", panel_width))
-    else:
-        approx = "≈" if getattr(context, "approximate", False) else ""
-        lines.extend(
-            [
-                _side_row(
-                    "normal",
-                    f" epoch {getattr(context, 'epoch', 0)} · "
-                    f"segments {getattr(context, 'summary_segments', 0)}",
-                    panel_width,
-                ),
-                _side_row(
-                    "normal",
-                    " trunk "
-                    f"{approx}{_human_count(getattr(context, 'estimated_trunk_tokens', 0))} tok",
-                    panel_width,
-                ),
-                _side_row(
-                    "dim",
-                    f" {_human_bytes(getattr(context, 'summary_trunk_bytes', 0))} serialized",
-                    panel_width,
-                ),
-                _side_row(
-                    "normal",
-                    " raw "
-                    f"{approx}{_human_count(getattr(context, 'estimated_raw_tail_tokens', 0))} tok",
-                    panel_width,
-                ),
-                _side_row(
-                    "dim",
-                    " checkpoint "
-                    + _side_clean(getattr(context, "checkpoint_ref", None) or "none"),
-                    panel_width,
-                ),
-            ]
-        )
+    lines.extend(_context_rows(snapshot, panel_width))
 
     lines.append(_side_row("heading", " SESSION USAGE", panel_width))
     lines.extend(_usage_rows(snapshot, cumulative_line, panel_width))
@@ -2563,6 +2749,16 @@ def _primary_rows(
     for role, text in rows:
         rendered.append((role, _clip(_safe_rendered(text), width)))
     return rendered
+
+
+def _primary_request_rows(
+    conversation_rows: tuple[tuple[str, str], ...],
+    rail_rows: tuple[tuple[str, str], ...],
+) -> tuple[tuple[str, str], ...]:
+    if not rail_rows:
+        return conversation_rows
+    rail_identity = "\x1f".join(f"{kind}\x1e{text}" for kind, text in rail_rows)
+    return (*conversation_rows, ("__rail__", rail_identity))
 
 
 _STATUS_KEYS = frozenset(
@@ -2922,6 +3118,24 @@ def _frame_inside(text: str, width: int) -> str:
     return "│" + _pad(clean, inner) + "│"
 
 
+def _split_frame_row(
+    text: str,
+    width: int,
+    rail_width: int,
+    *,
+    rail_text: str = "",
+    left_color: str = "",
+    rail_kind: str = "dim",
+    color: bool = False,
+) -> str:
+    left_width = _frame_content_width(width)
+    left = _paint(_frame_inside(text, left_width + 2), left_color, color)
+    if not rail_width:
+        return left
+    right = _pad(_paint(rail_text, _style_kind(rail_kind), color), rail_width)
+    return left + right + _paint("│", _DIM_CYAN, color)
+
+
 def _cockpit_frame_lines(
     snapshot: Any,
     transcript: Transcript,
@@ -2940,6 +3154,8 @@ def _cockpit_frame_lines(
     width = max(8, width)
     height = max(_FIXED_MIN_HEIGHT, height)
     inner = max(1, width - 2)
+    rail_width = _rail_width(width)
+    left_inner = _frame_content_width(width)
     status_rows = _status_rows(
         snapshot,
         transcript,
@@ -2952,29 +3168,94 @@ def _cockpit_frame_lines(
     )
     conversation_capacity = max(1, height - _frame_overhead(show_detail))
     status = _sanitize(getattr(snapshot, "session_status", "idle"))
-    lines = [_paint("┌" + _pad(f" Cambium · conversation · {status} ", inner) + "┐", _CYAN, color)]
     conversation = (
         list(primary_rows[-conversation_capacity:])
         if primary_rows is not None
-        else _transcript_lines(transcript, inner, conversation_capacity, color=color)
+        else _transcript_lines(transcript, left_inner, conversation_capacity, color=color)
     )
-    for role, text in conversation[:conversation_capacity]:
+    if not rail_width:
+        lines = [
+            _paint("┌" + _pad(f" Cambium · conversation · {status} ", inner) + "┐", _CYAN, color)
+        ]
+        for role, text in conversation[:conversation_capacity]:
+            lines.append(
+                _paint(
+                    _frame_inside(text, width),
+                    _ROLE_COLORS.get(role, ""),
+                    color,
+                )
+            )
+        while len(lines) < 1 + conversation_capacity:
+            lines.append(_frame_inside("", width))
+
+        lines.append(_paint("├" + "─" * inner + "┤", _DIM_CYAN, color))
+        for text in status_rows:
+            lines.append(_paint(_frame_inside(text, width), _DIM_CYAN, color))
+        label = _clip(_sanitize(input_label).replace(chr(10), " "), max(1, inner - 8))
+        lines.append(_paint(_frame_inside(f" input {label} ", width), _BLUE, color))
+        lines.append(_paint("└" + "─" * inner + "┘", _CYAN, color))
+        return lines[:height]
+
+    rail_rows = _rail_rows(snapshot, rail_width, conversation_capacity)
+    rail_heading = (
+        _pad("", rail_width)
+        if rail_width == _RAIL_COMPACT_WIDTH
+        else _pad(_paint(" OPERATOR RAIL", _CYAN, color), rail_width)
+    )
+    heading = _paint(
+        "┌" + _pad(f" Cambium · conversation · {status} ", left_inner) + "┬",
+        _CYAN,
+        color,
+    )
+    lines = [heading + rail_heading + _paint("┐", _CYAN, color)]
+    for index in range(conversation_capacity):
+        role, text = conversation[index] if index < len(conversation) else ("", "")
+        rail_kind, rail_text = rail_rows[index] if index < len(rail_rows) else ("", "")
         lines.append(
-            _paint(
-                _frame_inside(text, width),
-                _ROLE_COLORS.get(role, ""),
-                color,
+            _split_frame_row(
+                text,
+                width,
+                rail_width,
+                rail_text=rail_text,
+                left_color=_ROLE_COLORS.get(role, ""),
+                rail_kind=rail_kind,
+                color=color,
             )
         )
-    while len(lines) < 1 + conversation_capacity:
-        lines.append(_frame_inside("", width))
-
-    lines.append(_paint("├" + "─" * inner + "┤", _DIM_CYAN, color))
+    lines.append(
+        _paint(
+            "├" + "─" * left_inner + "┼" + "─" * rail_width + "┤",
+            _DIM_CYAN,
+            color,
+        )
+    )
     for text in status_rows:
-        lines.append(_paint(_frame_inside(text, width), _DIM_CYAN, color))
-    label = _clip(_sanitize(input_label).replace(chr(10), " "), max(1, inner - 8))
-    lines.append(_paint(_frame_inside(f" input {label} ", width), _BLUE, color))
-    lines.append(_paint("└" + "─" * inner + "┘", _CYAN, color))
+        lines.append(
+            _split_frame_row(
+                text,
+                width,
+                rail_width,
+                left_color=_DIM_CYAN,
+                color=color,
+            )
+        )
+    label = _clip(_sanitize(input_label).replace(chr(10), " "), max(1, left_inner - 8))
+    lines.append(
+        _split_frame_row(
+            f" input {label} ",
+            width,
+            rail_width,
+            left_color=_BLUE,
+            color=color,
+        )
+    )
+    lines.append(
+        _paint(
+            "└" + "─" * left_inner + "┴" + "─" * rail_width + "┘",
+            _CYAN,
+            color,
+        )
+    )
     return lines[:height]
 
 
@@ -3086,6 +3367,7 @@ class Cockpit:
         self._last_live_draw_at = 0.0
         self._draw_in_flight = False
         self._last_primary_rows: tuple[tuple[str, str], ...] = ()
+        self._last_conversation_rows: tuple[tuple[str, str], ...] = ()
         self._last_status_line = ""
         self._last_detail_line = ""
         self._last_status_fields: dict[str, str] | None = None
@@ -3274,8 +3556,18 @@ class Cockpit:
             self._draw_stream_now(request, preserve_input=preserve_input)
             return
 
-        content_width = max(8, self._last_size.columns - 2)
-        rows = tuple(_primary_rows(transcript, content_width, color=self.color))
+        content_width = _frame_content_width(self._last_size.columns)
+        conversation_rows = tuple(_primary_rows(transcript, content_width, color=self.color))
+        conversation_capacity = max(
+            1, self._last_size.lines - _frame_overhead(self._show_detail)
+        )
+        rail_width = _rail_width(self._last_size.columns)
+        rail_rows = (
+            tuple(_rail_rows(snapshot, rail_width, conversation_capacity))
+            if rail_width
+            else ()
+        )
+        rows = _primary_request_rows(conversation_rows, rail_rows)
         status_rows = tuple(
             _status_rows(
                 snapshot,
@@ -3299,15 +3591,15 @@ class Cockpit:
         if not self._fixed_frame:
             if preserve_input:
                 self.stream.write("\r\n")
-            conversation_capacity = max(
-                1, self._last_size.lines - _frame_overhead(self._show_detail)
-            )
-            hidden_rows = rows[:-conversation_capacity]
-            if self._last_primary_rows:
-                if rows[: len(self._last_primary_rows)] != self._last_primary_rows:
+            hidden_rows = conversation_rows[:-conversation_capacity]
+            if self._last_conversation_rows:
+                if (
+                    conversation_rows[: len(self._last_conversation_rows)]
+                    != self._last_conversation_rows
+                ):
                     hidden_rows = ()
                 else:
-                    hidden_rows = hidden_rows[len(self._last_primary_rows) :]
+                    hidden_rows = hidden_rows[len(self._last_conversation_rows) :]
             if hidden_rows:
                 # The fixed frame keeps only the tail; flush newly hidden rows
                 # so restored history and large live entries reach scrollback.
@@ -3326,7 +3618,7 @@ class Cockpit:
                 input_label=input_label,
                 activity_line=activity_line,
                 show_detail=self._show_detail,
-                primary_rows=rows,
+                primary_rows=conversation_rows,
             )
             self.stream.write("\n".join(lines))
             self.stream.write("\x1b[1A\r")
@@ -3335,6 +3627,7 @@ class Cockpit:
             self._frame_size = self._last_size
             self._frame_show_detail = self._show_detail
             self._last_primary_rows = rows
+            self._last_conversation_rows = conversation_rows
             self._last_status_rows = status_rows
             return
 
@@ -3348,6 +3641,7 @@ class Cockpit:
         if status_rows != self._last_status_rows:
             self._redraw_bottom(request, status_rows)
         self._last_primary_rows = rows
+        self._last_conversation_rows = conversation_rows
         self._last_status_rows = status_rows
 
     def _draw_stream_now(
@@ -3377,8 +3671,8 @@ class Cockpit:
         status_line = status_rows[1]
         detail_line = status_rows[2] if self._show_detail else ""
 
-        if rows[: len(self._last_primary_rows)] == self._last_primary_rows:
-            new_rows = rows[len(self._last_primary_rows) :]
+        if rows[: len(self._last_conversation_rows)] == self._last_conversation_rows:
+            new_rows = rows[len(self._last_conversation_rows) :]
         else:
             # A bounded transcript can evict old rows, and a failure block can
             # replace a previously emitted row.  Keep the append-only contract
@@ -3403,6 +3697,7 @@ class Cockpit:
             self.stream.flush()
 
         self._last_primary_rows = rows
+        self._last_conversation_rows = rows
         self._last_status_line = status_line
         self._last_detail_line = detail_line
         self._last_status_fields = current_status_fields
@@ -3413,8 +3708,15 @@ class Cockpit:
         status_rows: tuple[str, ...],
     ) -> None:
         snapshot, transcript, session_description, branch_line, cumulative_line, _, _ = request
+        rail_width = _rail_width(self._last_size.columns)
         rendered_rows = tuple(
-            _paint(_frame_inside(row, self._last_size.columns), _DIM_CYAN, self.color)
+            _split_frame_row(
+                row,
+                self._last_size.columns,
+                rail_width,
+                left_color=_DIM_CYAN,
+                color=self.color,
+            )
             for row in status_rows
         )
         del snapshot, transcript, session_description, branch_line, cumulative_line
@@ -3470,7 +3772,7 @@ class Cockpit:
                 session_description=session_description,
                 branch_line=branch_line,
                 cumulative_line=cumulative_line,
-                width=self._last_size.columns,
+                width=_frame_content_width(self._last_size.columns),
                 activity_line=self._activity_line,
                 show_detail=self._show_detail,
             )
