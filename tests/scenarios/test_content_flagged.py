@@ -101,9 +101,10 @@ def test_plural_policy_wording_matches_http_and_sse() -> None:
     assert _codex_stream_error(_codex_provider(), body, "access-token").outcome is (
         ProviderOutcome.CONTENT_FLAGGED
     )
-    assert Diffundo(())._classify_http(
-        _codex_provider(), 400, json.dumps(body)
-    ).outcome is ProviderOutcome.CONTENT_FLAGGED
+    assert (
+        Diffundo(())._classify_http(_codex_provider(), 400, json.dumps(body)).outcome
+        is ProviderOutcome.CONTENT_FLAGGED
+    )
 
 
 def test_anthropic_nested_error_envelope_matches_http_and_sse() -> None:
@@ -117,9 +118,10 @@ def test_anthropic_nested_error_envelope_matches_http_and_sse() -> None:
     assert _codex_stream_error(_codex_provider(), body["error"], "access-token").outcome is (
         ProviderOutcome.CONTENT_FLAGGED
     )
-    assert Diffundo(())._classify_http(
-        _codex_provider(), 400, json.dumps(body)
-    ).outcome is ProviderOutcome.CONTENT_FLAGGED
+    assert (
+        Diffundo(())._classify_http(_codex_provider(), 400, json.dumps(body)).outcome
+        is ProviderOutcome.CONTENT_FLAGGED
+    )
 
 
 def test_config_text_beats_content_filter_error_flag() -> None:
@@ -133,9 +135,10 @@ def test_config_text_beats_content_filter_error_flag() -> None:
     assert _codex_stream_error(_codex_provider(), body["error"], "access-token").outcome is (
         ProviderOutcome.CONFIG_ERROR
     )
-    assert Diffundo(())._classify_http(
-        _codex_provider(), 400, json.dumps(body)
-    ).outcome is ProviderOutcome.CONFIG_ERROR
+    assert (
+        Diffundo(())._classify_http(_codex_provider(), 400, json.dumps(body)).outcome
+        is ProviderOutcome.CONFIG_ERROR
+    )
 
 
 def test_policy_flag_beats_http_rate_and_auth_statuses() -> None:
@@ -159,9 +162,10 @@ def test_policy_violation_codes_match_http_and_sse(code: str) -> None:
     assert _codex_stream_error(_codex_provider(), body, "access-token").outcome is (
         ProviderOutcome.CONTENT_FLAGGED
     )
-    assert Diffundo(())._classify_http(
-        _codex_provider(), 400, json.dumps(body)
-    ).outcome is ProviderOutcome.CONTENT_FLAGGED
+    assert (
+        Diffundo(())._classify_http(_codex_provider(), 400, json.dumps(body)).outcome
+        is ProviderOutcome.CONTENT_FLAGGED
+    )
 
 
 def test_string_error_policy_marker_keeps_legacy_sse_refusal() -> None:
