@@ -211,6 +211,23 @@ def resolve_repo(repo: str | Path) -> Path:
     return Path(repo).expanduser().resolve()
 
 
+def _reject_nested_ephemeral(repo: Path) -> None:
+    """Keep supervised workers from starting another ephemeral session inside one."""
+    if not os.environ.get("CAMBIUM_SESSION_ID") or os.environ.get(
+        "CAMBIUM_ALLOW_NESTED_EPHEMERAL"
+    ) == "1":
+        return
+    roots = (
+        os.environ["CAMBIUM_SESSION_ID"],
+        os.environ.get("CAMBIUM_SESSION_DIR") or "/home/ubuntu/.cambium",
+    )
+    if any(repo.is_relative_to(Path(root).expanduser().resolve()) for root in roots):
+        raise ValueError(
+            "refusing nested-ephemeral run against a session worktree "
+            "(use --allow-nested-ephemeral)"
+        )
+
+
 def default_session_root(repo: str | Path | None = None) -> Path:
     """Return the repository-local root that contains user sessions."""
     target = resolve_repo("." if repo is None else repo)
@@ -764,6 +781,7 @@ def build_plan(
 ) -> dict[str, Any]:
     """Map one resolved config to the supervisor's one-task plan."""
     target_repo = resolve_repo(config.repo) if repo is None else Path(repo).resolve()
+    _reject_nested_ephemeral(target_repo)
     target_session = (
         Path(session_dir).expanduser().resolve()
         if session_dir is not None
@@ -851,6 +869,7 @@ def admit_session(config: OneShotConfig, session_dir: Path) -> None:
 async def run_oneshot(config: OneShotConfig, on_event: EventSink | None = None) -> PlanResult:
     """Run one prompt through exactly one supervisor plan."""
     repo = resolve_repo(config.repo)
+    _reject_nested_ephemeral(repo)
     preflight(config, repo)
     explicit_session_dir = (
         Path(config.session_root).expanduser().resolve()
