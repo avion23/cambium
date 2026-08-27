@@ -2,7 +2,7 @@
 
 ## PLAN MODE
 
-Plan file `P` is JSON; minimal plan. (src/cambium/supervisor.py:8558-8563,8586-8601)
+Plan file `P` is JSON; minimal plan. (src/cambium/supervisor.py:8495-8546,8547-8553)
 
 ```json
 {"tasks": [
@@ -14,7 +14,7 @@ Plan file `P` is JSON; minimal plan. (src/cambium/supervisor.py:8558-8563,8586-8
 
 `task_id`, `task`, `repo`, `worktree_path`, and `branch` are checked at plan admission;
 `requires_commit` is sent to the worker and `max_restarts` is read by the supervisor.
-(src/cambium/supervisor.py:7369-7388,3200-3221,4414-4419)
+(src/cambium/supervisor.py:7312-7339,3093-3113,4307-4314)
 
 ```sh
 PYTHONPATH=src python -m cambium supervisor --session-dir S --plan P
@@ -22,30 +22,30 @@ PYTHONPATH=src python -m cambium supervisor --session-dir S --plan P
 
 The CLI requires `--session-dir` and one of `--plan`, `--task-spec`, or `--demo`, then delegates to
 `supervisor.main`, which loads and runs `P`.
-(src/cambium/cli.py:198-211,707-725; src/cambium/supervisor.py:8554-8611)
+(src/cambium/cli.py:198-211,707-725; src/cambium/supervisor.py:8495-8568)
 
-`N` independent flat-plan entries create `N` concurrent trees in one `TaskGroup`. (src/cambium/supervisor.py:8290-8292,8421-8426)
+`N` independent flat-plan entries create `N` concurrent trees in one `TaskGroup`. (src/cambium/supervisor.py:8231-8247,8347-8365)
 
 ## ADMISSION
 
 For an unpinned `model_candidates` task, admission intersects authorized provider
 identities with enabled providers whose API-key or OAuth credential is locally ready.
-(src/cambium/supervisor.py:1160-1186,7512-7567)
+(src/cambium/supervisor.py:7447-7528,7529-7558)
 
 Credential-infeasible providers are recorded and emitted as `provider_infeasible`;
 an empty feasible set raises `NoCredentialFeasibleProvidersError` and becomes a
-failed task, without starting its worker. (src/cambium/supervisor.py:7568-7585,4045-4062,4311-4319)
+failed task, without starting its worker. (src/cambium/supervisor.py:7511-7528,3938-3955,4204-4212)
 
 An explicit empty `authorized_providers` list is deny-all, not “use every
 configured provider”: the worker raises and returns
-`authorized_providers explicitly empty`. (src/cambium/supervisor.py:7402-7412;
-src/cambium/worker.py:1034-1053,5541-5552)
+`authorized_providers explicitly empty`. (src/cambium/supervisor.py:7345-7355;
+src/cambium/worker.py:1043-1058,5851-5873)
 
 ## STALL/RESTART LIFECYCLE
 
 The worker calls repeated or empty action signatures stalled after the configured
 no-progress threshold and returns an `agent made no progress` failure.
-(src/cambium/worker.py:2817-2844,4378-4395,5146-5147)
+(src/cambium/worker.py:2986-3031,4660-4669,5451-5452)
 
 Each Diffundo provider attempt gets the smaller of the call deadline and its
 effort-aware deadline; `reasoning_effort: max` multiplies the base by `2.0`.
@@ -56,39 +56,39 @@ remain explicit. (src/cambium/oneshot.py:800-821)
 
 A restart-eligible failed generation consumes restart budget, emits `restart_scheduled`,
 sleeps with bounded jitter, starts a fresh process, and receives a fresh wall window.
-(src/cambium/supervisor.py:4542-4547,4955-5002)
+(src/cambium/supervisor.py:4820-4871,4872-4910)
 
 Every ordinary worker checkpoint records the tracked-workspace
 `workspace_hash`; the worker rejects resume if the current hash differs.
-(src/cambium/worker.py:3085-3108,3920-4003,4717-4724)
+(src/cambium/worker.py:3272-3298,4149-4229,5005-5013)
 
 The supervisor resumes only when its newest valid checkpoint hash matches, then
 advances only the generation fence instead of resetting the worktree.
-(src/cambium/supervisor.py:2818-2888,5003-5008)
+(src/cambium/supervisor.py:2711-2770,2772-2781)
 
 On a mismatch, resume is abandoned: recovery captures
 `salvage/<task>/<gen>/workspace.diff` and `salvage.json`, emits
 `worktree_salvaged`, then resets to `base_commit` and cleans the tree.
-(src/cambium/supervisor.py:2758-2816,2860-2869,2940-2977,5003-5017)
+(src/cambium/supervisor.py:2651-2708,2829-2869,2931-2996,4896-4910)
 
 ## SUCCESS INVARIANT
 
 The worker finalizer stages non-`.cambium` changes, makes at most one fenced commit,
 and reports `requires_commit`; the envelope repeats that boolean.
-(src/cambium/worker.py:5630-5658,5781-5841,6002-6050)
+(src/cambium/worker.py:5982-6015,6059-6174,6389-6441)
 
 The supervisor requires a boolean `requires_commit` and cross-checks commits,
 files, diff, base, and actual `HEAD` before entering merge.
-(src/cambium/supervisor.py:1998-2019,4757-4873)
+(src/cambium/supervisor.py:1891-1912,4650-4695)
 
 A reported success with a dirty worker tree fails integrity before merge, and
 normal cleanup retains it with `worktree_cleanup_deferred` rather than deleting
-it. (src/cambium/supervisor.py:6043-6070,4757-4804,2979-3103)
+it. (src/cambium/supervisor.py:5986-6013,4650-4695,2979-3103)
 
 A verified clean no-op is accepted only with `requires_commit=false`: the
 worker reports no commit, and the supervisor accepts `HEAD == base_commit`.
-(src/cambium/worker.py:5744-5780;
-src/cambium/supervisor.py:2005-2019,4848-4872)
+(src/cambium/worker.py:6111-6137;
+src/cambium/supervisor.py:1891-1912,4741-4765)
 
 ## CONTENT-FLAG RECOVERY
 
@@ -96,10 +96,10 @@ src/cambium/supervisor.py:2005-2019,4848-4872)
 cascade without changing provider health or spending retry backoff.
 (src/cambium/diffundo.py:311-329,1994-2005,2058-2107,2676-2763)
 
-A moderation/content-flagged summary gets one retry with a transformed tail; the second flag fails summary compaction. (src/cambium/worker.py:4477-4540)
+A moderation/content-flagged summary gets one retry with a transformed tail; the second flag fails summary compaction. (src/cambium/worker.py:4751-4809)
 
 Worker provider failure strings append the parseable `(content_flagged)`
-suffix when the outcome is content-flagged. (src/cambium/worker.py:2760-2778,4983-4993)
+suffix when the outcome is content-flagged. (src/cambium/worker.py:2947-2965,5242-5255)
 
 ## CAPACITIES
 
@@ -108,15 +108,15 @@ enforces per-parent fan-out `<=8` and depth `<=3`. Architectus also defaults
 its in-flight `max_width` to `8`; supervisor hierarchy waves resolve to the
 same default. (src/cambium/tasktree.py:44-50,245-269;
 src/cambium/architectus.py:288-311,544-648;
-src/cambium/supervisor.py:8071-8110)
+src/cambium/supervisor.py:8014-8053)
 
 The admission semaphore bounds live worker processes; parallel dispatch is
 unlimited by default, while `--max-workers N` opts into an explicit cap.
-(`max_concurrent_tasks=0` disables the semaphore.) (src/cambium/supervisor.py:2146-2150,4376-4402,8253-8254)
+(`max_concurrent_tasks=0` disables the semaphore.) (src/cambium/supervisor.py:2154-2157,4384-4410,8176-8194)
 
 **Can it start 50 subagents?** Yes: 50 flat top-level plan entries are
 configurable and all `N` entries are scheduled concurrently by default; no
 source-level count cap is present. Passing `--max-workers N` caps simultaneous
 processes, while hierarchical trees still obey fan-out `8`, depth `3`, and
-wave/core width `8`. (src/cambium/supervisor.py:8249-8254,8322-8343,8421-8426;
+wave/core width `8`. (src/cambium/supervisor.py:8231-8247,8347-8365,8025-8053;
 src/cambium/tasktree.py:245-269; src/cambium/architectus.py:297-311)
