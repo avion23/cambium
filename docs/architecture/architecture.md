@@ -391,3 +391,53 @@ hierarchy remain targets; approval and containment were removed by decision.
 Any target moves to current only after a caller and focused failure test
 demonstrate it. Keep public names and status mappings stable once a host API is
 introduced; a worker envelope is not a substitute for a typed root result.
+
+## EVENT-KIND GLOSSARY
+
+The table names durable event kinds and marks worker-only wire emissions where
+current forwarding is absent; references point to emit/forward sites
+(`render.py` uses the same vocabulary). `merge_*` is expanded to every
+merge-prefixed kind found in the current emit sites.
+
+| Kind | Emit site | Meaning |
+| --- | --- | --- |
+| `task_assigned` | `src/cambium/supervisor.py:4525-4541` | Records validated task admission, branch/base, provider assignment, and requirements. |
+| `child_admitted` | `src/cambium/supervisor.py:3484-3492` | Records a validated child revision before its task is created/spawned. |
+| `child_rejected` | `src/cambium/supervisor.py:3364-3373` | Records a rejected child proposal; validation, persistence, or child creation failed. |
+| `spawned` | `src/cambium/supervisor.py:5206-5214` | Records launch of a fresh worker process and the credential-name allowlist. |
+| `init` | `src/cambium/supervisor.py:5324-5329` | Records the supervisor-to-worker initialization handshake for a generation. |
+| `ready` | `src/cambium/supervisor.py:5552-5559` | Records the worker's correlated init acknowledgment and readiness to run. |
+| `run_task` | `src/cambium/supervisor.py:5584-5586` | Records dispatch of the correlated task payload to the ready worker. |
+| `heartbeat` | `src/cambium/worker.py:5850-5872`; forwarded at `src/cambium/supervisor.py:5823-5833` | Periodic worker liveness/progress; current fields are `turn`, `tool`, `status`; **`phase`/`tail`** are marked requested fields but are not present in this checkout's emitter. |
+| `tool_event` | `src/cambium/worker.py:2902-2922`; forwarded at `src/cambium/supervisor.py:5885-5906` | Redacted bounded tool invocation/result with turn, outcome, command, and duration. |
+| `usage_event` | `src/cambium/worker.py:3064-3082`; forwarded at `src/cambium/supervisor.py:5843-5879` | Redacted provider call usage, cost, latency, rate, quota, and context accounting. |
+| `checkpoint` | `src/cambium/worker.py:3112-3129`; forwarded at `src/cambium/supervisor.py:5834-5842` | Records an ordinary turn checkpoint reference and commits-so-far. |
+| `context_checkpoint` | `src/cambium/worker.py:3569-3602`; forwarded at `src/cambium/supervisor.py:5659-5667` | Records an immutable epoch checkpoint and its cache descriptor. |
+| `context_epoch_advanced` | `src/cambium/worker.py:3605-3628`; forwarded at `src/cambium/supervisor.py:5718-5730` | Records a successful fold from one context epoch to its successor. |
+| `context_fork` | `src/cambium/supervisor.py:3666-3708` | Records the parent's epoch and whether a child gets exact or semantic context reuse. |
+| `context_fork_skipped` | `src/cambium/worker.py:4814-4856`; supervisor forwarding at `src/cambium/supervisor.py:5759-5766` | Records that an unavailable, incompatible, or invalid epoch was not reused. |
+| `context_resume` | `src/cambium/supervisor.py:4705-4718` | Records a suspended parent resuming after bounded child results and join checks. |
+| `compaction_failed` | `src/cambium/worker.py:3631-3653`; forwarded at `src/cambium/supervisor.py:5731-5758` | Records a context-compaction failure with its epoch and bounded reason. |
+| `compaction_deferred` | `src/cambium/worker.py:3656-3678` (emitted at `src/cambium/worker.py:4597-4604`) | Worker-wire notice for a malformed/invalid summary fold deferred before the bounded retry limit. |
+| `worktree_salvaged` | `src/cambium/supervisor.py:2808-2816` | Records a bounded dirty-worktree evidence artifact captured before recovery or cleanup. |
+| `worktree_pruned` | `src/cambium/supervisor.py:3163-3168` | Records successful removal of a task worktree and branch. |
+| `worktree_cleanup_deferred` | `src/cambium/supervisor.py:2997-3159` | Records cleanup being retained/deferred because a safety or removal step failed. |
+| `provider_infeasible` | `src/cambium/supervisor.py:4045-4062` | Records a provider rejected at admission because its required credential is unavailable. |
+| `merge_started` | `src/cambium/supervisor.py:6878-6885,7059-7061` | Records start of private child integration or ref-only publication. |
+| `merge_committed` | `src/cambium/supervisor.py:7131-7140`; recovery at `src/cambium/merge.py:1157-1189` | Records an accepted expected-old ref advance, including recovered publication. |
+| `merge_failed` | `src/cambium/supervisor.py:6978-7002,7150-7200` | Records merge/publication failure; conflicts carry a structured `merge_conflict` status. |
+| `merge_reconciled` | `src/cambium/supervisor.py:6227-6233`; sequencer at `src/cambium/merge.py:1169-1196` | Records startup discovery that the ref advanced before its commit event. |
+| `merge_staging_prune_started` | `src/cambium/merge.py:438`; flushed by `src/cambium/supervisor.py:6110-6137` | Records the start of bounded stale staging/quarantine pruning. |
+| `merge_staging_pruned` | `src/cambium/merge.py:495-498,1083-1090`; flushed at `src/cambium/supervisor.py:6135-6137` | Records removal of one stale staging/quarantine artifact. |
+| `merge_staging_quarantined` | `src/cambium/merge.py:617-620,1125-1134`; flushed at `src/cambium/supervisor.py:6135-6137` | Records dirty staging moved into the bounded quarantine. |
+| `merge_staging_cleanup_failed` | `src/cambium/merge.py:576-582,1249-1255`; supervisor fallback at `src/cambium/supervisor.py:7013-7018` | Records staging cleanup failure that prevents silent artifact loss. |
+| `result` | `src/cambium/supervisor.py:5587-5623` (worker envelope at `src/cambium/worker.py:6021-6054`) | Records the correlated terminal worker verdict and redacted provider metadata. |
+| `exit` | `src/cambium/supervisor.py:5816-5821` (worker `exit_message` at `src/cambium/worker.py:6225-6234`) | Records the worker generation's terminal exit reason. |
+| `worker_failed` | `src/cambium/supervisor.py:4313-4343,4955-4963` | Records task/generation failure after protocol, integrity, recovery, or restart exhaustion. |
+| `timeout` | `src/cambium/supervisor.py:4554-4560,4948-4954` | Records a wall, ready, heartbeat, pong, or stdin deadline timeout and its phase. |
+| `recover` | `src/cambium/supervisor.py:2963-2977` | Records fenced worktree reset/clean recovery and the next generation. |
+| `session_ended` | `src/cambium/supervisor.py:2657-2665` | Records final session status and per-task statuses after shutdown cleanup. |
+
+`requires_commit` is an envelope field, not an event kind: the supervisor
+passes it in `src/cambium/supervisor.py:3219-3220`, and the worker includes it
+in `result_envelope` at `src/cambium/worker.py:6046-6050`.
