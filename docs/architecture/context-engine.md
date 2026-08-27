@@ -1,12 +1,8 @@
 # Cache-first append-only context engine
 
-**Status:** active contract for the implemented semantic-summary trunk,
-checkpoints, provider evidence, and fork/resume paths. Source and tests remain
-authoritative for current behavior. This document
-replaces the design authority previously split across
-`docs/research/cache-first-context-reuse-plan.md`,
-`docs/research/rolling-context-and-agent-reuse.md`, and
-`docs/research/compaction-design.md`.
+**Status:** active contract for the implemented CAST (Cache-Aligned Semantic
+Trunking) projection, checkpoints, provider evidence, and fork/resume paths.
+Source and tests remain authoritative for current behavior.
 
 ## 1. Decision
 

@@ -130,7 +130,6 @@ implementation-plan.md  delivery order for open contracts
 ## Pointers
 
 - [operations.md](operations.md) — running and operating sessions
-- [cast.md](cast.md) — CAST/K0 context epochs and rollover policy
 - [context-engine.md](context-engine.md) — context reuse and compaction
 - [terminal-interface.md](terminal-interface.md) — terminal rendering contract
 - [provider-routing.md](provider-routing.md) — Diffundo tiers, health, ordering

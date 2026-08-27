@@ -1,23 +1,12 @@
-# Retained research
+# Retained supporting notes
 
-Research is evidence, not runtime authority. Source, tests, and
-`docs/architecture/` win on disagreement.
+Source, tests, and `docs/architecture/` win on disagreement. This directory
+keeps only the engineering standard and the provider setup runbook that
+operators and contributors still need.
 
 Retained files:
 
-- [`cache-first-context-reuse-plan.md`](cache-first-context-reuse-plan.md) —
-  original cache-first hypothesis and acceptance evidence.
-- [`rolling-context-and-agent-reuse.md`](rolling-context-and-agent-reuse.md) —
-  rolling context and child-agent reuse analysis.
-- [`worker-coldstart.md`](worker-coldstart.md) — measured process/import costs.
-- [`sqlite-wal-durability.md`](sqlite-wal-durability.md) — measured event-store
-  durability behavior.
-- [`bench-harness-design.md`](bench-harness-design.md) — benchmark/evaluation
-  design.
-- [`test-strategy.md`](test-strategy.md) — testing principles and tiers.
+- [`codex-activation.md`](codex-activation.md) — Codex OAuth login, status,
+  verification, and rollback commands.
 - [`coding-constitution.md`](coding-constitution.md) — active engineering
   constraints.
-
-Superseded critique dispositions, status snapshots, pre-implementation reviews,
-provider comparisons, and abandoned design branches were removed. Git history
-preserves them when forensic context is needed.

@@ -21,7 +21,7 @@ regression that fails the gate and preserves the old anchor. Recording a new
 baseline is an explicit, separate operation (``report`` or ``re-anchor``).
 
 The report writes ``src/cambium/modules/<name>/tests/baselines/baseline.json``
-per the schema in ``docs/research/bench-harness-design.md``: schema_version, module,
+per the committed baseline schema: schema_version, module,
 dataset_version, git_sha, date, python, pytest; metric mean/std/count per
 train/eval/canaries split; canary total/kinds/taxonomy coverage/failed;
 dataset records/duplicate ids/leaks/balance; test count + p50/p90/max wall

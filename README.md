@@ -7,7 +7,7 @@ Live operator TUI — [`src/cambium/tui_screen.py`](src/cambium/tui_screen.py), 
 ## FEATURES
 
 - Provider rotation, demotion, failover, lease-rotation, and recoverable `CONTENT_FLAGGED` moderation recovery — [`src/cambium/diffundo.py`](src/cambium/diffundo.py).
-- CAST epoch checkpoints, summary trunk/raw tail, `cache_key` `prefix_sha256` hashing, and the provider-cache-evidence-only rule — [`src/cambium/worker.py`](src/cambium/worker.py), [`docs/architecture/cast.md`](docs/architecture/cast.md).
+- CAST epoch checkpoints, summary trunk/raw tail, `cache_key` `prefix_sha256` hashing, and the provider-cache-evidence-only rule — [`src/cambium/worker.py`](src/cambium/worker.py), [`docs/architecture/context-engine.md`](docs/architecture/context-engine.md).
 - Uncached-token budget charging and graceful forced finalization — [`src/cambium/worker.py`](src/cambium/worker.py).
 - Checkpoint-bound stall resume and `salvage/<task>/<gen>/workspace.diff` — [`src/cambium/supervisor.py`](src/cambium/supervisor.py).
 - Credential-feasible admission and the success invariant, including `requires_commit` — [`src/cambium/supervisor.py`](src/cambium/supervisor.py), [`src/cambium/worker.py`](src/cambium/worker.py).
@@ -49,7 +49,7 @@ Providers use `~/.config/cambium/providers.json`; API-key entries use the
 `api_key_env` convention `CAMBIUM_PROVIDER_<NAME>_API_KEY`; Codex OAuth uses
 `cambium auth oauth login PROVIDER` — [`src/cambium/provider_config.py`](src/cambium/provider_config.py), [`src/cambium/cli.py`](src/cambium/cli.py), [`src/cambium/oauth.py`](src/cambium/oauth.py).
 
-OPERATIONS: [`docs/architecture/operations.md`](docs/architecture/operations.md); caching internals: [`docs/architecture/cast.md`](docs/architecture/cast.md) + [`docs/architecture/context-engine.md`](docs/architecture/context-engine.md).
+OPERATIONS: [`docs/architecture/operations.md`](docs/architecture/operations.md); caching internals: [`docs/architecture/context-engine.md`](docs/architecture/context-engine.md).
 
 ## LIMITS
 

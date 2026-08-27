@@ -1,14 +1,13 @@
 """SQLite WAL event store with a single dedicated writer thread.
 
-Implements the architecture's event-log durability contract (docs/architecture.md
-§6.1-§6.5, validated in docs/research/sqlite-wal-durability.md): WAL mode with
+Implements the event-log durability contract: WAL mode with
 ``synchronous=NORMAL``, one writer thread that owns the write connection and the
 DB/WAL fds, a ``wal_checkpoint(TRUNCATE)`` + fsync cadence every
 ``fsync_interval_s``, and critical kinds that block the producer until the row is
 fsync'd.
 
-Deviations from the architecture text (noted here because another agent owns
-docs/architecture.md):
+Deviations from the architecture text are noted here because the module owns
+the concrete implementation:
 
 - **Bounded queue with an explicit overflow policy (M4).** The enqueue queue is
   bounded by ``max_queue_size`` (default 10 000, architecture §6.2 inv. 2).
@@ -29,8 +28,7 @@ docs/architecture.md):
 - **Checkpoint ``busy`` is never acknowledged (M4).** ``_fsync_now`` inspects
   the ``wal_checkpoint(TRUNCATE)`` result row; while ``busy != 0`` it retries
   for up to ``checkpoint_busy_retry_s`` and then raises (writer death) rather
-  than acking a non-flushed checkpoint (docs/research/sqlite-wal-durability.md
-  §3 finding 4).
+  than acking a non-flushed checkpoint.
 - **Final close/fsync errors propagate.** ``close()`` re-raises a failure in
   the writer's final flush instead of swallowing it.
 - **Phantom read.** An accepted non-critical append returns a reserved ``seq``
@@ -1295,8 +1293,7 @@ class EventStore:
         The ``wal_checkpoint(TRUNCATE)`` result row is ``(busy, log, ckpt)``.
         While ``busy != 0`` some frames were not flushed (a reader holds the
         WAL); retry up to ``checkpoint_busy_retry_s`` and then raise so no
-        durability acknowledgement is given (docs/research/sqlite-wal-durability.md
-        §3 finding 4).
+        durability acknowledgement is given.
         """
         deadline = time.monotonic() + self._checkpoint_busy_retry_s
         self._conn.execute(f"PRAGMA busy_timeout={_CHECKPOINT_BUSY_TIMEOUT_MS}").fetchall()
