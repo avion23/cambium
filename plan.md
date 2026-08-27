@@ -649,9 +649,8 @@ Third-critique verdicts (Sol-reviewed, 2026-08-20):
 
 Earlier rounds (unchanged):
 
-- Docker/Podman/broker sandbox or IPC replacement: sandboxing was removed by
-  recorded decision 10 (`docs/research/threat-model.md`), and this host blocks
-  unprivileged userns. Local JSONL stays.
+- Docker/Podman/broker sandbox or IPC replacement: sandboxing was previously
+  rejected, and this host blocks unprivileged userns. Local JSONL stays.
 - Actor/mailbox framework rewrite: named locks + single-writer queues already
   exist (`store.py`, `conversations.py`); no demonstrated race.
 - aiosqlite migration: does not fix the ghost-write contract (§9.1.2).
@@ -687,7 +686,7 @@ tools.py permission gate (default-permissive, structured
 scripts/context_cache_evidence.py fold-transition telemetry, new test
 files (cache-transition contract, warm-pool contract incl. pinning the
 dead `CAMBIUM_WARM_POOL_SIZE`, session-lifecycle smoke, CLI operator
-smoke), docs (threat-model addendum for the P2/P3 permission findings,
+smoke), docs (permission findings addendum for the P2/P3 findings,
 worker-coldstart correction, research index), and read-only runs
 (full-suite baseline verify, worktree-diff integration runbook,
 hanging-optimize-test root cause, delegation-defect verification,
@@ -728,7 +727,7 @@ Additional root fixes during integration:
   `test_worker_run_shell_denied_never_executes` updated to assert the
   denial evidence instead of event absence.
 - Docs: warm-pool default corrected in agents.md and architecture.md
-  (opt-in, default 0, env var unread); threat-model addendum corrected
+  (opt-in, default 0, env var unread); permission findings addendum corrected
   (shell enforced via policy port; network stays advisory until a
   network-touching tool exists); cli session help string lists all six
   subcommands.

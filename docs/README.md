@@ -18,10 +18,6 @@ Source and tests define current behavior.
   OpenCode-data gates.
   contract.
 
-
-- [`security/threat-model.md`](security/threat-model.md) — no-sandbox trust
-  boundary.
-
 ## Retained research
 
 Only active plans and measured evidence remain under
