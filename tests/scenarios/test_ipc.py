@@ -953,10 +953,10 @@ def test_stale_worker_never_mutates_newer_generations_staged_work(
     real_validate = worker_module.validate_worker_generation
     real_fenced_git = worker_module._fenced_git
 
-    def controlled_validate(path: Path, generation: int) -> bool:
-        if generation == 1 and read_generation(path) == 2:
+    def controlled_validate(actual: int, generation: int) -> bool:
+        if generation == 1 and actual == 2:
             return not allow_stale_detection.is_set()
-        return real_validate(path, generation)
+        return real_validate(actual, generation)
 
     def blocking_fenced_git(
         worktree: Path, generation: int, *args: str, cwd: str | Path | None = None

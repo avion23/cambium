@@ -18,6 +18,7 @@ import threading
 import time
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -307,6 +308,60 @@ async def _drive_loop(
         progress=worker.AgentProgress(),
         run_request_id=run_request_id,
     )
+
+
+def test_provider_boundary_degradation_is_emitted_and_fails_on_three_consecutive_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    worktree = _make_worktree(tmp_path / "repo")
+    config = _agent_config(worktree, fanout_config={"tier": "fast", "model": "loopback-model"})
+    writer = _FakeWriter()
+    providers = [
+        SimpleNamespace(
+            name=f"provider-{index}",
+            protocol=SimpleNamespace(value="loopback"),
+            reasoning_effort=None,
+        )
+        for index in range(3)
+    ]
+    monkeypatch.setattr(
+        worker,
+        "_provider_router",
+        lambda *_args, **_kwargs: (object(), ProviderTier.FAST, "loopback-model", "identity"),
+    )
+    monkeypatch.setattr(worker, "_provider_path", lambda: tmp_path / "providers.json")
+    monkeypatch.setattr(worker, "load_providers", lambda _path: providers)
+
+    def fail_boundary(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise RuntimeError("boundary unavailable")
+
+    monkeypatch.setattr(
+        worker,
+        "_provider_boundary",
+        fail_boundary,
+    )
+
+    outcome = asyncio.run(
+        worker._do_provider_work(
+            {
+                "scratch_repo": str(tmp_path / "repo"),
+                "worktree_path": str(worktree),
+                "request_id": "run-boundary",
+            },
+            config,
+            threading.Event(),
+            writer,  # type: ignore[arg-type]
+            worker.AgentProgress(),
+        )
+    )
+
+    assert outcome["status"] == "failed"
+    assert outcome["failure_reason"] == "provider boundary degraded too many times"
+    degraded = [
+        message for message in writer.messages() if message["type"] == "provider_boundary_degraded"
+    ]
+    assert len(degraded) == 3
+    assert all(message["error_type"] == "RuntimeError" for message in degraded)
 
 
 async def _drive_loop_with_heartbeats(
