@@ -89,6 +89,43 @@ class _ScriptedRouter:
         return _FakeCallResult(self.responses.pop(0))
 
 
+class _StreamingScriptedRouter(_ScriptedRouter):
+    def __init__(
+        self,
+        responses: list[str],
+        deltas: list[tuple[str, str]] | None = None,
+        *,
+        delta_delay_s: float = 0.0,
+        hold_s: float = 1.1,
+    ) -> None:
+        super().__init__(responses)
+        self.deltas = list(deltas or [])
+        self.delta_delay_s = delta_delay_s
+        self.hold_s = hold_s
+
+    async def call(
+        self,
+        tier: ProviderTier,
+        prompt: dict[str, Any],
+        *,
+        model: str | None = None,
+        budget_usd: float | None = None,
+        allow_model_substitution: bool = False,
+        on_delta: Any = None,
+    ) -> _FakeCallResult:
+        del tier, model, budget_usd, allow_model_substitution
+        self.prompts.append(prompt)
+        if not self.responses:
+            raise AssertionError("router call with no scripted response")
+        if self.delta_delay_s:
+            await asyncio.sleep(self.delta_delay_s)
+        if on_delta is not None:
+            for kind, fragment in self.deltas:
+                on_delta(kind, fragment)
+        await asyncio.sleep(self.hold_s)
+        return _FakeCallResult(self.responses.pop(0))
+
+
 class _UsageScriptedRouter(_ScriptedRouter):
     def __init__(self, responses: list[str], usages: list[dict[str, Any]]) -> None:
         super().__init__(responses)
@@ -270,6 +307,41 @@ async def _drive_loop(
         progress=worker.AgentProgress(),
         run_request_id=run_request_id,
     )
+
+
+async def _drive_loop_with_heartbeats(
+    config: worker.AgentConfig,
+    worktree: Path,
+    router: _ScriptedRouter,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    writer = _FakeWriter()
+    stop = threading.Event()
+    progress = worker.AgentProgress()
+    heartbeat = asyncio.create_task(
+        worker._heartbeat_loop(
+            cast(asyncio.StreamWriter, writer),
+            config.task_id,
+            config.generation,
+            stop,
+            progress,
+            config.heartbeat_interval_s,
+        )
+    )
+    try:
+        outcome = await worker._run_agent_loop(
+            config=config,
+            router=router,  # type: ignore[arg-type]  # duck-typed Diffundo
+            tier=ProviderTier.FAST,
+            model="loopback-model",
+            worktree=worktree,
+            writer=writer,  # type: ignore[arg-type]
+            stop=stop,
+            progress=progress,
+        )
+    finally:
+        stop.set()
+        await heartbeat
+    return outcome, writer.messages()
 
 
 def test_summary_flush_authorizes_substitution_and_preserves_provenance(tmp_path: Path) -> None:
@@ -1191,6 +1263,66 @@ def test_lint_feedback_visible_in_transcript(
 # ---------------------------------------------------------------------------
 # Heartbeat drain: _run_task does not block on a heartbeat that sleeps long
 # ---------------------------------------------------------------------------
+
+
+def test_heartbeats_report_waiting_then_streaming_tail(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = _make_worktree(repo)
+    config = _agent_config(worktree)
+    router = _StreamingScriptedRouter(
+        ['{"type":"finish","summary":"done"}'],
+        [("text", "answer fragment")],
+        delta_delay_s=0.15,
+    )
+
+    outcome, messages = asyncio.run(_drive_loop_with_heartbeats(config, worktree, router))
+
+    assert outcome["status"] == "succeeded"
+    heartbeats = [message for message in messages if message["type"] == "heartbeat"]
+    phases = [heartbeat.get("phase") for heartbeat in heartbeats]
+    assert "waiting" in phases
+    assert "streaming" in phases
+    assert phases.index("waiting") < phases.index("streaming")
+    assert any(heartbeat.get("tail") == "answer fragment" for heartbeat in heartbeats)
+
+
+def test_heartbeats_stay_waiting_without_provider_deltas(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = _make_worktree(repo)
+    config = _agent_config(worktree)
+    router = _StreamingScriptedRouter(['{"type":"finish","summary":"done"}'])
+
+    outcome, messages = asyncio.run(_drive_loop_with_heartbeats(config, worktree, router))
+
+    assert outcome["status"] == "succeeded"
+    heartbeats = [message for message in messages if message["type"] == "heartbeat"]
+    assert heartbeats
+    assert {heartbeat.get("phase") for heartbeat in heartbeats} == {"waiting"}
+    assert all("tail" not in heartbeat for heartbeat in heartbeats)
+
+
+def test_heartbeat_tail_is_bounded_and_terminally_safe(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = _make_worktree(repo)
+    config = _agent_config(worktree)
+    fragment = "\x1b[31m" + ("x" * 200) + "\x1b[0m\nnext"
+    router = _StreamingScriptedRouter(
+        ['{"type":"finish","summary":"done"}'],
+        [("output_text", fragment)],
+        delta_delay_s=0.15,
+    )
+
+    outcome, messages = asyncio.run(_drive_loop_with_heartbeats(config, worktree, router))
+
+    assert outcome["status"] == "succeeded"
+    tails = [
+        heartbeat["tail"]
+        for heartbeat in messages
+        if heartbeat["type"] == "heartbeat" and "tail" in heartbeat
+    ]
+    assert tails
+    assert all(len(tail) <= 120 for tail in tails)
+    assert all("\x1b" not in tail and "\n" not in tail for tail in tails)
 
 
 def test_run_task_drain_uses_config_heartbeat_interval(tmp_path: Path) -> None:
