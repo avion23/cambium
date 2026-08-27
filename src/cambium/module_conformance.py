@@ -2176,12 +2176,21 @@ def _reverse_scan_paths() -> tuple[Path, ...]:
             # optimize.py is the sanctioned in-process DSPy consumer, like cli.py
             # for module-test; it must import the module's dspy_program at runtime.
             "optimize.py",
+            # extract_pi.py is optional training-data tooling and intentionally
+            # uses the reference module to infer candidate labels.
+            "extract_pi.py",
         }
     ]
     for directory_name in ("scripts", "tools") if _repository_available() else ():
         directory = REPO_ROOT / directory_name
         if directory.is_dir():
-            paths.extend(sorted(path for path in directory.rglob("*.py") if _is_regular_file(path)))
+            paths.extend(
+                sorted(
+                    path
+                    for path in directory.rglob("*.py")
+                    if _is_regular_file(path) and path != REPO_ROOT / "scripts" / "extract_pi.py"
+                )
+            )
     return tuple(dict.fromkeys(paths))
 
 
@@ -2407,6 +2416,9 @@ def scan_external_module_files() -> tuple[AuditFinding, ...]:
             # the isolated module gate.
             "tests/scenarios/test_dspy_program.py",
             "tests/scenarios/test_optimize.py",
+            # The optional transcript extractor intentionally uses the
+            # reference module to infer candidate labels.
+            "scripts/extract_pi.py",
         }:
             continue
         if not lower.startswith(("scripts/", "tools/", "tests/")):
