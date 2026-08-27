@@ -2058,18 +2058,25 @@ class Diffundo:
                         self._terminal_death_providers = self._terminal_death_providers | {
                             provider.name
                         }
-                        lease = self._provider_lease
-                        if (
-                            lease is not None
-                            and lease.provider == provider.name
-                            and lease.model == provider.model
-                        ):
-                            # A lease keeps a healthy incumbent sticky, but a
-                            # terminally dead holder no longer owns the
-                            # semantic branch. Release only this lease state;
-                            # the pinned/fallback history remains needed for
-                            # provenance and dead-provider avoidance.
-                            self._provider_lease = None
+                    lease = self._provider_lease
+                    if (
+                        lease is not None
+                        and lease.provider == provider.name
+                        and lease.model == provider.model
+                        and (
+                            exc.is_real_death
+                            or (
+                                exc.outcome is ProviderOutcome.TIMEOUT
+                                and provider.name == self._pinned_provider
+                            )
+                        )
+                    ):
+                        # A lease keeps a healthy incumbent sticky, but a
+                        # terminally dead holder no longer owns the semantic
+                        # branch. Release only this lease state; the
+                        # pinned/fallback history remains needed for
+                        # provenance and dead-provider avoidance.
+                        self._provider_lease = None
                     tried.append(provider.name)
                     last_error = exc
                     pinned_fallback = (
@@ -2300,6 +2307,10 @@ class Diffundo:
                 provider
                 for provider in candidates
                 if provider.name == lease.provider and provider.model == lease.model
+            ]
+        elif self._fallback_origin is not None:
+            candidates = [
+                provider for provider in candidates if provider.name != self._fallback_origin
             ]
         requested_model = model
         if isinstance(requested_model, str) and requested_model:
