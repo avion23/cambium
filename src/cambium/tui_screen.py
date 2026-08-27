@@ -2419,13 +2419,8 @@ def _rail_depth(
 def _rail_tree_order(
     agents: tuple[Any, ...], depths: dict[str, int] | None = None
 ) -> tuple[Any, ...]:
-    tasks = [
-        _side_clean(getattr(agent, "task_id", "?")).strip() or "?" for agent in agents
-    ]
-    parents = {
-        task: _rail_parent_id(agent)
-        for agent, task in zip(agents, tasks, strict=True)
-    }
+    tasks = [_side_clean(getattr(agent, "task_id", "?")).strip() or "?" for agent in agents]
+    parents = {task: _rail_parent_id(agent) for agent, task in zip(agents, tasks, strict=True)}
     depths = {} if depths is None else depths
     order = sorted(
         range(len(agents)),
@@ -2441,9 +2436,7 @@ def _rail_lane_rows(agents: tuple[Any, ...], width: int) -> list[tuple[str, str]
     depths: dict[str, int] = {}
     agents = _rail_tree_order(agents, depths)
 
-    tasks = [
-        _side_clean(getattr(agent, "task_id", "?")).strip() or "?" for agent in agents
-    ]
+    tasks = [_side_clean(getattr(agent, "task_id", "?")).strip() or "?" for agent in agents]
     parents: dict[str, str | None] = {}
     children: dict[str | None, list[str]] = {}
     for agent, task in zip(agents, tasks, strict=True):
@@ -2487,8 +2480,7 @@ def _context_rows(
         ),
         _side_row(
             "normal",
-            " trunk "
-            f"{approx}{_human_count(getattr(context, 'estimated_trunk_tokens', 0))} tok",
+            f" trunk {approx}{_human_count(getattr(context, 'estimated_trunk_tokens', 0))} tok",
             panel_width,
         ),
         _side_row(
@@ -2498,8 +2490,7 @@ def _context_rows(
         ),
         _side_row(
             "normal",
-            " raw "
-            f"{approx}{_human_count(getattr(context, 'estimated_raw_tail_tokens', 0))} tok",
+            f" raw {approx}{_human_count(getattr(context, 'estimated_raw_tail_tokens', 0))} tok",
             panel_width,
         ),
         _side_row(
@@ -2509,8 +2500,7 @@ def _context_rows(
         ),
         _side_row(
             "dim",
-            " checkpoint "
-            + _side_clean(getattr(context, "checkpoint_ref", None) or "none"),
+            " checkpoint " + _side_clean(getattr(context, "checkpoint_ref", None) or "none"),
             panel_width,
         ),
     ]
@@ -3023,9 +3013,7 @@ def _running_tool(activity_line: str) -> tuple[str, str] | None:
     if match is None:
         return None
     duration = (
-        _format_duration(_usage_float(match.group(2)) * 1000)
-        if match.group(2) is not None
-        else ""
+        _format_duration(_usage_float(match.group(2)) * 1000) if match.group(2) is not None else ""
     )
     return _sanitize(match.group(1)), duration
 
@@ -3603,14 +3591,10 @@ class Cockpit:
 
         content_width = _frame_content_width(self._last_size.columns)
         conversation_rows = tuple(_primary_rows(transcript, content_width, color=self.color))
-        conversation_capacity = max(
-            1, self._last_size.lines - _frame_overhead(self._show_detail)
-        )
+        conversation_capacity = max(1, self._last_size.lines - _frame_overhead(self._show_detail))
         rail_width = _rail_width(self._last_size.columns)
         rail_rows = (
-            tuple(_rail_rows(snapshot, rail_width, conversation_capacity))
-            if rail_width
-            else ()
+            tuple(_rail_rows(snapshot, rail_width, conversation_capacity)) if rail_width else ()
         )
         rows = _primary_request_rows(conversation_rows, rail_rows)
         status_rows = tuple(
