@@ -1,8 +1,8 @@
 # Cache-first append-only context engine
 
-**Status:** active contract for the implemented semantic-summary trunk plus
-target contracts for remaining provider-cache, routing, and interactive-session
-work. Source and tests remain authoritative for current behavior. This document
+**Status:** active contract for the implemented semantic-summary trunk,
+checkpoints, provider evidence, and fork/resume paths. Source and tests remain
+authoritative for current behavior. This document
 replaces the design authority previously split across
 `docs/research/cache-first-context-reuse-plan.md`,
 `docs/research/rolling-context-and-agent-reuse.md`, and
@@ -32,9 +32,10 @@ or included in a later summary source.
 
 Raw events, ordinary checkpoints, and immutable epoch files remain the audit and
 recovery authority outside the active prompt. Child agents fork an immutable
-checkpoint and append a private continuation. Cache-compatible children reuse
-the exact trunk prefix; incompatible providers receive the same semantic summary
-entries under a fresh provider-specific head and accept a cold provider cache.
+checkpoint and append a private continuation. Exact-context-eligible children
+reuse the exact trunk prefix; non-redacted incompatible checkpoints can supply
+the same semantic summary entries under a fresh provider-specific head. Neither
+implies a cache hit.
 
 Appending a summary after the complete old transcript is still not compaction.
 The covered raw region must leave the active projection while remaining durable
@@ -46,17 +47,15 @@ Do not collapse these into a single `cache=true` concept:
 
 | Mechanism | Key | Correctness role | Typical lifetime |
 |---|---|---|---|
-| Provider prefix/KV cache | Provider-defined exact request prefix | None; performance only | Minutes to provider-defined persistence |
-| Local exact-response cache | Canonical request digest | Optional deterministic replay | Local policy |
-| Semantic response cache | Similarity + policy/version | Approximate; unsafe by default for code edits | Local policy |
-| Context checkpoint | Content digest + parent/version | Durable replay and branch identity | Session or retained history |
-| Active context epoch | Checkpoint + continuation projection | Model input state | Until compaction/fork/close |
-| Semantic memory | Typed facts with provenance and validity | Recalled evidence, not transcript replacement | Explicit retention policy |
+| Provider prefix/KV cache | Provider-owned request prefix | None; performance only | Provider-defined |
+| Epoch checkpoint | Content address plus `cache_key` | Durable replay and branch identity | Retained session history |
+| Active context epoch | `provider_messages` plus continuation | Model input state | Until compaction/fork/close |
+| Raw history | Append-only event log | Audit and recovery authority | Session retention policy |
 
-A cache hit and a cache miss for the same semantic request must produce the
-same request bytes and differ only in latency/accounting. Provider-specific
-cache controls belong in provider adapters and capability metadata, not in the
-semantic task description.
+Cambium has no local response cache: `Diffundo` is a stateless router
+(`src/cambium/diffundo.py:8-10`). A cache hit and a miss for the same request
+must produce the same request bytes; only provider-reported usage supplies hit
+evidence (`src/cambium/diffundo.py:1226-1237`).
 
 ## 3. State model
 
@@ -67,26 +66,19 @@ is a materialized view:
 P = project(E[from:to], projection_version, policy, capabilities)
 ```
 
-A context epoch is:
-
-```text
-Epoch = {
-  epoch_id,
-  parent_epoch_id,
-  source_range,
-  projection_version,
-  immutable_prefix,
-  recent_tail,
-  unresolved_items,
-  evidence_refs,
-  digest
-}
-```
+An epoch checkpoint is persisted as `{schema, content:{provider_messages,
+continuation_suffix}, meta:{identity/cache/loop/budget keys}}`. `content` holds
+only the two provider message lists; `meta` holds identity, cache, loop, budget,
+usage, and wall-deadline state
+(`src/cambium/worker.py:203-234`). Legacy flat epoch files with top-level
+`provider_messages` are accepted on load and can resume, including schema-4 files
+(`src/cambium/worker.py:3728-3758`).
 
 The implemented summary segment is:
 
 ```text
 SummaryEntry = {
+  type,
   sequence,
   source_sha256,
   source_message_count,
@@ -100,60 +92,61 @@ SummaryEntry = {
   files_and_symbols_changed,
   verification_results,
   relevant_failed_approaches,
-  open_items,
-  entry_sha256
+  open_items
 }
 ```
 
-Sequence, source digest/count, turn coverage, and the canonical entry digest are
+Sequence, source digest/count, turn coverage, and the canonical entry fields are
 validated before publication. Semantic arrays are bounded and remain user-role
-data; they do not acquire system authority.
+data; they do not acquire system authority
+(`src/cambium/summary_trunk.py:49-59`, `src/cambium/summary_trunk.py:85-103`).
 
-`digest` is over the canonical serialized epoch descriptor and its referenced
-artifacts. The model request has a stricter cache identity:
+The epoch `cache_key` is:
 
 ```text
-RequestIdentity = H(
-  provider,
-  model,
-  endpoint/protocol,
-  reasoning settings,
-  cache namespace/policy,
-  ordered tool names and schemas,
-  system/developer messages,
-  ordered conversation messages,
-  multimodal asset identities,
-  serialization/tokenization version
-)
+provider, model, protocol, reasoning_effort
+system_sha256, tools_sha256
+prefix_sha256, suffix_sha256, full_sha256
+prefix_bytes, message_count, redacted, provider_boundary
 ```
 
-A context digest proves Cambium replay identity. It does **not** prove that a
-provider retained or reused KV state. Provider-reported usage is the only
-direct cache evidence; latency changes are supporting evidence only.
+`system_sha256` hashes the system content and `tools_sha256` hashes the tool
+schema; prefix, suffix, and full hashes cover the exact message lists.
+`prefix_bytes` and `message_count` describe the provider prefix. `redacted`
+records persisted redaction; a redacted checkpoint is not exact-fork eligible.
+`provider_boundary` carries validated
+non-secret provider, endpoint, auth, model, protocol, tier, environment, and
+authorization identity
+(`src/cambium/worker.py:3455-3472`, `src/cambium/worker.py:406-461`,
+`src/cambium/worker.py:2469-2470`).
 
-This structure is a persistent data structure and a Merkle DAG: epochs share
-immutable ancestors rather than copying or mutating them. A child branch is an
-MVCC-style snapshot plus a private continuation. Publishing a new active epoch
-uses compare-and-swap against the expected parent/generation so duplicate or
-stale completions cannot advance the branch.
+These fields prove checkpoint identity and exact-context compatibility, not
+provider-cache eligibility or a cache hit. The loader recomputes the hashes and
+prefix size before use
+(`src/cambium/worker.py:3793-3852`).
 
 ## 4. Invariants
 
 ### C1. Cold-path equivalence
 
 Provider cache availability is not observable in the semantic request. A cold
-retry remains valid and receives the same request content.
+retry remains valid and receives the same request content. Matching a
+`cache_key`, model, or prefix can authorize an exact-context fork; it does not
+infer provider-cache eligibility or a hit. Only
+`usage_event.provider_cache_hit`, copied from
+provider-reported usage, is cache evidence
+(`src/cambium/diffundo.py:1226-1237`, `src/cambium/worker.py:2990-3005`).
 
 ### C2. Immutable replay prefix
 
-After publication, an epoch's prefix bytes, ordered tools, settings, artifacts,
-and descriptor never change. Corrections create a child epoch.
+After publication, an epoch's message bytes, cache key, and checkpoint file never
+change. Corrections create a child epoch.
 
 ### C3. Content/provenance binding
 
-Every checkpoint and child result names its source epoch, source event range,
-projection version, and referenced artifacts. Descriptor-to-artifact mismatch
-fails closed.
+Checkpoint loaders recompute message hashes, prefix size, and message count;
+descriptor or payload mismatch fails closed before a prompt is seeded
+(`src/cambium/worker.py:3793-3852`).
 
 ### C4. Raw history remains authoritative
 
@@ -165,10 +158,9 @@ and evaluators can recover the exact covered events.
 An LLM summary is not assumed deterministic, associative, or commutative. The
 published entry is immutable: `S1` must remain byte-identical when `S2` is
 appended, and a later flush may summarize only the new raw tail. Publication is
-idempotent and fail-closed through sequence, source digest/count, checkpoint
-identity, and exclusive immutable file creation. Re-running a failed provider
-call may yield different proposed text, but no invalid or duplicate proposal may
-advance the trunk.
+fail-closed through sequence, source digest/count, checkpoint identity, and
+exclusive immutable file creation. No invalid or duplicate proposal advances the
+trunk (`src/cambium/worker.py:4455-4473`, `src/cambium/worker.py:4657-4674`).
 
 ### C6. Bounded active context
 
@@ -192,15 +184,20 @@ coordination, validation, or rejection.
 
 ### C9. Exact compatibility before cache locality
 
-Provider/model/protocol/tool/schema/reasoning compatibility and task budgets are
-hard constraints. Cache locality, stickiness, cost, and latency are soft
-objectives only inside the feasible equivalence class.
+Provider/model/protocol/tool/schema/reasoning compatibility and the validated
+`provider_boundary` are hard constraints. Cache locality is a soft outcome
+inside that feasible class; credential readiness is checked before provider
+admission (`src/cambium/worker.py:2571-2618`,
+`src/cambium/supervisor.py:7553-7585`).
 
 ### C10. Accounting dimensions stay separate
 
 Record at least input, output, cache-read, cache-write, total, current-turn,
-cumulative, latency, and estimated cost. Cached tokens are normally a subset
-of input tokens and must not be added to total tokens again.
+cumulative, latency, and estimated cost. The budget prompt baseline is
+`max(0, prompt_tokens - cached_tokens)`; the charged prompt delta is that
+baseline minus the previous baseline, clamped at zero. Missing cache data treats
+the full prompt as uncached, and completions remain billable
+(`src/cambium/worker.py:1889-1926`).
 
 ## 5. Turn, fork, merge, and compaction protocol
 
@@ -211,28 +208,31 @@ of input tokens and must not be added to total tokens again.
 3. Check hard provider/model/context/tool constraints.
 4. Dispatch and persist the provider usage record independently of success.
 5. Append response/tool events to the raw log.
-6. Publish the continuation checkpoint with compare-and-swap.
+6. Publish the immutable checkpoint with exclusive creation so an existing file
+   cannot be replaced (`src/cambium/worker.py:3266-3299`).
 
 ### 5.2 Child fork
 
 A child descriptor contains:
 
 ```text
-child_id
-parent_epoch_id
-parent_generation
-context_projection_id
-task_contract
-tool_capabilities
-model/provider constraints
-budget
-merge_slot
+checkpoint_ref
+provider
+model
+system_sha256
+tools_sha256
+prefix_sha256
+suffix_sha256
+full_sha256
+prefix_bytes
+provider_boundary
 ```
 
-The descriptor is immutable. A child can use the same exact prefix only when
-provider, model, endpoint, settings, tools, and prefix bytes remain compatible.
-Otherwise Cambium reuses the semantic checkpoint while accepting a cold
-provider cache.
+The context-fork descriptor is immutable. An exact-context child is eligible only
+when the provider boundary, model/protocol/reasoning settings, tool schema,
+hashes, and prefix bytes match. Otherwise Cambium can reuse semantic summaries
+under a new provider head. Neither path claims a provider cache hit; only
+provider usage can make that claim (`src/cambium/worker.py:2487-2533`).
 
 ### 5.3 Child result
 
@@ -269,14 +269,14 @@ A flush runs only between completed provider/tool turns:
    the source range.
 2. Compute its canonical source digest, message count, next sequence number, and
    covered turn.
-3. Make one additional provider call containing the immutable trunk, the raw
-   tail, and a delimited summary-control request.
+3. Make a bounded summary call containing the immutable trunk, the raw tail, and
+   a delimited summary-control request; a content flag permits one transformed
+   retry.
 4. Account for this call exactly like every other provider call: usage, request
    debt, latency, cache evidence, token budget, cost, cancellation, and wall
    deadline all apply.
 5. Parse and validate the strict `SummaryEntry`: exact sequence and source
-   metadata, bounded semantic fields, canonical content digest, and no unknown
-   fields.
+   metadata, bounded semantic fields, canonical schema, and no unknown fields.
 6. Append the entry as one user-role trunk message, clear the covered raw tail,
    write a new immutable checkpoint, and publish the epoch transition only after
    durable creation succeeds.
@@ -291,65 +291,63 @@ threshold flush when the raw tail crosses the configured high-water mark. A
 legacy transcript-heavy checkpoint is migrated by summarizing its unsummarized
 continuation at the next flush; it is not recursively compacted.
 
-If summary generation, validation, redaction, checkpoint creation, or publication
-fails, the active checkpoint and raw tail remain unchanged and the task fails
-closed. No earlier summary is rewritten to recover space. Future hierarchical
-summary tiers, if needed, require a new explicit projection type rather than
-silently summarizing summaries.
+An invalid summary entry emits `compaction_deferred`, skips the fold, and leaves
+the active checkpoint and raw tail unchanged; the loop continues. After two
+consecutive deferrals, the next invalid entry becomes `compaction_failed`.
+Other flush errors emit `compaction_failed` and the boundary caller fails the
+task (`src/cambium/worker.py:183`, `src/cambium/worker.py:4590-4604`,
+`src/cambium/worker.py:4657-4670`, `src/cambium/worker.py:5217-5225`).
 
-The economic decision remains an online optimal-stopping problem:
-
-```text
-summary_call + expected_cache_rebuild
-    < expected_remaining_calls * per_call_context_saving + quality_benefit
-```
-
-Cambium currently uses configured thresholds and semantic boundaries; workload-
-specific adaptive policies remain future work.
+At the 90% token soft cap, the worker adds a forced-finalization instruction and
+allows bounded headroom for a terminal `finish` rather than cutting off the
+loop (`src/cambium/worker.py:237-247`, `src/cambium/worker.py:4301-4370`).
+The live flush policy uses configured raw-tail thresholds plus delegation and
+terminal boundaries (`src/cambium/worker.py:4435-4448`).
 
 ## 6. Provider cache capability contract
 
-A provider adapter should expose typed capabilities instead of a generic flag:
+Provider configuration carries a normalized `CacheCapability` with:
 
 ```text
-supports_implicit_prefix_cache
-supports_explicit_breakpoints
 minimum_cacheable_tokens
+cache_ttl_s
 cache_granularity_tokens
-cache_ttl_modes
-cache_namespace/key support
-cache_read_usage_path
-cache_write_usage_path
-input_price
 cache_read_price
 cache_write_price
-cache_isolation_scope
-cache_identity_fields
 ```
 
-Official APIs differ materially. OpenAI caching is based on exact prefixes and
-may expose cache keys/retention controls; Anthropic uses explicit cache control
-breakpoints and separate read/write accounting; Gemini has explicit context
-cache resources and TTLs. Provider adapters normalize evidence into Cambium's
-usage record without pretending the protocols are identical.
+This is provider capability and tariff metadata, not cache evidence
+(`src/cambium/provider_scheduler.py:56-124`,
+`src/cambium/provider_config.py:215`, `src/cambium/diffundo.py:624`). Cache
+namespace and isolation are not modeled.
 
-An absent provider cache field is `unknown`, not a proved miss. A positive
-provider-reported cache-read count is a hit. A documented zero is a miss. This
-three-valued state must not be collapsed before routing evidence is updated.
+`provider_cache_hit` is true only for a positive normalized cached-token count,
+false for present usage with no positive count, and absent when usage is absent;
+prefix equality never fills this field (`src/cambium/diffundo.py:1226-1237`).
 
 ## 7. Routing interaction
 
 The context engine supplies a cache-affinity identity to routing, but does not
 choose providers. Routing first constructs a feasible set from authorization,
 exact model constraints, protocol/tool support, context/output capacity,
-budget, health, and rate limits. It then applies configured priority. Only
-inside that class may it optimize expected quality, cost, latency, and the
-switching cost of losing cache affinity.
+budget, health, rate limits, and credential readiness. An explicit authorized
+set with no credential-ready provider raises `NoCredentialFeasibleProvidersError`
+before spawn (`src/cambium/supervisor.py:2030-2031`,
+`src/cambium/supervisor.py:7553-7585`).
 
-This is a constrained non-stationary bandit/scheduling problem with switching
-costs. Exploration cannot violate hard constraints. Deterministic weighted
-rendezvous hashing is a suitable baseline for stable assignment among truly
-equivalent providers because it minimizes churn when membership changes.
+Each provider attempt gets the smaller of the call deadline and
+`base * _REASONING_EFFORT_MULTIPLIERS.get(effort, 1.0)` (the `max` effort is
+2x).
+`CONTENT_FLAGGED` lets the caller transform context once before normal cascade
+recovery; it leaves provider health unchanged and consumes no retry backoff
+(`src/cambium/diffundo.py:161-164`, `src/cambium/diffundo.py:695-697`,
+`src/cambium/diffundo.py:2683-2690`, `src/cambium/diffundo.py:2759-2763`).
+
+The first successful provider binds a `ProviderLease`; child/context binding can
+inherit its root and cache identity. A pinned incumbent timeout or real-death
+result clears that lease before fallback; a successful fallback becomes the new
+lease (`src/cambium/diffundo.py:2062-2115`,
+`src/cambium/diffundo.py:2193-2255`).
 
 See [`provider-routing.md`](provider-routing.md).
 
@@ -359,7 +357,10 @@ Every interactive frontend attaches to a durable branch rather than inventing
 a new unrelated conversation for each line. It displays current-turn and
 cumulative usage, including cache reads/writes and context utilization. The UI
 is a projection over the canonical event stream; it does not own session or
-agent state.
+agent state. The TUI rail marks exact, semantic, and fresh context lineage as
+`=`, `~`, and `∅` (`src/cambium/observability.py:285-295`,
+`src/cambium/tui_screen.py:2325-2341`,
+`src/cambium/tui_screen.py:2447-2457`).
 
 See [`terminal-interface.md`](terminal-interface.md).
 
@@ -380,38 +381,48 @@ Verified in source and the full Python 3.14 test tiers:
 - the active request is the immutable head and semantic trunk plus a bounded raw
   tail, not the old transcript followed by its summary;
 - exact provider/model/protocol/tool-compatible children reuse the byte-identical
-  trunk prefix, while incompatible providers reuse the semantic entries under a
-  fresh head;
+  trunk prefix when eligible, while incompatible providers reuse the semantic
+  entries under a fresh head; neither path implies a provider cache hit;
 - legacy transcript checkpoints migrate on their next flush rather than being
   recursively folded;
 - raw events, ordinary checkpoints, and epoch artifacts remain available for
   audit and replay outside the active prompt;
-- redacted/corrupt/mismatched checkpoints and invalid summary responses fail
-  closed before they can seed or advance a prompt.
+- redacted/corrupt/mismatched checkpoints fail closed; invalid summary responses
+  defer the fold and later become `compaction_failed` after the deferral limit
+  (`src/cambium/worker.py:4590-4670`);
+- `requires_commit` is carried in the task/result contract and requires changed
+  work to be committed; a clean no-op may still succeed
+  (`src/cambium/worker.py:1235-1276`,
+  `src/cambium/worker.py:5744-5814`).
+- Turn resume requires a matching `workspace_hash`; dirty worktrees are saved as
+  a 1 MB-bounded `salvage/<task>/<gen>/workspace.diff` and emit
+  `worktree_salvaged` before recovery (`src/cambium/supervisor.py:858-875`,
+  `src/cambium/supervisor.py:2758-2816`).
+- After child integration, a parent `HEAD` mismatch against
+  `_accepted_integration_heads` fails the join/success invariant
+  (`src/cambium/supervisor.py:6354-6382`,
+  `src/cambium/supervisor.py:4774-4810`).
 
 Open deltas:
 
 - The REPL remains one-shot per prompt and does not expose the TUI's durable
   interactive branch; TUI starts that branch at a fresh root and continues one
   explicitly with `-c`/`--continue`;
-- provider cache capability, namespace, TTL, granularity, isolation, and
-  read/write pricing are not modeled as one typed contract;
-- `prompt_prefix_bytes` is not yet a canonical digest/size of the complete
-  provider request identity;
+- provider cache namespace and isolation are not modeled; the remaining cache
+  capability and tariff fields are normalized in `CacheCapability`;
 - repeated real-provider cache and held-out quality canaries are still required
   before claiming economic or quality gains across workloads;
-- strict model pinning, rate/concurrency modeling, and cache-aware cost routing
-  retain gaps described in `provider-routing.md`;
-- the implemented trunk is flat append-only semantic segmentation; any future
-  long-horizon hierarchy must introduce an explicit new projection and preserve
-  the current non-recursive invariant.
+- thresholded K0 rollover is implemented; adaptive break-even selection remains
+  a library-only policy path (`src/cambium/worker.py:4605-4630`,
+  `src/cambium/summary_trunk.py:769-818`).
 
 ## 10. Verification
 
 A cache/context change is accepted only with frozen configuration and repeated
 trials:
 
-1. **Replay identity:** canonical request digest equality for hit/cold paths.
+1. **Replay identity:** canonical checkpoint identity and compatibility equality;
+   provider hit evidence is checked separately.
 2. **Provider evidence:** repeated warm/cold trials with provider-reported cache
    read/write tokens; report sample count and distribution, not `1/1`.
 3. **Compaction quality:** paired held-out task evaluation before/after
@@ -424,32 +435,7 @@ trials:
 7. **Economics:** input/output/cache-read/cache-write costs are calculated from
    the provider's actual pricing fields.
 
-## 11. Computer-science foundations
-
-- **Persistent functional data structures / Merkle DAGs:** immutable shared
-  ancestry and content-addressed checkpoints.
-- **Event sourcing and materialized views:** raw events are authoritative;
-  active context is a rebuildable projection.
-- **MVCC / snapshot isolation:** children read a stable parent version and
-  publish against an expected generation.
-- **Write-ahead logging and idempotency keys:** crash-safe append before state
-  advancement; duplicate completion suppression.
-- **CALM theorem / semilattices:** monotone facts can merge without ordering;
-  non-monotone edits require coordination.
-- **Online algorithms / ski rental:** decide when cache rebuild and compaction
-  amortize over future calls.
-- **Bandits with switching costs:** provider quality exploration under cache
-  affinity and changing evidence.
-- **Little's Law:** request rate is not concurrency; safe in-flight capacity
-  depends on observed service time.
-- **Information retrieval and long-context results:** retrieval/projection is
-  required because relevant information can be lost in the middle of long
-  prompts.
-- **Typed recursive language-model runtimes:** recursion needs explicit
-  operators, budgets, and termination conditions rather than unconstrained
-  self-calls.
-
-## 12. References
+## 11. References
 
 - Git object model: <https://git-scm.com/book/en/v2/Git-Internals-Git-Objects>
 - CALM theorem: <https://arxiv.org/abs/1901.01930>
