@@ -3,6 +3,8 @@
 **Status:** persistent interactive branch and event-sourced dashboard implemented.
 Source and tests remain authoritative.
 
+Interactive-session lifecycle: see [`interactive-tui.md`](interactive-tui.md).
+
 ## Architecture
 
 Cambium separates command ownership from observability:
