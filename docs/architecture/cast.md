@@ -1,7 +1,8 @@
 # CAST: Cache-Aligned Semantic Trunking
 
-**Status:** implemented flat semantic trunk and interactive fork/resume protocol;
-adaptive epoch rollover remains an evaluation target.
+**Status:** implemented flat semantic trunk, checkpoint fork/resume, and
+thresholded K0 rollover; adaptive break-even selection remains an evaluation
+target.
 
 ## Abstract
 
@@ -11,8 +12,8 @@ failed tool syntax, abandoned plans, superseded observations, and intermediate
 repository states. Rewriting one global summary removes that noise but changes a
 large prompt prefix and can destroy provider-side prefix-cache reuse.
 
-**Cache-Aligned Semantic Trunking (CAST)** keeps the complete raw event history
-outside the model while presenting an append-only semantic projection:
+**Cache-Aligned Semantic Trunking (CAST)** keeps raw event history durable while
+presenting an append-only semantic projection:
 
 ```text
 H + S1 + S2 + ... + Sn + Wn
@@ -25,10 +26,11 @@ covered raw range from the active projection without deleting it from durable
 history. Earlier summary bytes remain unchanged, which aligns the logical data
 structure with exact-prefix prompt caches.
 
-CAST-FJ extends the trunk with fork-join subagents. A cache-compatible child
-reuses the exact provider/model prefix. An opportunistic child on another
-provider starts cold from the provider-neutral semantic summaries. Semantic
-result admission and Git artifact integration remain separate operations.
+CAST-FJ extends the trunk with fork-join subagents. An exact-context-eligible
+child reuses the exact provider/model prefix; a child on another provider starts
+from provider-neutral semantic summaries. Neither is provider-cache evidence.
+Semantic result admission and Git artifact integration remain separate
+operations.
 
 ## 1. Context is a graph
 
@@ -117,7 +119,8 @@ The model owns semantic fields such as decisions, facts, changed symbols,
 verification results, relevant failed approaches, and open work. The runtime
 owns sequence numbers, source hashes, source message counts, checkpoint
 identity, and graph edges. The model is never trusted to compute bookkeeping
-identity.
+identity (`src/cambium/summary_trunk.py:49-59`,
+`src/cambium/summary_trunk.py:85-103`).
 
 ## 3. Why the structure is cache-aligned
 
@@ -135,34 +138,27 @@ A repeatedly rewritten global summary instead changes most of the semantic
 prefix on every compaction.
 
 Cache retention and minimum cacheable block size are provider capabilities, not
-correctness assumptions. Cambium treats an approximately 60-second warm horizon
-as a configurable scheduling hint only. A cache miss must produce the same
+correctness assumptions. `CacheCapability` normalizes minimum size, TTL,
+granularity, and read/write prices; namespace and isolation are not modeled
+(`src/cambium/provider_scheduler.py:56-124`). A cache miss must produce the same
 semantic request and result contract as a hit.
 
-Small tails should normally be batched until one of these boundaries:
+The live worker flushes at the raw-tail high-water threshold, delegation, and
+terminal boundaries (`src/cambium/worker.py:4435-4448`,
+`src/cambium/worker.py:5217-5225`, `src/cambium/worker.py:5382-5397`). The
+separate `breakpoint_due` horizon check is not wired to a worker flush
+(`src/cambium/provider_scheduler.py:282-306`).
 
-- a provider/tool turn completed and the tail crosses its high-water mark;
-- delegation requires a clean immutable branch point;
-- terminal completion requires a reusable continuation checkpoint;
-- the expected cache horizon is about to expire;
-- the active context needs space for its output reserve.
+`provider_cache_hit` is copied from normalized provider usage; matching a
+prefix or model makes a child eligible, but never proves a hit
+(`src/cambium/diffundo.py:1226-1237`, `src/cambium/worker.py:2990-3005`).
 
-Provider adapters should eventually expose:
+## 4. Same-provider exact-context child
 
-```text
-minimum_cacheable_tokens
-cache_block_granularity_tokens
-cache_horizon_s
-supports_explicit_breakpoints
-cache_read_price
-cache_write_price
-```
-
-## 4. Same-provider cached child
-
-A child can reuse the exact parent prefix only when the provider, model,
-protocol, reasoning configuration, tool schemas, and serialized messages are
-compatible.
+An exact-context child can reuse the parent message prefix only when the
+provider boundary, model, protocol, reasoning configuration, tool schema,
+serialized messages, hashes, and prefix size match. This is eligibility, not a
+provider-cache eligibility or a hit (`src/cambium/worker.py:2487-2533`).
 
 ```text
 Parent, provider A/model M
@@ -180,33 +176,27 @@ Child, provider A/model M
 The child receives an immutable checkpoint descriptor and a private continuation.
 It cannot mutate the parent frontier directly.
 
-## 5. Fresh opportunistic child on another provider
+## 5. Cross-provider semantic child
 
-A weaker, free, or otherwise available provider may be useful for bounded
-research, indexing, summarization, or test triage even though it cannot reuse the
-parent provider's KV cache.
+An incompatible provider can reuse the immutable summary history but cannot
+reuse the parent provider's exact prefix.
 
 ```text
-Cached parent on provider A
+Parent on provider A
 
  [ H_A ][ S1 ][ S2 ][ S3 ]
                 |
                 | export provider-neutral summaries
                 v
-Fresh child on provider B
+Semantic child on provider B
 
  [ H_B ][ S1 ][ S2 ][ S3 ][ scoped child contract ]
-          \ semantic reuse / cold provider cache /
+          \ semantic reuse / no hit claim /
 ```
 
-This is a **semantic fork**, not a cache hit. The child starts with a fresh
-provider-specific head and the immutable summary history. It should receive only
-the capabilities and evidence required for its task. Weak or free lanes can be
-restricted to read-only task classes, and their claims can require review before
-parent admission.
-
-This allows Cambium to consume idle token capacity without rotating the main
-long-lived branch away from its incumbent provider.
+This is a **semantic fork**, not a cache hit. For a non-redacted checkpoint, the
+child starts with a fresh provider-specific head and receives only the summary
+history plus its scoped contract (`src/cambium/worker.py:2571-2618`).
 
 ## 6. Branch-back protocol
 
@@ -257,6 +247,18 @@ Before a mutating parent resumes, the required invariant is:
 post_join_parent_HEAD == accepted_integration_HEAD
 ```
 
+The supervisor checks that head and emits `join_invariant_failed` on mismatch;
+a successful worker that violates its result/worktree commit invariant becomes a
+failure with cleanup deferred (`src/cambium/supervisor.py:6354-6382`,
+`src/cambium/supervisor.py:4774-4810`).
+
+Checkpoint-bound resume requires the current worktree hash to equal the latest
+turn checkpoint hash. A dirty worktree that cannot resume is salvaged to
+the 1 MB-bounded `salvage/<task>/<gen>/workspace.diff` and emits
+`worktree_salvaged` (`src/cambium/supervisor.py:858-875`,
+`src/cambium/supervisor.py:2847-2869`,
+`src/cambium/supervisor.py:2758-2816`).
+
 A merge conflict should become a structured conflict envelope with conflicted
 paths and bounded evidence. The parent can resolve it or spawn an explicit
 resolver child; it must not receive a false success summary for code it cannot
@@ -278,42 +280,13 @@ New epoch E1
 [ K0 ][ W' ]
 ```
 
-`K0` is grounded from authoritative repository state, active decisions,
-unresolved obligations, verification evidence, and the raw event graph. It
-permanently removes superseded facts only from the active projection.
-
-Let:
-
-- `O` be old trunk tokens;
-- `K` be new snapshot tokens;
-- `p_c` and `p_u` be effective cached and uncached token prices;
-- `C_r` be snapshot generation and validation cost;
-- `Q_o - Q_n` be per-call quality improvement;
-- `N` be expected remaining calls.
-
-Rollover becomes economical when:
-
-```text
-N * [p_c * (O - K) + (Q_o - Q_n)]
-    > C_r + (p_u - p_c) * K
-```
-
-or:
-
-```text
-N* = [C_r + (p_u - p_c) * K]
-     / [p_c * (O - K) + (Q_o - Q_n)]
-```
-
-For subscriptions, the effective price includes shadow prices for five-hour,
-weekly, and monthly windows. A hard context limit, trust-policy change,
-provider/model migration, tool-schema change, poisoned summary, or failed
-quality canary forces rollover regardless of the estimate.
-
-A completely new session is rarer. It is appropriate for an unrelated task,
-repository or customer boundary, independent evaluation, or untrusted/corrupt
-history. Context size alone normally calls for a new epoch inside the same
-session.
+`K0` folds the active semantic fields from immutable summary entries and keeps
+the source entries in a rollover manifest; superseded facts disappear only from
+the active projection (`src/cambium/summary_trunk.py:670-735`,
+`src/cambium/worker.py:4608-4630`). The worker rolls over after configured
+segment/token bounds and resets the prompt baseline. `k0_rollover_decision`
+computes an economic break-even decision, but it is a library-only path; the
+live worker uses thresholds (`src/cambium/summary_trunk.py:769-818`).
 
 ## 8. Current Cambium implementation
 
@@ -322,28 +295,17 @@ Implemented:
 - append-only, disjoint semantic summary segments;
 - runtime-stamped segment identity;
 - durable raw history and immutable checkpoints;
-- exact cache-compatible child forks;
+- exact-context-eligible child forks, with provider hits reported separately;
 - cold cross-provider semantic-summary forks;
+- thresholded K0 rollover with a durable source manifest;
 - a persistent interactive TUI branch composed from isolated supervisor leaves;
-- per-agent usage, throughput, provider/model, trunk, tail, and epoch views.
+- per-agent usage, throughput, provider/model, trunk, tail, epoch, and lineage
+  views (`src/cambium/tui_screen.py:2325-2341`,
+  `src/cambium/tui_screen.py:2447-2457`).
 
 Still empirical or future work:
 
 - provider-specific cache-block calibration;
-- adaptive `K0` rollover and held-out quality canaries;
+- adaptive `K0` break-even selection and held-out quality canaries;
 - structured automatic resolver children for every Git conflict class;
-- workload-specific measurement of the break-even policy.
-
-## 9. Research questions
-
-| RQ | Hypothesis | Principal metrics |
-| --- | --- | --- |
-| Cache efficiency | Append-only segments improve reusable-prefix ratio | cache tokens, TTFT, cost |
-| Contradiction avoidance | explicit invalidation reduces regressions | contradictions, failed tests |
-| Fork accuracy | exact checkpoint children improve coupled edits | success, merge conflicts |
-| Opportunistic capacity | cold semantic children use idle providers safely | useful tokens, review cost |
-| Optimal rollover | online break-even beats fixed resets | cost-success frontier |
-
-Suggested title:
-
-> **CAST: Cache-Aligned Semantic Trunking for Long-Horizon Autonomous Coding Agents**
+- workload-specific measurement of the library-only break-even policy.
