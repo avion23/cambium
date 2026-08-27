@@ -363,7 +363,26 @@ _INVALID_PROMPT_POLICY_TYPES = frozenset(
         "safety_error",
     }
 )
-_INVALID_PROMPT_POLICY_MARKERS = ("usage policy", "disallowed", "safety")
+_INVALID_PROMPT_POLICY_MARKERS = frozenset(
+    {
+        "usage policy",
+        "usage policies",
+        "policy",
+        "policies",
+        "disallowed",
+        "safety",
+        "system",
+        "moderation",
+        "content filter",
+        "content filtering",
+        "content_filter",
+        "blocked",
+        "violation",
+    }
+)
+_STRUCTURED_POLICY_FLAG_CODES = frozenset(
+    {"content_policy_violation", "content_filter_violation"}
+)
 _STRUCTURED_CODEX_OUTCOMES = {
     "model_not_found": ProviderOutcome.CONFIG_ERROR,
     "unsupported_model": ProviderOutcome.CONFIG_ERROR,
@@ -381,6 +400,7 @@ _CODEX_CONFIG_CODES = frozenset(
         "unsupported_parameter",
     }
 )
+_CODEX_CONFIG_FIELD_MARKERS = frozenset({"unsupported", "parameter", "not_found"})
 _STRUCTURED_HTTP_OUTCOMES = {
     "invalid_api_key": ProviderOutcome.AUTH_ERROR,
     "invalid_api_token": ProviderOutcome.AUTH_ERROR,
@@ -439,20 +459,22 @@ def _error_tokens(body: str | Mapping[str, Any]) -> tuple[str, ...] | None:
 
 
 def _error_message_text(body: str | Mapping[str, Any]) -> str:
-    """Return only freeform message text for the legacy marker fallback."""
+    """Return freeform error text for the legacy marker fallback."""
     objects = _error_body_objects(body)
     if objects is None:
         return str(body)
     messages = [
         value
         for item in objects
-        for key in ("message", "detail")
+        for key in ("message", "detail", "error")
         if isinstance(value := item.get(key), str)
     ]
-    return " ".join(messages)
+    if messages:
+        return " ".join(messages)
+    return json.dumps(body, default=str) if isinstance(body, Mapping) else str(body)
 
 
-def _codex_prompt_flagged(error: Mapping[str, Any]) -> bool:
+def _codex_prompt_flagged(error: str | Mapping[str, Any]) -> bool:
     """Require the narrow policy evidence for a recoverable codex prompt flag."""
     objects = _error_body_objects(error)
     if objects is None:
@@ -469,11 +491,12 @@ def _codex_prompt_flagged(error: Mapping[str, Any]) -> bool:
         for value in (item.get("type"),)
         if isinstance(value, str)
     }
-    if "invalid_prompt" not in codes or not types.issubset(_INVALID_PROMPT_POLICY_TYPES):
+    types.discard("error")
+    if not types.issubset(_INVALID_PROMPT_POLICY_TYPES):
         return False
-    message = " ".join(
-        value for item in objects if isinstance(value := item.get("message"), str)
-    ).casefold()
+    if "invalid_prompt" not in codes and "invalid_request_error" not in types:
+        return False
+    message = _error_message_text(error).casefold()
     return any(marker in message for marker in _INVALID_PROMPT_POLICY_MARKERS)
 
 
@@ -488,14 +511,20 @@ def _structured_error_outcome(
     if tokens is None:
         return None
     objects = _error_body_objects(body)
-    prompt_flagged = objects is not None and (
-        not strict_prompt_flag or _codex_prompt_flagged(objects[0])
+    prompt_flagged = (
+        objects is not None if not strict_prompt_flag else _codex_prompt_flagged(body)
     )
+    if any(token in _CODEX_CONFIG_CODES for token in tokens):
+        return ProviderOutcome.CONFIG_ERROR
+    if strict_prompt_flag and prompt_flagged:
+        return ProviderOutcome.CONTENT_FLAGGED
     for token in tokens:
         if token in _STRUCTURED_CONTENT_FLAG_CODES:
             if not strict_prompt_flag and prompt_flagged:
                 return ProviderOutcome.CONTENT_FLAGGED
             if token == "invalid_prompt" and prompt_flagged:
+                return ProviderOutcome.CONTENT_FLAGGED
+            if token in _STRUCTURED_POLICY_FLAG_CODES:
                 return ProviderOutcome.CONTENT_FLAGGED
             if token in _STRUCTURED_POLICY_REFUSAL_CODES:
                 return policy_outcome
@@ -1639,11 +1668,14 @@ def _codex_stream_error(
 ) -> ProviderError:
     """Classify one in-stream codex error object into a ProviderError."""
     text = json.dumps(error, default=str)
-    outcome = _structured_error_outcome(
-        error,
-        policy_outcome=ProviderOutcome.REFUSAL,
-        strict_prompt_flag=True,
-    )
+    if _codex_config_400(error):
+        outcome = ProviderOutcome.CONFIG_ERROR
+    else:
+        outcome = _structured_error_outcome(
+            error,
+            policy_outcome=ProviderOutcome.REFUSAL,
+            strict_prompt_flag=True,
+        )
     if outcome is None:
         outcome = _keyword_codex_outcome(_error_message_text(error))
     return ProviderError(
@@ -1714,19 +1746,118 @@ def _parse_codex_sse(
     return completed, text, None
 
 
-def _codex_config_400(message: str) -> bool:
-    """True when structured codex 400 fields name a model/parameter problem.
+def _codex_config_400(message: str | Mapping[str, Any]) -> bool:
+    """True when a codex error body names a model/parameter problem.
 
-    Generic ``invalid``/``parameter`` words are not configuration evidence:
-    only normalized machine-readable codes can quarantine a provider here.
+    Configuration indicators in structured ``code``, ``model``, or ``param``
+    fields take precedence over policy-flag evidence. Freeform text retains
+    only the established model/parameter phrases.
     """
     tokens = _error_tokens(message)
     if tokens is None:
         return False
     if any(token in _CODEX_CONFIG_CODES for token in tokens):
         return True
+    objects = _error_body_objects(message)
+    if objects is not None and any(
+        isinstance(value, str) and bool(value.strip())
+        for item in objects
+        for value in (item.get("param"),)
+    ):
+        return True
+    if objects is not None and any(
+        isinstance(value, str)
+        and any(
+            marker in _ERROR_TOKEN_RE.sub("_", value.casefold()).strip("_")
+            for marker in _CODEX_CONFIG_FIELD_MARKERS
+        )
+        for item in objects
+        for field_name in ("code", "model", "param")
+        for value in (item.get(field_name),)
+    ):
+        return True
     lowered = _error_message_text(message).casefold()
     return any(marker in lowered for marker in _CODEX_CONFIG_TEXT_MARKERS)
+
+
+def _classify_http_403(
+    provider: ProviderConfig,
+    message: str,
+    *,
+    cause: BaseException | None,
+    retry_after_s: float | None,
+    account_quota_owner: str | None,
+    structured_http: ProviderOutcome | None,
+    content_flagged: bool,
+) -> ProviderError:
+    """Classify the provider-specific meanings carried by HTTP 403."""
+    if retry_after_s is None:
+        retry_after_s = _body_retry_after(message)
+    if _WAF_403_RE.search(message) or _CLOUDFLARE_1010_RE.search(message):
+        # A WAF/browser block says nothing about the provider credential. Keep
+        # it retryable with bounded backoff.
+        return ProviderError(
+            provider.name,
+            ProviderOutcome.ERROR,
+            f"HTTP 403 WAF/network block: {message}",
+            cause,
+            retry_after_s=retry_after_s,
+        )
+    lowered = _error_message_text(message).casefold()
+    if structured_http is ProviderOutcome.QUOTA or any(
+        marker in lowered for marker in _HTTP_403_QUOTA_MARKERS
+    ):
+        return ProviderError(
+            provider.name,
+            ProviderOutcome.QUOTA,
+            f"HTTP 403 quota/billing: {message}",
+            cause,
+            retry_after_s=retry_after_s,
+            account_quota_owner=account_quota_owner,
+        )
+    if structured_http is ProviderOutcome.CONFIG_ERROR or any(
+        marker in lowered for marker in _HTTP_403_MODEL_MARKERS
+    ):
+        return ProviderError(
+            provider.name,
+            ProviderOutcome.CONFIG_ERROR,
+            f"HTTP 403 model entitlement: {message}",
+            cause,
+        )
+    if content_flagged:
+        return ProviderError(
+            provider.name,
+            ProviderOutcome.CONTENT_FLAGGED,
+            f"HTTP 403 policy/content flag: {message}",
+            cause,
+        )
+    if structured_http is ProviderOutcome.AUTH_ERROR:
+        return ProviderError(
+            provider.name,
+            ProviderOutcome.AUTH_ERROR,
+            f"HTTP 403 credential rejected: {message}",
+            cause,
+        )
+    if any(marker in lowered for marker in _HTTP_403_REFUSAL_MARKERS):
+        return ProviderError(
+            provider.name,
+            ProviderOutcome.REFUSAL,
+            f"HTTP 403 policy/content refusal: {message}",
+            cause,
+        )
+    if any(marker in lowered for marker in _HTTP_403_AUTH_MARKERS):
+        return ProviderError(
+            provider.name,
+            ProviderOutcome.AUTH_ERROR,
+            f"HTTP 403 credential rejected: {message}",
+            cause,
+        )
+    # An unlabelled 403 remains fail-closed as an auth failure. Known
+    # provider/WAF, entitlement, quota, and policy shapes above avoid
+    # damaging provider health for their respective non-auth causes.
+    return ProviderError(
+        provider.name, ProviderOutcome.AUTH_ERROR, f"HTTP 403: {message}", cause
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -3016,6 +3147,11 @@ class Diffundo:
         retry_after_s: float | None = None,
         account_quota_owner: str | None = None,
     ) -> ProviderError:
+        config_400 = (
+            status == 400
+            and provider.protocol is Protocol.CODEX_RESPONSES
+            and _codex_config_400(message)
+        )
         structured = _structured_error_outcome(
             message,
             policy_outcome=ProviderOutcome.CONTENT_FLAGGED,
@@ -3033,6 +3169,13 @@ class Diffundo:
                 f"HTTP {status} redirect: provider completion endpoints must not redirect",
                 cause,
             )
+        if status in (401, 429) and content_flagged:
+            return ProviderError(
+                provider.name,
+                ProviderOutcome.CONTENT_FLAGGED,
+                f"HTTP {status} policy/content flag: {message}",
+                cause,
+            )
         if status == 429:
             if retry_after_s is None:
                 retry_after_s = _body_retry_after(message)
@@ -3045,75 +3188,27 @@ class Diffundo:
                 account_quota_owner=account_quota_owner,
             )
         if status == 403:
-            if retry_after_s is None:
-                retry_after_s = _body_retry_after(message)
-            if _WAF_403_RE.search(message) or _CLOUDFLARE_1010_RE.search(message):
-                # A WAF/browser block says nothing about the provider
-                # credential. Keep it retryable with bounded backoff.
-                return ProviderError(
-                    provider.name,
-                    ProviderOutcome.ERROR,
-                    f"HTTP 403 WAF/network block: {message}",
-                    cause,
-                    retry_after_s=retry_after_s,
-                )
-            lowered = _error_message_text(message).casefold()
-            if structured_http is ProviderOutcome.QUOTA or any(
-                marker in lowered for marker in _HTTP_403_QUOTA_MARKERS
-            ):
-                return ProviderError(
-                    provider.name,
-                    ProviderOutcome.QUOTA,
-                    f"HTTP 403 quota/billing: {message}",
-                    cause,
-                    retry_after_s=retry_after_s,
-                    account_quota_owner=account_quota_owner,
-                )
-            if structured_http is ProviderOutcome.CONFIG_ERROR or any(
-                marker in lowered for marker in _HTTP_403_MODEL_MARKERS
-            ):
-                return ProviderError(
-                    provider.name,
-                    ProviderOutcome.CONFIG_ERROR,
-                    f"HTTP 403 model entitlement: {message}",
-                    cause,
-                )
-            if content_flagged:
-                return ProviderError(
-                    provider.name,
-                    ProviderOutcome.CONTENT_FLAGGED,
-                    f"HTTP 403 policy/content flag: {message}",
-                    cause,
-                )
-            if structured_http is ProviderOutcome.AUTH_ERROR:
-                return ProviderError(
-                    provider.name,
-                    ProviderOutcome.AUTH_ERROR,
-                    f"HTTP 403 credential rejected: {message}",
-                    cause,
-                )
-            if any(marker in lowered for marker in _HTTP_403_REFUSAL_MARKERS):
-                return ProviderError(
-                    provider.name,
-                    ProviderOutcome.REFUSAL,
-                    f"HTTP 403 policy/content refusal: {message}",
-                    cause,
-                )
-            if any(marker in lowered for marker in _HTTP_403_AUTH_MARKERS):
-                return ProviderError(
-                    provider.name,
-                    ProviderOutcome.AUTH_ERROR,
-                    f"HTTP 403 credential rejected: {message}",
-                    cause,
-                )
-            # An unlabelled 403 remains fail-closed as an auth failure. Known
-            # provider/WAF, entitlement, quota, and policy shapes above avoid
-            # damaging provider health for their respective non-auth causes.
+            return _classify_http_403(
+                provider,
+                message,
+                cause=cause,
+                retry_after_s=retry_after_s,
+                account_quota_owner=account_quota_owner,
+                structured_http=structured_http,
+                content_flagged=content_flagged,
+            )
         if status in (401, 403):
             return ProviderError(
                 provider.name, ProviderOutcome.AUTH_ERROR, f"HTTP {status}: {message}", cause
             )
         if status == 400:
+            if config_400:
+                return ProviderError(
+                    provider.name,
+                    ProviderOutcome.CONFIG_ERROR,
+                    f"HTTP 400: {message}",
+                    cause,
+                )
             if content_flagged:
                 return ProviderError(
                     provider.name,
@@ -3126,13 +3221,6 @@ class Diffundo:
             # quarantines the provider, NOT a content refusal. The generic
             # all-400 -> REFUSAL rule below is unchanged for chat_completions
             # providers.
-            if provider.protocol is Protocol.CODEX_RESPONSES and _codex_config_400(message):
-                return ProviderError(
-                    provider.name,
-                    ProviderOutcome.CONFIG_ERROR,
-                    f"HTTP 400: {message}",
-                    cause,
-                )
             # Deterministic HTTP 400s are permanent request-level rejections
             # (verified live: zai 1214 'messages illegal' was retried then
             # cooled down). A generic 400 used to fall to the retryable ERROR
