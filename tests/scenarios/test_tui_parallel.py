@@ -23,9 +23,7 @@ def test_admission_is_unlimited_by_default_and_honors_explicit_cap(tmp_path: Pat
     assert capped._admission_semaphore._value == 2
 
 
-def test_queued_tui_prompts_use_one_flat_plan(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_queued_tui_prompts_use_one_flat_plan(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(oneshot, "preflight", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(oneshot, "admit_session", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
