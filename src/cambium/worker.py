@@ -4573,8 +4573,9 @@ async def _run_agent_loop(
         if base_messages is not None:
             transcript = copy.deepcopy([*base_messages[1:], *context_continuation])
 
-    def _restore_turn_context() -> None:
-        nonlocal base_messages, context_continuation
+    def _restore_turn_context(
+        transcript_snapshot: list[dict[str, Any]],
+    ) -> tuple[tuple[dict[str, Any], ...], list[dict[str, Any]], list[dict[str, Any]]]:
         initial_prompt = _build_agent_prompt(
             config.task,
             tools,
@@ -4583,17 +4584,21 @@ async def _run_agent_loop(
             parent_envelope=config.parent_envelope,
         )
         initial_trunk, _initial_tail = partition_summary_trunk(initial_prompt["messages"])
-        base_messages = tuple(copy.deepcopy(initial_trunk))
-        context_continuation = copy.deepcopy(transcript)
+        context_continuation = copy.deepcopy(transcript_snapshot)
         if (
             len(initial_trunk) > 1
             and context_continuation
             and context_continuation[0] == initial_trunk[1]
         ):
             context_continuation = context_continuation[1:]
-        _sync_context_transcript()
+        return (
+            tuple(copy.deepcopy(initial_trunk)),
+            context_continuation,
+            copy.deepcopy([*initial_trunk[1:], *context_continuation]),
+        )
 
-    def _maybe_restore_turn_context() -> None:
+    async def _maybe_restore_turn_context() -> None:
+        nonlocal base_messages, context_continuation, transcript
         if (
             turn_checkpoint_resumed
             and compaction_deferred
@@ -4601,7 +4606,9 @@ async def _run_agent_loop(
             and config.context_reuse
             and config.checkpoint_root is not None
         ):
-            _restore_turn_context()
+            base_messages, context_continuation, transcript = await asyncio.to_thread(
+                _restore_turn_context, transcript
+            )
 
     def _append_context_message(message: dict[str, str]) -> None:
         nonlocal transcript
@@ -5384,7 +5391,7 @@ async def _run_agent_loop(
                 else:
                     context_continuation.extend(invalid_messages)
                     _sync_context_transcript()
-                _maybe_restore_turn_context()
+                await _maybe_restore_turn_context()
                 _arm_finalization(turn)
                 if _observe_progress(response_content) and not _finalization_due(turn):
                     return _no_progress_failure(turn)
@@ -5449,7 +5456,7 @@ async def _run_agent_loop(
                         )
                     context_continuation.append({"role": "user", "content": "Continue."})
                     _sync_context_transcript()
-                _maybe_restore_turn_context()
+                await _maybe_restore_turn_context()
                 _arm_finalization(turn)
                 progress.tool = "plan"
                 continue
@@ -5459,7 +5466,7 @@ async def _run_agent_loop(
                 else:
                     context_continuation.append(action_message)
                     _sync_context_transcript()
-                _maybe_restore_turn_context()
+                await _maybe_restore_turn_context()
                 if code_changed and not verified_after_change:
                     reason = (
                         "finish rejected: you changed code but did not run a "
@@ -5616,7 +5623,7 @@ async def _run_agent_loop(
                 else:
                     context_continuation.extend(denied_messages)
                     _sync_context_transcript()
-                _maybe_restore_turn_context()
+                await _maybe_restore_turn_context()
                 _arm_finalization(turn)
                 progress.tool = name
                 continue
@@ -5670,7 +5677,7 @@ async def _run_agent_loop(
                 continuation_suffix.append(state_message)
                 context_continuation.extend(copy.deepcopy(continuation_suffix))
                 _sync_context_transcript()
-            _maybe_restore_turn_context()
+            await _maybe_restore_turn_context()
             _arm_finalization(turn)
             if writer is not None:
                 await _emit_tool_event(writer, config, name, arguments, turn, tool_result)
