@@ -1,443 +1,139 @@
 # Cambium architecture
 
-**Status:** current-versus-target contract. Source and tests establish current
-behavior. This document names targets but does not turn them into features.
-See [`agents.md`](../../agents.md) for the operating contract and the focused
-architecture documents beside this file for subsystem contracts.
+## What Cambium is
 
-## 1. Current runtime
+Cambium is a local multi-agent orchestrator that runs coding tasks through LLM
+providers. A supervisor spawns worker processes in Git worktrees, each worker
+drives a bounded agent loop against the Diffundo provider cascade, and durable
+events plus fenced commits make every outcome recoverable. It runs directly
+from source — no wheel, no install.
 
-Cambium runs directly from source; no wheel is built and no install is
-required or supported. The CLI routes `auth`, `supervisor`, `doctor`, `bench`,
-`module-test`, `version`, `run`, `repl`, `tui`, `monitor`, `optimize`,
-`session`, and `architectus`.
-The session surface includes `list`, `latest`, `show`, `status`, `resume`, and
-`usage`. Task-tree inspection remains available as `python -m cambium.tasktree`.
-`cambium.__init__` exports only `__version__`; there is no public session API.
+## Big picture
 
-### Plan and publication
+```mermaid
+flowchart LR
+    subgraph Providers
+        P1[Provider A]
+        P2[Provider B]
+        P3[Provider C]
+    end
+    D[Diffundo cascade<br/>tiered routing, cooldown,<br/>circuit breaker, failover]
+    S[Supervisor<br/>admission · generations · merge]
+    W1[Worker 1<br/>agent loop]
+    W2[Worker N<br/>agent loop]
+    DB[(events.db<br/>durable event log)]
+    CAST[CAST checkpoints<br/>immutable context epochs]
+    TUI[TUI / monitor<br/>cockpit · rail]
 
-`cambium.supervisor.run_plan` accepts a mapping with `tasks` or a task list. It
-validates supplied task records, rejects duplicate IDs and unsafe worktree
-paths, then supervises the supplied tasks concurrently in one
-`asyncio.TaskGroup`. A task worker runs in a Git worktree and process group. A
-clean worker whose envelope reports `succeeded` publishes; there is no
-task-command pre-merge gate. A succeeded envelope proceeds to merge only after
-the repository-integrity checks pass (worker success integrity, fencing,
-expected-old ref publication, session admission, worktree confinement,
-protocol/request correlation, and quarantine). Successful publication uses an
-expected-old atomic update of `refs/heads/main`. It is ref-only and never
-refreshes the caller's checkout or index. A child publication records its
-accepted integration head and advances a clean suspended parent before the
-join barrier; the invariant is
-`post_join_parent_HEAD == accepted_integration_HEAD`. A failed join emits a
-bounded `join_invariant_failed` record and cannot resume the parent.
+    P1 <--> D
+    P2 <--> D
+    P3 <--> D
+    D <--> W1
+    D <--> W2
+    S <--> W1
+    S <--> W2
+    W1 --> CAST
+    W2 --> CAST
+    S --> DB
+    W1 --> DB
+    W2 --> DB
+    DB --> TUI
+```
 
-A session-wide parallel-worker cap defaults to one worker per CPU:
-`run_plan` rewrites `max_concurrent_tasks=None` to the CPU count before
-building `_Runtime`, which creates an `asyncio.Semaphore` when the cap is
-nonzero (`0` disables the cap, meaning unlimited). The semaphore is acquired
-for the worker phase (spawn through worker exit) on both the flat and the
-hierarchy paths, and is released before merge, prune, and observer
-notification. A flat plan (no `depends_on`) fans out under one
-`asyncio.TaskGroup`; the flat canary
-(`test_flat_plan_ignores_max_width_and_preserves_canary`, four tasks) shows
-`max_width` is ignored on that path while the default CPU-count cap still
-bounds concurrent workers. A plan that supplies `depends_on` is built into
-one validated rooted `TaskTree` and dispatched in static ready-node waves:
-only nodes whose dependencies finished are admitted per wave, and each
-wave's concurrency is bounded by `max_width` (parameter, then the plan
-field, then `tasktree.MAX_WIDTH`). A failed node cascades so its descendants
-are never spawned. `resource_thresholds` remains the only host-health
-pre-flight.
+## Components
 
-The plan runtime creates `store.EventStore` at `.cambium/events.db`, emits
-records through it, and writes `.cambium/result.json` after shutdown. The
-one-task `run_session` adapter remains for compatibility. `EventStore` is
-the current event boundary; there is no current `events.py` or dead-letter
-queue module.
+**Diffundo** (`diffundo.py`, `routing.py`, `provider_config.py`) — a tiered
+multi-provider router. Within a tier it orders candidates by measured evidence
+(success, latency, throughput, cache hits) with rotation seeding and incumbent
+stickiness; across tiers it cascades on failure. Per-provider token buckets
+and in-flight caps gate admission, cooldowns and a circuit breaker quarantine
+unhealthy providers, and a per-tier recovery monitor re-admits them. A pinned
+provider keeps its task association until terminal-death evidence (auth 401/403,
+endpoint 5xx, or transport failure), at which point authorized fallbacks are
+tried in-tier first and the router sticks with the survivor. There is no local
+response cache: `provider_cache_hit` records only what the provider itself
+reports.
 
-Interactive TUI turns keep those stores isolated under
-`turn-NNNN/.cambium/events.db`. `supervisor.read_events` aggregates the turn
-stores into one session-level timeline with stable sequence numbers for the
-TUI and monitor; it does not rewrite archived turn history. The canonical root
-result keeps its `event_log_ref` as the owning root's
-`sqlite:<root>/.cambium/events.db` URI, with aggregation preserved as a
-read-time supervisor behavior.
+**Supervisor** (`supervisor.py`, `tasktree.py`, `merge.py`, `fencing.py`) —
+owns the plan and the lifecycle. `run_plan` validates task records, builds a
+`TaskTree` when tasks carry `depends_on` (static ready-node waves bounded by
+`max_width`), and fans out flat plans under a CPU-count worker cap. Per task it
+runs generations in an `asyncio.TaskGroup`: admission, spawn, restart-resume on
+recoverable failure, worktree salvage before any destructive cleanup, and merge.
+A succeeded worker publishes through an expected-old atomic update of
+`refs/heads/main` — ref-only, never touching the caller's checkout; conflicts
+surface as a structured `merge_conflict` envelope. Hierarchical plans support
+plan mode: a parent proposes typed child revisions (`propose_child`), the
+supervisor validates and durably admits them before dispatch, and the
+transactional join enforces `post_join_parent_HEAD == accepted_integration_HEAD`.
 
-The canonical root result written to `.cambium/result.json` is
-`results.Result`. Its JSON record includes the serving `provider` and the
-optional `fell_back_from` origin, so a terminal-death provider substitution is
-visible in the durable result rather than only in the event stream.
+**Worker** (`worker.py`, `tools.py`, `schemas.py`, `ipc.py`) — one process per
+task, in its own Git worktree and process group, speaking bounded NDJSON over
+stdio. With a `fanout_config` it runs the agent loop: each turn calls Diffundo
+and requires exactly one strict JSON action — `plan`, `tool_call`, or `finish` —
+dispatched against a six-tool roster: `delegate`, `read_batch`, `write_file`,
+`edit_file`, `git_op`, `run_shell`. The loop bounds turns, tokens, wall time,
+and transcript size; finalization creates at most one fenced commit (zero for a
+clean no-change finish) gated by the task's `requires_commit` flag, and returns
+a redacted result envelope.
 
-The supervisor gives each worker a bounded decoded-stdout `asyncio.Queue` and
-routes worker and runtime records through `EventStore`'s bounded writer queue.
-Worker stdout remains protocol-only NDJSON; diagnostics use stderr/logging.
-When a worker generation fails, the failure envelope/result reason includes
-the latest non-empty worker stderr tail after session redaction, bounded to
-512 characters. Non-critical store records can be dropped under the store
-overflow policy.
+**Store** (`store.py`, `results.py`) — `EventStore` at `.cambium/events.db` is
+the durable boundary: a bounded writer queue, critical-kind admission that
+waits for the writer, and observer copies that cannot mutate persisted rows.
+Interactive TUI turns keep per-turn stores under `turn-NNNN/.cambium/` that the
+supervisor aggregates into one session timeline at read time. The canonical
+root result lands in `.cambium/result.json`.
 
-### Worker and providers
+**TUI** (`tui.py`, `tui_screen.py`, `interactive.py`, `monitor.py`) — the
+interactive cockpit: a persistent semantic branch where each turn runs the
+same worker/store machinery, rendered as a live cockpit transcript with an
+agent rail (task tree state) and a ticker of turn activity. Slash commands
+(`compact`, `dashboard`, `clear`, …) drive context rollover and inspection;
+the monitor replays the same event stream for batch runs.
 
-`provider_config.load_providers` keeps the provider document boundary strict but
-quarantines an invalid entry instead of discarding the whole file. Each dropped
-entry is recorded as `{"entry", "reason", "quarantined_at"}` in the
-`<config>.quarantine` JSON sidecar; writes merge-deduplicate by canonical entry
-and reason, and the loader emits a warning (the one-shot path prints it to
-stderr). Before an entry is persisted, secret-key or secret-shaped string
-values in its `entry` copy become `<redacted:N>` markers. The serialized entry
-copy is capped at 64 KiB (`MAX_QUARANTINE_RECORD_BYTES`), with an oversized
-copy replaced by an `<oversized: ... bytes>` marker, and new sidecar payloads
-are capped at 1 MiB (`MAX_QUARANTINE_SIDECAR_BYTES`); records that do not fit
-are not appended. An existing sidecar over the limit is left unchanged. The
-loader refuses a symlink at the final sidecar path rather than following it.
-Accepted appends are written to a same-directory temporary file, flushed and
-`fsync`ed, then published with `os.replace`, so the sidecar replacement is
-atomic. Valid entries continue to load.
-Malformed JSON, invalid root structure, unknown root fields, duplicate provider
-names, and provider-environment collisions remain fatal structural errors. If
-every entry is quarantined, the loader returns a list-compatible empty provider
-set; `select_provider` and the one-shot resolver fail with the sidecar path so
-the operator gets a repairable error rather than an unexplained empty cascade.
+**Modules and optimize** (`modules/`, `optimize.py`, `opencode.py`,
+`scripts/extract_pi.py`) — optional training-data machinery. Optimizable
+modules declare a DSPy program and label field in a manifest; `cambium
+optimize` runs zero/bootstrap/GEPA optimizers and a dataset evaluator, fed by
+review-gated candidate extraction from OpenCode and pi session transcripts.
+None of it is on the task-execution path.
 
-`worker.do_work` selects one of two explicit modes:
+## Key invariants
 
-1. Without `fanout_config`, the deterministic marker worker edits and fences
-   one commit.
-2. With `fanout_config`, the worker loads the configured providers and runs a
-   custom bounded loop. Each turn calls `Diffundo`, requires exactly one strict
-   JSON action (`plan`, `tool_call`, or `finish`), validates permissions and
-   tool arguments, dispatches the tool, emits a `tool_event` and checkpoint,
-   and then, when the agent changed files, creates one fenced result commit.
-   A provider loop that finished cleanly with no non-`.cambium` changes is a
-   successful no-op: it owns zero commits and no empty commit is made; the
-    summary is carried in the result and rendered output. The agent is instructed to emit a
-    short `plan` action before any `tool_call`, and the plan is retained in the
-    transcript. Context reuse and rolling deterministic compaction are default-on.
-    A fold rewrites only the active continuation projection, persists it as the
-    next immutable content-addressed epoch, and updates supervisor fork metadata;
-    the stable head and older epoch files are not mutated. The transcript remains
-    bounded within `max_turns`. A
-   `read_batch` tool reads related files in one bounded call, and lint feedback
-   from `write_file` reaches the agent as a tool observation. Summary-only
-   checkpoints can be rolled into one CAST K0 semantic projection under the
-   configured cache/CAST policy, producing a new immutable epoch.
+- **Durable events are the contract.** If it isn't in `events.db`, it didn't
+  happen; critical events wait for the writer or the failure is visible.
+- **CAST checkpoints are `{content, meta}`** — immutable, content-addressed
+  epochs; a fold writes a successor epoch and never mutates the old head.
+- **Provider-cache evidence comes only from the provider** — the router sends
+  `cache=False` and never maintains a local response cache.
+- **The success invariant honors `requires_commit`**: a task that must commit
+  cannot succeed empty-handed.
+- **Single fenced commit per task** — the generation fence file bounds one
+  worker to at most one commit; a clean no-change finish owns zero.
+- **Salvage before prune** — a dirty worktree's diff is captured durably
+  (`worktree_salvaged`) before any recovery or cleanup can destroy it.
 
-The loop bounds turns, tokens, wall time, transcript size, and summaries. It
-returns cumulative provider usage and latency as redacted metadata. `lm.py`
-contains optional DSPy-compatible `CambiumLM` and `ArchitectusLM` adapters;
-they are not a supervisor planner.
+## Repo map
 
-`Diffundo` is a tiered provider router with health, independent request-rate
-and in-flight capacity buckets, cooldown, circuit-breaker, and evidence-based
-candidate ordering. The ordering key uses success confidence, latency-SLO
-compliance, expected cost per successful turn, measured output throughput,
-normalized latency/cache evidence, incumbent stickiness, rotation, debt, and
-configured order when evidence is absent. A depleted bucket reports
-`RATE_LIMITED`. It has no local response cache. HTTP 429 responses carry a
-parsed `Retry-After` delay into the same-provider retry path. One-shot runs
-store routing debt in `<repo>/.cambium/routing-state.json`; `DebtStore` itself
-defaults to `~/.config/cambium/routing-state.json` when no path is supplied.
-Interactive wall budgets use explicit configuration when supplied and can
-otherwise scale from provider throughput hints and measured branch usage with a
-safety factor.
+```text
+src/cambium/        package: supervisor, worker, diffundo, store, tui, ...
+  modules/          optimizable modules (example, should_review)
+tests/              unit + scenario tests (the behavioral spec)
+docs/architecture/  the focused subsystem contracts (see below)
+scripts/            extraction and smoke-test drivers
+artifacts/          pipeline state (e.g. reviewed training snapshots)
+optimized/          optimizer program output
+agents.md           operating contract for contributors
+implementation-plan.md  delivery order for open contracts
+```
 
-A pinned one-shot provider remains the task's primary association until
-`Diffundo.ProviderError.is_real_death` reports terminal evidence: key-level
-HTTP 401/403 authentication failure, HTTP 5xx endpoint failure, or a terminal
-connection, DNS, or TLS/SSL transport failure. 429/quota pressure and other
-transient outcomes retain their retry, cooldown, disable, or refusal semantics
-and do not trigger this pinned-provider fallback. When terminal death is
-established, authorized fallback candidates are tried in the same tier before
-other tiers; once one serves, the router records the original provider and
-stays with the serving association rather than bouncing back.
+## Pointers
 
-`provider_scheduler.py` owns the provider-neutral `CacheHorizonConfig` and
-`CastConfig` values. `summary_trunk.py` compiles immutable semantic history into
-CAST K0; interactive `/compact` and configured rollover paths write a successor
-content-addressed epoch and preserve the source segments.
-
-The escaped-secret bench canary was deleted by product decision; it is no
-longer a live blocker.
-
-### Trees, diagnostics, and modules
-
-`tasktree.build_tree` validates one rooted dependency tree, cycle and
-depth/width bounds, and deep-copies each input `spec` into frozen node records.
-`topological_order` and `ready_tasks` are pure inspection/scheduling inputs.
-`run_plan` integrates them on the hierarchy path: a plan whose tasks carry
-`depends_on` is built into a `TaskTree` and dispatched in static ready-node
-waves; a flat plan keeps the one-`TaskGroup` fan-out under the default
-CPU-count cap.
-
-`architectus.ArchitectusCore` is the injected decision port: `run_plan`
-accepts an optional `architectus` argument (an `ArchitectusCore` or an
-`aggregate`/`step` adapter) and an optional `conversations` flag that opens
-`ConversationStore` at `<session_dir>/.cambium/conversations.db`. When the
-port is configured, each admitted parent's terminal envelope feeds
-`aggregate`/`step` and the resulting typed proposals are routed through the
-existing `_admit_child` revision validation (never the live tree directly);
-every admitted/rejected revision is appended to the conversation store.
-`orchestrator.py` forwards both options from its stabilized public `run`
-surface, and `cambium supervisor --conversations` exposes the flag on the
-CLI. The unified supervisor accepts the same `--plan`, `--task-spec`, and
-`--demo` inputs as the module entry point. With neither backend configured,
-`run_plan` keeps the normal execution path. The session-scoped warm pool is
-opt-in via `--warm-pool-size` (default 0, disabled); the
-`CAMBIUM_WARM_POOL_SIZE` environment variable is not read.
-
-`doctor` checks Python/Git and `uv`, worktree hygiene, provider environment and
-auth coverage, optional event and conversation databases, module datasets, and
-advisory host health. Its provider-environment check reads the file named by
-`CAMBIUM_PROVIDERS` or `<cwd>/.cambium/providers.json` (falling back to the
-shipped default sample), not the trusted user config
-`~/.config/cambium/providers.json` that `run` selects providers from.
-`resources.py` is deleted; there is no `CompileGate` and
-no `ResourceBudget` class. `module_conformance` provides an
-isolated module-test gate. `modules/example` and `modules/should_review` have
-deterministic decision logic,
-train/eval/canary data, split metrics, and a JSON CLI with `decide` and
-`evaluate` operations. There is no `eval_cache.py`.
-
-The tracked source does not contain `worker_pool.py`, `events.py`, or `dlq.py`.
-Do not use those names as current architecture components.
-
-### Optimization
-
-The direct `python -m cambium.optimize` driver offers the three optimizer
-choices `zero`, `bootstrap`, and `gepa`; the top-level `cambium optimize`
-wrapper exposes the same choices. GEPA calls `build_trainsets` with a
-seeded shuffle and `_GEPA_VAL_FRACTION = 0.3`, producing a deterministic
-approximately 70/30 train/held-out validation split while leaving at least one
-training record. It requires at least four reviewed, non-canary records and
-both resulting splits; otherwise `run_stage_gepa` raises the clear
-`OptimizeError` data error before compilation.
-
-`run_stage_gepa` passes the same Diffundo-backed reflection LM used by the
-program to `dspy.GEPA`, and `_CostLedger` bounds provider spending. The
-remaining ledger dollars become GEPA's `max_metric_calls`; every LM call is
-recorded by `_TrackingDiffundo`, and budget exhaustion writes the partial
-report with `budget_exhausted`. Completed reports include a `stage_gepa`
-section with train/evaluation means and any GEPA call, iteration, and full
-validation-evaluation counters exposed by the installed DSPy version. The
-The direct and wrapper commands share the module manifest and optimizer
-label-resolution logic.
-
-The `eval` subcommand is `cambium optimize eval MODULE --dataset PATH`, with
-optional `--program-dir PATH`, `--budget-usd N`, `--tier TIER`, and `--json`.
-Without `--program-dir`, it loads `optimized/<MODULE>/program.json` when that
-state is present and otherwise evaluates a fresh program. Its JSON report has
-`module`, `program` (`fresh` or `optimized`), `dataset`, and `splits`; each
-split has `mean`, `std`, `count`, and per-record `records` with `index` and
-`score`.
-
-An optimizable module declares its package-local DSPy module in the manifest's
-`dspy_program` field. `should_review` sets that field to
-`cambium.modules.should_review.dspy_program` and its `label_field` to
-`review`; `_label_field` carries that name through optimizer metric lookup,
-prediction parsing, fallback decisions, gold labels, and DSPy training-example
-conversion. This keeps the second module's `review` labels distinct from the
-default `decompose` label.
-
-Training data has two read-only extraction paths. `cambium.opencode` accepts
-explicit OpenCode SQLite databases or storage directories, discovers only
-databases with the `session`/`project`/`message`/`part` schema, and extracts
-explicit visible decision/rationale pairs after redaction and canonical-pair
-deduplication. `scripts/extract_pi.py` recursively scans pi session `*.jsonl`
-files and emits redacted, inferred candidates with count-only outcome evidence;
-the inferred label is always review-required and the script does not copy
-assistant or tool output into the candidate record.
-
-The OpenCode `--review-gate` output and every pi candidate file are queues, not
-training data: their records carry `candidate: true`, `redacted: true`, and
-`review_status: "needs_review"`. `_reviewed_transcript_records` admits only
-explicitly approved records, ignores `rejected`/`excluded` records, and fails
-closed on pending or unknown statuses; transcript candidates are opt-in via
-`--include-transcript-candidates` or `--transcript-candidates PATH`, and a
-candidate file may not contain a canary. The committed reviewed snapshot
-`artifacts/optimization/first-real-extraction/train_queue_v2.jsonl` contains
-34 approved records: 24 marked `train` and 10 marked `val`. It is pipeline
-state, not an implicit module dataset; the optimizer consumes a candidate file
-only when one of those opt-in flags is supplied.
-
-### 1.1 Bounded CAST context policy and transactional fork joins
-
-`src/cambium/context_policy.py` defines `CastPolicy`, a bounded CAST/K0
-context policy: token ceilings for prompt, transcript, and cache trunk plus
-epoch rollover thresholds. Interactive sessions consult it when deciding
-whether the next turn fits the bounded window or must roll over into a new
-K0 epoch (see §CAST in `cast.md`).
-
-Fork joins are transactional: a worker's integration is accepted only if
-the parent session head still matches the head observed at fork time, and
-`supervisor._assert_parent_join_invariant` enforces
-`post_join_parent_HEAD == accepted_integration_HEAD` durably. A failed
-invariant produces a structured conflict envelope instead of silent
-overwrite; conflicting work lands on a side branch for manual reconciliation.
-Context epochs are published per rollover so resumed sessions rebuild from
-the correct epoch boundary (`tests/scenarios/test_context_epochs.py`,
-`test_join_invariant.py`).
-
-## 2. Ownership and invariants
-
-1. The caller owns the session directory and supplies plan records.
-2. The supervisor owns validation, worker handles, generations, event
-   admission, restart decisions, and publication order.
-3. A worker owns its worktree edits, provider calls, tool context, and at most
-   one fenced commit (zero for a clean no-change finish); it cannot publish
-   `main` directly.
-4. The merge sequencer owns staging, expected-old checks, quarantine, and
-   cleanup. A conflict, non-fast-forward, or cleanup violation does not
-   advance `main`; conflicts surface as a structured `merge_failed` envelope
-   with `status=merge_conflict`, conflicted files, bounded diff evidence, and
-   the integration head.
-5. The event store owns durable rows and its writer thread. Observer copies
-   cannot mutate persisted records.
-
-IPC is bounded and correlated by request ID (generation is not enforced for
-   message correlation). Fatal framing, oversized lines, missing correlated
-   results, non-zero exits, and deadline failures follow the boundary-specific
-   supervisor policy; malformed lines that fail JSON parsing and valid JSON
-   lines that are not objects are counted as parse errors and skipped up to the
-   same bound, never failing supervision. Tool schemas reject malformed calls.
-
-Provider credentials are allowlisted environment values. They must not enter
-task specs, prompts persisted as events, logs, or result
-artifacts. Worktree and process-group isolation is not an OS sandbox.
-`approval.py` and `resources.py` are deleted; `tools.py` exposes the six
-dispatch tools (`delegate`, `read_batch`, `write_file`, `edit_file`, `git_op`,
-and `run_shell`) without `ApprovalGate` or `CompileGate`.
-
-Live-use blockers were removed by product decision; this is a local development
-tool run directly from source.
-
-## 3. Target contracts and delivery order
-
-These are open contracts, not current interfaces. Production hierarchy and
-dynamic admission are current behavior (see §1); the open contracts below are
-the delivery order for what remains.
-
-### Production hierarchy and admission
-
-Landed (see §1 and [`implementation-plan.md`](../../implementation-plan.md)
-steps 1–2): `run_plan` builds one validated `TaskTree` for plans with
-`depends_on`, computes static ready-node waves bounded by `max_width`, admits
-only nodes whose dependencies and width limits are satisfied, and gives each
-child a fresh bounded context (own spec + strict parent envelope). A parent may
-propose a typed tree revision (`propose_child`), but the supervisor validates
-and durably admits it before dispatch; a provider response cannot mutate the
-live tree in place. The Architectus decision port and conversation persistence
-are wired at that boundary.
-
-### Per-worker containment and approval
-
-Per-worker OS containment and production approval were removed by product
-decision; worktree/process-group isolation is the only worker boundary.
-
-### Provider accounting before routing policy
-
-Landed (see §1 and [`implementation-plan.md`](../../implementation-plan.md)
-step 3): durable redacted usage events, provider and model identity, token/cost
-fields, request-rate status, account-quota ownership, privacy/redaction rules,
-Retry-After and `RATE_LIMITED` behavior, prompt-prefix/cache-hit metrics, and
-measured output throughput are in place. Priority remains the first policy
-class; measured quality and throughput refine ordering only within an
-equal-priority run.
-
-### External-provider acceptance
-
-Run a disposable credentialed smoke through the worker loop, tool event,
-checkpoint, and ref-only merge. Keep credentials in the environment and
-network opt-in. The driver is committed (`scripts/external-provider-smoke.sh`)
-and passed against a live codex OAuth session (ChatGPT `pro`): a real
-`codex_responses` run produced usage events, exactly one ref-only commit
-touching only the fixture, and an unchanged main on the failure fixture. The
-smoke's fanout plan derives tier/model from the supplied provider config, and
-the supervisor injects the codex OAuth token for tasks whose
-`authorized_providers` set is empty (unrestricted). Deployment
-credentials/configuration are external and ephemeral.
-
-## 4. Failure policy by boundary
-
-| Boundary | Current check | Required outcome |
-| --- | --- | --- |
-| Plan | `run_plan` rejects malformed tasks, duplicate IDs, and unsafe paths before worker setup. | No worker side effect before structural validation. |
-| Task tree | `build_tree` rejects missing dependencies, multiple roots/parents, cycles, and bounds. | A future scheduler dispatches only a validated graph with snapshotted specs. |
-| IPC | Framing limits, request IDs, heartbeat deadlines, and request-correlated result checks are enforced in `_Runtime._drive_generation`. | Stale or missing worker messages cannot complete a task. |
-| Worker | Provider/tool failures, missing results, non-zero exits, and wall/token limits fail the generation; recoverable failures may restart it. | A worker verdict is accepted only for its active generation. |
-| Merge | Conflict, non-fast-forward, unsafe quarantine, cleanup failure, or a failed parent join stops publication/resume. | `main` advances only through the expected-old ref contract; accepted child publication must satisfy `post_join_parent_HEAD == accepted_integration_HEAD`. Conflicts use a structured `merge_conflict` envelope. |
-| Store | Critical event admission waits for the writer; writer death raises; non-critical overflow follows the bounded queue policy. | Durable failure is visible; no silent success after store failure. |
-
-The table describes checks on paths that call these modules. A helper's
-existence is not proof of integration: Redaction, resource admission, and
-hierarchy remain targets; approval and containment were removed by decision.
-
-## 5. Source map
-
-| Concern | Current source | State |
-| --- | --- | --- |
-| CLI/version | `pyproject.toml`, `src/cambium/cli.py`, `__init__.py` | Direct-source CLI; version-only package export |
-| Plan runtime | `src/cambium/supervisor.py` | Flat concurrent `run_plan` for plans without `depends_on`; static ready-node waves with width-bounded admission for plans with `depends_on`; one-task adapter retained |
-| Worker/IPC | `src/cambium/worker.py`, `src/cambium/ipc.py`, `src/cambium/prompts.py` | Marker mode, custom provider loop, bounded NDJSON; `CODING_AGENT` and `SEMANTIC_SUMMARIZER` prompt text is centralized in versioned constants (`PROMPTS_VERSION`) with a drift test against worker embeds |
-| Provider/LM | `src/cambium/diffundo.py`, `src/cambium/routing.py`, `src/cambium/provider_config.py`, `src/cambium/lm.py` | Independent request-rate/in-flight lanes, measured `tokens_per_s` plus configured throughput hints, priority router, and optional adapters |
-| Context/CAST | `src/cambium/summary_trunk.py`, `src/cambium/provider_scheduler.py`, `src/cambium/interactive.py` | Immutable summary entries, K0 projection/rollover, cache-horizon and CAST thresholds, and interactive epoch publication |
-| Tree/planner | `tasktree.py`, `architectus.py`, `orchestrator.py` | Pure tree/core; `build_tree`/`ready_tasks`/`topological_order` wired into `run_plan` for static waves; dynamic child admission wired through the injected decision port (`ArchitectusCore` or `aggregate`/`step` adapter) with conversation persistence, exposed by `Orchestrator.run` and `cambium supervisor --conversations` |
-| Store/merge | `store.py`, `merge.py`, `results.py`, `fencing.py` | Current event, result, and ref-publication boundaries |
-| Controls | `src/cambium/tools.py`, `src/cambium/schemas.py`, `redact.py` | Six tools are wired through `TOOL_SCHEMAS` and `TOOL_DISPATCH`; `run_shell`/`git_op` run without `ApprovalGate`/`CompileGate`; `approval.py` and `resources.py` are deleted |
-| Diagnostics/evaluation | `doctor.py`, `module_conformance.py`, `bench.py`, `modules/example/`, `modules/should_review/` | CLI diagnostics and module evaluation exist |
-| Optimization/training data | `src/cambium/optimize.py`, `src/cambium/cli.py`, `src/cambium/modules/base.py`, `src/cambium/modules/example/`, `src/cambium/modules/should_review/`, `src/cambium/opencode.py`, `scripts/extract_pi.py`, `artifacts/optimization/first-real-extraction/train_queue_v2.jsonl` | Zero-shot/bootstrap/GEPA and `eval` driver, manifest-selected DSPy programs with label-aware evaluation, read-only OpenCode/pi extraction, review-gated candidate admission, and the 34-record reviewed snapshot |
-
-Any target moves to current only after a caller and focused failure test
-demonstrate it. Keep public names and status mappings stable once a host API is
-introduced; a worker envelope is not a substitute for a typed root result.
-
-## EVENT-KIND GLOSSARY
-
-The table names durable event kinds and marks worker-only wire emissions where
-current forwarding is absent; references point to emit/forward sites
-(`render.py` uses the same vocabulary). `merge_*` is expanded to every
-merge-prefixed kind found in the current emit sites.
-
-| Kind | Emit site | Meaning |
-| --- | --- | --- |
-| `task_assigned` | `src/cambium/supervisor.py:4525-4541` | Records validated task admission, branch/base, provider assignment, and requirements. |
-| `child_admitted` | `src/cambium/supervisor.py:3484-3492` | Records a validated child revision before its task is created/spawned. |
-| `child_rejected` | `src/cambium/supervisor.py:3364-3373` | Records a rejected child proposal; validation, persistence, or child creation failed. |
-| `spawned` | `src/cambium/supervisor.py:5206-5214` | Records launch of a fresh worker process and the credential-name allowlist. |
-| `init` | `src/cambium/supervisor.py:5324-5329` | Records the supervisor-to-worker initialization handshake for a generation. |
-| `ready` | `src/cambium/supervisor.py:5552-5559` | Records the worker's correlated init acknowledgment and readiness to run. |
-| `run_task` | `src/cambium/supervisor.py:5584-5586` | Records dispatch of the correlated task payload to the ready worker. |
-| `heartbeat` | `src/cambium/worker.py:5850-5872`; forwarded at `src/cambium/supervisor.py:5823-5833` | Periodic worker liveness/progress; current fields are `turn`, `tool`, `status`; **`phase`/`tail`** are marked requested fields but are not present in this checkout's emitter. |
-| `tool_event` | `src/cambium/worker.py:2902-2922`; forwarded at `src/cambium/supervisor.py:5885-5906` | Redacted bounded tool invocation/result with turn, outcome, command, and duration. |
-| `usage_event` | `src/cambium/worker.py:3064-3082`; forwarded at `src/cambium/supervisor.py:5843-5879` | Redacted provider call usage, cost, latency, rate, quota, and context accounting. |
-| `checkpoint` | `src/cambium/worker.py:3112-3129`; forwarded at `src/cambium/supervisor.py:5834-5842` | Records an ordinary turn checkpoint reference and commits-so-far. |
-| `context_checkpoint` | `src/cambium/worker.py:3569-3602`; forwarded at `src/cambium/supervisor.py:5659-5667` | Records an immutable epoch checkpoint and its cache descriptor. |
-| `context_epoch_advanced` | `src/cambium/worker.py:3605-3628`; forwarded at `src/cambium/supervisor.py:5718-5730` | Records a successful fold from one context epoch to its successor. |
-| `context_fork` | `src/cambium/supervisor.py:3666-3708` | Records the parent's epoch and whether a child gets exact or semantic context reuse. |
-| `context_fork_skipped` | `src/cambium/worker.py:4814-4856`; supervisor forwarding at `src/cambium/supervisor.py:5759-5766` | Records that an unavailable, incompatible, or invalid epoch was not reused. |
-| `context_resume` | `src/cambium/supervisor.py:4705-4718` | Records a suspended parent resuming after bounded child results and join checks. |
-| `compaction_failed` | `src/cambium/worker.py:3631-3653`; forwarded at `src/cambium/supervisor.py:5731-5758` | Records a context-compaction failure with its epoch and bounded reason. |
-| `compaction_deferred` | `src/cambium/worker.py:3656-3678` (emitted at `src/cambium/worker.py:4597-4604`) | Worker-wire notice for a malformed/invalid summary fold deferred before the bounded retry limit. |
-| `worktree_salvaged` | `src/cambium/supervisor.py:2808-2816` | Records a bounded dirty-worktree evidence artifact captured before recovery or cleanup. |
-| `worktree_pruned` | `src/cambium/supervisor.py:3163-3168` | Records successful removal of a task worktree and branch. |
-| `worktree_cleanup_deferred` | `src/cambium/supervisor.py:2997-3159` | Records cleanup being retained/deferred because a safety or removal step failed. |
-| `provider_infeasible` | `src/cambium/supervisor.py:4045-4062` | Records a provider rejected at admission because its required credential is unavailable. |
-| `merge_started` | `src/cambium/supervisor.py:6878-6885,7059-7061` | Records start of private child integration or ref-only publication. |
-| `merge_committed` | `src/cambium/supervisor.py:7131-7140`; recovery at `src/cambium/merge.py:1157-1189` | Records an accepted expected-old ref advance, including recovered publication. |
-| `merge_failed` | `src/cambium/supervisor.py:6978-7002,7150-7200` | Records merge/publication failure; conflicts carry a structured `merge_conflict` status. |
-| `merge_reconciled` | `src/cambium/supervisor.py:6227-6233`; sequencer at `src/cambium/merge.py:1169-1196` | Records startup discovery that the ref advanced before its commit event. |
-| `merge_staging_prune_started` | `src/cambium/merge.py:438`; flushed by `src/cambium/supervisor.py:6110-6137` | Records the start of bounded stale staging/quarantine pruning. |
-| `merge_staging_pruned` | `src/cambium/merge.py:495-498,1083-1090`; flushed at `src/cambium/supervisor.py:6135-6137` | Records removal of one stale staging/quarantine artifact. |
-| `merge_staging_quarantined` | `src/cambium/merge.py:617-620,1125-1134`; flushed at `src/cambium/supervisor.py:6135-6137` | Records dirty staging moved into the bounded quarantine. |
-| `merge_staging_cleanup_failed` | `src/cambium/merge.py:576-582,1249-1255`; supervisor fallback at `src/cambium/supervisor.py:7013-7018` | Records staging cleanup failure that prevents silent artifact loss. |
-| `result` | `src/cambium/supervisor.py:5587-5623` (worker envelope at `src/cambium/worker.py:6021-6054`) | Records the correlated terminal worker verdict and redacted provider metadata. |
-| `exit` | `src/cambium/supervisor.py:5816-5821` (worker `exit_message` at `src/cambium/worker.py:6225-6234`) | Records the worker generation's terminal exit reason. |
-| `worker_failed` | `src/cambium/supervisor.py:4313-4343,4955-4963` | Records task/generation failure after protocol, integrity, recovery, or restart exhaustion. |
-| `timeout` | `src/cambium/supervisor.py:4554-4560,4948-4954` | Records a wall, ready, heartbeat, pong, or stdin deadline timeout and its phase. |
-| `recover` | `src/cambium/supervisor.py:2963-2977` | Records fenced worktree reset/clean recovery and the next generation. |
-| `session_ended` | `src/cambium/supervisor.py:2657-2665` | Records final session status and per-task statuses after shutdown cleanup. |
-
-`requires_commit` is an envelope field, not an event kind: the supervisor
-passes it in `src/cambium/supervisor.py:3219-3220`, and the worker includes it
-in `result_envelope` at `src/cambium/worker.py:6046-6050`.
+- [operations.md](operations.md) — running and operating sessions
+- [cast.md](cast.md) — CAST/K0 context epochs and rollover policy
+- [context-engine.md](context-engine.md) — context reuse and compaction
+- [terminal-interface.md](terminal-interface.md) — terminal rendering contract
+- [provider-routing.md](provider-routing.md) — Diffundo tiers, health, ordering
+- [user-cli.md](user-cli.md) — CLI surface
+- [interactive-tui.md](interactive-tui.md) — cockpit turns and slash commands
+- [events.md](events.md) — event-kind glossary for `events.db`
