@@ -6,11 +6,7 @@ current behavior. Do not infer implementation from a role name or a draft.
 ## Development mode
 
 This repository is under active development. KISS is the default. Implement
-only what the task asks for. If the task is only a simple question or requests
-an informational explanation without repository changes, answer directly
-without inspecting files, editing, delegating, or running tests. The source,
-test, and handoff workflow below applies only when repository work is
-requested or required. Unless the task explicitly requests it:
+only what the task asks for. Unless the task explicitly requests it:
 
 - Do not add gates, approval systems, admission controls, containment,
   sandboxes, retries, fallbacks, readiness checks, or production hardening.
