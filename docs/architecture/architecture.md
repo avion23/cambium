@@ -134,6 +134,5 @@ implementation-plan.md  delivery order for open contracts
 - [context-engine.md](context-engine.md) — context reuse and compaction
 - [terminal-interface.md](terminal-interface.md) — terminal rendering contract
 - [provider-routing.md](provider-routing.md) — Diffundo tiers, health, ordering
-- [user-cli.md](user-cli.md) — CLI surface
 - [interactive-tui.md](interactive-tui.md) — cockpit turns and slash commands
 - [events.md](events.md) — event-kind glossary for `events.db`
