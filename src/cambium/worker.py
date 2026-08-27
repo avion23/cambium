@@ -536,7 +536,7 @@ def _validate_resume(value: Any) -> dict[str, Any] | None:
     checkpoint_ref = value.get("checkpoint_ref")
     if not isinstance(checkpoint_ref, str) or not checkpoint_ref:
         raise ContextForkError("resume 'checkpoint_ref' must be a non-empty string")
-    _validate_checkpoint_ref_shape(checkpoint_ref)
+    _resume_checkpoint_kind(checkpoint_ref)
     epoch = value.get("epoch")
     if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch <= 0:
         raise ContextForkError("resume 'epoch' must be a positive integer")
@@ -777,6 +777,30 @@ def git(*args: str, cwd: str | Path | None = None) -> tuple[int, str, str]:
         env=scrub_environment(),
     )
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+
+
+def _workspace_hash(worktree: Path | str | None) -> str | None:
+    """Hash the exact tracked workspace diff used for checkpoint reuse."""
+    if worktree is None:
+        return None
+    try:
+        proc = subprocess.run(
+            [
+                "git",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "diff",
+                "HEAD",
+                "--no-ext-diff",
+                "--no-color",
+            ],
+            cwd=worktree,
+            capture_output=True,
+            env=scrub_environment(),
+        )
+    except OSError:
+        return None
+    return _sha256_hex(proc.stdout) if proc.returncode == 0 else None
 
 
 def _fenced_git(
@@ -1534,6 +1558,7 @@ _EPOCH_REF_RE = re.compile(
     r"epoch-(?P<epoch>[0-9]{3,})-(?P<pre>[0-9a-f]{16})-"
     r"(?P<persisted>[0-9a-f]{16})\.json\Z"
 )
+_TURN_REF_RE = re.compile(r"turn-(?P<turn>[0-9]{3,})\.json\Z")
 
 
 def _validate_checkpoint_ref_shape(checkpoint_ref: str) -> tuple[str, int, str, str]:
@@ -1557,6 +1582,34 @@ def _validate_checkpoint_ref_shape(checkpoint_ref: str) -> tuple[str, int, str, 
         match.group("pre"),
         match.group("persisted"),
     )
+
+
+def _validate_turn_checkpoint_ref_shape(checkpoint_ref: str) -> tuple[str, int]:
+    """Validate a relative ordinary turn checkpoint reference."""
+    if type(checkpoint_ref) is not str or not checkpoint_ref:
+        raise ContextForkError("invalid checkpoint_ref")
+    relative = Path(checkpoint_ref)
+    if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+        raise ContextForkError("invalid checkpoint_ref path")
+    if len(relative.parts) != 2:
+        raise ContextForkError("invalid checkpoint_ref path")
+    task_component, filename = relative.parts
+    if task_component != _safe_task_id(task_component):
+        raise ContextForkError("invalid checkpoint_ref task path")
+    match = _TURN_REF_RE.fullmatch(filename)
+    if match is None:
+        raise ContextForkError("invalid checkpoint_ref filename")
+    return task_component, int(match.group("turn"))
+
+
+def _resume_checkpoint_kind(checkpoint_ref: str) -> str:
+    """Return whether a resume reference names an epoch or turn checkpoint."""
+    try:
+        _validate_checkpoint_ref_shape(checkpoint_ref)
+    except ContextForkError:
+        _validate_turn_checkpoint_ref_shape(checkpoint_ref)
+        return "turn"
+    return "epoch"
 
 
 def _canonical_json_bytes(value: Any) -> bytes:
@@ -3010,6 +3063,7 @@ def _write_checkpoint_file(
         "transcript": _strip_finalization_directive(transcript),
         "usage": usage,
         "commits_so_far": commits_so_far,
+        "workspace_hash": _workspace_hash(config.worktree),
     }
     redactor = config.redactor or _checkpoint_redactor(config.provider_env_keys)
     payload = cast(dict[str, Any], redactor.redact_mapping(payload))
@@ -3822,6 +3876,92 @@ def _load_epoch_checkpoint(
     )
 
 
+def _load_turn_checkpoint(config: AgentConfig, checkpoint_ref: str) -> dict[str, Any]:
+    """Load one ordinary turn checkpoint for a checkpoint-bound restart."""
+    root = config.checkpoint_root
+    if root is None:
+        raise ContextForkError("no checkpoint root configured")
+    task_component, ref_turn = _validate_turn_checkpoint_ref_shape(checkpoint_ref)
+    if task_component != _safe_task_id(config.task_id):
+        raise ContextForkError("invalid checkpoint_ref path")
+    relative = Path(checkpoint_ref)
+    root = root.resolve()
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ContextForkError("checkpoint path is a symlink")
+    path = root / relative
+    if not path.is_relative_to(root):
+        raise ContextForkError("checkpoint_ref escapes the checkpoint root")
+    try:
+        if path.stat().st_size > MAX_LINE_BYTES * 4:
+            raise ContextForkError("checkpoint exceeds the size cap")
+        data = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=_reject_duplicate_pairs,
+            parse_constant=_reject_json_constant,
+        )
+    except ContextForkError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise ContextForkError(f"checkpoint unreadable: {exc.__class__.__name__}") from exc
+    if not isinstance(data, dict):
+        raise ContextForkError("checkpoint is not an object")
+    expected_keys = frozenset(
+        {
+            "schema",
+            "task",
+            "generation",
+            "turn",
+            "transcript",
+            "usage",
+            "commits_so_far",
+            "workspace_hash",
+        }
+    )
+    if set(data) != expected_keys:
+        raise ContextForkError("checkpoint has an invalid key set")
+    if data.get("schema") != CHECKPOINT_SCHEMA:
+        raise ContextForkError("checkpoint schema mismatch")
+    if not isinstance(data.get("task"), str):
+        raise ContextForkError("checkpoint task invalid")
+    generation = data.get("generation")
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation <= 0:
+        raise ContextForkError("checkpoint generation invalid")
+    if data.get("turn") != ref_turn:
+        raise ContextForkError("checkpoint turn does not match its filename")
+    raw_transcript = data.get("transcript")
+    if not isinstance(raw_transcript, list) or len(raw_transcript) > MAX_CONTEXT_MESSAGES:
+        raise ContextForkError("checkpoint transcript invalid")
+    transcript = [
+        _context_message(message, f"transcript[{index}]")
+        for index, message in enumerate(raw_transcript)
+    ]
+    usage = data.get("usage")
+    if not isinstance(usage, dict) or any(
+        not isinstance(key, str)
+        or isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+        for key, value in usage.items()
+    ):
+        raise ContextForkError("checkpoint usage invalid")
+    commits = data.get("commits_so_far")
+    if not isinstance(commits, list) or not all(isinstance(commit, str) for commit in commits):
+        raise ContextForkError("checkpoint commits_so_far invalid")
+    workspace_hash = data.get("workspace_hash")
+    if not isinstance(workspace_hash, str) or _SHA256_HEX_RE.fullmatch(workspace_hash) is None:
+        raise ContextForkError("checkpoint workspace_hash invalid")
+    return {
+        "turn": ref_turn,
+        "transcript": transcript,
+        "usage": dict(usage),
+        "commits_so_far": list(commits),
+        "workspace_hash": workspace_hash,
+    }
+
+
 def _loop_failure_outcome(loop_outcome: dict[str, Any]) -> dict[str, Any]:
     outcome = {
         "status": loop_outcome.get("status", "failed"),
@@ -4148,6 +4288,7 @@ async def _run_agent_loop(
     first_turn = 1
     last_provider: str | None = None
     last_latency_s = 0.0
+    turn_checkpoint_resumed = False
     provider_compat = provider_compat or {}
     provider_boundaries = provider_boundaries or {}
 
@@ -4517,7 +4658,50 @@ async def _run_agent_loop(
         return True, None
 
     resume = config.resume
-    if resume is not None:
+    try:
+        resume_kind = (
+            _resume_checkpoint_kind(resume["checkpoint_ref"]) if resume is not None else None
+        )
+    except ContextForkError as exc:
+        return _loop_result(
+            outcome,
+            "failed",
+            f"context_resume_failed: {exc}",
+            0,
+            cumulative_usage,
+            transcript,
+        )
+    if resume is not None and resume_kind == "turn":
+        try:
+            turn_checkpoint = _load_turn_checkpoint(config, resume["checkpoint_ref"])
+            if resume["epoch"] != turn_checkpoint["turn"]:
+                raise ContextForkError("resume turn does not match checkpoint")
+            current_hash = _workspace_hash(worktree)
+            if current_hash != turn_checkpoint["workspace_hash"]:
+                raise ContextForkError("workspace hash does not match checkpoint")
+            transcript = copy.deepcopy(turn_checkpoint["transcript"])
+            cumulative_usage = dict(turn_checkpoint["usage"])
+            restored_total = _usage_total(cumulative_usage)
+            budget_new_tokens = restored_total if restored_total is not None else 0
+            restored_prompt = _usage_prompt_tokens(cumulative_usage)
+            previous_prompt_tokens = restored_prompt if restored_prompt is not None else 0
+            code_changed = current_hash != _sha256_hex(b"")
+            progress_detector.restore(transcript)
+            first_turn = turn_checkpoint["turn"] + 1
+            turn_checkpoint_resumed = True
+            for child_result in resume["child_results"]:
+                transcript.append({"role": "user", "content": _child_result_lines(child_result)})
+            outcome["commits_so_far"] = turn_checkpoint["commits_so_far"]
+        except ContextForkError as exc:
+            return _loop_result(
+                outcome,
+                "failed",
+                f"context_resume_failed: {exc}",
+                0,
+                cumulative_usage,
+                transcript,
+            )
+    elif resume is not None:
         try:
             resume_checkpoint = _load_epoch_checkpoint(
                 config, resume["checkpoint_ref"], expect_task_id=True
@@ -4633,7 +4817,12 @@ async def _run_agent_loop(
 
     # The main agent starts in trunk mode too. The stable head is frozen once;
     # later summaries extend it and the raw working tail remains separate.
-    if base_messages is None and config.context_reuse and config.checkpoint_root is not None:
+    if (
+        base_messages is None
+        and not turn_checkpoint_resumed
+        and config.context_reuse
+        and config.checkpoint_root is not None
+    ):
         initial_prompt = _build_agent_prompt(
             config.task,
             tools,
@@ -5813,6 +6002,9 @@ async def _emit_result_envelope(writer: asyncio.StreamWriter, outcome: dict[str,
             envelope["epoch"] = epoch
         if checkpoint_ref is not None:
             envelope["checkpoint_ref"] = checkpoint_ref
+    salvage_ref = outcome.get("salvage_ref")
+    if isinstance(salvage_ref, str) and salvage_ref:
+        envelope["salvage_ref"] = salvage_ref
     if status == TaskStatus.SUCCEEDED.value or "requires_commit" in outcome:
         envelope["requires_commit"] = bool(outcome.get("requires_commit", False))
     provider_metadata = outcome.get("provider_metadata")

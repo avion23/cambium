@@ -154,6 +154,7 @@ from .worker import (
     _safe_task_id,
     _validate_checkpoint_ref_shape,
     _validate_provider_boundary,
+    _workspace_hash,
 )
 from .worker import (
     _fork_cache_compatible as _worker_fork_cache_compatible,
@@ -851,6 +852,46 @@ def _status_line_is_fence(line: str) -> bool:
     return is_cache_artifact_path(path)
 
 
+def _bounded_salvage_diff(diff: bytes) -> tuple[bytes, bool]:
+    """Bound salvage bytes while retaining an explicit clipping marker."""
+    if len(diff) <= MAX_SALVAGE_BYTES:
+        return diff, False
+    keep = max(0, MAX_SALVAGE_BYTES - len(_SALVAGE_TRUNCATION_MARKER))
+    return diff[:keep] + _SALVAGE_TRUNCATION_MARKER, True
+
+
+def _write_salvage_artifacts(
+    directory: Path,
+    diff: bytes,
+    metadata: dict[str, Any],
+) -> None:
+    """Atomically publish one salvage diff and its metadata sidecar."""
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    files = {
+        directory / "workspace.diff": diff,
+        directory / "salvage.json": (json.dumps(metadata, sort_keys=True) + "\n").encode("utf-8"),
+    }
+    for target, content in files.items():
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f".{target.name}.", suffix=".tmp", dir=directory
+        )
+        temporary_path = Path(temporary_name)
+        published = False
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary_path, target)
+            published = True
+        finally:
+            if not published:
+                try:
+                    temporary_path.unlink()
+                except FileNotFoundError:
+                    pass
+
+
 def _cfg_float(task_spec: dict[str, Any], key: str, env: str, default: float) -> float:
     spec_value = task_spec.get(key)
     value = spec_value if spec_value is not None else os.environ.get(env, default)
@@ -1056,6 +1097,9 @@ WORKER_EXIT_WAIT_S = 10.0
 TERM_GRACE_S = 5.0
 MAX_PARSE_ERRORS = 500
 PROTO_UNKNOWN_REQUEST_ID = "PROTO_UNKNOWN_REQUEST_ID"
+MAX_SALVAGE_BYTES = 1_000_000
+_SALVAGE_TRUNCATION_MARKER = b"\n... [salvage truncated]\n"
+_CRITICAL_EVENT_KINDS = CRITICAL_KINDS | {"worktree_salvaged"}
 
 
 _ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
@@ -1761,6 +1805,7 @@ class TaskResult:
     summary: str | None = None
     provider: str | None = None
     fell_back_from: str | None = None
+    salvage_ref: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2218,6 +2263,8 @@ class _Runtime:
         self._handles: dict[str, WorkerHandle] = {}
         self._results: dict[str, TaskResult] = {}
         self._task_envelopes: dict[str, dict[str, Any]] = {}
+        self._salvage_refs: dict[str, str] = {}
+        self._salvaged_generations: set[tuple[str, int]] = set()
         self._worktree_lock = asyncio.Lock()
         self._merge_lock = asyncio.Lock()
         self._rid = 0
@@ -2364,7 +2411,7 @@ class _Runtime:
                 async with self._event_append_lock:
                     await asyncio.to_thread(self._store.append, durable_record)
             except (OSError, RuntimeError, StoreError, TypeError, ValueError) as exc:
-                if kind in CRITICAL_KINDS:
+                if kind in _CRITICAL_EVENT_KINDS:
                     raise
                 print(f"cambium: event store error: {exc}", file=sys.stderr)
         if self._on_event is None:
@@ -2372,7 +2419,7 @@ class _Runtime:
         observer_failure_is_fatal = (
             _observer_failure_is_fatal
             if _observer_failure_is_fatal is not None
-            else kind not in CRITICAL_KINDS
+            else kind not in _CRITICAL_EVENT_KINDS
         )
         observer_record = self._copy_event(record)
         if _deferred_observers is not None:
@@ -2514,6 +2561,7 @@ class _Runtime:
                         for line in listing.stdout.splitlines()
                     )
                     if not registered:
+                        await self._salvage_worktree(spec, generation=max(generations, default=1))
                         shutil.rmtree(worktree, ignore_errors=True)
                         await self._git(repo, "branch", "-D", spec["branch"], check=False)
 
@@ -2618,6 +2666,9 @@ class _Runtime:
     def plan_result(self) -> PlanResult:
         results: list[TaskResult] = []
         for task_id, result in self._results.items():
+            salvage_ref = self._salvage_refs.get(task_id)
+            if salvage_ref is not None and result.salvage_ref != salvage_ref:
+                result = replace(result, salvage_ref=salvage_ref)
             envelope = self._task_envelopes.get(task_id)
             metadata = envelope.get("provider_metadata") if isinstance(envelope, dict) else None
             if isinstance(metadata, dict):
@@ -2664,6 +2715,182 @@ class _Runtime:
         result = await self._git(path, *args, check=check)
         return result.stdout.strip() or None
 
+    async def _git_diff_bytes(self, worktree: Path, base_commit: str) -> bytes:
+        """Return the raw tracked diff used by salvage artifacts."""
+        result = await asyncio.to_thread(
+            subprocess.run,
+            [
+                "git",
+                "-C",
+                str(worktree),
+                "diff",
+                "--no-ext-diff",
+                "--no-color",
+                "--binary",
+                base_commit,
+                "--",
+            ],
+            capture_output=True,
+            env=_strip_sensitive_env(scrub_environment(), worktree=worktree),
+            start_new_session=True,
+        )
+        return result.stdout if result.returncode == 0 else b""
+
+    def _retain_salvage_ref(self, task_id: str, salvage_ref: str) -> None:
+        self._salvage_refs[task_id] = salvage_ref
+        result = self._results.get(task_id)
+        if result is not None and result.salvage_ref != salvage_ref:
+            self._results[task_id] = replace(result, salvage_ref=salvage_ref)
+        envelope = self._task_envelopes.get(task_id)
+        if envelope is None:
+            envelope = {
+                "task_id": task_id,
+                "status": result.status if result is not None else "failed",
+            }
+            self._task_envelopes[task_id] = envelope
+            if self._last_envelope is None:
+                self._last_envelope = envelope
+        envelope["salvage_ref"] = salvage_ref
+
+    async def _salvage_worktree(
+        self,
+        spec: dict[str, Any],
+        *,
+        generation: int | None = None,
+        deferred_observers: list[tuple[dict[str, Any], bool]] | None = None,
+    ) -> str | None:
+        """Capture a dirty worktree before recovery or terminal cleanup."""
+        task_id = spec["task_id"]
+        worktree = Path(spec["worktree_path"]).resolve()
+        if generation is None:
+            handle = self._handles.get(task_id)
+            generation = handle.generation if handle is not None else read_generation(worktree)
+        generation = generation or 1
+        key = (task_id, generation)
+        existing = self._salvage_refs.get(task_id)
+        if key in self._salvaged_generations:
+            return existing
+        if not worktree.is_dir():
+            return None
+        status = await self._git(
+            worktree,
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignored=matching",
+            check=False,
+        )
+        if status.returncode != 0 or not any(
+            not _status_line_is_fence(line) for line in status.stdout.splitlines()
+        ):
+            return None
+        base_commit = spec.get("base_commit")
+        base = base_commit if isinstance(base_commit, str) and base_commit else "HEAD"
+        diff = await self._git_diff_bytes(worktree, base)
+        bounded, truncated = _bounded_salvage_diff(diff)
+        salvage_ref = Path("salvage") / _safe_task_id(task_id) / str(generation) / "workspace.diff"
+        directory = self._session_dir.resolve() / salvage_ref.parent
+        metadata = {
+            "task_id": task_id,
+            "generation": generation,
+            "base_commit": base,
+            "branch": spec["branch"],
+            "captured_at": time.time(),
+            "truncated": truncated,
+        }
+        await asyncio.to_thread(_write_salvage_artifacts, directory, bounded, metadata)
+        salvage_ref_text = salvage_ref.as_posix()
+        self._salvaged_generations.add(key)
+        self._retain_salvage_ref(task_id, salvage_ref_text)
+        await self.emit(
+            "worktree_salvaged",
+            task_id=task_id,
+            generation=generation,
+            path=salvage_ref_text,
+            bytes=len(bounded),
+            _deferred_observers=deferred_observers,
+        )
+        return salvage_ref_text
+
+    def _latest_turn_checkpoint(self, spec: Mapping[str, Any]) -> tuple[str, dict[str, Any]] | None:
+        """Return the newest usable ordinary turn checkpoint for a task."""
+        task_id = spec.get("task_id")
+        if not isinstance(task_id, str) or not task_id:
+            return None
+        directory = (
+            self._session_dir.resolve()
+            / ".cambium"
+            / "checkpoints"
+            / _safe_task_id(task_id)
+        )
+        try:
+            candidates = sorted(
+                (
+                    path
+                    for path in directory.iterdir()
+                    if path.is_file() and not path.is_symlink()
+                ),
+                key=lambda path: int(path.stem.removeprefix("turn-"))
+                if re.fullmatch(r"turn-[0-9]+", path.stem)
+                else -1,
+                reverse=True,
+            )
+        except (FileNotFoundError, OSError, ValueError):
+            return None
+        for path in candidates:
+            match = re.fullmatch(r"turn-(?P<turn>[0-9]+)\.json", path.name)
+            if match is None:
+                continue
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, UnicodeDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            turn = payload.get("turn")
+            workspace_hash = payload.get("workspace_hash")
+            if (
+                isinstance(turn, bool)
+                or not isinstance(turn, int)
+                or turn != int(match.group("turn"))
+                or not isinstance(workspace_hash, str)
+                or _SHA256_HEX_RE.fullmatch(workspace_hash) is None
+            ):
+                continue
+            ref = Path(_safe_task_id(task_id)) / path.name
+            return ref.as_posix(), payload
+        return None
+
+    async def _checkpoint_resume_payload(self, spec: dict[str, Any]) -> dict[str, Any] | None:
+        """Build a resume envelope only when the worktree matches its checkpoint."""
+        worktree = Path(spec["worktree_path"]).resolve()
+        current_hash = await asyncio.to_thread(_workspace_hash, worktree)
+        checkpoint = self._latest_turn_checkpoint(spec)
+        if current_hash is None or checkpoint is None:
+            return None
+        checkpoint_ref, payload = checkpoint
+        if payload.get("workspace_hash") != current_hash:
+            return None
+        turn = payload["turn"]
+        return {
+            "checkpoint_ref": checkpoint_ref,
+            "epoch": turn,
+            "child_results": [],
+            "child_results_truncated": False,
+            "workspace_changed": False,
+        }
+
+    async def _reuse_worktree(self, spec: dict[str, Any], generation: int) -> int:
+        """Advance only the fence for a checkpoint-bound restart."""
+        async with self._worktree_lock:
+            worktree = Path(spec["worktree_path"]).resolve()
+            if not worktree.exists():
+                return await self._ensure_worktree_locked(spec, generation)
+            persisted_generation = await asyncio.to_thread(next_generation, worktree)
+            new_generation = max(persisted_generation, generation)
+            await asyncio.to_thread(write_generation, worktree, new_generation)
+            return new_generation
+
     @staticmethod
     def _registered_worktree_paths(listing: str) -> set[Path]:
         paths: set[Path] = set()
@@ -2695,6 +2922,7 @@ class _Runtime:
         if worktree.exists():
             stale_generation = await asyncio.to_thread(read_generation, worktree)
         if worktree.exists():
+            await self._salvage_worktree(spec, generation=stale_generation or generation)
             # stale unregistered directory; it is session-owned, so drop it
             shutil.rmtree(worktree, ignore_errors=True)
         await self._git(repo, "branch", "-D", branch, check=False)
@@ -2724,6 +2952,7 @@ class _Runtime:
         await self._git(repo, "worktree", "prune", check=False)
         if not worktree.exists():
             return await self._ensure_worktree_locked(spec, generation)
+        await self._salvage_worktree(spec, generation=read_generation(worktree) or generation)
         # Advance the durable token before touching the worktree, then exclude
         # the supervisor-owned fence directory from the destructive clean.
         # A supervisor crash after clean must leave this generation durable.
@@ -2810,6 +3039,17 @@ class _Runtime:
                             )
                             return
 
+                handle = self._handles.get(task_id)
+                cleanup_generation = (
+                    handle.generation
+                    if handle is not None
+                    else read_generation(worktree)
+                )
+                await self._salvage_worktree(
+                    spec,
+                    generation=cleanup_generation or 1,
+                    deferred_observers=deferred,
+                )
                 generation_invalidated = False
                 if force:
                     try:
@@ -2827,7 +3067,6 @@ class _Runtime:
                             _deferred_observers=deferred,
                         )
                         return
-                handle = self._handles.get(task_id)
                 if handle is not None and handle.proc is not None:
                     await _kill_worker(handle.proc)
                     try:
@@ -4345,6 +4584,9 @@ class _Runtime:
                     # generation supplied its required terminal exit message.
                     if outcome.clean:
                         self._last_envelope = sanitized_envelope
+                        salvage_ref = self._salvage_refs.get(task_id)
+                        if salvage_ref is not None:
+                            sanitized_envelope["salvage_ref"] = salvage_ref
                         self._task_envelopes[task_id] = sanitized_envelope
                 wall_detail = (
                     _wall_timeout_detail(wall_budget, deadline, restarts)
@@ -4762,7 +5004,21 @@ class _Runtime:
                 # actually runs — worktree recovery above all else must not
                 # consume it.
                 deadline = None
-                generation = await self._recover_worktree(spec, generation + 1)
+                resume_payload = await self._checkpoint_resume_payload(spec)
+                if resume_payload is not None:
+                    spec["resume"] = resume_payload
+                    spec["_turn_resume_ref"] = resume_payload["checkpoint_ref"]
+                    generation = await self._reuse_worktree(spec, generation + 1)
+                else:
+                    turn_resume_ref = spec.pop("_turn_resume_ref", None)
+                    current_resume = spec.get("resume")
+                    if (
+                        isinstance(turn_resume_ref, str)
+                        and isinstance(current_resume, dict)
+                        and current_resume.get("checkpoint_ref") == turn_resume_ref
+                    ):
+                        spec.pop("resume", None)
+                    generation = await self._recover_worktree(spec, generation + 1)
                 if spec.get("_resolver_child"):
                     await self._prepare_resolver_worktree(spec)
         finally:
@@ -6282,6 +6538,10 @@ class _Runtime:
             if not integration_head:
                 raise RuntimeError("no refs/heads/main to seed resolver staging")
             spec["base_commit"] = integration_head
+            await self._salvage_worktree(
+                spec,
+                generation=read_generation(worktree) or 1,
+            )
             reset = await self._git(worktree, "reset", "--hard", integration_head, check=False)
             if reset.returncode != 0:
                 raise RuntimeError(
