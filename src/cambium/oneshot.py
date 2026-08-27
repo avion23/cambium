@@ -781,7 +781,7 @@ def build_plan(
     )
     max_restarts = config.max_restarts
     if max_restarts is None:
-        max_restarts = 1 if config.interactive else 0
+        max_restarts = 1
     task_id = config.task_id or "oneshot"
     worktree = (
         Path(config.worktree_path).expanduser().resolve()

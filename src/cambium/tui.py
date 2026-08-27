@@ -794,6 +794,7 @@ async def _run_interactive(
     reader_threads: set[threading.Thread] = set()
     input_eof = False
     input_closing = False
+    turn_active = False
 
     async def _read_line_source() -> str | None:
         """Read a prompt without stopping live turn events or input steering."""
@@ -998,9 +999,10 @@ async def _run_interactive(
                         cumulative_line=_cumulative.line(snapshot=live_snapshot),
                         activity_line=_activity.render(),
                         turn_active=True,
-                    )
+                )
 
                 _start_input_read()
+                turn_active = True
                 turn_task = loop.create_task(session.run_turn(turn, on_event=_live_sink))
 
                 def _request_cancel() -> None:  # noqa: B023
@@ -1120,14 +1122,25 @@ async def _run_interactive(
                         pass
                     if signal_installed:
                         loop.remove_signal_handler(signal.SIGINT)
+                    turn_active = False
 
                 snapshot = state.snapshot(session_dir=turn.session_dir)
                 last_snapshot = snapshot
                 cumulative.add(snapshot)
                 transcript.finish_stream(_response_markdown(render, response))
                 _draw_final(snapshot, activity_line=activity.status_line())
+    except asyncio.CancelledError:
+        if not native_input:
+            raise
+        if turn_active:
+            raise
+        return ExitCode.SUCCESS
     except KeyboardInterrupt:
-        return ExitCode.INTERRUPTED
+        if not native_input:
+            return ExitCode.INTERRUPTED
+        if turn_active:
+            return ExitCode.INTERRUPTED
+        return ExitCode.SUCCESS
     except BrokenPipeError:
         return ExitCode.SUCCESS
     finally:
