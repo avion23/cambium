@@ -123,9 +123,7 @@ class _SummaryFlushRouter:
         self.all_providers_dead = all_providers_dead
         self.malformed_summaries = malformed_summaries
         self.responses = (
-            list(responses)
-            if responses is not None
-            else ['{"type":"finish","summary":"done"}']
+            list(responses) if responses is not None else ['{"type":"finish","summary":"done"}']
         )
         self.prompts: list[dict[str, Any]] = []
         self.allow_model_substitution: list[bool] = []
@@ -392,15 +390,18 @@ def test_two_malformed_summaries_fail_on_the_third_fold_attempt(tmp_path: Path) 
     messages = writer.messages()
     assert len([message for message in messages if message["type"] == "compaction_deferred"]) == 2
     assert len([message for message in messages if message["type"] == "compaction_failed"]) == 1
-    assert len(
-        [
-            prompt
-            for prompt in router.prompts
-            if str(prompt["messages"][-1].get("content", "")).startswith(
-                "<cambium-summary-control>\n"
-            )
-        ]
-    ) == 3
+    assert (
+        len(
+            [
+                prompt
+                for prompt in router.prompts
+                if str(prompt["messages"][-1].get("content", "")).startswith(
+                    "<cambium-summary-control>\n"
+                )
+            ]
+        )
+        == 3
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -604,10 +605,13 @@ def test_max_turns_edge_injects_the_same_finalization_directive(tmp_path: Path) 
 
     assert outcome["status"] == "succeeded"
     assert len(router.prompts) == 2
-    assert sum(
-        message.get("content") == worker.FINAL_SYNTHESIS_DIRECTIVE
-        for message in router.prompts[1]["messages"]
-    ) == 1
+    assert (
+        sum(
+            message.get("content") == worker.FINAL_SYNTHESIS_DIRECTIVE
+            for message in router.prompts[1]["messages"]
+        )
+        == 1
+    )
 
 
 def test_build_agent_prompt_head_passes_d8c_lint() -> None:
@@ -1405,6 +1409,7 @@ def test_finalize_worktree_excludes_cache_artifacts_from_commit(tmp_path: Path) 
 
     assert outcome["status"] == "succeeded"
     assert outcome["failure_reason"] is None
+    assert outcome["requires_commit"] is False
     assert outcome["files_changed"] == ["main.py"]
     assert len(outcome["commits"]) == 1
     sha = outcome["commits"][0]
@@ -1449,3 +1454,86 @@ def test_finalize_worktree_only_cache_artifacts_is_true_noop(tmp_path: Path) -> 
     assert outcome["commits"] == []
     assert outcome["files_changed"] == []
     assert _base_commit(worktree) == base_commit
+
+
+def test_requires_commit_defaults_and_passes_through_run_task() -> None:
+    init = {"task_id": "requires-commit"}
+    config = worker.AgentConfig.from_init(init)
+
+    assert config.requires_commit is False
+    assert (
+        worker._merge_task_config(config, init, {"requires_commit": True}).requires_commit is True
+    )
+    with pytest.raises(ValueError, match="requires_commit"):
+        worker.AgentConfig.from_init({**init, "requires_commit": "yes"})
+
+
+def test_provider_router_explicit_empty_authorization_fails_closed() -> None:
+    assert (
+        worker.AgentConfig.from_init(
+            {"task_id": "legacy", "authorized_providers": None}
+        ).authorized_providers_explicit
+        is False
+    )
+    with pytest.raises(worker.AllProvidersFailed) as raised:
+        worker._provider_router(
+            {"tier": "fast", "model": "loopback-model"},
+            authorized_providers=(),
+            authorized_providers_explicit=True,
+        )
+
+    failure = raised.value
+    assert failure.providers_tried == ()
+    assert failure.last_error is not None
+    assert str(failure.last_error) == "authorized_providers explicitly empty"
+
+
+def test_finalize_worktree_requires_commit_when_dirty_commit_is_not_produced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    worktree = _make_worktree(repo)
+    base_commit = _base_commit(worktree)
+    config = replace(_agent_config(worktree), base_commit=base_commit, requires_commit=True)
+    (worktree / "alpha.txt").write_text("dirty content\n", encoding="utf-8")
+
+    def no_commit(
+        _worktree: Path,
+        _generation: int,
+        *args: str,
+        cwd: str | Path | None = None,
+    ) -> tuple[int, str, str]:
+        del cwd
+        return 0, "", ""
+
+    monkeypatch.setattr(worker, "_fenced_git", no_commit)
+    outcome = _finalize_worktree_outcome(
+        worktree, config, {"request_id": "test", "scratch_repo": str(repo)}
+    )
+
+    assert outcome["status"] == "failed"
+    assert outcome["failure_reason"] == "requires_commit unmet"
+    assert outcome["commits"] == []
+
+
+def test_clean_noop_envelope_reports_requires_commit_false(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = _make_worktree(repo)
+    base_commit = _base_commit(worktree)
+    config = replace(_agent_config(worktree), base_commit=base_commit)
+    outcome = _finalize_worktree_outcome(
+        worktree, config, {"request_id": "test", "scratch_repo": str(repo)}
+    )
+    outcome.update(
+        request_id="test",
+        task_id=config.task_id,
+        generation=config.generation,
+    )
+    writer = _FakeWriter()
+
+    asyncio.run(worker._emit_result_envelope(cast(asyncio.StreamWriter, writer), outcome))
+
+    envelope = writer.messages()[0]
+    assert envelope["status"] == "succeeded"
+    assert envelope["commits"] == []
+    assert envelope["requires_commit"] is False
