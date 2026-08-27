@@ -2711,6 +2711,9 @@ def _rail_rows(
         return _compact_rail_rows(snapshot, panel_width, capacity)
     lines = [_side_row("heading", " LANES", panel_width)]
     agents = _rail_tree_order(tuple(getattr(snapshot, "agents", ())))
+    if not agents:
+        lines.append(_side_row("dim", " no agents yet", panel_width))
+        return lines[: max(1, capacity)]
     lane_rows = _rail_lane_rows(agents, panel_width)
     selected = _rail_selected_agent(snapshot, agents)
     for agent, lane_row in zip(agents, lane_rows, strict=True):
