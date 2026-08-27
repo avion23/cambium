@@ -16,8 +16,6 @@ Source and tests define current behavior.
   persistent interactive TUI, event-sourced dashboard, and monitor.
 - [`architecture/optimization.md`](architecture/optimization.md) — DSPy and
   OpenCode-data gates.
-- [`security/threat-model.md`](security/threat-model.md) — no-sandbox trust
-  boundary.
 
 ## Retained research
 
