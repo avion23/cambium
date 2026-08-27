@@ -1777,7 +1777,11 @@ def _usage_completion_tokens(usage: dict[str, Any] | None) -> int | None:
 
 
 def _usage_cached_tokens(usage: dict[str, Any] | None) -> int | None:
-    """Return the provider-reported cached prompt tokens, when available."""
+    """Return provider-reported cached prompt tokens, when available.
+
+    The count is trusted for marginal-cost accounting: an inflated provider
+    value makes the measured uncached cost smaller than reality.
+    """
     if not isinstance(usage, dict):
         return None
     value = usage.get("cached_tokens")
@@ -2201,6 +2205,16 @@ def _render_rolling_compaction(
         + _ROLLING_CONTEXT_CLOSE
     )
     return [{"role": "user", "content": content}]
+
+
+def _compaction_retry_tail(
+    raw_tail: list[dict[str, Any]], redactor: Redactor | None
+) -> list[dict[str, str]]:
+    """Make one bounded, redacted summary retry payload from a raw tail."""
+    retry_tail = copy.deepcopy(raw_tail)
+    if redactor is not None:
+        retry_tail = cast(list[dict[str, Any]], redactor.redact_mapping(retry_tail))
+    return _render_rolling_compaction(retry_tail, MAX_OBSERVATION_BYTES)
 
 
 def _parent_envelope_lines(parent_envelope: dict[str, Any]) -> str:
@@ -2650,6 +2664,12 @@ def _is_content_flagged(exc: BaseException) -> bool:
     return False
 
 
+def _provider_call_failure_reason(exc: BaseException) -> str:
+    """Keep the provider content outcome parseable in the loop result."""
+    suffix = " (content_flagged)" if _is_content_flagged(exc) else ""
+    return f"provider call failed: {exc.__class__.__name__}{suffix}"
+
+
 def _best_partial_answer(transcript: list[dict[str, Any]]) -> str:
     """Return the last model-authored terminal summary before a flag."""
     for message in reversed(transcript):
@@ -2953,7 +2973,7 @@ def _write_checkpoint_file(
         "task": config.task,
         "generation": config.generation,
         "turn": turn,
-        "transcript": transcript,
+        "transcript": _strip_finalization_directive(transcript),
         "usage": usage,
         "commits_so_far": commits_so_far,
     }
@@ -4064,6 +4084,8 @@ async def _run_agent_loop(
     usage_epoch: int | None = None
     usage_fork_of: str | None = None
     first_turn = 1
+    last_provider: str | None = None
+    last_latency_s = 0.0
     provider_compat = provider_compat or {}
     provider_boundaries = provider_boundaries or {}
 
@@ -4087,6 +4109,14 @@ async def _run_agent_loop(
 
     def _arm_finalization(turn: int, *, turn_limit: bool = True) -> None:
         nonlocal finalized, finalization_grace_used
+        if (
+            base_messages is not None
+            and config.resume is not None
+            and turn_limit
+            and budget_new_tokens < soft_cap
+            and turn >= config.max_turns - 2
+        ):
+            return
         if finalized:
             return
         if budget_new_tokens < soft_cap and (not turn_limit or turn < config.max_turns - 2):
@@ -4197,55 +4227,74 @@ async def _run_agent_loop(
                 raw_tail,
                 through_turn=summary_through_turn,
             )
-            sent_summary_prompt = copy.deepcopy(summary_prompt)
-            try:
-                summary_caller = getattr(router, "summary_call", None)
-                if callable(summary_caller):
-                    assert summary_caller is not None
-                    summary_result = await summary_caller(
-                        tier,
-                        summary_prompt,
-                        model=model,
-                        budget_usd=budget_usd,
-                        # Summary entries are provider-neutral semantic state;
-                        # unlike the agent transcript, they may be generated
-                        # by a configured sibling when the pinned endpoint is
-                        # unavailable.
-                        allow_model_substitution=True,
-                    )
-                else:
-                    summary_result = await router.call(
-                        tier,
-                        summary_prompt,
-                        model=model,
-                        budget_usd=budget_usd,
-                        allow_model_substitution=True,
-                    )
-            except Exception as exc:
-                if writer is not None:
-                    await _emit_usage_event(
-                        writer,
-                        config,
-                        _failure_usage_event(
-                            exc,
-                            turn=turn,
+            summary_result: CallResult | None = None
+            for summary_attempt in range(2):
+                sent_summary_prompt = copy.deepcopy(summary_prompt)
+                try:
+                    summary_caller = getattr(router, "summary_call", None)
+                    if callable(summary_caller):
+                        assert summary_caller is not None
+                        summary_result = await summary_caller(
+                            tier,
+                            summary_prompt,
                             model=model,
-                            router=router,
-                            prompt=sent_summary_prompt,
-                            call_kind="summary",
-                        ),
-                        epoch=usage_epoch,
-                        fork_of=usage_fork_of,
+                            budget_usd=budget_usd,
+                            # Summary entries are provider-neutral semantic state;
+                            # unlike the agent transcript, they may be generated
+                            # by a configured sibling when the pinned endpoint is
+                            # unavailable.
+                            allow_model_substitution=True,
+                        )
+                    else:
+                        summary_result = await router.call(
+                            tier,
+                            summary_prompt,
+                            model=model,
+                            budget_usd=budget_usd,
+                            allow_model_substitution=True,
+                        )
+                except Exception as exc:
+                    if writer is not None:
+                        await _emit_usage_event(
+                            writer,
+                            config,
+                            _failure_usage_event(
+                                exc,
+                                turn=turn,
+                                model=model,
+                                router=router,
+                                prompt=sent_summary_prompt,
+                                call_kind="summary",
+                            ),
+                            epoch=usage_epoch,
+                            fork_of=usage_fork_of,
+                        )
+                    content_flagged = isinstance(exc, AllProvidersFailed) and _is_content_flagged(
+                        exc
                     )
-                detail = exc.__class__.__name__
-                if isinstance(exc, AllProvidersFailed) and exc.last_error is not None:
-                    inner = exc.last_error
-                    inner_message = str(inner).strip() or "<no message>"
-                    detail = (
-                        f"{detail}: {inner.__class__.__name__}: "
-                        f"{_cap_utf8(inner_message, MAX_ENVELOPE_FIELD_CHARS)}"
-                    )
-                raise ContextForkError(f"summary provider call failed: {detail}") from exc
+                    if content_flagged and summary_attempt == 0:
+                        summary_prompt, expectation = build_summary_request(
+                            trunk_messages,
+                            _compaction_retry_tail(raw_tail, config.redactor),
+                            through_turn=summary_through_turn,
+                        )
+                        continue
+                    if content_flagged:
+                        raise ContextForkError(
+                            "summary flagged by provider content filter"
+                        ) from exc
+                    detail = exc.__class__.__name__
+                    if isinstance(exc, AllProvidersFailed) and exc.last_error is not None:
+                        inner = exc.last_error
+                        inner_message = str(inner).strip() or "<no message>"
+                        detail = (
+                            f"{detail}: {inner.__class__.__name__}: "
+                            f"{_cap_utf8(inner_message, MAX_ENVELOPE_FIELD_CHARS)}"
+                        )
+                    raise ContextForkError(f"summary provider call failed: {detail}") from exc
+                break
+            if summary_result is None:
+                raise ContextForkError("summary provider call failed")
             if time.monotonic() >= wall_deadline:
                 raise ContextForkError("wall budget exceeded during summary flush")
             declared_summary_model = router.declared_model(summary_result.provider)
@@ -4544,9 +4593,8 @@ async def _run_agent_loop(
                 # The tuple is immutable and every message is deep-copied at
                 # the prompt boundary. No later turn can rewrite the epoch
                 # prefix in place.
-                _folded = False
                 if config.context_reuse:
-                    _folded, compaction_failure = await _bound_context_continuation(turn)
+                    _, compaction_failure = await _bound_context_continuation(turn)
                     if compaction_failure is not None:
                         return _loop_result(
                             outcome,
@@ -4559,7 +4607,7 @@ async def _run_agent_loop(
                             cumulative_usage,
                             transcript,
                         )
-                if finalized and not _folded and not any(
+                if finalized and not any(
                     message.get("content") == FINAL_SYNTHESIS_DIRECTIVE
                     for message in context_continuation
                 ):
@@ -4625,7 +4673,7 @@ async def _run_agent_loop(
                     outcome,
                     "failed",
                     _phase_failure(
-                        f"provider call failed: {exc.__class__.__name__}",
+                        _provider_call_failure_reason(exc),
                         final_synthesis=final_synthesis_call,
                     ),
                     turn - 1,
@@ -4714,6 +4762,8 @@ async def _run_agent_loop(
                     cumulative_usage,
                     transcript,
                 )
+            last_provider = result.provider
+            last_latency_s = max(0.0, float(result.latency_s))
             try:
                 action = _native_tool_action(result) or _parse_agent_action(result.content)
             except ValueError as exc:
@@ -4748,14 +4798,14 @@ async def _run_agent_loop(
                 continue
             trailing = _action_trailing(result.content)
             action_message = _canonical_action_message(action)
-            if final_synthesis_call and action["type"] != "finish":
+            if (
+                base_messages is not None
+                and config.resume is not None
+                and turn >= config.max_turns
+                and action["type"] != "finish"
+                and not finalized
+            ):
                 _append_context_message(action_message)
-                if turn < config.max_turns and not finalization_grace_used:
-                    finalization_grace_used = True
-                    _append_context_message(
-                        {"role": "user", "content": FINAL_SYNTHESIS_REMINDER}
-                    )
-                    continue
                 return _loop_result(
                     outcome,
                     "failed",
@@ -4766,6 +4816,26 @@ async def _run_agent_loop(
                     cumulative_usage,
                     transcript,
                 )
+            if final_synthesis_call and action["type"] != "finish":
+                _append_context_message(action_message)
+                if turn < config.max_turns and not finalization_grace_used:
+                    finalization_grace_used = True
+                    _append_context_message(
+                        {"role": "user", "content": FINAL_SYNTHESIS_REMINDER}
+                    )
+                    continue
+                if base_messages is not None and config.resume is not None:
+                    return _loop_result(
+                        outcome,
+                        "failed",
+                        _phase_failure(
+                            f"non-terminal action: {action['type']}", final_synthesis=True
+                        ),
+                        turn,
+                        cumulative_usage,
+                        transcript,
+                    )
+                break
             if _observe_progress(action=action) and not _finalization_due(turn):
                 return _no_progress_failure(turn)
             if action["type"] == "plan":
@@ -5083,17 +5153,45 @@ async def _run_agent_loop(
                         "epoch": checkpoint.epoch,
                         "checkpoint_ref": checkpoint.checkpoint_ref,
                     }
-        return _loop_result(
-            outcome,
-            "failed",
-            _phase_failure(
-                f"no terminal action before turn limit ({config.max_turns})",
-                final_synthesis=finalized,
-            ),
-            config.max_turns,
-            cumulative_usage,
-            transcript,
-        )
+        if base_messages is not None and config.resume is not None:
+            return _loop_result(
+                outcome,
+                "failed",
+                _phase_failure(
+                    f"no terminal action before turn limit ({config.max_turns})",
+                    final_synthesis=finalized,
+                ),
+                config.max_turns,
+                cumulative_usage,
+                transcript,
+            )
+        if writer is not None:
+            graceful_event: dict[str, Any] = {
+                "turn": config.max_turns,
+                "model": model,
+                "call_kind": "agent",
+                "failure_reason": "graceful stop: max turns exceeded",
+            }
+            if last_provider is not None:
+                graceful_event["provider"] = last_provider
+            await _emit_usage_event(
+                writer,
+                config,
+                graceful_event,
+                epoch=usage_epoch,
+                fork_of=usage_fork_of,
+            )
+        return {
+            **outcome,
+            "status": "succeeded",
+            "failure_reason": None,
+            "summary": _best_partial_answer(transcript),
+            "turn": config.max_turns,
+            "usage": cumulative_usage,
+            "provider": last_provider,
+            "latency_s": last_latency_s,
+            "transcript": transcript,
+        }
     except GenerationFenceError as exc:
         return _loop_result(
             outcome, "failed", str(exc), progress.turn, cumulative_usage, transcript
