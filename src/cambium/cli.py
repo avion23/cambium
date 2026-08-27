@@ -175,12 +175,12 @@ def _agent_model_argument(value: str) -> str:
     return value
 
 
-def _positive_int(value: str) -> int:
+def _positive_int(value: str, *, allow_zero: bool = False) -> int:
     try:
         parsed = int(value)
     except ValueError:
         parsed = None
-    if parsed is None or parsed <= 0:
+    if parsed is None or parsed < (0 if allow_zero else 1):
         raise argparse.ArgumentTypeError("must be a positive integer")
     return parsed
 
@@ -270,6 +270,13 @@ def _add_routing_budget_arguments(parser: argparse.ArgumentParser) -> None:
         type=_positive_int,
         metavar="N",
         help="maximum agent-loop turns (default 50)",
+    )
+    parser.add_argument(
+        "--max-restarts",
+        type=lambda value: _positive_int(value, allow_zero=True),
+        default=None,
+        metavar="N",
+        help="maximum worker restarts (default 1)",
     )
 
 
@@ -1063,6 +1070,7 @@ async def _run_oneshot(args: argparse.Namespace) -> int:
             max_turns=_budget_or_default(
                 getattr(args, "max_turns", None), oneshot.DEFAULT_MAX_TURNS
             ),
+            max_restarts=getattr(args, "max_restarts", None),
             context_reuse=True,
         )
     except ValueError as exc:
