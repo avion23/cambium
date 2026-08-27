@@ -1648,6 +1648,76 @@ def test_finalize_worktree_requires_commit_when_dirty_commit_is_not_produced(
     assert outcome["commits"] == []
 
 
+def test_requires_commit_doc_only_finish_publishes_commit(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    worktree = _make_worktree(repo)
+    base_commit = _base_commit(worktree)
+    config = replace(_agent_config(worktree), base_commit=base_commit, requires_commit=True)
+    router = _ScriptedRouter(
+        [
+            '{"type":"plan","steps":["write the release notes","finish"]}',
+            '{"type":"tool_call","name":"run_shell","arguments":{"cmd":['
+            '"sh","-c","mkdir -p docs && printf \'%s\\n\' \'release notes\' '
+            '> docs/release.md"]}}',
+            '{"type":"finish","summary":"wrote release notes"}',
+        ]
+    )
+
+    loop_outcome = asyncio.run(_drive_loop(config, worktree, router))
+    assert loop_outcome["status"] == "succeeded"
+    outcome = worker._finalize_worktree(
+        run={"request_id": "test", "scratch_repo": str(repo)},
+        config=config,
+        worktree=worktree,
+        generation=config.generation,
+        worker_identity="test-worker",
+        stop=threading.Event(),
+        loop_outcome=loop_outcome,
+    )
+    outcome.update(request_id="test", task_id=config.task_id, generation=config.generation)
+    writer = _FakeWriter()
+
+    asyncio.run(worker._emit_result_envelope(cast(asyncio.StreamWriter, writer), outcome))
+
+    envelope = writer.messages()[0]
+    assert envelope["status"] == "succeeded"
+    assert envelope["requires_commit"] is True
+    assert len(envelope["commits"]) == 1
+    assert envelope["files_changed"] == ["docs/release.md"]
+    assert _base_commit(worktree) == envelope["commits"][0]
+
+
+def test_requires_commit_clean_finish_fails(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = _make_worktree(repo)
+    base_commit = _base_commit(worktree)
+    config = replace(_agent_config(worktree), base_commit=base_commit, requires_commit=True)
+    router = _ScriptedRouter(
+        [
+            '{"type":"plan","steps":["finish"]}',
+            '{"type":"finish","summary":"nothing changed"}',
+        ]
+    )
+
+    loop_outcome = asyncio.run(_drive_loop(config, worktree, router))
+    assert loop_outcome["status"] == "succeeded"
+    outcome = worker._finalize_worktree(
+        run={"request_id": "test", "scratch_repo": str(repo)},
+        config=config,
+        worktree=worktree,
+        generation=config.generation,
+        worker_identity="test-worker",
+        stop=threading.Event(),
+        loop_outcome=loop_outcome,
+    )
+
+    assert outcome["status"] == "failed"
+    assert outcome["failure_reason"] == "requires_commit unmet: no changes"
+    assert outcome["commits"] == []
+
+
 def test_clean_noop_envelope_reports_requires_commit_false(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     worktree = _make_worktree(repo)

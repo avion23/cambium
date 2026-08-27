@@ -94,9 +94,10 @@ feedback from ``write_file``, is appended to the transcript so the agent sees
 success or failure.
 The worker owns at most one fenced commit of the resulting changes; a
 successful provider loop that leaves no non-``.cambium`` changes owns none.
-A true no-op succeeds only while the worktree HEAD still resolves to the
-base commit and writes no final transcript checkpoint; an advanced HEAD is
-reported as a failure so no unfenced commit is ever merged.
+A true no-op succeeds only when ``requires_commit`` is false and the worktree
+HEAD still resolves to the base commit; it writes no final transcript
+checkpoint. An advanced HEAD is reported as a failure so no unfenced commit
+is ever merged.
 
 Malformed wire input is fatal: the worker emits ``fatal_error``, then
 ``exit_message`` (reason "fatal"), and exits nonzero (let-it-crash). The
@@ -5832,9 +5833,10 @@ def _finalize_worktree(
 ) -> dict[str, Any]:
     """Stage the agent's changed files (excluding ``.cambium/``) and make at
     most ONE fenced worker-owned commit with generation + identity trailers.
-    A clean worktree succeeds as a no-op only while HEAD still resolves to
-    the base commit; such a true no-op receives no empty commit and writes
-    no ordinary final checkpoint. Returns the result-envelope shape: model summary +
+    A clean worktree succeeds as a no-op only when ``requires_commit`` is false
+    and HEAD still resolves to the base commit; such a true no-op receives no
+    empty commit and writes no ordinary final checkpoint. Returns the
+    result-envelope shape: model summary +
     cumulative safe provider metadata.
 
     The commit message, envelope, state paths, and provider metadata are all
@@ -5949,8 +5951,12 @@ def _finalize_worktree(
                     )
                     return outcome
         if not changed:
-            if config.requires_commit and workspace_differs:
-                outcome["failure_reason"] = "requires_commit unmet"
+            if config.requires_commit:
+                outcome["failure_reason"] = (
+                    "requires_commit unmet"
+                    if workspace_differs
+                    else "requires_commit unmet: no changes"
+                )
                 return outcome
             _require_generation(worktree, generation)
             terminal_checkpoint = _write_terminal_epoch()
