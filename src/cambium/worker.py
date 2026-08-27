@@ -194,6 +194,17 @@ MAX_ENVELOPE_FIELD_CHARS = 2_000
 MAX_ENVELOPE_ITEMS = 16
 MAX_CONTEXT_MESSAGES = 512
 CHECKPOINT_EPOCH_SCHEMA = 4
+# Start synthesis before the hard ceiling so a bounded terminal response can
+# still be produced instead of discarding the action that crossed the edge.
+SOFT_TOKEN_CAP_RATIO = 0.9
+FINAL_SYNTHESIS_HEADROOM_RATIO = 0.1
+FINAL_SYNTHESIS_MIN_HEADROOM_TOKENS = 4_000
+FINAL_SYNTHESIS_DIRECTIVE = (
+    "Forced finalization: produce the final answer NOW with no further tool use. "
+    'Return exactly one terminal finish action: {"type":"finish","summary":"..."} '
+    "summarizing the work completed so far."
+)
+FINAL_SYNTHESIS_REMINDER = "Finalization active: return finish now."
 
 
 class TaskStatus(StrEnum):
@@ -289,6 +300,7 @@ class ContextCheckpoint:
     verification_failed: bool
     no_progress_actions: int
     budget_new_tokens: int
+    # Historical wire name; stores the previous uncached prompt baseline.
     previous_prompt_tokens: int
     cumulative_usage: dict[str, int]
     wall_deadline: float
@@ -1764,6 +1776,42 @@ def _usage_completion_tokens(usage: dict[str, Any] | None) -> int | None:
     return None
 
 
+def _usage_cached_tokens(usage: dict[str, Any] | None) -> int | None:
+    """Return the provider-reported cached prompt tokens, when available."""
+    if not isinstance(usage, dict):
+        return None
+    value = usage.get("cached_tokens")
+    return int(value) if _valid_usage_count(value) else None
+
+
+def _usage_budget_charge(
+    usage: dict[str, Any] | None, previous_prompt_tokens: int
+) -> tuple[int, int]:
+    """Return marginal token charge and the next uncached prompt baseline.
+
+    A reported cache count is removed from the current prompt before taking
+    its delta; missing cache data treats the full prompt as uncached, the safe
+    upper bound used by older providers. Completions always remain billable.
+    Callers validate usable totals before charging.
+    """
+    total = _usage_total(usage)
+    if total is None:
+        return 0, 0
+    prompt_tokens = _usage_prompt_tokens(usage)
+    if prompt_tokens is None:
+        return total, 0
+    cached_tokens = _usage_cached_tokens(usage)
+    uncached_prompt_tokens = (
+        max(0, prompt_tokens - cached_tokens) if cached_tokens is not None else prompt_tokens
+    )
+    prompt_delta = max(0, uncached_prompt_tokens - previous_prompt_tokens)
+    completion_tokens = _usage_completion_tokens(usage)
+    completion_charge = (
+        completion_tokens if completion_tokens is not None else max(0, total - prompt_tokens)
+    )
+    return prompt_delta + completion_charge, uncached_prompt_tokens
+
+
 def _usage_total(usage: dict[str, Any] | None) -> int | None:
     """Return one completion's usable token total, or ``None`` (fail closed).
 
@@ -2568,6 +2616,56 @@ def _canonical_action_message(action: dict[str, Any]) -> dict[str, str]:
         "role": "assistant",
         "content": json.dumps(action, sort_keys=True, separators=(",", ":")),
     }
+
+
+def _final_synthesis_message() -> dict[str, str]:
+    """Return the single bounded directive used at either budget edge."""
+    return {"role": "user", "content": FINAL_SYNTHESIS_DIRECTIVE}
+
+
+def _strip_finalization_directive(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep the transient directive out of durable epoch messages."""
+    return [
+        message for message in messages if message.get("content") != FINAL_SYNTHESIS_DIRECTIVE
+    ]
+
+
+def _phase_failure(reason: str, *, final_synthesis: bool) -> str:
+    """Name a terminal synthesis failure without relabeling normal failures."""
+    return f"final synthesis failed: {reason}" if final_synthesis else reason
+
+
+def _is_content_flagged(exc: BaseException) -> bool:
+    """Recognize the provider content outcome without owning its enum."""
+    candidates: list[Any] = [exc]
+    if isinstance(exc, AllProvidersFailed) and exc.last_error is not None:
+        candidates.append(exc.last_error)
+    for candidate in candidates:
+        outcome = getattr(candidate, "outcome", None)
+        value = getattr(outcome, "value", outcome)
+        if isinstance(value, str) and value.casefold().replace("-", "_").replace(" ", "_") == (
+            "content_flagged"
+        ):
+            return True
+    return False
+
+
+def _best_partial_answer(transcript: list[dict[str, Any]]) -> str:
+    """Return the last model-authored terminal summary before a flag."""
+    for message in reversed(transcript):
+        if message.get("role") != "assistant":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        try:
+            action = _parse_agent_action(content)
+        except ValueError:
+            continue
+        summary = action.get("summary")
+        if isinstance(summary, str) and summary.strip():
+            return _bounded_text(summary, MAX_SUMMARY_CHARS)
+    return "best partial answer: work completed before final synthesis was content-flagged"
 
 
 def _progress_signature(content: str | None, action: Mapping[str, Any] | None = None) -> str:
@@ -3937,6 +4035,14 @@ async def _run_agent_loop(
     cumulative_usage: dict[str, int] = {}
     budget_new_tokens = 0
     previous_prompt_tokens = 0
+    previous_usage_source: tuple[str, str] | None = None
+    soft_cap = int(config.max_tokens * SOFT_TOKEN_CAP_RATIO)
+    finalization_cap = config.max_tokens + max(
+        FINAL_SYNTHESIS_MIN_HEADROOM_TOKENS,
+        int(config.max_tokens * FINAL_SYNTHESIS_HEADROOM_RATIO),
+    )
+    finalized = False
+    finalization_grace_used = False
     transcript: list[dict[str, Any]] = []
     tools = _exposed_tool_schemas(config)
     lint_diag = LintDiag()
@@ -3965,6 +4071,35 @@ async def _run_agent_loop(
         nonlocal transcript
         if base_messages is not None:
             transcript = copy.deepcopy([*base_messages[1:], *context_continuation])
+
+    def _append_context_message(message: dict[str, str]) -> None:
+        nonlocal transcript
+        if base_messages is None:
+            transcript.append(message)
+            if message.get("content") == FINAL_SYNTHESIS_DIRECTIVE:
+                transcript = _summarize_transcript(transcript, config.max_transcript_chars)
+            return
+        context_continuation.append(message)
+        _sync_context_transcript()
+
+    def _finalization_due(turn: int) -> bool:
+        return finalized or budget_new_tokens >= soft_cap or turn >= config.max_turns - 2
+
+    def _arm_finalization(turn: int, *, turn_limit: bool = True) -> None:
+        nonlocal finalized, finalization_grace_used
+        if finalized:
+            return
+        if budget_new_tokens < soft_cap and (not turn_limit or turn < config.max_turns - 2):
+            return
+        finalized = True
+        finalization_grace_used = False
+        _append_context_message(_final_synthesis_message())
+
+    def _drop_finalization_directive() -> None:
+        nonlocal transcript, context_continuation
+        context_continuation = _strip_finalization_directive(context_continuation)
+        transcript = _strip_finalization_directive(transcript)
+        _sync_context_transcript()
 
     def _observe_progress(
         content: str | None = None, action: Mapping[str, Any] | None = None
@@ -3997,6 +4132,7 @@ async def _run_agent_loop(
         nonlocal base_messages, context_continuation, current_epoch_checkpoint
         nonlocal epoch_count, compaction_armed, usage_epoch, cumulative_usage
         nonlocal budget_new_tokens, previous_prompt_tokens
+        nonlocal previous_usage_source
 
         if base_messages is None:
             return False, None
@@ -4140,21 +4276,21 @@ async def _run_agent_loop(
                     fork_of=usage_fork_of,
                 )
             cumulative_usage = _accumulate_usage(cumulative_usage, summary_result.usage)
-            summary_prompt_tokens = _usage_prompt_tokens(summary_result.usage)
-            summary_completion_tokens = _usage_completion_tokens(summary_result.usage)
-            if summary_prompt_tokens is None:
-                budget_new_tokens += summary_total
+            summary_source = (summary_result.provider, summary_result.model)
+            if previous_usage_source != summary_source:
                 previous_prompt_tokens = 0
-            else:
-                budget_new_tokens += max(0, summary_prompt_tokens - previous_prompt_tokens)
-                previous_prompt_tokens = summary_prompt_tokens
-                budget_new_tokens += (
-                    summary_completion_tokens
-                    if summary_completion_tokens is not None
-                    else max(0, summary_total - summary_prompt_tokens)
+            summary_charge, previous_prompt_tokens = _usage_budget_charge(
+                summary_result.usage, previous_prompt_tokens
+            )
+            previous_usage_source = summary_source
+            budget_new_tokens += summary_charge
+            _arm_finalization(turn, turn_limit=False)
+            if finalized and budget_new_tokens > finalization_cap:
+                raise ContextForkError(
+                    _phase_failure(
+                        "token budget exceeded during summary flush", final_synthesis=True
+                    )
                 )
-            if budget_new_tokens > config.max_tokens:
-                raise ContextForkError("token budget exceeded during summary flush")
             summary_entry = parse_summary_response(summary_result.content, expectation)
             new_trunk = append_summary_entry(trunk_messages, summary_entry)
             before_entries = summary_entries(new_trunk)
@@ -4291,6 +4427,12 @@ async def _run_agent_loop(
         progress_detector.no_progress_actions = no_progress_actions
         budget_new_tokens = resume_checkpoint.budget_new_tokens
         previous_prompt_tokens = resume_checkpoint.previous_prompt_tokens
+        resume_provider = resume_checkpoint.cache_key.provider
+        previous_usage_source = (
+            (resume_provider, resume_checkpoint.cache_key.model)
+            if isinstance(resume_provider, str) and resume_provider
+            else None
+        )
         cumulative_usage = dict(resume_checkpoint.cumulative_usage)
         absolute_wall_deadline = resume_checkpoint.wall_deadline
         first_turn = resume_checkpoint.turn + 1
@@ -4376,9 +4518,10 @@ async def _run_agent_loop(
 
     wall_deadline = time.monotonic() + max(0.0, absolute_wall_deadline - time.time())
     try:
-        for turn in range(first_turn, config.max_turns + 1):
+        for turn in range(first_turn, config.max_turns + 2):
             progress.turn = turn
             progress.status = "working"
+            final_synthesis_call = finalized
             if stop.is_set():
                 return _loop_result(
                     outcome, "cancelled", None, turn - 1, cumulative_usage, transcript
@@ -4387,7 +4530,7 @@ async def _run_agent_loop(
                 return _loop_result(
                     outcome,
                     "failed",
-                    "wall budget exceeded",
+                    _phase_failure("wall budget exceeded", final_synthesis=final_synthesis_call),
                     turn - 1,
                     cumulative_usage,
                     transcript,
@@ -4395,6 +4538,34 @@ async def _run_agent_loop(
             _require_generation(worktree, config.generation)
             if base_messages is None:
                 transcript = _summarize_transcript(transcript, config.max_transcript_chars)
+            else:
+                if finalized:
+                    _drop_finalization_directive()
+                # The tuple is immutable and every message is deep-copied at
+                # the prompt boundary. No later turn can rewrite the epoch
+                # prefix in place.
+                _folded = False
+                if config.context_reuse:
+                    _folded, compaction_failure = await _bound_context_continuation(turn)
+                    if compaction_failure is not None:
+                        return _loop_result(
+                            outcome,
+                            "failed",
+                            _phase_failure(
+                                f"compaction_failed: {compaction_failure}",
+                                final_synthesis=final_synthesis_call,
+                            ),
+                            turn - 1,
+                            cumulative_usage,
+                            transcript,
+                        )
+                if finalized and not _folded and not any(
+                    message.get("content") == FINAL_SYNTHESIS_DIRECTIVE
+                    for message in context_continuation
+                ):
+                    _append_context_message(_final_synthesis_message())
+            _arm_finalization(turn, turn_limit=False)
+            if base_messages is None:
                 prompt = _build_agent_prompt(
                     config.task,
                     tools,
@@ -4403,21 +4574,8 @@ async def _run_agent_loop(
                     parent_envelope=config.parent_envelope,
                 )
             else:
-                # The tuple is immutable and every message is deep-copied at
-                # the prompt boundary. No later turn can rewrite the epoch
-                # prefix in place.
-                if config.context_reuse:
-                    _folded, compaction_failure = await _bound_context_continuation(turn)
-                    if compaction_failure is not None:
-                        return _loop_result(
-                            outcome,
-                            "failed",
-                            f"compaction_failed: {compaction_failure}",
-                            turn - 1,
-                            cumulative_usage,
-                            transcript,
-                        )
                 prompt = _fork_prompt(base_messages, context_continuation, tools)
+            final_synthesis_call = finalized
             # Keep the object handed to the router immutable for checkpointing.
             # A provider adapter is allowed to normalize its local request, but
             # the epoch must describe the exact object Cambium submitted.
@@ -4425,25 +4583,51 @@ async def _run_agent_loop(
             try:
                 result = await router.call(tier, prompt, model=model, budget_usd=budget_usd)
             except Exception as exc:
+                failure_event = _failure_usage_event(
+                    exc,
+                    turn=turn,
+                    model=model,
+                    router=router,
+                    prompt=sent_prompt,
+                    call_kind="agent",
+                )
+                partial_content_flag = (
+                    final_synthesis_call
+                    and _is_content_flagged(exc)
+                    and not (code_changed and not verified_after_change)
+                )
+                if final_synthesis_call and not partial_content_flag:
+                    failure_event["failure_reason"] = _phase_failure(
+                        str(failure_event.get("failure_reason", "provider call failed")),
+                        final_synthesis=True,
+                    )
                 if writer is not None:
                     await _emit_usage_event(
                         writer,
                         config,
-                        _failure_usage_event(
-                            exc,
-                            turn=turn,
-                            model=model,
-                            router=router,
-                            prompt=sent_prompt,
-                            call_kind="agent",
-                        ),
+                        failure_event,
                         epoch=usage_epoch,
                         fork_of=usage_fork_of,
                     )
+                if partial_content_flag:
+                    return {
+                        **outcome,
+                        "status": "succeeded",
+                        "failure_reason": None,
+                        "summary": _best_partial_answer(transcript),
+                        "turn": turn,
+                        "usage": cumulative_usage,
+                        "provider": failure_event.get("provider", outcome.get("provider")),
+                        "latency_s": 0.0,
+                        "transcript": transcript,
+                    }
                 return _loop_result(
                     outcome,
                     "failed",
-                    f"provider call failed: {exc.__class__.__name__}",
+                    _phase_failure(
+                        f"provider call failed: {exc.__class__.__name__}",
+                        final_synthesis=final_synthesis_call,
+                    ),
                     turn - 1,
                     cumulative_usage,
                     transcript,
@@ -4452,7 +4636,7 @@ async def _run_agent_loop(
                 return _loop_result(
                     outcome,
                     "failed",
-                    "wall budget exceeded",
+                    _phase_failure("wall budget exceeded", final_synthesis=final_synthesis_call),
                     turn,
                     cumulative_usage,
                     transcript,
@@ -4462,7 +4646,10 @@ async def _run_agent_loop(
                 return _loop_result(
                     outcome,
                     "failed",
-                    "provider response model mismatch",
+                    _phase_failure(
+                        "provider response model mismatch",
+                        final_synthesis=final_synthesis_call,
+                    ),
                     turn - 1,
                     cumulative_usage,
                     transcript,
@@ -4477,7 +4664,10 @@ async def _run_agent_loop(
                 return _loop_result(
                     outcome,
                     "failed",
-                    "provider usage contains invalid token counts",
+                    _phase_failure(
+                        "provider usage contains invalid token counts",
+                        final_synthesis=final_synthesis_call,
+                    ),
                     turn - 1,
                     cumulative_usage,
                     transcript,
@@ -4487,7 +4677,10 @@ async def _run_agent_loop(
                 return _loop_result(
                     outcome,
                     "failed",
-                    "provider usage missing usable token counts",
+                    _phase_failure(
+                        "provider usage missing usable token counts",
+                        final_synthesis=final_synthesis_call,
+                    ),
                     turn - 1,
                     cumulative_usage,
                     transcript,
@@ -4501,24 +4694,22 @@ async def _run_agent_loop(
                     fork_of=usage_fork_of,
                 )
             cumulative_usage = _accumulate_usage(cumulative_usage, result.usage)
-            prompt_tokens = _usage_prompt_tokens(result.usage)
-            completion_tokens = _usage_completion_tokens(result.usage)
-            if prompt_tokens is None:
-                budget_new_tokens += total
+            usage_source = (result.provider, result.model)
+            if previous_usage_source != usage_source:
                 previous_prompt_tokens = 0
-            else:
-                budget_new_tokens += max(0, prompt_tokens - previous_prompt_tokens)
-                previous_prompt_tokens = prompt_tokens
-                budget_new_tokens += (
-                    completion_tokens
-                    if completion_tokens is not None
-                    else max(0, total - prompt_tokens)
-                )
-            if budget_new_tokens > config.max_tokens:
+            usage_charge, previous_prompt_tokens = _usage_budget_charge(
+                result.usage, previous_prompt_tokens
+            )
+            previous_usage_source = usage_source
+            budget_new_tokens += usage_charge
+            if final_synthesis_call and budget_new_tokens > finalization_cap:
                 return _loop_result(
                     outcome,
                     "failed",
-                    "token budget exceeded",
+                    _phase_failure(
+                        f"token budget exceeded ({budget_new_tokens} > {finalization_cap})",
+                        final_synthesis=True,
+                    ),
                     turn,
                     cumulative_usage,
                     transcript,
@@ -4542,12 +4733,40 @@ async def _run_agent_loop(
                 else:
                     context_continuation.extend(invalid_messages)
                     _sync_context_transcript()
-                if _observe_progress(response_content):
+                _arm_finalization(turn)
+                if _observe_progress(response_content) and not _finalization_due(turn):
                     return _no_progress_failure(turn)
+                if final_synthesis_call:
+                    return _loop_result(
+                        outcome,
+                        "failed",
+                        _phase_failure(f"invalid action: {exc}", final_synthesis=True),
+                        turn,
+                        cumulative_usage,
+                        transcript,
+                    )
                 continue
             trailing = _action_trailing(result.content)
             action_message = _canonical_action_message(action)
-            if _observe_progress(action=action):
+            if final_synthesis_call and action["type"] != "finish":
+                _append_context_message(action_message)
+                if turn < config.max_turns and not finalization_grace_used:
+                    finalization_grace_used = True
+                    _append_context_message(
+                        {"role": "user", "content": FINAL_SYNTHESIS_REMINDER}
+                    )
+                    continue
+                return _loop_result(
+                    outcome,
+                    "failed",
+                    _phase_failure(
+                        f"non-terminal action: {action['type']}", final_synthesis=True
+                    ),
+                    turn,
+                    cumulative_usage,
+                    transcript,
+                )
+            if _observe_progress(action=action) and not _finalization_due(turn):
                 return _no_progress_failure(turn)
             if action["type"] == "plan":
                 if base_messages is None:
@@ -4562,6 +4781,7 @@ async def _run_agent_loop(
                         )
                     context_continuation.append({"role": "user", "content": "Continue."})
                     _sync_context_transcript()
+                _arm_finalization(turn)
                 progress.tool = "plan"
                 continue
             if action["type"] == "finish":
@@ -4587,8 +4807,20 @@ async def _run_agent_loop(
                     else:
                         context_continuation.append({"role": "user", "content": reason})
                         _sync_context_transcript()
+                    if final_synthesis_call:
+                        return _loop_result(
+                            outcome,
+                            "failed",
+                            _phase_failure(reason, final_synthesis=True),
+                            turn,
+                            cumulative_usage,
+                            transcript,
+                        )
                     progress.tool = "finish"
                     continue
+
+                if finalized:
+                    _drop_finalization_directive()
 
                 # The root/parent performs one additional summary call at the
                 # terminal boundary. Forked children return their strict result
@@ -4612,7 +4844,10 @@ async def _run_agent_loop(
                         return _loop_result(
                             outcome,
                             "failed",
-                            f"compaction_failed: {compaction_failure}",
+                            _phase_failure(
+                                f"compaction_failed: {compaction_failure}",
+                                final_synthesis=final_synthesis_call,
+                            ),
                             turn,
                             cumulative_usage,
                             transcript,
@@ -4628,7 +4863,9 @@ async def _run_agent_loop(
                 terminal_provider = result.provider
                 terminal_boundary = provider_boundaries.get(result.provider)
                 terminal_compat = provider_compat
-                terminal_messages = copy.deepcopy(sent_prompt["messages"])
+                terminal_messages = _strip_finalization_directive(
+                    copy.deepcopy(sent_prompt["messages"])
+                )
                 terminal_suffix = [copy.deepcopy(action_message)]
                 if base_messages is not None and current_epoch_checkpoint is not None:
                     terminal_key = current_epoch_checkpoint.cache_key
@@ -4708,6 +4945,7 @@ async def _run_agent_loop(
                 else:
                     context_continuation.extend(denied_messages)
                     _sync_context_transcript()
+                _arm_finalization(turn)
                 progress.tool = name
                 continue
             if stop.is_set():
@@ -4760,10 +4998,16 @@ async def _run_agent_loop(
                 continuation_suffix.append(state_message)
                 context_continuation.extend(copy.deepcopy(continuation_suffix))
                 _sync_context_transcript()
+            _arm_finalization(turn)
             if writer is not None:
                 await _emit_tool_event(writer, config, name, arguments, turn, tool_result)
                 await _persist_checkpoint(writer, config, turn, transcript, cumulative_usage, [])
-            if config.context_reuse and name == "delegate" and tool_result.ok:
+            if (
+                config.context_reuse
+                and name == "delegate"
+                and tool_result.ok
+                and not finalized
+            ):
                 checkpoint: ContextCheckpoint | None = None
                 checkpoint_was_emitted = False
                 if base_messages is not None and config.checkpoint_root is not None:
@@ -4842,7 +5086,10 @@ async def _run_agent_loop(
         return _loop_result(
             outcome,
             "failed",
-            f"max turns exceeded ({config.max_turns})",
+            _phase_failure(
+                f"no terminal action before turn limit ({config.max_turns})",
+                final_synthesis=finalized,
+            ),
             config.max_turns,
             cumulative_usage,
             transcript,

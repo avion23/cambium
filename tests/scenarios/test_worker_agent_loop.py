@@ -80,6 +80,27 @@ class _ScriptedRouter:
         return _FakeCallResult(self.responses.pop(0))
 
 
+class _UsageScriptedRouter(_ScriptedRouter):
+    def __init__(self, responses: list[str], usages: list[dict[str, Any]]) -> None:
+        super().__init__(responses)
+        self.usages = list(usages)
+
+    async def call(
+        self,
+        tier: ProviderTier,
+        prompt: dict[str, Any],
+        *,
+        model: str | None = None,
+        budget_usd: float | None = None,
+        allow_model_substitution: bool = False,
+    ) -> _FakeCallResult:
+        del tier, model, budget_usd, allow_model_substitution
+        self.prompts.append(prompt)
+        if not self.responses or not self.usages:
+            raise AssertionError("router call with no scripted response")
+        return _FakeCallResult(self.responses.pop(0), usage=self.usages.pop(0))
+
+
 class _SummaryFlushRouter:
     """Router double that requires substitution authorization for summaries."""
 
@@ -339,6 +360,132 @@ def test_build_agent_prompt_head_is_byte_stable_across_transcript_growth() -> No
     )
     assert grown["messages"][0]["content"] == fresh["messages"][0]["content"]
     assert prompt_prefix_bytes(grown) == prompt_prefix_bytes(fresh)
+
+
+def test_usage_budget_charge_uses_uncached_baseline_and_safe_fallback() -> None:
+    cached = {
+        "prompt_tokens": 100,
+        "cached_tokens": 90,
+        "completion_tokens": 5,
+        "total_tokens": 105,
+    }
+    assert worker._usage_budget_charge(cached, 0) == (15, 10)
+    assert worker._usage_budget_charge(
+        {**cached, "prompt_tokens": 120, "cached_tokens": 110, "total_tokens": 125},
+        10,
+    ) == (5, 10)
+
+    missing_cache = {
+        "prompt_tokens": 120,
+        "completion_tokens": 5,
+        "total_tokens": 125,
+    }
+    assert worker._usage_budget_charge(missing_cache, 100) == (25, 120)
+    # A provider/model switch starts a new uncached baseline at the caller.
+    assert worker._usage_budget_charge(cached, 0) == (15, 10)
+
+
+def test_cached_heavy_turn_uses_paid_tokens_not_gross_prompt(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = _make_worktree(repo)
+    config = _agent_config(worktree, max_tokens=20)
+    router = _UsageScriptedRouter(
+        [
+            '{"type":"tool_call","name":"read_batch","arguments":{"paths":["alpha.txt"]}}',
+            '{"type":"finish","summary":"read the file"}',
+        ],
+        [
+            {
+                "prompt_tokens": 100,
+                "cached_tokens": 90,
+                "completion_tokens": 5,
+                "total_tokens": 105,
+            },
+            {
+                "prompt_tokens": 120,
+                "cached_tokens": 110,
+                "completion_tokens": 5,
+                "total_tokens": 125,
+            },
+        ],
+    )
+
+    outcome = asyncio.run(_drive_loop(config, worktree, router))
+
+    assert outcome["status"] == "succeeded"
+    assert outcome["failure_reason"] is None
+    assert len(router.prompts) == 2
+    assert worker.FINAL_SYNTHESIS_DIRECTIVE not in json.dumps(router.prompts)
+
+
+def test_soft_cap_injects_one_forced_finalization(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = _make_worktree(repo)
+    config = _agent_config(worktree, max_tokens=100)
+    router = _UsageScriptedRouter(
+        [
+            '{"type":"tool_call","name":"read_batch","arguments":{"paths":["alpha.txt"]}}',
+            '{"type":"finish","summary":"read the file"}',
+        ],
+        [
+            {"prompt_tokens": 90, "completion_tokens": 0, "total_tokens": 90},
+            {"prompt_tokens": 100, "completion_tokens": 0, "total_tokens": 100},
+        ],
+    )
+
+    outcome = asyncio.run(_drive_loop(config, worktree, router))
+
+    assert outcome["status"] == "succeeded"
+    assert len(router.prompts) == 2
+    injected = [
+        message
+        for message in router.prompts[1]["messages"]
+        if message.get("content") == worker.FINAL_SYNTHESIS_DIRECTIVE
+    ]
+    assert len(injected) == 1
+
+
+def test_finalization_may_use_scaled_headroom_past_hard_cap(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = _make_worktree(repo)
+    config = _agent_config(worktree, max_tokens=100)
+    router = _UsageScriptedRouter(
+        [
+            '{"type":"tool_call","name":"read_batch","arguments":{"paths":["alpha.txt"]}}',
+            '{"type":"finish","summary":"best available result"}',
+        ],
+        [
+            {"prompt_tokens": 95, "completion_tokens": 0, "total_tokens": 95},
+            {"prompt_tokens": 4_000, "completion_tokens": 0, "total_tokens": 4_000},
+        ],
+    )
+
+    outcome = asyncio.run(_drive_loop(config, worktree, router))
+
+    assert outcome["status"] == "succeeded"
+    assert worker.FINAL_SYNTHESIS_MIN_HEADROOM_TOKENS == 4_000
+    assert 4_000 > config.max_tokens
+
+
+def test_max_turns_edge_injects_the_same_finalization_directive(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = _make_worktree(repo)
+    config = _agent_config(worktree, max_turns=3)
+    router = _ScriptedRouter(
+        [
+            '{"type":"tool_call","name":"read_batch","arguments":{"paths":["alpha.txt"]}}',
+            '{"type":"finish","summary":"read the file"}',
+        ]
+    )
+
+    outcome = asyncio.run(_drive_loop(config, worktree, router))
+
+    assert outcome["status"] == "succeeded"
+    assert len(router.prompts) == 2
+    assert sum(
+        message.get("content") == worker.FINAL_SYNTHESIS_DIRECTIVE
+        for message in router.prompts[1]["messages"]
+    ) == 1
 
 
 def test_build_agent_prompt_head_passes_d8c_lint() -> None:
