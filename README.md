@@ -1,17 +1,17 @@
 # Cambium
 
 Multi-provider coding harness — [`src/cambium/diffundo.py`](src/cambium/diffundo.py).<br>
-Rotation, demotion, failover, lease-rotation, and CAST context caching — [`src/cambium/diffundo.py`](src/cambium/diffundo.py), [`src/cambium/worker.py`](src/cambium/worker.py).<br>
+Rotation, cooldown/circuit-breaker, failover, and lease-rotation — [`src/cambium/diffundo.py`](src/cambium/diffundo.py); demotion — [`src/cambium/selection.py`](src/cambium/selection.py); CAST context caching — [`src/cambium/worker.py`](src/cambium/worker.py).<br>
 Live operator TUI — [`src/cambium/tui_screen.py`](src/cambium/tui_screen.py), [`src/cambium/observability.py`](src/cambium/observability.py).
 
 ## FEATURES
 
-- Provider rotation, demotion, failover, lease-rotation, and recoverable `CONTENT_FLAGGED` moderation recovery — [`src/cambium/diffundo.py`](src/cambium/diffundo.py).
-- CAST epoch checkpoints, summary trunk/raw tail, `cache_key` `prefix_sha256` hashing, and the provider-cache-evidence-only rule — [`src/cambium/worker.py`](src/cambium/worker.py), [`docs/architecture/context-engine.md`](docs/architecture/context-engine.md).
+- Provider rotation, cooldown/circuit-breaker, failover, and lease-rotation — [`src/cambium/diffundo.py`](src/cambium/diffundo.py); demotion — [`src/cambium/selection.py`](src/cambium/selection.py); recoverable `CONTENT_FLAGGED` moderation recovery — [`src/cambium/diffundo.py`](src/cambium/diffundo.py).
+- CAST epoch checkpoints, summary trunk/raw tail, `cache_key` `prefix_sha256` hashing, and the provider-cache-evidence-only rule — [`src/cambium/worker.py`](src/cambium/worker.py), [`docs/architecture/context-engine.md#6-provider-cache-capability-contract`](docs/architecture/context-engine.md#6-provider-cache-capability-contract).
 - Uncached-token budget charging and graceful forced finalization — [`src/cambium/worker.py`](src/cambium/worker.py).
-- Checkpoint-bound stall resume and `salvage/<task>/<gen>/workspace.diff` — [`src/cambium/supervisor.py`](src/cambium/supervisor.py).
+- Checkpoint resume and `salvage/<task>/<gen>/workspace.diff` — [`src/cambium/supervisor.py`](src/cambium/supervisor.py).
 - Credential-feasible admission and the success invariant, including `requires_commit` — [`src/cambium/supervisor.py`](src/cambium/supervisor.py), [`src/cambium/worker.py`](src/cambium/worker.py).
-- Operator rail with lineage glyphs and fold ticks — [`src/cambium/tui_screen.py`](src/cambium/tui_screen.py), [`src/cambium/observability.py`](src/cambium/observability.py).
+- Operator rail with lineage glyphs and epoch rail ticks — [`src/cambium/tui_screen.py`](src/cambium/tui_screen.py), [`src/cambium/observability.py`](src/cambium/observability.py).
 - Integer-only duration stats — [`src/cambium/tui_screen.py`](src/cambium/tui_screen.py).
 - Plan-mode parallel workers — [`src/cambium/supervisor.py`](src/cambium/supervisor.py), [`src/cambium/cli.py`](src/cambium/cli.py).
 
@@ -53,7 +53,7 @@ OPERATIONS: [`docs/architecture/operations.md`](docs/architecture/operations.md)
 
 ## LIMITS
 
-- Slow-tier tests (`-m slow`) carry known failures — [`src/cambium/supervisor.py`](src/cambium/supervisor.py).
+- Some non-scenario suites (bench/cli/lm/routing) are not part of the enforced gate — [`pyproject.toml`](pyproject.toml).
 - Worker-side moderation transform-retry is not yet implemented — [`src/cambium/worker.py`](src/cambium/worker.py).
 - Nested orchestration needs `CAMBIUM_ALLOW_NESTED_EPHEMERAL=1` — [`src/cambium/oneshot.py`](src/cambium/oneshot.py).
 
