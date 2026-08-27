@@ -979,11 +979,13 @@ def _provider_router(
     task_id: str | None = None,
     requirements: Mapping[str, Any] | None = None,
 ) -> tuple[Diffundo, ProviderTier, str, str]:
+    if (
+        authorized_providers_explicit
+        and authorized_providers is not None
+        and not authorized_providers
+    ):
+        raise AllProvidersFailed([], ValueError("authorized_providers explicitly empty"))
     providers = load_providers(_provider_path())
-    # An explicitly empty authorized list is the historical "unrestricted"
-    # wire value (the supervisor always sends the key): restriction applies
-    # only to a non-empty list. `authorized_providers_explicit` records the
-    # distinction for the provider-boundary descriptor, nothing more.
     if authorized_providers:
         authorized = frozenset(authorized_providers)
         providers = [provider for provider in providers if provider.name in authorized]
@@ -1168,6 +1170,7 @@ class AgentConfig:
     checkpoint_root: Path | None
     cast_policy: CastPolicy = dataclass_field(default_factory=CastPolicy)
     requirements: dict[str, Any] | None = None
+    requires_commit: bool = False
     max_transcript_chars: int = MAX_TRANSCRIPT_CHARS
     # Supervisor-level admission balancing (solution C): the provider this
     # task was assigned at admission; presets Diffundo's sticky primary.
@@ -1207,6 +1210,8 @@ class AgentConfig:
         """Derive threshold defaults for direct in-process configurations."""
         if not isinstance(self.cast_policy, CastPolicy):
             raise ValueError("cast_policy must be a CastPolicy")
+        if type(self.requires_commit) is not bool:
+            raise ValueError("requires_commit must be a boolean")
         threshold_high = self.rolling_compact_threshold_high
         if threshold_high == 0:
             threshold_high = self.max_transcript_chars
@@ -1262,10 +1267,13 @@ class AgentConfig:
         ):
             raise ValueError("init assigned_provider must be a string")
         provider_env_keys = _provider_env_keys(init.get("provider_env_keys"))
-        authorized_providers = _provider_env_keys(init.get("authorized_providers"))
+        authorized_raw = init.get("authorized_providers")
+        authorized_providers = _provider_env_keys(authorized_raw)
         authorized_explicit = init.get("authorized_providers_explicit")
         if authorized_explicit is None:
-            authorized_explicit = "authorized_providers" in init
+            authorized_explicit = authorized_raw is not None and "authorized_providers" in init
+        elif authorized_raw is None:
+            authorized_explicit = False
         if type(authorized_explicit) is not bool:
             raise ValueError("init authorized_providers_explicit must be a boolean")
         debt = init.get("debt")
@@ -1306,6 +1314,7 @@ class AgentConfig:
             checkpoint_root=checkpoint_root,
             cast_policy=_cast_policy(init.get("cast_policy"), "init"),
             requirements=_task_requirements(init, _provider_fanout_config(init)),
+            requires_commit=_strict_bool(init.get("requires_commit"), "init requires_commit"),
             max_transcript_chars=max_transcript_chars,
             provider_env_keys=provider_env_keys,
             redactor=_checkpoint_redactor(provider_env_keys, init.get("credentials")),
@@ -1347,6 +1356,9 @@ def _merge_task_config(
     requirements = config.requirements
     if requirements is None:
         requirements = _task_requirements(run, fanout_config)
+    requires_commit = config.requires_commit
+    if "requires_commit" not in init:
+        requires_commit = _strict_bool(run.get("requires_commit"), "run_task requires_commit")
     parent_envelope = config.parent_envelope or _validate_parent_envelope(
         run.get("parent_envelope")
     )
@@ -1407,6 +1419,7 @@ def _merge_task_config(
         checkpoint_root=config.checkpoint_root,
         cast_policy=cast_policy,
         requirements=requirements,
+        requires_commit=requires_commit,
         max_transcript_chars=config.max_transcript_chars,
         provider_env_keys=config.provider_env_keys,
         redactor=config.redactor,
@@ -1429,9 +1442,12 @@ def _config_from_run(run: dict[str, Any]) -> AgentConfig:
     task_id = run.get("task_id", "unknown")
     if type(task_id) is not str or not task_id:
         raise ValueError("run_task task_id must be a non-empty string")
+    authorized_raw = run.get("authorized_providers")
     authorized_explicit = run.get("authorized_providers_explicit")
     if authorized_explicit is None:
-        authorized_explicit = "authorized_providers" in run
+        authorized_explicit = authorized_raw is not None and "authorized_providers" in run
+    elif authorized_raw is None:
+        authorized_explicit = False
     if type(authorized_explicit) is not bool:
         raise ValueError("run_task authorized_providers_explicit must be a boolean")
     max_transcript_chars = _positive_int(
@@ -1467,6 +1483,7 @@ def _config_from_run(run: dict[str, Any]) -> AgentConfig:
         checkpoint_root=None,
         cast_policy=_cast_policy(run.get("cast_policy"), "run_task"),
         requirements=_task_requirements(run, _provider_fanout_config(run)),
+        requires_commit=_strict_bool(run.get("requires_commit"), "run_task requires_commit"),
         max_transcript_chars=max_transcript_chars,
         provider_env_keys=provider_env_keys,
         redactor=_checkpoint_redactor(provider_env_keys, run.get("credentials")),
@@ -2641,9 +2658,7 @@ def _final_synthesis_message() -> dict[str, str]:
 
 def _strip_finalization_directive(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     """Keep the transient directive out of durable epoch messages."""
-    return [
-        message for message in messages if message.get("content") != FINAL_SYNTHESIS_DIRECTIVE
-    ]
+    return [message for message in messages if message.get("content") != FINAL_SYNTHESIS_DIRECTIVE]
 
 
 def _phase_failure(reason: str, *, final_synthesis: bool) -> str:
@@ -3811,6 +3826,7 @@ def _loop_failure_outcome(loop_outcome: dict[str, Any]) -> dict[str, Any]:
     outcome = {
         "status": loop_outcome.get("status", "failed"),
         "failure_reason": loop_outcome.get("failure_reason"),
+        "requires_commit": bool(loop_outcome.get("requires_commit", False)),
         "commits": [],
         "files_changed": [],
         "diff": "",
@@ -4086,6 +4102,7 @@ async def _run_agent_loop(
     outcome: dict[str, Any] = {
         "status": "failed",
         "failure_reason": None,
+        "requires_commit": config.requires_commit,
         "summary": "",
         "turn": 0,
         "usage": {},
@@ -4274,13 +4291,14 @@ async def _run_agent_loop(
                 through_turn=summary_through_turn,
             )
             summary_result: CallResult | None = None
+            sent_summary_prompt = copy.deepcopy(summary_prompt)
             for summary_attempt in range(2):
                 sent_summary_prompt = copy.deepcopy(summary_prompt)
                 try:
                     summary_caller = getattr(router, "summary_call", None)
                     if callable(summary_caller):
                         assert summary_caller is not None
-                        summary_result = await summary_caller(
+                        summary_result = await cast(Callable[..., Any], summary_caller)(
                             tier,
                             summary_prompt,
                             model=model,
@@ -4872,9 +4890,7 @@ async def _run_agent_loop(
                 return _loop_result(
                     outcome,
                     "failed",
-                    _phase_failure(
-                        f"non-terminal action: {action['type']}", final_synthesis=True
-                    ),
+                    _phase_failure(f"non-terminal action: {action['type']}", final_synthesis=True),
                     turn,
                     cumulative_usage,
                     transcript,
@@ -4883,9 +4899,7 @@ async def _run_agent_loop(
                 _append_context_message(action_message)
                 if turn < config.max_turns and not finalization_grace_used:
                     finalization_grace_used = True
-                    _append_context_message(
-                        {"role": "user", "content": FINAL_SYNTHESIS_REMINDER}
-                    )
+                    _append_context_message({"role": "user", "content": FINAL_SYNTHESIS_REMINDER})
                     continue
                 if base_messages is not None and config.resume is not None:
                     return _loop_result(
@@ -5135,12 +5149,7 @@ async def _run_agent_loop(
             if writer is not None:
                 await _emit_tool_event(writer, config, name, arguments, turn, tool_result)
                 await _persist_checkpoint(writer, config, turn, transcript, cumulative_usage, [])
-            if (
-                config.context_reuse
-                and name == "delegate"
-                and tool_result.ok
-                and not finalized
-            ):
+            if config.context_reuse and name == "delegate" and tool_result.ok and not finalized:
                 checkpoint: ContextCheckpoint | None = None
                 checkpoint_was_emitted = False
                 if base_messages is not None and config.checkpoint_root is not None:
@@ -5277,6 +5286,7 @@ async def _do_provider_work(
                 "failure_reason": (
                     f"worktree_path {worktree} outside session scratch root {session_root}"
                 ),
+                "requires_commit": config.requires_commit,
             }
         )
     if not worktree.exists():
@@ -5284,6 +5294,7 @@ async def _do_provider_work(
             {
                 "status": "failed",
                 "failure_reason": f"worker worktree is missing: {worktree}",
+                "requires_commit": config.requires_commit,
             }
         )
     try:
@@ -5298,10 +5309,16 @@ async def _do_provider_work(
             requirements=config.requirements,
         )
     except Exception as exc:
+        failure_reason = f"provider routing failed: {exc.__class__.__name__}"
+        if isinstance(exc, AllProvidersFailed) and str(exc.last_error) == (
+            "authorized_providers explicitly empty"
+        ):
+            failure_reason = "authorized_providers explicitly empty"
         return _loop_failure_outcome(
             {
                 "status": "failed",
-                "failure_reason": f"provider routing failed: {exc.__class__.__name__}",
+                "failure_reason": failure_reason,
+                "requires_commit": config.requires_commit,
             }
         )
     try:
@@ -5403,6 +5420,7 @@ def _finalize_worktree(
     outcome: dict[str, Any] = {
         "status": "failed",
         "failure_reason": None,
+        "requires_commit": config.requires_commit,
         "commits": [],
         "files_changed": [],
         "diff": "",
@@ -5493,7 +5511,24 @@ def _finalize_worktree(
                 "unverified changes"
             )
             return outcome
+        workspace_differs = bool(changed)
+        if not workspace_differs and config.requires_commit:
+            for diff_args in (
+                ("diff", "--quiet", resolved_base),
+                ("diff", "--cached", "--quiet", resolved_base),
+            ):
+                diff_rc, _diff, diff_err = git(*diff_args, cwd=worktree)
+                if diff_rc == 1:
+                    workspace_differs = True
+                elif diff_rc != 0:
+                    outcome["failure_reason"] = (
+                        f"git diff failed while checking base_commit: {diff_err}"
+                    )
+                    return outcome
         if not changed:
+            if config.requires_commit and workspace_differs:
+                outcome["failure_reason"] = "requires_commit unmet"
+                return outcome
             _require_generation(worktree, generation)
             terminal_checkpoint = _write_terminal_epoch()
             # True no-op: no ordinary final checkpoint is written. The summary
@@ -5517,7 +5552,11 @@ def _finalize_worktree(
             _require_generation(worktree, generation)
             rc, _out, err = _fenced_git(worktree, generation, "add", "--", path, cwd=worktree)
             if rc != 0:
-                outcome["failure_reason"] = f"git add failed for {path}: {err}"
+                outcome["failure_reason"] = (
+                    "requires_commit unmet"
+                    if config.requires_commit
+                    else f"git add failed for {path}: {err}"
+                )
                 return outcome
         _require_generation(worktree, generation)
         rc, _out, err = _fenced_git(
@@ -5531,9 +5570,18 @@ def _finalize_worktree(
             cwd=worktree,
         )
         if rc != 0:
-            outcome["failure_reason"] = f"commit failed: {err}"
+            outcome["failure_reason"] = (
+                "requires_commit unmet" if config.requires_commit else f"commit failed: {err}"
+            )
             return outcome
-        _rc, sha, _err = git("rev-parse", "HEAD", cwd=worktree)
+        sha_rc, sha, sha_err = git("rev-parse", "HEAD", cwd=worktree)
+        if sha_rc != 0 or sha == resolved_base:
+            outcome["failure_reason"] = (
+                "requires_commit unmet"
+                if config.requires_commit
+                else f"cannot resolve committed HEAD: {sha_err}"
+            )
+            return outcome
         _rc, diff, _err = git("diff", f"{resolved_base}..HEAD", cwd=worktree)
         diff, diff_truncated = cap_diff(diff)
         _require_generation(worktree, generation)
@@ -5724,6 +5772,7 @@ async def _run_task(
     outcome["request_id"] = run_rid
     outcome["task_id"] = task_id
     outcome["generation"] = generation
+    outcome["requires_commit"] = config.requires_commit
     outcome["started_at"] = started_at
     outcome["ended_at"] = time.time()
     await _emit_proposed_children(writer, run, task_id)
@@ -5764,6 +5813,8 @@ async def _emit_result_envelope(writer: asyncio.StreamWriter, outcome: dict[str,
             envelope["epoch"] = epoch
         if checkpoint_ref is not None:
             envelope["checkpoint_ref"] = checkpoint_ref
+    if status == TaskStatus.SUCCEEDED.value or "requires_commit" in outcome:
+        envelope["requires_commit"] = bool(outcome.get("requires_commit", False))
     provider_metadata = outcome.get("provider_metadata")
     if isinstance(provider_metadata, dict):
         envelope["provider_metadata"] = provider_metadata
