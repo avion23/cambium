@@ -1333,6 +1333,13 @@ class ActivityState:
             return
         if kind in _TURN_DONE_KINDS:
             status = data.get("status")
+            if status == "suspended":
+                self._state = "SUSPENDED"
+                self._active = True
+                self._finished = False
+                self._responding = False
+                self._tools.clear()
+                return
             self._state = "ERROR" if status in _FAILURE_STATUSES else "DONE"
             self._active = False
             self._finished = True
@@ -1390,6 +1397,8 @@ class ActivityState:
             return "✓ DONE"
         elif self._state == "ERROR":
             return "✗ ERROR"
+        elif self._state == "SUSPENDED":
+            label = f"SUSPENDED · waiting… {turn_elapsed:7.1f}s"
         else:
             label = f"WAITING · thinking… {turn_elapsed:7.1f}s"
         return f"{_SPINNER_FRAMES[self._frame]} {label}"
@@ -2321,6 +2330,7 @@ _RAIL_STATE_GLYPHS = {
     "exited": "✓",
     "failed": "✗",
     "cancelled": "✗",
+    "rejected": "✗",
 }
 _RAIL_LINEAGE_GLYPHS = {"exact": "=", "semantic": "~", "fresh": "∅", "": "?"}
 
@@ -2356,18 +2366,45 @@ def _rail_lineage_glyph(lineage: Any) -> str:
     return _RAIL_LINEAGE_GLYPHS.get(value, "?")
 
 
-def _rail_depth(task_id: str, parents: Mapping[str, str | None]) -> int:
-    depth = 0
-    current = task_id
-    seen: set[str] = set()
-    while (parent := parents.get(current)) is not None and current not in seen:
-        seen.add(current)
-        current = parent
+def _rail_depth(
+    task_id: str,
+    parents: Mapping[str, str | None],
+    depths: dict[str, int] | None = None,
+) -> int:
+    depths = {} if depths is None else depths
+    if task_id in depths:
+        return depths[task_id]
+
+    path: list[str] = []
+    positions: dict[str, int] = {}
+    current: str | None = task_id
+    while current is not None and current not in depths and current not in positions:
+        positions[current] = len(path)
+        path.append(current)
+        current = parents.get(current)
+
+    if current is None:
+        depth = 0
+        if path:
+            depths[path.pop()] = depth
+    elif current in depths:
+        depth = depths[current]
+    else:
+        cycle_start = positions[current]
+        depth = len(path) - cycle_start
+        for node in path[cycle_start:]:
+            depths[node] = depth
+        del path[cycle_start:]
+
+    for node in reversed(path):
         depth += 1
-    return depth
+        depths[node] = depth
+    return depths[task_id]
 
 
-def _rail_tree_order(agents: tuple[Any, ...]) -> tuple[Any, ...]:
+def _rail_tree_order(
+    agents: tuple[Any, ...], depths: dict[str, int] | None = None
+) -> tuple[Any, ...]:
     tasks = [
         _side_clean(getattr(agent, "task_id", "?")).strip() or "?" for agent in agents
     ]
@@ -2375,9 +2412,10 @@ def _rail_tree_order(agents: tuple[Any, ...]) -> tuple[Any, ...]:
         task: _rail_parent_id(agent)
         for agent, task in zip(agents, tasks, strict=True)
     }
+    depths = {} if depths is None else depths
     order = sorted(
         range(len(agents)),
-        key=lambda index: (_rail_depth(tasks[index], parents), index),
+        key=lambda index: (_rail_depth(tasks[index], parents, depths), index),
     )
     return tuple(agents[index] for index in order)
 
@@ -2386,7 +2424,8 @@ def _rail_lane_rows(agents: tuple[Any, ...], width: int) -> list[tuple[str, str]
     panel_width = max(1, width)
     if not agents:
         return [_side_row("dim", " no agents yet", panel_width)]
-    agents = _rail_tree_order(agents)
+    depths: dict[str, int] = {}
+    agents = _rail_tree_order(agents, depths)
 
     tasks = [
         _side_clean(getattr(agent, "task_id", "?")).strip() or "?" for agent in agents
@@ -2403,7 +2442,7 @@ def _rail_lane_rows(agents: tuple[Any, ...], width: int) -> list[tuple[str, str]
         parent = parents.get(task)
         siblings = children.get(parent, ())
         connector = "└" if not siblings or task == siblings[-1] else "├"
-        indent = "  " * _rail_depth(task, parents)
+        indent = "  " * min(_rail_depth(task, parents, depths), panel_width // 2)
         state = _side_clean(getattr(agent, "state", "queued")).strip().casefold() or "queued"
         lineage = _rail_lineage_glyph(getattr(agent, "lineage", ""))
         prefix = f"{indent}{connector}{_rail_state_glyph(state)}{lineage} "
@@ -2718,8 +2757,10 @@ def _side_sections(
     return [_side_row(kind, text, panel_width) for kind, text in lines[:capacity]]
 
 
-def _style_kind(kind: str) -> str:
-    if kind in {"failed", "cancelled", "error"}:
+def _style_kind(kind: Any) -> str:
+    if not isinstance(kind, str):
+        kind = _side_clean(kind)
+    if kind in {"failed", "cancelled", "rejected", "error"}:
         return _RED
     if kind in {"active", "starting", "merging", "running"}:
         return _YELLOW
@@ -2925,6 +2966,8 @@ def _activity_status(snapshot: Any, activity_line: str) -> str:
     if "✓" in clean or "DONE" in upper or "SUCCEEDED" in upper:
         return "✓ done"
 
+    if "SUSPENDED" in upper:
+        return f"{spinner} suspended"
     if "COOLDOWN" in upper:
         verb = "cooldown"
     elif "STREAMING" in upper or "RESPONDING" in upper:
@@ -3162,7 +3205,7 @@ def _cockpit_frame_lines(
         session_description=session_description,
         branch_line=branch_line,
         cumulative_line=cumulative_line,
-        width=inner,
+        width=left_inner,
         activity_line=activity_line,
         show_detail=show_detail,
     )
@@ -3750,6 +3793,8 @@ class Cockpit:
         """Update only the fixed status pane while readline owns the input."""
         if not self.enabled or self._last_request is None or self._draw_in_flight:
             return
+        previous_size = self._last_size
+        self._last_size = shutil.get_terminal_size((120, 40))
         if self._turn_active and self._input_active and self._pending_draw is not None:
             now = time.monotonic()
             if now - self._last_live_draw_at >= _LIVE_DRAW_INTERVAL:
@@ -3761,6 +3806,9 @@ class Cockpit:
             return
         self._activity_line = _sanitize(activity_line).replace(chr(10), " ")
         request = (*self._last_request[:6], self._activity_line)
+        if previous_size != self._last_size:
+            self._draw_live_now(request, force=True)
+            return
         if self._frame_show_detail != self._show_detail:
             self._draw_live_now(request, force=True)
             return

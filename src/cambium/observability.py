@@ -9,6 +9,7 @@ provider-reported token counts remain the authority for exact prompt usage.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from collections import deque
@@ -19,7 +20,7 @@ from typing import Any
 
 from .summary_trunk import SUMMARY_ENTRY_OPEN
 
-_TERMINAL_STATES = frozenset({"succeeded", "failed", "cancelled", "exited"})
+_TERMINAL_STATES = frozenset({"succeeded", "failed", "cancelled", "exited", "rejected"})
 _ACTIVE_STATES = frozenset({"starting", "active", "merging"})
 _STATE_PRIORITY = {
     "queued": 0,
@@ -28,6 +29,7 @@ _STATE_PRIORITY = {
     "merging": 3,
     "exited": 4,
     "cancelled": 5,
+    "rejected": 5,
     "failed": 6,
     "succeeded": 7,
 }
@@ -214,6 +216,22 @@ def _event_seq(event: Mapping[str, Any], fallback: int) -> int:
     return value if type(value) is int and value > 0 else fallback
 
 
+def _event_fingerprint(event: Mapping[str, Any]) -> bytes:
+    content = {key: value for key, value in event.items() if key != "seq"}
+    try:
+        encoded = json.dumps(
+            content,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+            default=repr,
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError):
+        encoded = repr(content).encode("utf-8", "replace")
+    return hashlib.sha256(encoded).digest()
+
+
 def _event_time(event: Mapping[str, Any]) -> float | None:
     value = event.get("monotonic_ms")
     number = _finite_non_negative(value)
@@ -254,6 +272,8 @@ def _event_detail(kind: str, payload: Mapping[str, Any]) -> str:
 
 def _set_state(agent: _Agent, state: str) -> None:
     if agent.state in _TERMINAL_STATES:
+        if agent.state == "failed" and state == "starting":
+            agent.state = state
         return
     if state in _TERMINAL_STATES:
         agent.state = state
@@ -384,6 +404,7 @@ class ObservabilityState:
         self._recent: deque[RecentEvent] = deque(maxlen=max(1, recent_limit))
         self._last_seq = 0
         self._synthetic_seq = 0
+        self._unsequenced_hashes: deque[bytes] = deque(maxlen=64)
         self._first_time: float | None = None
         self._last_time: float | None = None
         self._session_status = "idle"
@@ -403,10 +424,17 @@ class ObservabilityState:
     def apply(self, event: Mapping[str, Any]) -> None:
         if not isinstance(event, Mapping):
             return
+        raw_seq = event.get("seq")
+        valid_seq = raw_seq if type(raw_seq) is int and raw_seq > 0 else None
+        if valid_seq is None:
+            fingerprint = _event_fingerprint(event)
+            if fingerprint in self._unsequenced_hashes:
+                return
+            self._unsequenced_hashes.append(fingerprint)
+        elif valid_seq <= self._last_seq:
+            return
         self._synthetic_seq += 1
         seq = _event_seq(event, self._synthetic_seq)
-        if type(event.get("seq")) is int and seq <= self._last_seq:
-            return
         self._last_seq = max(self._last_seq, seq)
         kind = _string(event.get("kind")) or "event"
         payload = _payload(event)
@@ -430,6 +458,8 @@ class ObservabilityState:
                 and child_epoch >= 0
             ):
                 child.epoch = max(child.epoch, child_epoch)
+            if kind == "child_rejected":
+                _set_state(child, "rejected")
         lineage = _context_lineage(kind, payload)
         if lineage is not None:
             lineage_task_id = child_id or task_id

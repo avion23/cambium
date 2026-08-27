@@ -249,3 +249,35 @@ def test_dashboard_sanitizes_provider_derived_text_at_render_boundary(tmp_path: 
     assert "codex-live/gpt-5" in rendered
     assert "HTTP 503 body next" in rendered
     assert "primary-fallback" in rendered
+
+
+def test_unsequenced_and_invalid_sequence_replays_are_deduplicated() -> None:
+    state = ObservabilityState(recent_limit=8)
+    unsequenced = {
+        "kind": "usage_event",
+        "task_id": "root",
+        "payload": {
+            "usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12}
+        },
+    }
+    invalid_sequence = {**unsequenced, "seq": 0}
+
+    state.apply(unsequenced)
+    state.apply(dict(unsequenced))
+    state.apply(invalid_sequence)
+    state.apply(dict(invalid_sequence))
+
+    snapshot = state.snapshot()
+    assert snapshot.calls == 1
+    assert len(snapshot.recent_events) == 1
+
+
+def test_unsequenced_event_hash_ring_is_bounded() -> None:
+    state = ObservabilityState(recent_limit=128)
+    for index in range(64):
+        state.apply({"kind": f"event-{index}"})
+
+    assert len(state._unsequenced_hashes) == 64
+    state.apply({"kind": "event-64"})
+    state.apply({"kind": "event-0"})
+    assert len(state.snapshot().recent_events) == 66
