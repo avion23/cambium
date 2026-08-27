@@ -61,6 +61,7 @@ def main() -> int:
     scratch = Path(run["scratch_repo"]).resolve()
     target_file = run["target_file"]
     marker = run.get("marker", "// cambium-probe")
+    commits: list[str] = []
 
     leaked = sorted(key for key in PROBE_KEYS if key in os.environ)
     authorized = os.environ.get(AUTHORIZED_KEY) == AUTHORIZED_VALUE
@@ -103,6 +104,9 @@ def main() -> int:
             rc, _out, err = git("commit", "-m", f"env-probe: {task_id}", cwd=worktree)
             status = "succeeded" if rc == 0 else "failed"
             failure_reason = None if rc == 0 else f"commit failed: {err}"
+            if status == "succeeded":
+                _rc, commit, _err = git("rev-parse", "HEAD", cwd=worktree)
+                commits.append(commit)
 
     send(
         {
@@ -112,7 +116,7 @@ def main() -> int:
             "generation": generation,
             "status": status if status != "pending" else "failed",
             "failure_reason": failure_reason,
-            "commits": [],
+            "commits": commits,
             "files_changed": [target_file],
         }
     )

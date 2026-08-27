@@ -972,10 +972,14 @@ def test_worker_context_reuse_fork_resume_is_byte_exact(tmp_path, monkeypatch) -
         assert checkpoint_path is not None
         assert checkpoint_path.is_file()
         checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
-        assert checkpoint["epoch"] == 1
-        assert checkpoint["task_id"] == task["task_id"]
-        assert checkpoint["checkpoint_ref"] == checkpoint_ref
-        checkpoint_prefix = checkpoint["provider_messages"] + checkpoint["continuation_suffix"]
+        assert set(checkpoint) == {"schema", "content", "meta"}
+        assert checkpoint["meta"]["epoch"] == 1
+        assert checkpoint["meta"]["task_id"] == task["task_id"]
+        assert checkpoint["meta"]["checkpoint_ref"] == checkpoint_ref
+        checkpoint_prefix = (
+            checkpoint["content"]["provider_messages"]
+            + checkpoint["content"]["continuation_suffix"]
+        )
         prefix_length = len(checkpoint_prefix)
 
         assert len(requests) == 4
@@ -1044,12 +1048,18 @@ def test_worker_context_reuse_fork_resume_is_byte_exact(tmp_path, monkeypatch) -
         assert child_usage[0]["epoch"] == 1
         assert child_usage[0]["fork_of"] == checkpoint_ref
         assert child_usage[0]["provider_cache_hit"] is True
-        assert child_usage[0]["prompt_prefix_bytes"] == checkpoint["cache_key"]["prefix_bytes"]
+        assert (
+            child_usage[0]["prompt_prefix_bytes"]
+            == checkpoint["meta"]["cache_key"]["prefix_bytes"]
+        )
         # The resumed action call is followed by the terminal summary call.
         assert parent_usage[-2]["epoch"] == 1
         assert "fork_of" not in parent_usage[-2]
         assert parent_usage[-2]["provider_cache_hit"] is True
-        assert parent_usage[-2]["prompt_prefix_bytes"] == checkpoint["cache_key"]["prefix_bytes"]
+        assert (
+            parent_usage[-2]["prompt_prefix_bytes"]
+            == checkpoint["meta"]["cache_key"]["prefix_bytes"]
+        )
         assert parent_usage[-1]["epoch"] == 1
         assert "fork_of" not in parent_usage[-1]
         assert all("epoch" not in payload for payload in parent_usage[:3])

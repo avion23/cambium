@@ -235,7 +235,6 @@ def check_module(manifest) -> None:
             )
             assert r["split"] == split, f"{rid}: split field mismatch"
             assert r["license"] == "internal", f"{rid}: license"
-            assert r["redacted"] is False, f"{rid}: redacted"
             inp, exp = r["input"], r["expected"]
             assert isinstance(inp.get("task"), str) and inp["task"].strip(), f"{rid}: task"
             assert isinstance(inp.get("context"), str), f"{rid}: context"

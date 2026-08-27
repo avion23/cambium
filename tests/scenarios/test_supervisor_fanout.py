@@ -380,6 +380,9 @@ def test_branch_delete_failure_defers_cleanup_without_false_prune(tmp_path) -> N
         target.write_text(target.read_text().rstrip("\\n") + "\\n" + run["marker"] + "\\n")
         subprocess.run(["git", "add", run["target_file"]], cwd=worktree, check=True)
         subprocess.run(["git", "commit", "-m", "branch-lock-worker"], cwd=worktree, check=True)
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=worktree, check=True, capture_output=True, text=True
+        ).stdout.strip()
         lock = Path(run["repo"]) / ".git" / "refs" / "heads" / f"{run['branch']}.lock"
         lock.parent.mkdir(parents=True, exist_ok=True)
         lock.write_text("concurrent ref lock\\n")
@@ -388,6 +391,7 @@ def test_branch_delete_failure_defers_cleanup_without_false_prune(tmp_path) -> N
             "request_id": run["request_id"],
             "task_id": init["task_id"],
             "status": "succeeded",
+            "commits": [commit],
         })
         send({
             "type": "exit_message",
@@ -477,12 +481,16 @@ def test_dirty_worker_tree_defers_cleanup_and_keeps_tree_registered(tmp_path) ->
             ["git", "add", run["target_file"], ".gitignore"], cwd=worktree, check=True
         )
         subprocess.run(["git", "commit", "-m", "dirty-worker"], cwd=worktree, check=True)
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=worktree, check=True, capture_output=True, text=True
+        ).stdout.strip()
         (worktree / "leftover.txt").write_text("dirty content\\n")
         send({
             "type": "result_envelope",
             "request_id": run["request_id"],
             "task_id": init["task_id"],
             "status": "succeeded",
+            "commits": [commit],
         })
         send({
             "type": "exit_message",
