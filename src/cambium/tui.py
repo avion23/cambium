@@ -399,6 +399,18 @@ def _queued_prompt_notice(prompt: str) -> str | None:
     return f"queued: {prompt}" if prompt.strip() else None
 
 
+def _take_queued_task_prompts(pending: deque[str], first: str) -> list[str]:
+    """Take adjacent ordinary prompts, leaving queued commands in order."""
+    prompts = [first]
+    while pending:
+        prompt = pending[0]
+        stripped = prompt.strip()
+        if not stripped or stripped == "v" or _is_quit_prompt(prompt) or stripped.startswith("/"):
+            break
+        prompts.append(pending.popleft())
+    return prompts
+
+
 def _restore_result_summary(turn_dir: Path) -> str | None:
     result_path = turn_dir / ".cambium" / "result.json"
     try:
@@ -418,23 +430,32 @@ def _restore_turn_transcript(
     transcript: Transcript,
 ) -> None:
     """Replay durable prompt/output events into the bounded cockpit tail."""
-    prompt_seen = False
+    prompt_task_ids: set[str] = set()
+    unassigned_prompt_seen = False
     result_summary: str | None = None
     for event in events:
         kind = event.get("kind")
         payload = _event_payload(event)
-        if kind == "task_assigned" and not prompt_seen:
+        if kind == "task_assigned":
             task_id = event.get("task_id")
-            if task_id in {None, "interactive-main"}:
+            if task_id is None or task_id == "interactive-main" or (
+                isinstance(task_id, str) and task_id.startswith("interactive-task-")
+            ):
                 prompt = _event_text(payload, "task", "prompt", "user_prompt")
-                if prompt is not None:
-                    transcript.user(prompt)
-                    prompt_seen = True
+                prompt_key = task_id if isinstance(task_id, str) else "__unassigned__"
+                if prompt is not None and prompt_key not in prompt_task_ids:
+                    if not (prompt_key == "interactive-main" and unassigned_prompt_seen):
+                        transcript.user(prompt)
+                    prompt_task_ids.add(prompt_key)
         elif kind in {"user_prompt", "user_message", "prompt"}:
             prompt = _event_text(payload, "text", "content", "prompt", "task")
             if prompt is not None:
                 transcript.user(prompt)
-                prompt_seen = True
+                task_id = event.get("task_id")
+                if isinstance(task_id, str):
+                    prompt_task_ids.add(task_id)
+                else:
+                    unassigned_prompt_seen = True
         elif kind == "response":
             response = _event_text(payload, "text", "content", "summary", "output_text")
             if response is not None:
@@ -443,7 +464,7 @@ def _restore_turn_transcript(
             result_summary = _event_text(payload, "summary", "output_text") or result_summary
         transcript.observe_event(event)
 
-    if not prompt_seen:
+    if not prompt_task_ids:
         plan_path = turn_dir / "plan.json"
         try:
             with plan_path.open(encoding="utf-8") as stream:
@@ -451,12 +472,14 @@ def _restore_turn_transcript(
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             plan = None
         tasks = plan.get("tasks") if isinstance(plan, Mapping) else None
-        if isinstance(tasks, list) and tasks:
-            first = tasks[0]
-            if isinstance(first, Mapping):
-                prompt = first.get("task")
+        if isinstance(tasks, list):
+            for task in tasks:
+                if not isinstance(task, Mapping):
+                    continue
+                prompt = task.get("task")
                 if isinstance(prompt, str) and prompt.strip():
                     transcript.user(prompt)
+                    prompt_task_ids.add(str(task.get("task_id", "")))
 
     transcript.finish_stream(result_summary or _restore_result_summary(turn_dir))
 
@@ -537,6 +560,7 @@ async def _run_legacy(
     out: TextIO,
     err: TextIO,
     quiet: bool,
+    max_workers: int | None = None,
 ) -> int:
     """Preserve deterministic line-oriented behavior for pipes and tests."""
     from cambium import oneshot, render, stats
@@ -736,6 +760,7 @@ async def _run_interactive(
     out: TextIO,
     err: TextIO,
     quiet: bool,
+    max_workers: int | None = None,
 ) -> int:
     """Run one persistent cache-aligned branch in one persistent cockpit."""
     from cambium import render
@@ -933,17 +958,37 @@ async def _run_interactive(
                     continue
 
                 transcript.user(prompt)
-                turn = session.prepare_turn(prompt)
-                state = ObservabilityState(recent_limit=16)
-                sequence = 1
-                state.apply(
-                    {
-                        "seq": sequence,
-                        "kind": "interactive_turn_started",
-                        "task_id": "interactive-main",
-                        "payload": {"turn": turn.number},
-                    }
+                prompts = _take_queued_task_prompts(pending_prompts, prompt)
+                for queued_prompt in prompts[1:]:
+                    transcript.user(queued_prompt)
+                turns = (
+                    (session.prepare_turn(prompts[0]),)
+                    if len(prompts) == 1
+                    else session.prepare_turns(prompts)
                 )
+                dispatch = turns[0] if len(turns) == 1 else turns
+                turn = turns[0]
+                state = ObservabilityState(recent_limit=16)
+                sequence = 0
+                task_ids = [
+                    getattr(getattr(item, "config", None), "task_id", None)
+                    or ("interactive-main" if index == 0 else f"interactive-task-{index}")
+                    for index, item in enumerate(turns)
+                ]
+                turns_by_task = dict(zip(task_ids, turns, strict=True))
+                for task_id, item in zip(task_ids, turns, strict=True):
+                    sequence += 1
+                    state.apply(
+                        {
+                            "seq": sequence,
+                            "kind": "interactive_turn_started",
+                            "task_id": task_id,
+                            "payload": {
+                                "turn": item.number,
+                                "task": getattr(getattr(item, "config", None), "prompt", prompt),
+                            },
+                        }
+                    )
                 completed = False
                 cancel_requested = False
                 activity = ActivityState()
@@ -981,9 +1026,13 @@ async def _run_interactive(
                     _state: ObservabilityState = state,
                     _cumulative: _Cumulative = cumulative,
                     _turn=turn,
+                    _turns_by_task=turns_by_task,
+                    _turns=turns,
                 ) -> None:
                     nonlocal sequence
-                    session.observe_event(_turn, record)
+                    session.observe_event(
+                        _turns_by_task.get(record.get("task_id"), _turns[0]), record
+                    )
                     transcript.observe_event(record)
                     _activity.observe_event(record)
                     sequence += 1
@@ -1003,7 +1052,10 @@ async def _run_interactive(
 
                 _start_input_read()
                 turn_active = True
-                turn_task = loop.create_task(session.run_turn(turn, on_event=_live_sink))
+                run_kwargs: dict[str, Any] = {"on_event": _live_sink}
+                if max_workers:
+                    run_kwargs["max_concurrent_tasks"] = max_workers
+                turn_task = loop.create_task(session.run_turn(dispatch, **run_kwargs))
 
                 def _request_cancel() -> None:  # noqa: B023
                     nonlocal cancel_requested
@@ -1078,9 +1130,9 @@ async def _run_interactive(
                         _draw_final(snapshot)
                         continue
 
-                    session.observe_result(turn, response)
+                    session.observe_result(dispatch, response)
                     succeeded = response.exit_code == 0
-                    session.complete_turn(turn, succeeded=succeeded)
+                    session.complete_turn(dispatch, succeeded=succeeded)
                     activity.complete(succeeded=succeeded)
                     completed = True
                     if not succeeded:
@@ -1152,7 +1204,13 @@ async def _run_interactive(
 
 
 async def run_tui(
-    config, *, input_stream=None, output_stream=None, error_stream=None, quiet=False
+    config,
+    *,
+    input_stream=None,
+    output_stream=None,
+    error_stream=None,
+    quiet=False,
+    max_workers: int | None = 0,
 ) -> int:
     """Run Cambium's terminal frontend.
 
@@ -1170,6 +1228,7 @@ async def run_tui(
             out=out,
             err=err,
             quiet=quiet,
+            max_workers=max_workers,
         )
     return await _run_legacy(
         config,
@@ -1177,6 +1236,7 @@ async def run_tui(
         out=out,
         err=err,
         quiet=quiet,
+        max_workers=max_workers,
     )
 
 

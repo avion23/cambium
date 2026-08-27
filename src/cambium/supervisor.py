@@ -2127,7 +2127,7 @@ class _Runtime:
         redactor: Redactor | None = None,
         resource_thresholds: dict[str, Any] | None = None,
         provider_environment: Mapping[str, str] | None = None,
-        max_concurrent_tasks: int | None = None,
+        max_concurrent_tasks: int | None = 0,
         debt_store: DebtStore | None = None,
         oauth_store: OAuthStore | None = None,
         architectus: Any = None,
@@ -2151,8 +2151,8 @@ class _Runtime:
         self._debt_store = debt_store
         self._oauth_store = oauth_store
         self._event_append_lock = asyncio.Lock()
-        # max_concurrent_tasks=0 disables the cap (no semaphore); None is
-        # rewritten to the auto default by run_plan before _Runtime is built.
+        # max_concurrent_tasks=0 (and None for direct callers) disables the
+        # cap; a positive value creates the admission semaphore.
         self._admission_semaphore = (
             None if not max_concurrent_tasks else asyncio.Semaphore(max_concurrent_tasks)
         )
@@ -8180,7 +8180,7 @@ async def run_plan(
     resource_thresholds: dict[str, Any] | None = None,
     provider_environment: Mapping[str, str] | None = None,
     max_width: int | None = None,
-    max_concurrent_tasks: int | None = None,
+    max_concurrent_tasks: int | None = 0,
     routing_state_path: str | Path | None = None,
     reject_reused_session: bool = False,
     oauth_store: OAuthStore | None = None,
@@ -8241,9 +8241,9 @@ async def run_plan(
       with reason ``dependency_failed:<parent>``.
     - ``max_concurrent_tasks`` bounds how many worker processes run at once
       (a session-wide parallel-worker cap, I2.3) on either path. Defaults to
-      one per CPU; pass ``0`` for unlimited concurrency. The cap covers the
-      worker phase only (spawn through worker exit), never merge, prune, or
-      observer notification.
+      ``0`` for unlimited concurrency; pass a positive value to cap it. The
+      cap covers the worker phase only (spawn through worker exit), never
+      merge, prune, or observer notification.
     """
     session_dir = Path(session_dir)
     if type(resolver_child_enabled) is not bool:
@@ -8272,11 +8272,7 @@ async def run_plan(
     ):
         raise ValueError("max_concurrent_tasks must be a non-negative int or None")
     if max_concurrent_tasks is None:
-        cpu_count = getattr(os, "process_cpu_count", None)
-        max_concurrent_tasks = max(
-            1,
-            cpu_count() if cpu_count is not None else (os.cpu_count() or 1),
-        )
+        max_concurrent_tasks = 0
     if type(warm_pool_size) is not int or warm_pool_size < 0:
         raise ValueError("warm_pool_size must be a non-negative int")
 
@@ -8454,6 +8450,7 @@ async def _amain_plan(
     plan: dict[str, Any],
     *,
     conversations: bool = False,
+    max_concurrent_tasks: int = 0,
     warm_pool_size: int = 0,
     context_reuse: bool = True,
 ) -> int:
@@ -8468,6 +8465,7 @@ async def _amain_plan(
             plan,
             on_event=print_event,
             conversations=conversations,
+            max_concurrent_tasks=max_concurrent_tasks,
             warm_pool_size=warm_pool_size,
             context_reuse=context_reuse,
         )
@@ -8520,10 +8518,20 @@ def main(argv: list[str] | None = None) -> int:
         help="persist child-revision conversations at "
         "<session-dir>/.cambium/conversations.db for the session",
     )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=0,
+        metavar="N",
+        help="maximum concurrent worker processes (default: unlimited)",
+    )
     args = parser.parse_args(argv)
     session_dir = Path(args.session_dir)
     if args.warm_pool_size < 0:
         print("cambium supervisor: --warm-pool-size must be non-negative", file=sys.stderr)
+        return 2
+    if args.max_workers < 0:
+        print("cambium supervisor: --max-workers must be non-negative", file=sys.stderr)
         return 2
     try:
         if args.plan:
@@ -8548,6 +8556,7 @@ def main(argv: list[str] | None = None) -> int:
                     session_dir,
                     plan,
                     conversations=args.conversations,
+                    max_concurrent_tasks=args.max_workers,
                     warm_pool_size=args.warm_pool_size,
                 )
             )
