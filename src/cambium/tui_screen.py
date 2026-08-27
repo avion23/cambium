@@ -179,6 +179,10 @@ _LIVE_DRAW_INTERVAL = 0.1
 _SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 _ACTIVITY_PHASE_GLYPHS = {"thinking": "◌", "streaming": "▸", "waiting": "…"}
 _ACTIVITY_TAIL_MAX_CHARS = 120
+_ACTIVITY_PHASE_RE = re.compile(
+    r"^[◌▸…]\s+(thinking|streaming|waiting)\s+(\d+(?:\.\d+)?)s(?:\s+·\s*(.*))?$",
+    re.IGNORECASE,
+)
 _FIRST_TOKEN_KINDS = frozenset(
     {
         "assistant_first_token",
@@ -2357,6 +2361,7 @@ def _agent_rows(agents: tuple[Any, ...], width: int) -> list[tuple[str, str]]:
 
 _RAIL_FULL_WIDTH = 32
 _RAIL_COMPACT_WIDTH = 6
+_RAIL_DETAIL_MIN_WIDTH = 24
 _RAIL_STATE_GLYPHS = {
     "active": "●",
     "queued": "○",
@@ -2582,16 +2587,136 @@ def _compact_rail_rows(
     return rows[: max(1, capacity)]
 
 
+def _rail_selected_agent(snapshot: Any, agents: tuple[Any, ...]) -> Any | None:
+    """Return the run currently represented by the live activity ticker."""
+    if not agents:
+        return None
+    by_task = {
+        _side_clean(getattr(agent, "task_id", "?")).strip() or "?": agent for agent in agents
+    }
+    for key in ("selected_task_id", "cursor_task_id", "selected_run_id"):
+        value = getattr(snapshot, key, None)
+        if isinstance(value, str) and value in by_task:
+            return by_task[value]
+    for key in ("selected_agent", "selected_run"):
+        value = getattr(snapshot, key, None)
+        task_id = getattr(value, "task_id", None)
+        if isinstance(task_id, str) and task_id in by_task:
+            return by_task[task_id]
+    cursor = getattr(snapshot, "cursor", None)
+    if type(cursor) is int and 0 <= cursor < len(agents):
+        return agents[cursor]
+    for agent in agents:
+        if any(
+            getattr(agent, key, False) is True
+            for key in ("selected", "is_selected", "focused", "cursor")
+        ):
+            return agent
+    return next(
+        (agent for agent in agents if getattr(agent, "role", "") == "main"),
+        agents[0],
+    )
+
+
+def _rail_non_negative(value: Any) -> float | None:
+    if type(value) not in (int, float) or not math.isfinite(float(value)) or value < 0:
+        return None
+    return float(value)
+
+
+def _rail_detail_rows(
+    agent: Any,
+    width: int,
+    *,
+    activity_line: str = "",
+) -> list[tuple[str, str]]:
+    """Render the selected run's live details as bounded child rows."""
+    panel_width = max(1, width)
+    phase_match = _ACTIVITY_PHASE_RE.match(
+        sanitize_terminal_text(activity_line, single_line=True).strip()
+    )
+    phase = getattr(agent, "phase", None)
+    phase = _side_clean(phase).strip().casefold().replace("_", "-") if phase else ""
+    if phase not in _ACTIVITY_PHASE_GLYPHS:
+        phase = phase_match.group(1).casefold() if phase_match is not None else ""
+    tail = _activity_tail(getattr(agent, "tail", None))
+    if not tail and phase_match is not None:
+        tail = _activity_tail(phase_match.group(3)) if phase != "waiting" else ""
+
+    duration = next(
+        (
+            number
+            for key in ("duration_s", "elapsed_s", "turn_duration_s", "duration")
+            if (number := _rail_non_negative(getattr(agent, key, None))) is not None
+        ),
+        None,
+    )
+    if duration is None and phase_match is not None:
+        duration = max(0.0, _usage_float(phase_match.group(2)))
+
+    tool = _side_clean(getattr(agent, "current_tool", None) or getattr(agent, "tool", "")).strip()
+    running = _running_tool(activity_line)
+    if running is not None:
+        tool = running[0]
+    tool_duration_ms = getattr(agent, "tool_duration_ms", None)
+    if tool_duration_ms is None:
+        tool_duration_ms = getattr(agent, "duration_ms", None)
+    tool_duration_ms = _rail_non_negative(tool_duration_ms)
+    if tool_duration_ms is not None and tool_duration_ms <= 0:
+        tool_duration_ms = None
+    tool_ok = getattr(agent, "tool_ok", None)
+    if type(tool_ok) is not bool:
+        tool_ok = None
+    if not (phase or tail or duration is not None or tool_duration_ms is not None):
+        return []
+
+    status = _side_clean(getattr(agent, "status", None) or getattr(agent, "state", "")).strip()
+    prefix = "   "
+    rows: list[tuple[str, str]] = []
+    if phase:
+        rows.append(
+            _side_row(
+                "active",
+                f"{prefix}phase {_ACTIVITY_PHASE_GLYPHS[phase]} {phase}",
+                panel_width,
+            )
+        )
+    if tail:
+        rows.append(_side_row("dim", f"{prefix}tail {tail}", panel_width))
+    if tool:
+        entry = TranscriptEntry(
+            role="tool",
+            text="",
+            tool_name=tool,
+            tool_ok=tool_ok,
+            duration_ms=tool_duration_ms,
+        )
+        rows.append(_side_row("active", prefix + _tool_line(entry), panel_width))
+    if duration is not None:
+        rows.append(_side_row("dim", f"{prefix}duration {_fmt_secs(duration)}", panel_width))
+    if status:
+        rows.append(_side_row(status.casefold(), f"{prefix}status {status}", panel_width))
+    return rows
+
+
 def _rail_rows(
     snapshot: Any,
     width: int = _RAIL_FULL_WIDTH,
     capacity: int = 32,
+    *,
+    activity_line: str = "",
 ) -> list[tuple[str, str]]:
     panel_width = max(1, width)
     if panel_width <= _RAIL_COMPACT_WIDTH:
         return _compact_rail_rows(snapshot, panel_width, capacity)
     lines = [_side_row("heading", " LANES", panel_width)]
-    lines.extend(_rail_lane_rows(tuple(getattr(snapshot, "agents", ())), panel_width))
+    agents = _rail_tree_order(tuple(getattr(snapshot, "agents", ())))
+    lane_rows = _rail_lane_rows(agents, panel_width)
+    selected = _rail_selected_agent(snapshot, agents)
+    for agent, lane_row in zip(agents, lane_rows, strict=True):
+        lines.append(lane_row)
+        if agent is selected and panel_width >= _RAIL_DETAIL_MIN_WIDTH:
+            lines.extend(_rail_detail_rows(agent, panel_width, activity_line=activity_line))
     lines.append(_side_row("heading", " CONTEXT", panel_width))
     lines.extend(_context_rows(snapshot, panel_width, compact_epoch=True))
     lines.extend(_rail_fold_rows(snapshot, panel_width))
@@ -2980,11 +3105,7 @@ def _primary_status_line(
 def _activity_status(snapshot: Any, activity_line: str) -> str:
     """Reduce the verbose activity ticker to a single state-and-duration pair."""
     clean = sanitize_terminal_text(activity_line, single_line=True).strip()
-    phase_match = re.match(
-        r"^[◌▸…]\s+(thinking|streaming|waiting)\s+(\d+(?:\.\d+)?)s(?:\s+·\s*(.*))?$",
-        clean,
-        re.IGNORECASE,
-    )
+    phase_match = _ACTIVITY_PHASE_RE.match(clean)
     if phase_match is not None:
         phase = phase_match.group(1).casefold()
         line = f"{_ACTIVITY_PHASE_GLYPHS[phase]} {phase} "
@@ -3265,7 +3386,12 @@ def _cockpit_frame_lines(
         lines.append(_paint("└" + "─" * inner + "┘", _CYAN, color))
         return lines[:height]
 
-    rail_rows = _rail_rows(snapshot, rail_width, conversation_capacity)
+    rail_rows = _rail_rows(
+        snapshot,
+        rail_width,
+        conversation_capacity,
+        activity_line=activity_line,
+    )
     rail_heading = (
         _pad("", rail_width)
         if rail_width == _RAIL_COMPACT_WIDTH
@@ -3441,6 +3567,7 @@ class Cockpit:
         self._last_detail_line = ""
         self._last_status_fields: dict[str, str] | None = None
         self._last_status_rows: tuple[str, ...] = ()
+        self._last_rail_rows: tuple[tuple[str, str], ...] = ()
         self._last_request: tuple[Any, Transcript, str, str, str, str, str] | None = None
         self._fixed_frame = False
         self._frame_size: os.terminal_size | None = None
@@ -3630,7 +3757,16 @@ class Cockpit:
         conversation_capacity = max(1, self._last_size.lines - _frame_overhead(self._show_detail))
         rail_width = _rail_width(self._last_size.columns)
         rail_rows = (
-            tuple(_rail_rows(snapshot, rail_width, conversation_capacity)) if rail_width else ()
+            tuple(
+                _rail_rows(
+                    snapshot,
+                    rail_width,
+                    conversation_capacity,
+                    activity_line=activity_line,
+                )
+            )
+            if rail_width
+            else ()
         )
         rows = _primary_request_rows(conversation_rows, rail_rows)
         status_rows = tuple(
@@ -3694,6 +3830,7 @@ class Cockpit:
             self._last_primary_rows = rows
             self._last_conversation_rows = conversation_rows
             self._last_status_rows = status_rows
+            self._last_rail_rows = rail_rows
             return
 
         if rows != self._last_primary_rows:
@@ -3708,6 +3845,7 @@ class Cockpit:
         self._last_primary_rows = rows
         self._last_conversation_rows = conversation_rows
         self._last_status_rows = status_rows
+        self._last_rail_rows = rail_rows
 
     def _draw_stream_now(
         self,
@@ -3766,6 +3904,42 @@ class Cockpit:
         self._last_status_line = status_line
         self._last_detail_line = detail_line
         self._last_status_fields = current_status_fields
+        self._last_rail_rows = ()
+
+    def _redraw_rail(
+        self,
+        conversation_rows: tuple[tuple[str, str], ...],
+        rail_rows: tuple[tuple[str, str], ...],
+    ) -> None:
+        """Rewrite changed rail cells without rebuilding the live frame."""
+        rail_width = _rail_width(self._last_size.columns)
+        if not rail_width:
+            return
+        capacity = max(1, self._last_size.lines - _frame_overhead(self._show_detail))
+        changed = [
+            index
+            for index in range(capacity)
+            if (self._last_rail_rows[index] if index < len(self._last_rail_rows) else ("", ""))
+            != (rail_rows[index] if index < len(rail_rows) else ("", ""))
+        ]
+        if not changed:
+            return
+        self.stream.write("\x1b[s")
+        for index in changed:
+            role, text = conversation_rows[index] if index < len(conversation_rows) else ("", "")
+            kind, rail_text = rail_rows[index] if index < len(rail_rows) else ("", "")
+            line = _split_frame_row(
+                text,
+                self._last_size.columns,
+                rail_width,
+                rail_text=rail_text,
+                left_color=_ROLE_COLORS.get(role, ""),
+                rail_kind=kind,
+                color=self.color,
+            )
+            distance = self._last_size.lines - 3 - index
+            self.stream.write(f"\x1b[{distance}A\r{_CLEAR_LINE}{line}\x1b[u")
+        self.stream.flush()
 
     def _redraw_bottom(
         self,
@@ -3835,6 +4009,25 @@ class Cockpit:
             self._draw_live_now(request, force=True)
             return
         snapshot, transcript, session_description, branch_line, cumulative_line, _, _ = request
+        conversation_width = _frame_content_width(self._last_size.columns)
+        conversation_rows = tuple(
+            _primary_rows(transcript, conversation_width, color=self.color)
+        )
+        conversation_capacity = max(1, self._last_size.lines - _frame_overhead(self._show_detail))
+        rail_width = _rail_width(self._last_size.columns)
+        rail_rows = (
+            tuple(
+                _rail_rows(
+                    snapshot,
+                    rail_width,
+                    conversation_capacity,
+                    activity_line=self._activity_line,
+                )
+            )
+            if rail_width
+            else ()
+        )
+        self._redraw_rail(conversation_rows, rail_rows)
         status_rows = tuple(
             _status_rows(
                 snapshot,
@@ -3842,14 +4035,17 @@ class Cockpit:
                 session_description=session_description,
                 branch_line=branch_line,
                 cumulative_line=cumulative_line,
-                width=_frame_content_width(self._last_size.columns),
+                width=conversation_width,
                 activity_line=self._activity_line,
                 show_detail=self._show_detail,
             )
         )
         self._redraw_bottom(request, status_rows)
         self._last_request = request
+        self._last_primary_rows = _primary_request_rows(conversation_rows, rail_rows)
+        self._last_conversation_rows = conversation_rows
         self._last_status_rows = status_rows
+        self._last_rail_rows = rail_rows
 
     def move_to_input(self, *, label: str = "›", native: bool = False) -> None:
         if not self.enabled:
