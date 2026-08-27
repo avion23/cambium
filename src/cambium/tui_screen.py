@@ -1338,6 +1338,7 @@ class ActivityState:
                 self._active = True
                 self._finished = False
                 self._responding = False
+                self._cooldown = None
                 self._tools.clear()
                 return
             self._state = "ERROR" if status in _FAILURE_STATUSES else "DONE"
