@@ -92,22 +92,83 @@ def test_codex_stream_error_classification_table(
     assert "codex stream error:" in classified.message
 
 
-def test_plural_usage_policies_is_content_flagged_on_http_and_sse() -> None:
-    error = {
+def test_plural_policy_wording_matches_http_and_sse() -> None:
+    body = {
         "type": "invalid_request_error",
         "code": "invalid_prompt",
         "message": "Prompt was blocked by the usage policies",
     }
-    assert (
-        _codex_stream_error(_codex_provider(), error, "access-token").outcome
-        is ProviderOutcome.CONTENT_FLAGGED
+    assert _codex_stream_error(_codex_provider(), body, "access-token").outcome is (
+        ProviderOutcome.CONTENT_FLAGGED
     )
+    assert Diffundo(())._classify_http(
+        _codex_provider(), 400, json.dumps(body)
+    ).outcome is ProviderOutcome.CONTENT_FLAGGED
 
-    router = Diffundo(())
-    http_error = router._classify_http(
-        _codex_provider(), 400, json.dumps({"error": error})
+
+def test_anthropic_nested_error_envelope_matches_http_and_sse() -> None:
+    body = {
+        "type": "error",
+        "error": {
+            "type": "invalid_request_error",
+            "message": "Output blocked by content filtering policy",
+        },
+    }
+    assert _codex_stream_error(_codex_provider(), body["error"], "access-token").outcome is (
+        ProviderOutcome.CONTENT_FLAGGED
     )
-    assert http_error.outcome is ProviderOutcome.CONTENT_FLAGGED
+    assert Diffundo(())._classify_http(
+        _codex_provider(), 400, json.dumps(body)
+    ).outcome is ProviderOutcome.CONTENT_FLAGGED
+
+
+def test_config_text_beats_content_filter_error_flag() -> None:
+    body = {
+        "error": {
+            "type": "content_filter_error",
+            "param": "stream",
+            "message": "Unsupported parameter: stream",
+        }
+    }
+    assert _codex_stream_error(_codex_provider(), body["error"], "access-token").outcome is (
+        ProviderOutcome.CONFIG_ERROR
+    )
+    assert Diffundo(())._classify_http(
+        _codex_provider(), 400, json.dumps(body)
+    ).outcome is ProviderOutcome.CONFIG_ERROR
+
+
+def test_policy_flag_beats_http_rate_and_auth_statuses() -> None:
+    body = json.dumps(
+        {
+            "type": "invalid_request_error",
+            "code": "invalid_prompt",
+            "message": "Prompt was blocked by the safety system",
+        }
+    )
+    router = Diffundo(())
+    for status in (401, 429):
+        assert router._classify_http(_codex_provider(), status, body).outcome is (
+            ProviderOutcome.CONTENT_FLAGGED
+        )
+
+
+@pytest.mark.parametrize("code", ["content_policy_violation", "content_filter_violation"])
+def test_policy_violation_codes_match_http_and_sse(code: str) -> None:
+    body = {"code": code, "message": "blocked"}
+    assert _codex_stream_error(_codex_provider(), body, "access-token").outcome is (
+        ProviderOutcome.CONTENT_FLAGGED
+    )
+    assert Diffundo(())._classify_http(
+        _codex_provider(), 400, json.dumps(body)
+    ).outcome is ProviderOutcome.CONTENT_FLAGGED
+
+
+def test_string_error_policy_marker_keeps_legacy_sse_refusal() -> None:
+    body = {"error": "content_policy"}
+    assert _codex_stream_error(_codex_provider(), body, "access-token").outcome is (
+        ProviderOutcome.REFUSAL
+    )
 
 
 @pytest.mark.parametrize(
