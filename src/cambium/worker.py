@@ -5678,7 +5678,7 @@ async def _emit_delegated_child(
         writer,
         {
             "type": "propose_child",
-            "request_id": request_id or make_request_id("propose"),
+            "request_id": make_request_id("propose"),
             "parent_task_id": config.task_id,
             "child_task_id": arguments["child_task_id"],
             "kind": arguments["kind"],
