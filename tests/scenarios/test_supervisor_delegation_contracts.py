@@ -256,9 +256,7 @@ def test_each_child_admission_gets_a_supervisor_request_id(tmp_path: Path) -> No
         await runtime._admit_child(parent, _proposal(session_dir, repo, "child-b"), {})
 
     asyncio.run(scenario())
-    request_ids = [
-        event["request_id"] for event in emitted if event["kind"] == "child_admitted"
-    ]
+    request_ids = [event["request_id"] for event in emitted if event["kind"] == "child_admitted"]
 
     assert len(request_ids) == 2
     assert len(set(request_ids)) == 2
@@ -297,9 +295,7 @@ def test_failed_worker_reason_reaches_decision_port(tmp_path: Path) -> None:
     repo.mkdir()
     subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
     subprocess.run(["git", "-C", str(repo), "config", "user.name", "supervisor-test"], check=True)
-    subprocess.run(
-        ["git", "-C", str(repo), "config", "user.email", "supervisor@test"], check=True
-    )
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "supervisor@test"], check=True)
     (repo / "a.txt").write_text("base\n", encoding="utf-8")
     subprocess.run(["git", "-C", str(repo), "add", "a.txt"], check=True, capture_output=True)
     subprocess.run(
