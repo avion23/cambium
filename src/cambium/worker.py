@@ -3273,6 +3273,8 @@ def _write_checkpoint_file(
     transcript: list[dict[str, Any]],
     usage: dict[str, int],
     commits_so_far: list[str],
+    *,
+    compaction_deferred: bool = False,
 ) -> Path | None:
     if config.checkpoint_root is None:
         return None
@@ -3287,6 +3289,7 @@ def _write_checkpoint_file(
         "usage": usage,
         "commits_so_far": commits_so_far,
         "workspace_hash": _workspace_hash(config.worktree),
+        "compaction_deferred": compaction_deferred,
     }
     redactor = config.redactor or _checkpoint_redactor(config.provider_env_keys)
     payload = cast(dict[str, Any], redactor.redact_mapping(payload))
@@ -3321,9 +3324,17 @@ async def _persist_checkpoint(
     transcript: list[dict[str, Any]],
     usage: dict[str, int],
     commits_so_far: list[str],
+    *,
+    compaction_deferred: bool = False,
 ) -> None:
     path = await asyncio.to_thread(
-        _write_checkpoint_file, config, turn, transcript, usage, commits_so_far
+        _write_checkpoint_file,
+        config,
+        turn,
+        transcript,
+        usage,
+        commits_so_far,
+        compaction_deferred=compaction_deferred,
     )
     if path is not None:
         await _emit_checkpoint(writer, config, turn, path, commits_so_far)
@@ -4177,7 +4188,8 @@ def _load_turn_checkpoint(config: AgentConfig, checkpoint_ref: str) -> dict[str,
             "workspace_hash",
         }
     )
-    if set(data) != expected_keys:
+    checkpoint_keys = set(data)
+    if checkpoint_keys not in (expected_keys, expected_keys | {"compaction_deferred"}):
         raise ContextForkError("checkpoint has an invalid key set")
     if data.get("schema") != CHECKPOINT_SCHEMA:
         raise ContextForkError("checkpoint schema mismatch")
@@ -4210,12 +4222,16 @@ def _load_turn_checkpoint(config: AgentConfig, checkpoint_ref: str) -> dict[str,
     workspace_hash = data.get("workspace_hash")
     if not isinstance(workspace_hash, str) or _SHA256_HEX_RE.fullmatch(workspace_hash) is None:
         raise ContextForkError("checkpoint workspace_hash invalid")
+    compaction_deferred = data.get("compaction_deferred", False)
+    if type(compaction_deferred) is not bool:
+        raise ContextForkError("checkpoint compaction_deferred invalid")
     return {
         "turn": ref_turn,
         "transcript": transcript,
         "usage": dict(usage),
         "commits_so_far": list(commits),
         "workspace_hash": workspace_hash,
+        "compaction_deferred": compaction_deferred,
     }
 
 
@@ -4539,6 +4555,7 @@ async def _run_agent_loop(
     epoch_count = 0
     current_epoch_checkpoint: ContextCheckpoint | None = None
     compaction_armed = True
+    compaction_deferred = False
     consecutive_compaction_deferrals = 0
     usage_epoch: int | None = None
     usage_fork_of: str | None = None
@@ -4546,6 +4563,7 @@ async def _run_agent_loop(
     last_provider: str | None = None
     last_latency_s = 0.0
     turn_checkpoint_resumed = False
+    last_turn_checkpoint: int | None = None
     provider_compat = provider_compat or {}
     provider_boundaries = provider_boundaries or {}
     _install_codex_progress_observer(router, progress)
@@ -4554,6 +4572,43 @@ async def _run_agent_loop(
         nonlocal transcript
         if base_messages is not None:
             transcript = copy.deepcopy([*base_messages[1:], *context_continuation])
+
+    def _restore_turn_context(
+        transcript_snapshot: list[dict[str, Any]],
+    ) -> tuple[tuple[dict[str, Any], ...], list[dict[str, Any]], list[dict[str, Any]]]:
+        initial_prompt = _build_agent_prompt(
+            config.task,
+            tools,
+            [],
+            model_identity,
+            parent_envelope=config.parent_envelope,
+        )
+        initial_trunk, _initial_tail = partition_summary_trunk(initial_prompt["messages"])
+        context_continuation = copy.deepcopy(transcript_snapshot)
+        if (
+            len(initial_trunk) > 1
+            and context_continuation
+            and context_continuation[0] == initial_trunk[1]
+        ):
+            context_continuation = context_continuation[1:]
+        return (
+            tuple(copy.deepcopy(initial_trunk)),
+            context_continuation,
+            copy.deepcopy([*initial_trunk[1:], *context_continuation]),
+        )
+
+    async def _maybe_restore_turn_context() -> None:
+        nonlocal base_messages, context_continuation, transcript
+        if (
+            turn_checkpoint_resumed
+            and compaction_deferred
+            and base_messages is None
+            and config.context_reuse
+            and config.checkpoint_root is not None
+        ):
+            base_messages, context_continuation, transcript = await asyncio.to_thread(
+                _restore_turn_context, transcript
+            )
 
     def _append_context_message(message: dict[str, str]) -> None:
         nonlocal transcript
@@ -4621,7 +4676,7 @@ async def _run_agent_loop(
         is treated as raw tail once, then replaced by the first summary entry.
         """
         nonlocal base_messages, context_continuation, current_epoch_checkpoint
-        nonlocal epoch_count, compaction_armed, usage_epoch, cumulative_usage
+        nonlocal epoch_count, compaction_armed, compaction_deferred, usage_epoch, cumulative_usage
         nonlocal budget_new_tokens, previous_prompt_tokens
         nonlocal previous_usage_source
         nonlocal consecutive_compaction_deferrals
@@ -4812,7 +4867,18 @@ async def _run_agent_loop(
             except SummaryTrunkError as exc:
                 if consecutive_compaction_deferrals >= MAX_CONSECUTIVE_COMPACTION_DEFERRALS:
                     raise
+                compaction_deferred = True
                 consecutive_compaction_deferrals += 1
+                if last_turn_checkpoint is not None:
+                    await asyncio.to_thread(
+                        _write_checkpoint_file,
+                        config,
+                        last_turn_checkpoint,
+                        transcript,
+                        cumulative_usage,
+                        [],
+                        compaction_deferred=True,
+                    )
                 deferred_reason = str(exc).strip() or exc.__class__.__name__
                 if writer is not None:
                     await _emit_compaction_deferred(
@@ -4898,6 +4964,7 @@ async def _run_agent_loop(
         epoch_count = checkpoint.epoch
         usage_epoch = checkpoint.epoch
         compaction_armed = True
+        compaction_deferred = False
         consecutive_compaction_deferrals = 0
         _sync_context_transcript()
         if writer is not None:
@@ -4953,6 +5020,7 @@ async def _run_agent_loop(
             turn_checkpoint_resumed = True
             for child_result in resume["child_results"]:
                 transcript.append({"role": "user", "content": _child_result_lines(child_result)})
+            compaction_deferred = turn_checkpoint["compaction_deferred"]
             outcome["commits_so_far"] = turn_checkpoint["commits_so_far"]
         except ContextForkError as exc:
             return _loop_result(
@@ -5207,6 +5275,7 @@ async def _run_agent_loop(
                         "provider": failure_event.get("provider", outcome.get("provider")),
                         "latency_s": 0.0,
                         "transcript": transcript,
+                        "compaction_deferred": compaction_deferred,
                     }
                 return _loop_result(
                     outcome,
@@ -5322,6 +5391,7 @@ async def _run_agent_loop(
                 else:
                     context_continuation.extend(invalid_messages)
                     _sync_context_transcript()
+                await _maybe_restore_turn_context()
                 _arm_finalization(turn)
                 if _observe_progress(response_content) and not _finalization_due(turn):
                     return _no_progress_failure(turn)
@@ -5386,6 +5456,7 @@ async def _run_agent_loop(
                         )
                     context_continuation.append({"role": "user", "content": "Continue."})
                     _sync_context_transcript()
+                await _maybe_restore_turn_context()
                 _arm_finalization(turn)
                 progress.tool = "plan"
                 continue
@@ -5395,6 +5466,7 @@ async def _run_agent_loop(
                 else:
                     context_continuation.append(action_message)
                     _sync_context_transcript()
+                await _maybe_restore_turn_context()
                 if code_changed and not verified_after_change:
                     reason = (
                         "finish rejected: you changed code but did not run a "
@@ -5537,6 +5609,7 @@ async def _run_agent_loop(
                     "provider": terminal_provider,
                     "latency_s": max(0.0, float(result.latency_s)),
                     "transcript": transcript,
+                    "compaction_deferred": compaction_deferred,
                 }
             name, arguments = action["name"], action["arguments"]
             denial = _permission_denied(name, arguments, config)
@@ -5550,6 +5623,7 @@ async def _run_agent_loop(
                 else:
                     context_continuation.extend(denied_messages)
                     _sync_context_transcript()
+                await _maybe_restore_turn_context()
                 _arm_finalization(turn)
                 progress.tool = name
                 continue
@@ -5603,10 +5677,20 @@ async def _run_agent_loop(
                 continuation_suffix.append(state_message)
                 context_continuation.extend(copy.deepcopy(continuation_suffix))
                 _sync_context_transcript()
+            await _maybe_restore_turn_context()
             _arm_finalization(turn)
             if writer is not None:
                 await _emit_tool_event(writer, config, name, arguments, turn, tool_result)
-                await _persist_checkpoint(writer, config, turn, transcript, cumulative_usage, [])
+                await _persist_checkpoint(
+                    writer,
+                    config,
+                    turn,
+                    transcript,
+                    cumulative_usage,
+                    [],
+                    compaction_deferred=compaction_deferred,
+                )
+                last_turn_checkpoint = turn
             if config.context_reuse and name == "delegate" and tool_result.ok and not finalized:
                 checkpoint: ContextCheckpoint | None = None
                 checkpoint_was_emitted = False
@@ -5682,6 +5766,7 @@ async def _run_agent_loop(
                         "transcript": transcript,
                         "epoch": checkpoint.epoch,
                         "checkpoint_ref": checkpoint.checkpoint_ref,
+                        "compaction_deferred": compaction_deferred,
                     }
         if base_messages is not None and config.resume is not None:
             return _loop_result(
@@ -5721,6 +5806,7 @@ async def _run_agent_loop(
             "provider": last_provider,
             "latency_s": last_latency_s,
             "transcript": transcript,
+            "compaction_deferred": compaction_deferred,
         }
     except GenerationFenceError as exc:
         return _loop_result(
@@ -6085,6 +6171,7 @@ def _finalize_worktree(
             loop_outcome.get("transcript", []),
             loop_outcome.get("usage", {}),
             [sha],
+            compaction_deferred=bool(loop_outcome.get("compaction_deferred", False)),
         )
         terminal_checkpoint = _write_terminal_epoch()
         outcome.update(
