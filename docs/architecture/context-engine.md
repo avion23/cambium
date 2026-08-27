@@ -12,6 +12,11 @@ not treat an API model as a stateful process. The reusable object is an
 optional acceleration of replaying that projection; it is never correctness
 state.
 
+The model is a transition oracle at this boundary:
+`(model request, tool observations) -> proposed action/result`. It may be
+nondeterministic, but it does not own branch state; Cambium validates
+transitions and owns persistence, budgets, tool effects, and publication.
+
 The source of truth is an append-only event/history log. The implemented active
 request projection is:
 
@@ -47,6 +52,11 @@ Do not collapse these into a single `cache=true` concept:
 | Epoch checkpoint | Content address plus `cache_key` | Durable replay and branch identity | Retained session history |
 | Active context epoch | `provider_messages` plus continuation | Model input state | Until compaction/fork/close |
 | Raw history | Append-only event log | Audit and recovery authority | Session retention policy |
+
+Warm worker reuse is separate from provider cache and context epochs: the three
+mechanisms have independent keys, lifetimes, and failure modes. Keeping a worker
+alive never proves provider KV-cache retention; provider failover must preserve
+semantic checkpoint correctness even when its cache is cold.
 
 Cambium has no local response cache: `Diffundo` is a stateless router
 (`src/cambium/diffundo.py:8-10`). A cache hit and a miss for the same request
@@ -170,6 +180,12 @@ A child receives only the stable task contract, relevant evidence projection,
 required tool schemas, and explicit parent state. It does not automatically
 inherit unrelated sibling transcripts, secrets, or the complete parent
 scratch history.
+
+Recursive reuse is typed and bounded, not process cloning. A child is admitted
+against an immutable parent epoch/generation with a scoped task/capability
+projection, budget, and deterministic merge slot; supervisor-owned depth,
+descendant, concurrency, retry, output, and cancellation limits plus an
+explicit terminal condition prevent unbounded self-delegation.
 
 ### C8. Deterministic admission and merge
 

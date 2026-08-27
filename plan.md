@@ -813,7 +813,7 @@ each isolated worktree and integrated only scoped changes:
   rollback/reopen validation, and raw-range support.
 - `architectus.py`: direct public contract coverage; unused exports recorded,
   not deleted without a separate scope.
-- README and `docs/architecture/user-cli.md`: CLI flags, defaults, exits,
+- README and `docs/architecture/operations.md`: CLI flags, defaults, exits,
   credential forms, session artifacts, supervisor, Architectus, doctor, bench,
   module-test, and version behavior synchronized with real help surfaces.
 
