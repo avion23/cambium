@@ -475,18 +475,27 @@ def test_transcript_blocks_are_dense_with_one_separator_and_no_trailing_blank() 
     transcript = Transcript()
     transcript.user("prompt")
     transcript.assistant("first\n\n\nsecond\n\n")
+    transcript.system("operator note")
 
     rows = _transcript_lines(transcript, 60, 100)
-    values = [value for _, value in rows]
+    values = [value.rstrip() for _, value in rows]
     assert values[-1].strip()
-    assert (
-        max(
-            sum(not value.strip() for value in values[index : index + 3])
-            for index in range(max(1, len(values) - 2))
-        )
-        <= 1
+    assert values == [
+        "YOU ▸ prompt",
+        "CAMBIUM ▸ first",
+        "    second",
+        "SYSTEM ▸ operator note",
+    ]
+
+    transcript.observe_event(
+        {
+            "kind": "tool_event",
+            "payload": {"tool": "run_shell", "ok": True, "duration_ms": 83},
+        }
     )
-    assert values.count("") <= 1
+    values = [value.rstrip() for _, value in _transcript_lines(transcript, 60, 100)]
+    assert values[-2] == ""
+    assert values[-1].endswith("83ms ✓ run_shell")
 
 
 def test_transcript_labels_are_inline_and_separators_only_split_speakers() -> None:
@@ -500,11 +509,9 @@ def test_transcript_labels_are_inline_and_separators_only_split_speakers() -> No
     values = [_visible(value).rstrip() for _, value in _transcript_lines(transcript, 80, 100)]
     assert values[0].startswith("YOU ▸ first prompt")
     assert values[1].startswith("YOU ▸ second prompt")
-    assert values[2] == ""
-    assert values[3].startswith("CAMBIUM ▸ first answer")
-    assert values[4].startswith("CAMBIUM ▸ second answer")
-    assert values[5] == ""
-    assert values[6].startswith("SYSTEM ▸ operator note")
+    assert values[2].startswith("CAMBIUM ▸ first answer")
+    assert values[3].startswith("CAMBIUM ▸ second answer")
+    assert values[4].startswith("SYSTEM ▸ operator note")
 
 
 def test_status_strip_has_one_detail_row_and_hides_context_internals_from_spinner() -> None:
@@ -630,6 +637,34 @@ def test_duration_formatter_uses_integer_units(duration_ms: int, expected: str) 
     assert tui_screen._format_duration(duration_ms) == expected
 
 
+@pytest.mark.parametrize(
+    ("duration_ms", "count", "expected"),
+    [
+        (83, 2, "   83ms ✓ run_shell ×2"),
+        (1000, 3, "     1s ✓ run_shell ×3"),
+        (24411, 2, "    24s ✓ run_shell ×2"),
+        (0, 2, "✓ run_shell ×2"),
+        (None, 1, "✓ run_shell"),
+    ],
+)
+def test_tool_rows_put_positive_duration_first(
+    duration_ms: int | None, count: int, expected: str
+) -> None:
+    entry = tui_screen.TranscriptEntry(
+        role="tool",
+        text="run_shell: ok",
+        tool_name="run_shell",
+        tool_ok=True,
+        duration_ms=duration_ms,
+    )
+
+    line = tui_screen._tool_line(entry, count=count, last_duration_ms=duration_ms)
+    assert line == expected
+    assert tui_screen._tool_compact_lines(
+        entry, 80, count=count, last_duration_ms=duration_ms
+    )[0][1] == "  " + expected
+
+
 def test_activity_state_reports_waiting_streaming_done_error_and_cooldown() -> None:
     activity = ActivityState()
     activity.start(now=10.0)
@@ -661,6 +696,41 @@ def test_activity_state_reports_waiting_streaming_done_error_and_cooldown() -> N
     activity.observe_event({"kind": "turn_failed", "payload": {"reason": "provider"}}, now=21.0)
     assert activity.state == "ERROR"
     assert activity.status_line() == "✗ ERROR"
+
+
+def test_activity_heartbeat_phase_tail_is_latest_sanitized_and_not_transcript() -> None:
+    activity = ActivityState()
+    activity.start(now=10.0)
+
+    activity.observe_event(
+        {
+            "kind": "heartbeat",
+            "payload": {"phase": "thinking", "tail": "read\n\x1b[31mconfig"},
+        },
+        now=11.0,
+    )
+    assert activity.render(now=13.0) == "◌ thinking 3s · read config"
+
+    activity.observe_event(
+        {
+            "kind": "heartbeat",
+            "payload": {"phase": "streaming", "tail": "answer fragment"},
+        },
+        now=12.0,
+    )
+    assert activity.render(now=14.0) == "▸ streaming 4s · answer fragment"
+
+    activity.observe_event(
+        {"kind": "heartbeat", "payload": {"phase": "waiting", "tail": "stale tail"}},
+        now=15.0,
+    )
+    assert activity.render(now=16.0) == "… waiting 6s"
+
+    transcript = Transcript()
+    transcript.observe_event(
+        {"kind": "heartbeat", "payload": {"phase": "thinking", "tail": "private tail"}}
+    )
+    assert transcript.entries == ()
 
 
 def test_suspended_activity_stays_live_and_has_distinct_status() -> None:
@@ -940,7 +1010,7 @@ def test_cockpit_paints_mid_turn_tool_tick_while_input_is_pending() -> None:
         )
 
         live_output = stream.getvalue()
-        assert "✓ run_shell 118s" in live_output
+        assert "118s ✓ run_shell" in live_output
         assert live_output.endswith("› ")
         assert cockpit._input_active
 
@@ -1300,7 +1370,7 @@ def test_repeated_successful_tool_events_render_as_one_counter_line() -> None:
     text = "\n".join(lines)
 
     assert len(transcript.entries) == 4
-    assert "✓ run_shell ×4 · last 2s" in text
+    assert "2s ✓ run_shell ×4" in text
     assert "✓ 4 tools · last run_shell 2s" in text
 
 
@@ -1404,9 +1474,9 @@ def test_failed_tool_event_breaks_runs_and_feeds_failure_context() -> None:
     )
     text = "\n".join(lines)
 
-    assert "✓ run_shell 141ms" in text
+    assert "141ms ✓ run_shell" in text
     assert "err1" in text
-    assert "✓ run_shell 2s" in text
+    assert "2s ✓ run_shell" in text
     assert "✗ run_shell 9s" not in text
     assert len(transcript.entries) == 3
 
@@ -1485,9 +1555,9 @@ def test_mixed_successful_tools_do_not_collapse_across_each_other() -> None:
     )
     text = "\n".join(lines)
 
-    assert "✓ git_op 141ms" in text
-    assert "✓ run_shell 9s" in text
-    assert "✓ git_op 2s" in text
+    assert "141ms ✓ git_op" in text
+    assert "9s ✓ run_shell" in text
+    assert "2s ✓ git_op" in text
     assert "×" not in text
 
 

@@ -2822,6 +2822,8 @@ def _build_agent_prompt(
         "You act inside a disposable git worktree and must complete the task.",
         "File-tool paths may be absolute anywhere on the system; relative paths "
         "resolve against cwd.",
+        "Format final answers in Markdown (short headings, bullets, tables where useful); "
+        "the operator TUI renders Markdown.",
     ]
     if model_identity:
         system_lines.append(

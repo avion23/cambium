@@ -35,6 +35,8 @@ CODING_AGENT = "\n".join(
         "You act inside a disposable git worktree and must complete the task.",
         "File-tool paths may be absolute anywhere on the system; relative paths "
         "resolve against cwd.",
+        "Format final answers in Markdown (short headings, bullets, tables where useful); "
+        "the operator TUI renders Markdown.",
         SEMANTIC_SUMMARIZER,
         "In normal mode, return exactly one JSON object; it must be one action:",
         '  plan:      {"type": "plan", "steps": ["...", "..."]}',
