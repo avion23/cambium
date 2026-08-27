@@ -364,58 +364,6 @@ agent state. The TUI rail marks exact, semantic, and fresh context lineage as
 
 See [`terminal-interface.md`](terminal-interface.md).
 
-## 9. Current implementation map (2026-08-21)
-
-Verified in source and the full Python 3.14 test tiers:
-
-- `src/cambium/summary_trunk.py` defines strict immutable `SummaryEntry`
-  parsing, canonical serialization, source binding, sequence validation, and
-  digest verification;
-- provider-backed root agents enter trunk mode immediately when durable epoch
-  storage is available;
-- threshold, delegation, and terminal boundaries perform explicit additional
-  summary calls, and those calls participate in normal usage and request-debt
-  accounting;
-- each raw range is summarized once; tests prove the existing head and `S1`
-  remain byte-stable when later entries are appended;
-- the active request is the immutable head and semantic trunk plus a bounded raw
-  tail, not the old transcript followed by its summary;
-- exact provider/model/protocol/tool-compatible children reuse the byte-identical
-  trunk prefix when eligible, while incompatible providers reuse the semantic
-  entries under a fresh head; neither path implies a provider cache hit;
-- legacy transcript checkpoints migrate on their next flush rather than being
-  recursively folded;
-- raw events, ordinary checkpoints, and epoch artifacts remain available for
-  audit and replay outside the active prompt;
-- redacted/corrupt/mismatched checkpoints fail closed; invalid summary responses
-  defer the fold and later become `compaction_failed` after the deferral limit
-  (`src/cambium/worker.py:4590-4670`);
-- `requires_commit` is carried in the task/result contract and requires changed
-  work to be committed; a clean no-op may still succeed
-  (`src/cambium/worker.py:1235-1276`,
-  `src/cambium/worker.py:5744-5814`).
-- Turn resume requires a matching `workspace_hash`; dirty worktrees are saved as
-  a 1 MB-bounded `salvage/<task>/<gen>/workspace.diff` and emit
-  `worktree_salvaged` before recovery (`src/cambium/supervisor.py:858-875`,
-  `src/cambium/supervisor.py:2758-2816`).
-- After child integration, a parent `HEAD` mismatch against
-  `_accepted_integration_heads` fails the join/success invariant
-  (`src/cambium/supervisor.py:6354-6382`,
-  `src/cambium/supervisor.py:4774-4810`).
-
-Open deltas:
-
-- The REPL remains one-shot per prompt and does not expose the TUI's durable
-  interactive branch; TUI starts that branch at a fresh root and continues one
-  explicitly with `-c`/`--continue`;
-- provider cache namespace and isolation are not modeled; the remaining cache
-  capability and tariff fields are normalized in `CacheCapability`;
-- repeated real-provider cache and held-out quality canaries are still required
-  before claiming economic or quality gains across workloads;
-- thresholded K0 rollover is implemented; adaptive break-even selection remains
-  a library-only policy path (`src/cambium/worker.py:4605-4630`,
-  `src/cambium/summary_trunk.py:769-818`).
-
 ## 10. Verification
 
 A cache/context change is accepted only with frozen configuration and repeated
