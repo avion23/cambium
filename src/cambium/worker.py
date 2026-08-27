@@ -146,7 +146,7 @@ from cambium.diffundo import (
     prompt_prefix_bytes,
     validate_prompt_structure,
 )
-from cambium.fencing import is_cache_artifact_path, validate_worker_generation
+from cambium.fencing import is_cache_artifact_path, read_generation, validate_worker_generation
 from cambium.ipc import (
     MAX_LINE_BYTES,
     MessageTooLong,
@@ -187,6 +187,9 @@ MAX_SUMMARY_CHARS = 2_000
 MAX_NO_PROGRESS_ACTIONS = 2
 # Do not retry a provider that keeps returning invalid semantic summaries.
 MAX_CONSECUTIVE_COMPACTION_DEFERRALS = 2
+# A provider-boundary lookup may fall back to the unknown boundary, but never
+# indefinitely within one provider turn.
+MAX_CONSECUTIVE_PROVIDER_BOUNDARY_DEGRADATIONS = 3
 DEFAULT_PROGRESS_WINDOW = 3
 MAX_DIFF_BYTES = 64 * 1024  # 64 KiB bounded upward diff envelope.
 DEFAULT_MAX_TURNS = 50
@@ -865,7 +868,7 @@ def _fenced_git(
         start_new_session=True,
     )
     while proc.poll() is None:
-        if validate_worker_generation(worktree, generation):
+        if validate_worker_generation(read_generation(worktree), generation):
             time.sleep(0.001)
             continue
         try:
@@ -883,7 +886,7 @@ def _fenced_git(
 
 
 def _require_generation(worktree: Path, generation: int) -> None:
-    if not validate_worker_generation(worktree, generation):
+    if not validate_worker_generation(read_generation(worktree), generation):
         raise GenerationFenceError(
             f"generation mismatch for {worktree}: worker={generation}, "
             "persisted generation is different or missing"
@@ -3860,53 +3863,39 @@ async def _emit_compaction_deferred(
     )
 
 
-def _load_epoch_checkpoint(
-    config: AgentConfig, checkpoint_ref: str, *, expect_task_id: bool
-) -> ContextCheckpoint:
-    """Load and integrity-check one epoch checkpoint, or fail closed.
+async def _emit_provider_boundary_degraded(
+    writer: asyncio.StreamWriter,
+    config: AgentConfig,
+    run: Mapping[str, Any],
+    exc: BaseException,
+) -> None:
+    await send(
+        writer,
+        {
+            "type": "provider_boundary_degraded",
+            "request_id": run.get("request_id"),
+            "task_id": config.task_id,
+            "generation": config.generation,
+            "error_type": exc.__class__.__name__,
+        },
+    )
 
-    A missing, corrupt, escaping, or tampered checkpoint raises
-    :class:`ContextForkError`; the caller then falls back to the legacy
-    fresh-prompt path (fork) or fails the task (resume). The message-list
-    hashes are recomputed and compared so no malformed payload ever seeds a
-    prompt prefix.
-    """
-    root = config.checkpoint_root
-    if root is None:
-        raise ContextForkError("no checkpoint root configured")
-    root = root.resolve()
-    if not isinstance(checkpoint_ref, str) or not checkpoint_ref:
-        raise ContextForkError("invalid checkpoint_ref")
+
+def _validate_epoch_checkpoint_data(
+    data: dict[str, Any],
+    checkpoint_ref: str,
+    *,
+    expected_task_id: str | None = None,
+    expected_generation: int | None = None,
+) -> ContextCheckpoint:
+    """Validate one flat or nested epoch checkpoint for every runtime boundary."""
+    if not isinstance(data, dict):
+        raise ContextForkError("checkpoint is not an object")
     task_component, ref_epoch, _address_pre, address_persisted = _validate_checkpoint_ref_shape(
         checkpoint_ref
     )
-    if expect_task_id and task_component != _safe_task_id(config.task_id):
+    if expected_task_id is not None and task_component != _safe_task_id(expected_task_id):
         raise ContextForkError("invalid checkpoint_ref path")
-    relative = Path(checkpoint_ref)
-    current = root
-    for part in relative.parts:
-        current = current / part
-        if current.is_symlink():
-            raise ContextForkError("checkpoint path is a symlink")
-    path = root / relative
-    if not path.is_relative_to(root):
-        raise ContextForkError("checkpoint_ref escapes the checkpoint root")
-    try:
-        if path.stat().st_size > MAX_LINE_BYTES * 4:
-            raise ContextForkError("checkpoint exceeds the size cap")
-    except FileNotFoundError as exc:
-        raise ContextForkError("checkpoint unreadable: FileNotFoundError") from exc
-    try:
-        text = path.read_text(encoding="utf-8")
-        data = json.loads(
-            text,
-            object_pairs_hook=_reject_duplicate_pairs,
-            parse_constant=_reject_json_constant,
-        )
-    except (OSError, ValueError) as exc:
-        raise ContextForkError(f"checkpoint unreadable: {exc.__class__.__name__}") from exc
-    if not isinstance(data, dict):
-        raise ContextForkError("checkpoint is not an object")
     data = _join_checkpoint_payload(data)
     if _checkpoint_address(data) != address_persisted:
         raise ContextForkError("checkpoint persisted-address mismatch")
@@ -3940,14 +3929,14 @@ def _load_epoch_checkpoint(
         raise ContextForkError("checkpoint schema mismatch")
     if not isinstance(data.get("task_id"), str) or not data["task_id"]:
         raise ContextForkError("checkpoint task_id invalid")
-    if expect_task_id and data.get("task_id") != config.task_id:
+    if expected_task_id is not None and data.get("task_id") != expected_task_id:
         raise ContextForkError("checkpoint task_id mismatch")
     if data.get("checkpoint_ref") != checkpoint_ref:
         raise ContextForkError("checkpoint_ref mismatch")
     generation = data.get("generation")
     if isinstance(generation, bool) or not isinstance(generation, int) or generation <= 0:
         raise ContextForkError("checkpoint generation invalid")
-    if expect_task_id and generation != config.generation:
+    if expected_generation is not None and generation != expected_generation:
         raise ContextForkError("checkpoint generation mismatch")
     epoch = data.get("epoch")
     if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch <= 0:
@@ -4096,6 +4085,51 @@ def _load_epoch_checkpoint(
         previous_prompt_tokens=data["previous_prompt_tokens"],
         cumulative_usage=dict(usage),
         wall_deadline=float(wall_deadline),
+    )
+
+
+def _load_epoch_checkpoint(
+    config: AgentConfig, checkpoint_ref: str, *, expect_task_id: bool
+) -> ContextCheckpoint:
+    """Load an epoch checkpoint and map validation failures to ``ContextForkError``."""
+    root = config.checkpoint_root
+    if root is None:
+        raise ContextForkError("no checkpoint root configured")
+    root = root.resolve()
+    if not isinstance(checkpoint_ref, str) or not checkpoint_ref:
+        raise ContextForkError("invalid checkpoint_ref")
+    task_component, _ref_epoch, _address_pre, _address_persisted = _validate_checkpoint_ref_shape(
+        checkpoint_ref
+    )
+    if expect_task_id and task_component != _safe_task_id(config.task_id):
+        raise ContextForkError("invalid checkpoint_ref path")
+    relative = Path(checkpoint_ref)
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ContextForkError("checkpoint path is a symlink")
+    path = root / relative
+    if not path.is_relative_to(root):
+        raise ContextForkError("checkpoint_ref escapes the checkpoint root")
+    try:
+        if path.stat().st_size > MAX_LINE_BYTES * 4:
+            raise ContextForkError("checkpoint exceeds the size cap")
+    except FileNotFoundError as exc:
+        raise ContextForkError("checkpoint unreadable: FileNotFoundError") from exc
+    try:
+        data = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=_reject_duplicate_pairs,
+            parse_constant=_reject_json_constant,
+        )
+    except (OSError, ValueError) as exc:
+        raise ContextForkError(f"checkpoint unreadable: {exc.__class__.__name__}") from exc
+    return _validate_epoch_checkpoint_data(
+        data,
+        checkpoint_ref,
+        expected_task_id=config.task_id if expect_task_id else None,
+        expected_generation=config.generation if expect_task_id else None,
     )
 
 
@@ -5745,19 +5779,50 @@ async def _do_provider_work(
                 "requires_commit": config.requires_commit,
             }
         )
-    try:
-        provider_path = _provider_path()
-        configured_providers = load_providers(provider_path)
-        provider_compat = {
-            p.name: (p.protocol.value, p.reasoning_effort) for p in configured_providers
-        }
-        provider_boundaries = {
-            p.name: _provider_boundary(config, p, provider_config_path=provider_path)
-            for p in configured_providers
-        }
-    except Exception:
-        provider_compat = {}
-        provider_boundaries = {}
+    provider_compat: dict[str, tuple[str, str | None]] = {}
+    provider_boundaries: dict[str, dict[str, Any]] = {}
+    consecutive_degradations = 0
+    for _attempt in range(MAX_CONSECUTIVE_PROVIDER_BOUNDARY_DEGRADATIONS):
+        try:
+            provider_path = _provider_path()
+            configured_providers = load_providers(provider_path)
+        except Exception as exc:
+            consecutive_degradations += 1
+            provider_compat = {}
+            provider_boundaries = {}
+            if writer is not None:
+                await _emit_provider_boundary_degraded(writer, config, run, exc)
+            if consecutive_degradations >= MAX_CONSECUTIVE_PROVIDER_BOUNDARY_DEGRADATIONS:
+                return _loop_failure_outcome(
+                    {
+                        "status": "failed",
+                        "failure_reason": "provider boundary degraded too many times",
+                        "requires_commit": config.requires_commit,
+                    }
+                )
+            continue
+        for provider in configured_providers:
+            try:
+                name = provider.name
+                compatibility = (provider.protocol.value, provider.reasoning_effort)
+                boundary = _provider_boundary(config, provider, provider_config_path=provider_path)
+            except Exception as exc:
+                consecutive_degradations += 1
+                if writer is not None:
+                    await _emit_provider_boundary_degraded(writer, config, run, exc)
+                if consecutive_degradations >= MAX_CONSECUTIVE_PROVIDER_BOUNDARY_DEGRADATIONS:
+                    return _loop_failure_outcome(
+                        {
+                            "status": "failed",
+                            "failure_reason": "provider boundary degraded too many times",
+                            "requires_commit": config.requires_commit,
+                        }
+                    )
+                continue
+            provider_compat[name] = compatibility
+            provider_boundaries[name] = boundary
+            consecutive_degradations = 0
+        break
     worker_identity = secrets.token_hex(16)
     loop_outcome = await _run_agent_loop(
         config=config,

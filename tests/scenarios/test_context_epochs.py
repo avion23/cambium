@@ -1901,8 +1901,10 @@ def test_suspended_envelope_without_flag_fails_closed(
     assert not _kinds(events, "context_fork")
 
 
-def test_legacy_flat_epoch_checkpoint_still_loads(tmp_path: Path) -> None:
-    """Pre-split flat checkpoints (schema 4) resume transparently."""
+def test_shared_epoch_validator_accepts_nested_and_legacy_flat_checkpoints(
+    tmp_path: Path,
+) -> None:
+    """The worker-owned validator accepts both checkpoint layouts."""
     checkpoint_root = tmp_path / "ckpts"
     config = _agent_config(tmp_path / "wt", checkpoint_root=checkpoint_root)
     checkpoint = _write_epoch(config)
@@ -1910,6 +1912,13 @@ def test_legacy_flat_epoch_checkpoint_still_loads(tmp_path: Path) -> None:
     legacy_path = checkpoint_root / checkpoint.checkpoint_ref
     legacy = json.loads(legacy_path.read_text(encoding="utf-8"))
     assert "content" in legacy, "new writer must emit the nested layout"
+    nested = worker._validate_epoch_checkpoint_data(
+        legacy,
+        checkpoint.checkpoint_ref,
+        expected_task_id=config.task_id,
+        expected_generation=config.generation,
+    )
+    assert nested.epoch == checkpoint.epoch
 
     flat = worker._join_checkpoint_payload(legacy)
     task_component = checkpoint.checkpoint_ref.split("/")[0]
@@ -1925,6 +1934,13 @@ def test_legacy_flat_epoch_checkpoint_still_loads(tmp_path: Path) -> None:
     legacy_path = checkpoint_root / legacy_ref
     legacy_path.write_text(json.dumps(flat4, sort_keys=True), encoding="utf-8")
 
+    shared = worker._validate_epoch_checkpoint_data(
+        flat4,
+        legacy_ref,
+        expected_task_id=config.task_id,
+        expected_generation=config.generation,
+    )
+    assert shared.epoch == checkpoint.epoch
     loaded = worker._load_epoch_checkpoint(config, legacy_ref, expect_task_id=True)
     assert loaded.provider_messages == checkpoint.provider_messages
     assert loaded.epoch == checkpoint.epoch

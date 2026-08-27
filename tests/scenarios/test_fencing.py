@@ -9,6 +9,7 @@ from pathlib import Path
 from cambium.fencing import (
     FENCE_FILE,
     read_generation,
+    validate_worker_generation,
     write_generation,
 )
 
@@ -35,6 +36,12 @@ def test_generation_is_written_after_git_clean_fd_during_recovery(tmp_path: Path
     # Architecture §7.5 writes the new fence after reset/clean, so it survives.
     assert write_generation(repo, 2) == 2
     assert read_generation(repo) == 2
+
+
+def test_validate_worker_generation_is_a_pure_comparison() -> None:
+    assert validate_worker_generation(4, 4)
+    assert not validate_worker_generation(0, 4)
+    assert not validate_worker_generation(4, 3)
 
 
 def test_fence_dir_and_file_are_private_under_permissive_umask(tmp_path: Path) -> None:

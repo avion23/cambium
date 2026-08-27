@@ -614,7 +614,7 @@ def test_generation_survives_crash_after_worktree_clean(
 
     after_crash = read_generation(worktree)
     assert after_crash >= 10
-    assert not validate_worker_generation(worktree, 1)
+    assert not validate_worker_generation(read_generation(worktree), 1)
 
     result = asyncio.run(run_plan(session_dir, {"tasks": [task]}))
 

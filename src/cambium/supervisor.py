@@ -80,7 +80,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -102,7 +102,6 @@ from cambium.system_health import can_run_heavy
 from .architectus import ActionKind, ArchitectusCore
 from .auth import MIN_API_KEY_BYTES, AuthStore, oauth_env_suffix, scrub_environment
 from .conversations import ConversationStore, ConversationStoreError
-from .diffundo import prompt_prefix_bytes
 from .ipc import MAX_LINE_BYTES, encode_message, write_frame
 from .merge import MergeConflictError, MergeSequencer
 from .oauth import (
@@ -146,13 +145,12 @@ from .tasktree import (
 )
 from .worker import (
     _SHA256_HEX_RE,
-    CHECKPOINT_EPOCH_SCHEMA,
     MAX_ENVELOPE_FIELD_CHARS,
     MAX_ENVELOPE_ITEMS,
-    MAX_OBSERVATION_BYTES,
     _cap_utf8,
     _safe_task_id,
     _validate_checkpoint_ref_shape,
+    _validate_epoch_checkpoint_data,
     _validate_provider_boundary,
     _workspace_hash,
 )
@@ -278,6 +276,9 @@ _COMPACTION_FAILED_FIELDS = frozenset(
         "reason",
     }
 )
+_PROVIDER_BOUNDARY_DEGRADED_FIELDS = frozenset(
+    {"type", "request_id", "task_id", "generation", "error_type"}
+)
 
 
 def _invalid_context_checkpoint_fields(msg: dict[str, Any]) -> list[str]:
@@ -397,6 +398,26 @@ def _invalid_compaction_failed_fields(msg: dict[str, Any]) -> list[str]:
     return invalid
 
 
+def _invalid_provider_boundary_degraded_fields(msg: dict[str, Any]) -> list[str]:
+    """Return malformed provider-boundary degradation event fields."""
+    unknown = sorted(set(msg) - _PROVIDER_BOUNDARY_DEGRADED_FIELDS, key=str)
+    if unknown:
+        return unknown
+    invalid: list[str] = []
+    if msg.get("type") != "provider_boundary_degraded":
+        invalid.append("type")
+    for field in ("task_id", "error_type"):
+        if not isinstance(msg.get(field), str) or not msg[field]:
+            invalid.append(field)
+    if type(msg.get("generation")) is not int or msg["generation"] <= 0:
+        invalid.append("generation")
+    if "request_id" in msg and msg["request_id"] is not None and not isinstance(
+        msg["request_id"], str
+    ):
+        invalid.append("request_id")
+    return invalid
+
+
 def _epoch_checkpoint_path(session_dir: Path, task_id: str, checkpoint_ref: str) -> Path:
     """Return one session-owned epoch checkpoint path after strict validation."""
     try:
@@ -495,26 +516,6 @@ def _load_epoch_checkpoint_data(
     return data
 
 
-def _checkpoint_json_bytes(value: Any) -> bytes:
-    return json.dumps(
-        value,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    ).encode("utf-8")
-
-
-def _checkpoint_messages_sha256(messages: list[dict[str, str]]) -> str:
-    return hashlib.sha256(_checkpoint_json_bytes(messages)).hexdigest()
-
-
-def _checkpoint_address(data: dict[str, Any]) -> str:
-    normalized = dict(data)
-    normalized["checkpoint_ref"] = ""
-    return hashlib.sha256(_checkpoint_json_bytes(normalized)).hexdigest()[:16]
-
-
 def _validate_advanced_epoch_checkpoint(
     session_dir: Path,
     task_id: str,
@@ -523,136 +524,18 @@ def _validate_advanced_epoch_checkpoint(
 ) -> None:
     checkpoint_ref = msg["checkpoint_ref"]
     data = _load_epoch_checkpoint_data(session_dir, task_id, checkpoint_ref)
-    from .worker import _join_checkpoint_payload
-
-    data = _join_checkpoint_payload(data)
-    expected_keys = frozenset(
-        {
-            "schema",
-            "task_id",
-            "generation",
-            "epoch",
-            "turn",
-            "created_at",
-            "cache_key",
-            "provider_messages",
-            "continuation_suffix",
-            "checkpoint_ref",
-            "code_changed",
-            "verified_after_change",
-            "verification_failed",
-            "no_progress_actions",
-            "budget_new_tokens",
-            "previous_prompt_tokens",
-            "cumulative_usage",
-            "wall_deadline",
-        }
+    checkpoint = _validate_epoch_checkpoint_data(
+        data,
+        checkpoint_ref,
+        expected_task_id=task_id,
+        expected_generation=generation,
     )
-    if set(data) != expected_keys:
-        raise ValueError("checkpoint has an invalid key set")
-    try:
-        _task_component, ref_epoch, _address_pre, address_persisted = (
-            _validate_checkpoint_ref_shape(checkpoint_ref)
-        )
-    except (TypeError, ValueError) as exc:
-        raise ValueError("checkpoint_ref is invalid") from exc
-    if data.get("schema") not in (CHECKPOINT_EPOCH_SCHEMA, 4):
-        raise ValueError("checkpoint schema mismatch")
-    if data.get("task_id") != task_id or data.get("generation") != generation:
-        raise ValueError("checkpoint identity mismatch")
     if (
-        data.get("epoch") != msg["epoch"]
-        or data.get("epoch") != ref_epoch
-        or data.get("turn") != msg["turn"]
-        or data.get("checkpoint_ref") != checkpoint_ref
+        checkpoint.epoch != msg["epoch"]
+        or checkpoint.turn != msg["turn"]
+        or asdict(checkpoint.cache_key) != msg["cache_key"]
     ):
         raise ValueError("checkpoint descriptor mismatch")
-    cache_key = data.get("cache_key")
-    if not isinstance(cache_key, dict) or cache_key != msg["cache_key"]:
-        raise ValueError("checkpoint cache_key mismatch")
-    try:
-        _validate_provider_boundary(cache_key["provider_boundary"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError("checkpoint provider boundary is invalid") from exc
-
-    def _messages(field: str) -> list[dict[str, str]]:
-        raw_messages = data.get(field)
-        if not isinstance(raw_messages, list):
-            raise ValueError(f"checkpoint {field} is invalid")
-        messages: list[dict[str, str]] = []
-        for message in raw_messages:
-            if not isinstance(message, dict) or set(message) != {"role", "content"}:
-                raise ValueError(f"checkpoint {field} contains an invalid message")
-            role = message.get("role")
-            content = message.get("content")
-            if (
-                not isinstance(role, str)
-                or role not in {"system", "user", "assistant", "tool"}
-                or not isinstance(content, str)
-                or len(content.encode("utf-8")) > MAX_OBSERVATION_BYTES
-            ):
-                raise ValueError(f"checkpoint {field} contains an invalid message")
-            messages.append(
-                {
-                    "role": role,
-                    "content": content,
-                }
-            )
-        return messages
-
-    provider_messages = _messages("provider_messages")
-    continuation_suffix = _messages("continuation_suffix")
-    if not provider_messages or provider_messages[0]["role"] != "system":
-        raise ValueError("checkpoint provider_messages is invalid")
-    full_messages = [*provider_messages, *continuation_suffix]
-    expected_cache_values = {
-        "system_sha256": hashlib.sha256(
-            provider_messages[0]["content"].encode("utf-8")
-        ).hexdigest(),
-        "prefix_sha256": _checkpoint_messages_sha256(provider_messages),
-        "suffix_sha256": _checkpoint_messages_sha256(continuation_suffix),
-        "full_sha256": _checkpoint_messages_sha256(full_messages),
-        "prefix_bytes": prompt_prefix_bytes({"messages": provider_messages}) or 0,
-        "message_count": len(provider_messages),
-    }
-    if any(
-        cache_key.get(field) != expected_value
-        for field, expected_value in expected_cache_values.items()
-    ):
-        raise ValueError("checkpoint cache_key content mismatch")
-
-    for field in ("code_changed", "verified_after_change", "verification_failed"):
-        if type(data.get(field)) is not bool:
-            raise ValueError(f"checkpoint {field} is invalid")
-    for field in ("generation", "epoch", "turn"):
-        value = data.get(field)
-        if type(value) is not int or value <= 0:
-            raise ValueError(f"checkpoint {field} is invalid")
-    for field in ("no_progress_actions", "budget_new_tokens", "previous_prompt_tokens"):
-        value = data.get(field)
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise ValueError(f"checkpoint {field} is invalid")
-    usage = data.get("cumulative_usage")
-    if not isinstance(usage, dict) or any(
-        not isinstance(key, str)
-        or isinstance(value, bool)
-        or not isinstance(value, int)
-        or value < 0
-        for key, value in usage.items()
-    ):
-        raise ValueError("checkpoint cumulative_usage is invalid")
-    for field, positive in (("created_at", False), ("wall_deadline", True)):
-        value = data.get(field)
-        if isinstance(value, bool) or not isinstance(value, int | float):
-            raise ValueError(f"checkpoint {field} is invalid")
-        try:
-            finite = math.isfinite(value)
-        except (OverflowError, TypeError):
-            finite = False
-        if not finite or (positive and value <= 0):
-            raise ValueError(f"checkpoint {field} is invalid")
-    if _checkpoint_address(data) != address_persisted:
-        raise ValueError("checkpoint persisted-address mismatch")
 
 
 def _wire_str(value: Any) -> str | None:
@@ -5755,6 +5638,33 @@ class _Runtime:
                             request_id=msg["request_id"],
                             epoch=msg["epoch"],
                             reason=msg["reason"],
+                        )
+                elif mtype == "provider_boundary_degraded":
+                    invalid = _invalid_provider_boundary_degraded_fields(msg)
+                    if invalid:
+                        await self.emit(
+                            "protocol",
+                            task_id=task_id,
+                            generation=generation,
+                            note="provider_boundary_degraded rejected: invalid field(s)",
+                            fields=invalid,
+                        )
+                    elif msg.get("task_id") != task_id or msg.get("generation") != generation:
+                        await self.emit(
+                            "protocol",
+                            task_id=task_id,
+                            generation=generation,
+                            note="provider_boundary_degraded rejected: identity mismatch",
+                            expected_task_id=task_id,
+                            expected_generation=generation,
+                        )
+                    else:
+                        await self.emit(
+                            "provider_boundary_degraded",
+                            task_id=task_id,
+                            generation=generation,
+                            request_id=msg.get("request_id"),
+                            error_type=msg["error_type"],
                         )
                 elif mtype == "context_fork_skipped":
                     fork_skip_reason = msg.get("reason")

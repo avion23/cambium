@@ -189,18 +189,12 @@ def next_generation(worktree: Path) -> int:
         return generation
 
 
-def validate_worker_generation(worktree: Path, worker_generation: int | None) -> bool:
-    """Return whether a worker claims the current, present generation.
-
-    Generation ``0`` is the missing/invalid-file sentinel, so it never
-    validates a worker. A stale worker must be killed rather than trusted.
-    """
-    if (
-        worker_generation is None
-        or isinstance(worker_generation, bool)
-        or not isinstance(worker_generation, int)
-        or worker_generation <= 0
-    ):
-        return False
-    current_generation = read_generation(worktree)
-    return current_generation > 0 and worker_generation == current_generation
+def validate_worker_generation(actual: int, expected: int) -> bool:
+    """Return whether two already-read generation tokens match."""
+    return (
+        type(actual) is int
+        and type(expected) is int
+        and actual > 0
+        and expected > 0
+        and actual == expected
+    )
