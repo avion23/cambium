@@ -7,7 +7,7 @@ import json
 import subprocess
 import textwrap
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -133,13 +133,109 @@ def test_empty_fanout_uses_provider_payload_boundary_and_keeps_marker_opt_in(
     assert marker_payload["marker"] == "// marker"
 
 
+def test_heartbeat_phase_and_tail_are_forwarded_safely(tmp_path: Path) -> None:
+    repo, base = _repo(tmp_path)
+    worker = tmp_path / "heartbeat-worker.py"
+    worker.write_text(
+        textwrap.dedent(
+            """
+            import json
+            import sys
+
+            def send(message):
+                print(json.dumps(message), flush=True)
+
+            init = json.loads(sys.stdin.readline())
+            task_id = init["task_id"]
+            generation = init["generation"]
+            send({
+                "type": "ready",
+                "request_id": init["request_id"],
+                "task_id": task_id,
+                "generation": generation,
+                "proto": 1,
+            })
+            run = json.loads(sys.stdin.readline())
+            for heartbeat in (
+                {
+                    "turn": 1,
+                    "tool": "stream",
+                    "status": "working",
+                    "phase": "streaming",
+                    "tail": "safe\\n\\x1b[31m" + "x" * 130,
+                },
+                {
+                    "turn": 2,
+                    "tool": "wait",
+                    "status": "working",
+                    "phase": "invalid",
+                    "tail": "second\\n\\x1b[32mline",
+                },
+                {"turn": 3, "tool": None, "status": "working"},
+            ):
+                send({
+                    "type": "heartbeat",
+                    "task_id": task_id,
+                    "generation": generation,
+                    **heartbeat,
+                })
+            send({
+                "type": "result_envelope",
+                "request_id": run["request_id"],
+                "task_id": task_id,
+                "generation": generation,
+                "status": "succeeded",
+                "commits": [],
+                "files_changed": [],
+                "diff": "",
+            })
+            send({
+                "type": "exit_message",
+                "task_id": task_id,
+                "generation": generation,
+                "reason": "done",
+            })
+            """
+        ),
+        encoding="utf-8",
+    )
+    session_dir = tmp_path / "session"
+    task = {
+        "task_id": "heartbeat",
+        "task": "report progress",
+        "repo": str(repo),
+        "worktree_path": str(session_dir / "wt"),
+        "branch": "heartbeat",
+        "base_commit": base,
+        "worker": str(worker),
+        "max_restarts": 0,
+    }
+
+    result = asyncio.run(run_plan(session_dir, {"tasks": [task]}))
+    heartbeats = [
+        event["payload"] for event in read_events(session_dir) if event["kind"] == "heartbeat"
+    ]
+
+    assert result.results[0].status == "succeeded"
+    assert len(heartbeats) == 3
+    assert heartbeats[0]["phase"] == "streaming"
+    assert heartbeats[0]["tail"] == "safe " + "x" * 115
+    assert len(heartbeats[0]["tail"]) == 120
+    assert "phase" not in heartbeats[1]
+    assert heartbeats[1]["turn"] == 2
+    assert heartbeats[1]["tool"] == "wait"
+    assert heartbeats[1]["status"] == "working"
+    assert heartbeats[1]["tail"] == "second line"
+    assert heartbeats[2] == {"turn": 3, "tool": None, "status": "working"}
+
+
 def test_each_child_admission_gets_a_supervisor_request_id(tmp_path: Path) -> None:
     session_dir = tmp_path / "session"
     repo = tmp_path / "repo"
     parent = _parent(session_dir, repo)
     runtime = _Runtime(session_dir, None)
     runtime.set_session_tasks([parent])
-    runtime._task_group = _TaskGroup()
+    cast(Any, runtime)._task_group = _TaskGroup()
     emitted: list[dict[str, Any]] = []
 
     async def emit(kind: str, **payload: Any) -> None:

@@ -144,6 +144,7 @@ from .tasktree import (
     ready_tasks,
     topological_order,
 )
+from .terminal import sanitize_terminal_text
 from .worker import (
     _SHA256_HEX_RE,
     CHECKPOINT_EPOCH_SCHEMA,
@@ -173,6 +174,7 @@ DURABLE_EVENT_TIMEOUT_S = 5.0
 # Kept local to the supervisor because resolver staging uses a normal merge
 # worktree rather than the merge sequencer's rebase worktree.
 _RESOLVER_UNMERGED_PAIRS = frozenset({"DD", "AU", "UD", "UA", "DU", "AA", "UU"})
+_HEARTBEAT_PHASES = frozenset({"waiting", "thinking", "streaming"})
 
 EventSink = Callable[[dict[str, Any]], None | Awaitable[None]]
 
@@ -5823,13 +5825,22 @@ class _Runtime:
                 elif mtype == "heartbeat":
                     last_heartbeat = loop.time()
                     handle.last_heartbeat = last_heartbeat
+                    forwarded = {
+                        "turn": msg.get("turn"),
+                        "tool": msg.get("tool"),
+                        "status": msg.get("status"),
+                    }
+                    phase = msg.get("phase")
+                    if type(phase) is str and phase in _HEARTBEAT_PHASES:
+                        forwarded["phase"] = phase
+                    tail = msg.get("tail")
+                    if isinstance(tail, str):
+                        forwarded["tail"] = sanitize_terminal_text(tail, single_line=True)[:120]
                     await self.emit(
                         "heartbeat",
                         task_id=task_id,
-                        turn=msg.get("turn"),
-                        tool=msg.get("tool"),
-                        status=msg.get("status"),
                         generation=generation,
+                        **forwarded,
                     )
                 elif mtype == "checkpoint":
                     await self.emit(
