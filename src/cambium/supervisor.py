@@ -3222,6 +3222,8 @@ class _Runtime:
         }
         if isinstance(spec.get("requirements"), dict) and spec["requirements"]:
             payload["requirements"] = dict(spec["requirements"])
+        if spec.get("requires_commit") is not None:
+            payload["requires_commit"] = bool(spec["requires_commit"])
         if spec.get("fanout_config") is None:
             write_marker = spec.get("write_marker", True)
             if not isinstance(write_marker, bool):
@@ -4948,7 +4950,9 @@ class _Runtime:
                     return
                 reason = generation_reason or "crash"
                 if outcome.timeout_phase:
-                    timeout_payload = {"detail": wall_detail} if wall_detail is not None else {}
+                    timeout_payload: dict[str, Any] = (
+                        {"detail": wall_detail} if wall_detail is not None else {}
+                    )
                     await self.emit(
                         "timeout",
                         task_id=task_id,
