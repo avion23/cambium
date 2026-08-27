@@ -1,6 +1,6 @@
 """Persistent interactive-session coordination for REPL and TUI frontends.
 
-The supervisor still owns one immutable worker session per submitted prompt.
+The supervisor still owns immutable worker sessions for submitted prompts.
 This module links those leaves into one long semantic branch by carrying the
 latest immutable context checkpoint forward.  A cache-compatible continuation
 uses the exact ``context_fork`` descriptor and provider/model lease; the same
@@ -9,8 +9,8 @@ can still recover the provider-neutral semantic trunk without pretending that
 its KV cache is warm.
 
 The coordinator is deliberately small and single-writer.  Frontends call
-``prepare_turn`` -> ``observe_event`` -> ``complete_turn`` serially.  No worker
-or renderer mutates the branch head directly.
+``prepare_turn``/``prepare_turns`` -> ``observe_event`` -> ``complete_turn``.
+No worker or renderer mutates the branch head directly.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ import re
 import shutil
 import sqlite3
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -960,16 +960,22 @@ class InteractiveSession:
             model = None
         self._set_serving_preference(provider, model)
 
-    def observe_result(self, turn: InteractiveTurn, result: Any) -> None:
-        """Record a terminal serving pair, including router fallback provenance."""
+    def observe_result(
+        self, turn: InteractiveTurn | Sequence[InteractiveTurn], result: Any
+    ) -> None:
+        """Record terminal serving pairs, including router fallback provenance."""
+        turns = self._normalize_turns(turn)
+        by_task = {item.config.task_id: item for item in turns}
         results = getattr(result, "results", None)
-        item = results[0] if isinstance(results, tuple | list) and results else result
-        provider = getattr(item, "provider", None)
-        if not isinstance(provider, str) or not provider:
-            return
-        model = getattr(item, "model", None)
-        if provider != self.provider or (isinstance(model, str) and model != self.model):
-            self._record_serving_preference(turn, provider, model)
+        items = results if isinstance(results, tuple | list) and results else (result,)
+        for item in items:
+            provider = getattr(item, "provider", None)
+            if not isinstance(provider, str) or not provider:
+                continue
+            model = getattr(item, "model", None)
+            target = by_task.get(getattr(item, "task_id", None), turns[0])
+            if provider != self.provider or (isinstance(model, str) and model != self.model):
+                self._record_serving_preference(target, provider, model)
 
     def set_model_preference(self, value: str) -> str:
         """Validate and persist a provider/model preference for later turns."""
@@ -1039,6 +1045,8 @@ class InteractiveSession:
                 if (requested_provider, requested_model) in configured:
                     options = configured
 
+        if requested_provider is None or requested_model is None:
+            return "model: expected PROVIDER or PROVIDER:MODEL"
         if (requested_provider, requested_model) not in options:
             if not any(provider == requested_provider for provider, _model in options):
                 return (
@@ -1096,7 +1104,10 @@ class InteractiveSession:
                 shell_permission=True,
                 network_permission=False,
                 heartbeat_interval_s=1.0,
-                max_wall_s=self._base_config.max_wall_s,
+                max_wall_s=(
+                    self._base_config.max_wall_s
+                    or oneshot.DEFAULT_INTERACTIVE_WALL_BUDGET_S
+                ),
                 checkpoint_root=checkpoint_root,
                 provider_env_keys=self._base_config.provider_env_keys,
             )
@@ -1115,6 +1126,8 @@ class InteractiveSession:
             rolled_messages, _projection, _history = rollover_summary_trunk(trunk)
             cache_key = checkpoint.cache_key
             provider = cache_key.provider
+            if not isinstance(provider, str) or not provider:
+                return "compact: checkpoint provider is unavailable"
             provider_compat = {provider: (cache_key.protocol, cache_key.reasoning_effort)}
             rolled = _write_epoch_checkpoint(
                 config,
@@ -1215,7 +1228,16 @@ class InteractiveSession:
 
     def prepare_turn(self, prompt: str) -> InteractiveTurn:
         """Allocate one new supervisor leaf and attach the latest context seed."""
-        if not isinstance(prompt, str) or not prompt.strip():
+        return self.prepare_turns((prompt,))[0]
+
+    def prepare_turns(self, prompts: Sequence[str]) -> tuple[InteractiveTurn, ...]:
+        """Allocate one leaf containing a flat batch of independent prompts."""
+        if isinstance(prompts, str):
+            prompts = (prompts,)
+        prompts = tuple(prompts)
+        if not prompts or any(
+            not isinstance(prompt, str) or not prompt.strip() for prompt in prompts
+        ):
             raise InteractiveSessionError("interactive prompt must be non-empty")
         self._reconcile_provider_preference()
         number = self._turn + 1
@@ -1226,11 +1248,7 @@ class InteractiveSession:
         session_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
         config = replace(
             self._base_config,
-            prompt=prompt,
             session_root=session_dir,
-            task_id="interactive-main",
-            worktree_path=session_dir / "wt",
-            branch=None,
             session_mode=SessionMode.NEW,
         )
         context_fork: dict[str, Any] | None = None
@@ -1265,16 +1283,49 @@ class InteractiveSession:
         if changes:
             config = replace(config, **changes)
         self._pending_seed = None
-        return InteractiveTurn(
-            number=number,
-            session_dir=session_dir,
-            config=config,
-            context_fork=context_fork,
-            summary_trunk_ref=summary_trunk_ref,
+        batch = len(prompts) > 1
+        return tuple(
+            InteractiveTurn(
+                number=number,
+                session_dir=session_dir,
+                config=replace(
+                    config,
+                    prompt=prompt,
+                    task_id=(
+                        "interactive-main"
+                        if index == 1
+                        else f"interactive-task-{number}-{index}"
+                    ),
+                    worktree_path=session_dir / (f"wt-{index}" if batch else "wt"),
+                    branch=(f"cambium-interactive-{number}-{index}" if batch else None),
+                ),
+                context_fork=copy.deepcopy(context_fork),
+                summary_trunk_ref=summary_trunk_ref,
+            )
+            for index, prompt in enumerate(prompts, start=1)
         )
 
-    async def run_turn(self, turn: InteractiveTurn, *, on_event=None):
-        """Run one prepared leaf through the canonical supervisor runtime.
+    @staticmethod
+    def _normalize_turns(
+        turns: InteractiveTurn | Sequence[InteractiveTurn],
+    ) -> tuple[InteractiveTurn, ...]:
+        normalized = (turns,) if isinstance(turns, InteractiveTurn) else tuple(turns)
+        if not normalized or not all(isinstance(turn, InteractiveTurn) for turn in normalized):
+            raise InteractiveSessionError("interactive run requires at least one prepared turn")
+        if any(turn.number != normalized[0].number for turn in normalized):
+            raise InteractiveSessionError("interactive batch turns must share a turn number")
+        if any(turn.session_dir != normalized[0].session_dir for turn in normalized):
+            raise InteractiveSessionError("interactive batch turns must share a session directory")
+        return normalized
+
+    async def run_turn(
+        self,
+        turn: InteractiveTurn | Sequence[InteractiveTurn],
+        *,
+        on_event=None,
+        max_concurrent_tasks: int | None = None,
+    ):
+        """Run one or more prepared leaves in one flat supervisor plan.
 
         This mirrors :func:`oneshot.run_oneshot` only at the frontend adapter
         boundary, then adds the two context-link fields that ordinary one-shot
@@ -1282,17 +1333,24 @@ class InteractiveSession:
         admission, workers, events, merge publication, and result construction
         remain owned by the existing oneshot/supervisor path.
         """
-        config = turn.config
+        turns = self._normalize_turns(turn)
+        session_dir = turns[0].session_dir
         repo = self.repo
-        oneshot.preflight(config, repo, turn.session_dir)
-        oneshot.admit_session(config, turn.session_dir)
-        resolved, provider_environment = oneshot._resolve_provider(config, repo)
-        plan = oneshot.build_plan(resolved, repo, turn.session_dir)
-        task = plan["tasks"][0]
-        if turn.context_fork is not None:
-            task["context_fork"] = copy.deepcopy(turn.context_fork)
-        if turn.summary_trunk_ref is not None:
-            task["summary_trunk_ref"] = turn.summary_trunk_ref
+        for item in turns:
+            oneshot.preflight(item.config, repo, session_dir)
+        oneshot.admit_session(turns[0].config, session_dir)
+        tasks: list[dict[str, Any]] = []
+        provider_environment: dict[str, str] = {}
+        resolved = turns[0].config
+        for item in turns:
+            resolved, environment = oneshot._resolve_provider(item.config, repo)
+            provider_environment.update(environment)
+            task = oneshot.build_plan(resolved, repo, session_dir)["tasks"][0]
+            if item.context_fork is not None:
+                task["context_fork"] = copy.deepcopy(item.context_fork)
+            if item.summary_trunk_ref is not None:
+                task["summary_trunk_ref"] = item.summary_trunk_ref
+            tasks.append(task)
         routing_state_path = (
             resolved.routing_state_path
             if resolved.routing_state_path is not None
@@ -1304,10 +1362,12 @@ class InteractiveSession:
             "reject_reused_session": True,
             "context_reuse": resolved.context_reuse,
         }
+        if max_concurrent_tasks is not None:
+            kwargs["max_concurrent_tasks"] = max_concurrent_tasks
         if provider_environment:
             kwargs["provider_environment"] = provider_environment
-        result = await supervisor.run_plan(turn.session_dir, plan, **kwargs)
-        self.observe_result(turn, result)
+        result = await supervisor.run_plan(session_dir, {"tasks": tasks}, **kwargs)
+        self.observe_result(turns, result)
         return result
 
     def observe_event(self, turn: InteractiveTurn, event: Mapping[str, Any]) -> None:
@@ -1371,11 +1431,15 @@ class InteractiveSession:
             self._last_epoch = self._pending_seed.epoch
             self._last_checkpoint = checkpoint_ref
 
-    def complete_turn(self, turn: InteractiveTurn, *, succeeded: bool) -> None:
+    def complete_turn(
+        self, turn: InteractiveTurn | Sequence[InteractiveTurn], *, succeeded: bool
+    ) -> None:
         """Publish the captured checkpoint as the next branch head."""
-        if turn.number <= self._turn:
+        turns = self._normalize_turns(turn)
+        number = turns[0].number
+        if number <= self._turn:
             raise InteractiveSessionError("interactive turns must complete in order")
-        self._turn = turn.number
+        self._turn = number
         if succeeded and self._pending_seed is not None:
             self._seed = self._pending_seed
         self._pending_seed = None

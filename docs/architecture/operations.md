@@ -110,12 +110,13 @@ same default. (src/cambium/tasktree.py:44-50,245-269;
 src/cambium/architectus.py:288-311,544-648;
 src/cambium/supervisor.py:8071-8110)
 
-The admission semaphore bounds live worker processes; `max_concurrent_tasks`
-defaults to one per CPU, while `0` removes that semaphore. (src/cambium/supervisor.py:2261-2265,4491-4517,8300-8304)
+The admission semaphore bounds live worker processes; parallel dispatch is
+unlimited by default, while `--max-workers N` opts into an explicit cap.
+(`max_concurrent_tasks=0` disables the semaphore.) (src/cambium/supervisor.py:2146-2150,4376-4402,8253-8254)
 
 **Can it start 50 subagents?** Yes: 50 flat top-level plan entries are
-configurable and all `N` entries are scheduled; no source-level count cap is
-present. They are not necessarily 50 simultaneous processes: the semaphore
-cap applies, while hierarchical trees still obey fan-out `8`, depth `3`, and
-wave/core width `8`. (src/cambium/supervisor.py:8290-8304,8322-8343,8421-8426;
+configurable and all `N` entries are scheduled concurrently by default; no
+source-level count cap is present. Passing `--max-workers N` caps simultaneous
+processes, while hierarchical trees still obey fan-out `8`, depth `3`, and
+wave/core width `8`. (src/cambium/supervisor.py:8249-8254,8322-8343,8421-8426;
 src/cambium/tasktree.py:245-269; src/cambium/architectus.py:297-311)

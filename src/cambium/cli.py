@@ -185,6 +185,10 @@ def _positive_int(value: str, *, allow_zero: bool = False) -> int:
     return parsed
 
 
+def _non_negative_int(value: str) -> int:
+    return _positive_int(value, allow_zero=True)
+
+
 def _positive_float(value: str) -> float:
     try:
         parsed = float(value)
@@ -220,6 +224,13 @@ def _add_supervisor_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="persist child-revision conversations at "
         "<session-dir>/.cambium/conversations.db for the session",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=_non_negative_int,
+        default=0,
+        metavar="N",
+        help="maximum concurrent worker processes (default: unlimited)",
     )
 
 
@@ -287,6 +298,13 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
         help="prompt to run against the repository",
     )
     _add_routing_budget_arguments(parser)
+    parser.add_argument(
+        "--max-workers",
+        type=_non_negative_int,
+        default=0,
+        metavar="N",
+        help="maximum concurrent worker processes (default: unlimited)",
+    )
     parser.add_argument("--json", action="store_true", help="print the result as JSON")
 
 
@@ -462,6 +480,13 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Start the Cambium terminal dashboard.",
     )
     _add_routing_budget_arguments(tui)
+    tui.add_argument(
+        "--max-workers",
+        type=_non_negative_int,
+        default=0,
+        metavar="N",
+        help="maximum concurrent worker processes (default: unlimited)",
+    )
     tui.add_argument(
         "-c",
         "--continue",
@@ -716,6 +741,8 @@ def _supervisor_args(args: argparse.Namespace) -> list[str]:
         delegated.extend(["--warm-pool-size", str(args.warm_pool_size)])
     if getattr(args, "conversations", False):
         delegated.append("--conversations")
+    if getattr(args, "max_workers", 0):
+        delegated.extend(["--max-workers", str(args.max_workers)])
     return delegated
 
 
@@ -1161,7 +1188,11 @@ async def _run_tui(args: argparse.Namespace) -> int:
         max_tokens=cast(int, _budget_or_default(args.max_tokens, oneshot.DEFAULT_MAX_TOKENS)),
         max_turns=cast(int, _budget_or_default(args.max_turns, oneshot.DEFAULT_MAX_TURNS)),
     )
-    return await tui.run_tui(config, quiet=getattr(args, "quiet", False))
+    return await tui.run_tui(
+        config,
+        quiet=getattr(args, "quiet", False),
+        max_workers=getattr(args, "max_workers", 0),
+    )
 
 
 async def _run_monitor(args: argparse.Namespace) -> int:
