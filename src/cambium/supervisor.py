@@ -100,7 +100,7 @@ from cambium.provider_config import (
 from cambium.system_health import can_run_heavy
 
 from .architectus import ActionKind, ArchitectusCore
-from .auth import MIN_API_KEY_BYTES, oauth_env_suffix, scrub_environment
+from .auth import MIN_API_KEY_BYTES, AuthStore, oauth_env_suffix, scrub_environment
 from .conversations import ConversationStore, ConversationStoreError
 from .diffundo import prompt_prefix_bytes
 from .ipc import MAX_LINE_BYTES, encode_message, write_frame
@@ -1110,6 +1110,35 @@ def _provider_environment_value(key: str, provider_environment: Mapping[str, str
     return os.environ.get(key)
 
 
+def _provider_credential_ready_at_admission(
+    provider: Any,
+    provider_environment: Mapping[str, str] | None = None,
+    oauth_store: OAuthStore | None = None,
+) -> bool:
+    """Reuse one-shot credential readiness without changing process state."""
+    auth = getattr(provider, "auth", None)
+    if getattr(auth, "value", auth) == AuthMode.CODEX_CHATGPT.value:
+        if oauth_store is None:
+            from .oneshot import _provider_credential_ready
+
+            return _provider_credential_ready(provider, AuthStore())
+        store = oauth_store
+        try:
+            return store.read_document(provider.name) is not None
+        except OAuthMissingError:
+            return False
+
+    env_name = getattr(provider, "api_key_env", "")
+    if provider_environment is not None and env_name in provider_environment:
+        return bool(provider_environment[env_name])
+
+    # oneshot owns the API-key/AuthStore readiness definition.  Keep this
+    # local import because oneshot imports this module for its run adapter.
+    from .oneshot import _provider_credential_ready
+
+    return _provider_credential_ready(provider, AuthStore())
+
+
 def _validate_provider_credential(value: object) -> None:
     """Reject a credential that is unsafe to use as an unrestricted redaction needle."""
     if not isinstance(value, str):
@@ -1918,12 +1947,40 @@ def _bounded_resume_envelope(envelope: Mapping[str, Any]) -> dict[str, Any]:
     return _bounded_strict_envelope(envelope)
 
 
+def _success_invariant_violation(
+    spec: Mapping[str, Any], envelope: Mapping[str, Any], actual_head: str
+) -> bool:
+    """Return whether a successful envelope disagrees with its worktree."""
+    requires_commit = envelope.get("requires_commit", False)
+    if type(requires_commit) is not bool:
+        return True
+    commits = envelope.get("commits", [])
+    files_changed = envelope.get("files_changed", [])
+    unified_diff = envelope.get("diff", envelope.get("unified_diff", ""))
+    if (
+        not isinstance(commits, list)
+        or not all(isinstance(commit, str) for commit in commits)
+        or not isinstance(files_changed, list)
+        or not all(isinstance(path, str) for path in files_changed)
+        or not isinstance(unified_diff, str)
+    ):
+        return True
+    base_head = spec.get("base_commit")
+    if actual_head != base_head:
+        return not commits or commits[-1] != actual_head
+    return bool(commits) or bool(files_changed) or unified_diff != "" or requires_commit
+
+
 class DuplicateTaskIDError(ValueError):
     """The plan cannot be dispatched because a task id is repeated."""
 
 
 class InvalidBaseCommitError(ValueError):
     """A task base does not resolve to a commit in its repository."""
+
+
+class NoCredentialFeasibleProvidersError(ValueError):
+    """No authorized provider has a credential usable at admission."""
 
 
 class WorktreeRecoveryError(RuntimeError):
@@ -2800,8 +2857,9 @@ class _Runtime:
                         _deferred_observers=deferred,
                     )
                     return
-                if not force and any(
-                    not _status_line_is_fence(line) for line in status.stdout.splitlines()
+                if not force and (
+                    spec.get("_defer_cleanup") is True
+                    or any(not _status_line_is_fence(line) for line in status.stdout.splitlines())
                 ):
                     await self.emit(
                         "worktree_cleanup_deferred",
@@ -3749,6 +3807,25 @@ class _Runtime:
 
     # -- per-task supervision ------------------------------------------------
 
+    async def _emit_provider_infeasible(self, spec: Mapping[str, Any]) -> None:
+        """Persist each credential-infeasible provider once for this task."""
+        records = spec.get("_provider_infeasible", ())
+        if not isinstance(records, list | tuple):
+            return
+        if isinstance(spec, dict):
+            spec.pop("_provider_infeasible", None)
+        for record in records:
+            if not isinstance(record, tuple) or len(record) != 2:
+                continue
+            provider, reason = record
+            if isinstance(provider, str) and isinstance(reason, str):
+                await self.emit(
+                    "provider_infeasible",
+                    task_id=spec.get("task_id"),
+                    provider=provider,
+                    reason=reason,
+                )
+
     def _resolve_assignment(self, spec: dict[str, Any]) -> None:
         """Admission-time (provider, model) selection for un-pinned tasks.
 
@@ -3763,7 +3840,13 @@ class _Runtime:
         """
         if self._debt_store is None:
             return
-        if _resolve_model_candidates(spec, self._debt_store.as_mapping(), self._lanes):
+        if _resolve_model_candidates(
+            spec,
+            self._debt_store.as_mapping(),
+            self._lanes,
+            provider_environment=self._provider_environment,
+            oauth_store=self._oauth_store,
+        ):
             self._lanes[spec["assigned_provider"]].in_flight += 1
             spec["_lane_reserved"] = True
 
@@ -3992,14 +4075,23 @@ class _Runtime:
                 return
             try:
                 await self._supervise(spec)
+            except NoCredentialFeasibleProvidersError:
+                reason = "no credential-feasible providers"
+                await self._emit_provider_infeasible(spec)
+                await self.emit("worker_failed", task_id=task_id, reason=reason)
+                self._results[task_id] = TaskResult(
+                    task_id=task_id, status="failed", exit_code=1, reason=reason
+                )
             except InvalidBaseCommitError:
                 reason = "invalid_base_commit"
+                await self._emit_provider_infeasible(spec)
                 await self.emit("worker_failed", task_id=task_id, reason=reason)
                 self._results[task_id] = TaskResult(
                     task_id=task_id, status="failed", exit_code=1, reason=reason
                 )
             except WorktreeRecoveryError:
                 reason = "worktree_recovery_failed"
+                await self._emit_provider_infeasible(spec)
                 await self.emit("worker_failed", task_id=task_id, reason=reason)
                 self._results[task_id] = TaskResult(
                     task_id=task_id, status="failed", exit_code=1, reason=reason
@@ -4010,6 +4102,7 @@ class _Runtime:
                 # coroutine and have TaskGroup cancel unrelated siblings.
                 detail = str(exc).strip().replace("\n", " ")[:512]
                 reason = f"{exc.__class__.__name__}: {detail}" if detail else exc.__class__.__name__
+                await self._emit_provider_infeasible(spec)
                 await self.emit("worker_failed", task_id=task_id, reason=reason, internal=True)
                 self._results[task_id] = TaskResult(
                     task_id=task_id, status="failed", exit_code=1, reason=reason
@@ -4148,6 +4241,7 @@ class _Runtime:
                     resource_denied=True,
                     reasons=reasons,
                 )
+                await self._emit_provider_infeasible(spec)
                 self._results[task_id] = TaskResult(
                     task_id=task_id,
                     status="failed",
@@ -4194,6 +4288,7 @@ class _Runtime:
             # usage event already folded by earlier admissions. The decision
             # is idempotent across restarts (a resolved spec carries a model).
             self._resolve_assignment(spec)
+            await self._emit_provider_infeasible(spec)
             assigned_payload: dict[str, Any] = {
                 "task_id": task_id,
                 "repo": str(repo),
@@ -4423,14 +4518,25 @@ class _Runtime:
                             summary=worker_summary,
                         )
                         return
-                    integrity = await self._worker_success_integrity(spec, worktree)
                     head: str | None = None
-                    if integrity is None:
+                    integrity = await self._worker_success_integrity(spec, worktree)
+                    if integrity is None or integrity == "worker_tree_dirty":
                         head = await self._git_stdout(
                             worktree, "rev-parse", "--verify", "HEAD^{commit}", check=False
                         )
                         if head is None:
                             integrity = "worker_head_failed"
+                    if (
+                        integrity == "worker_tree_dirty"
+                        and head is not None
+                        and _success_invariant_violation(
+                            spec,
+                            cast(dict[str, Any], outcome.envelope),
+                            head,
+                        )
+                    ):
+                        integrity = "success invariant violated"
+                        spec["_defer_cleanup"] = True
                     if integrity is not None:
                         await self.emit(
                             "worker_failed",
@@ -4449,6 +4555,34 @@ class _Runtime:
                             status="failed",
                             exit_code=1,
                             reason=integrity,
+                            restarts=restarts,
+                            summary=worker_summary,
+                        )
+                        return
+                    if _success_invariant_violation(
+                        spec,
+                        cast(dict[str, Any], outcome.envelope),
+                        cast(str, head),
+                    ):
+                        spec["_defer_cleanup"] = True
+                        reason = "success invariant violated"
+                        await self.emit(
+                            "worker_failed",
+                            task_id=task_id,
+                            generation=generation,
+                            reason=reason,
+                        )
+                        await self._reject_child_proposals(
+                            task_id,
+                            outcome.proposals,
+                            reason="ParentIntegrityFailed",
+                            message="parent success was rejected by supervisor integrity checks",
+                        )
+                        self._results[task_id] = TaskResult(
+                            task_id=task_id,
+                            status="failed",
+                            exit_code=1,
+                            reason=reason,
                             restarts=restarts,
                             summary=worker_summary,
                         )
@@ -7112,7 +7246,12 @@ def _ensure_lanes(lanes: dict[str, LaneState], providers: Sequence[Any]) -> None
 
 
 def _resolve_model_candidates(
-    spec: dict[str, Any], debt: Mapping[str, Any], lanes: dict[str, LaneState]
+    spec: dict[str, Any],
+    debt: Mapping[str, Any],
+    lanes: dict[str, LaneState],
+    *,
+    provider_environment: Mapping[str, str] | None = None,
+    oauth_store: OAuthStore | None = None,
 ) -> bool:
     """Resolve a task's (provider, model) when it declares ``model_candidates``
     and its fanout_config carries no pinned model.
@@ -7120,11 +7259,11 @@ def _resolve_model_candidates(
     The pure pick lives in :func:`cambium.routing.resolve_assignment`; this
     function loads the provider config, restricts the pool to the task's
     authorized provider identities (carried by name, so OAuth providers are
-    never dropped the way env-key filtering dropped them), and applies the
-    returned assignment to ``spec`` at the runtime edge (mutates
-    ``fanout_config`` and records ``assigned_provider``). Returns True when an
-    assignment was written; pinned tasks and tasks without a fanout_config are
-    left untouched and return False.
+    never dropped the way env-key filtering dropped them), intersects that set
+    with credential readiness, and applies the returned assignment to ``spec``
+    at the runtime edge (mutates ``fanout_config`` and records
+    ``assigned_provider``). Returns True when an assignment was written; pinned
+    tasks and tasks without a fanout_config are left untouched and return False.
     """
     fanout_config = spec.get("fanout_config")
     candidates = spec.get("model_candidates")
@@ -7154,6 +7293,40 @@ def _resolve_model_candidates(
                 for provider in providers
                 if provider.api_key_env in authorized_provider_keys
             ]
+    else:
+        feasible: list[Any] = []
+        infeasible: list[tuple[str, str]] = []
+        for provider in providers:
+            if provider.name not in authorized:
+                continue
+            if not getattr(provider, "enabled", True):
+                continue
+            if not _provider_credential_ready_at_admission(
+                provider,
+                provider_environment,
+                oauth_store,
+            ):
+                infeasible.append((provider.name, "credential unavailable"))
+                continue
+            feasible.append(provider)
+        if infeasible:
+            recorded = spec.setdefault("_provider_infeasible", [])
+            if not isinstance(recorded, list):
+                recorded = spec["_provider_infeasible"] = []
+            known = {
+                item[0]
+                for item in recorded
+                if isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], str)
+            }
+            for provider, reason in infeasible:
+                if provider not in known:
+                    recorded.append((provider, reason))
+                    known.add(provider)
+        if not feasible:
+            raise NoCredentialFeasibleProvidersError()
+        providers = feasible
+        authorized = frozenset(provider.name for provider in feasible)
+        spec["authorized_providers"] = [provider.name for provider in feasible]
     # A caller-pinned tier is a hard constraint: only providers in that tier
     # may serve the task, so the assignment can never contradict it.
     raw_pinned_tier = fanout_config.get("tier")
@@ -7190,6 +7363,9 @@ def _preassign_lanes(
     specs: Sequence[dict[str, Any]],
     debt: Mapping[str, ProviderDebt] | None,
     lanes: dict[str, LaneState],
+    *,
+    provider_environment: Mapping[str, str] | None = None,
+    oauth_store: OAuthStore | None = None,
 ) -> None:
     """Batch-aware (provider, model) pre-assignment for a plan wave (H1).
 
@@ -7206,8 +7382,16 @@ def _preassign_lanes(
     batch_debt = {name: replace(entry) for name, entry in (debt or {}).items()}
     for spec in specs:
         try:
-            assigned = _resolve_model_candidates(spec, batch_debt, lanes)
+            assigned = _resolve_model_candidates(
+                spec,
+                batch_debt,
+                lanes,
+                provider_environment=provider_environment,
+                oauth_store=oauth_store,
+            )
         except LaneCapacityExhausted:
+            continue
+        except NoCredentialFeasibleProvidersError:
             continue
         if not assigned:
             continue
@@ -7975,6 +8159,8 @@ async def run_plan(
                     [spec for spec in specs if spec["task_id"] not in runtime._results],
                     debt_store.as_mapping(),
                     runtime._lanes,
+                    provider_environment=provider_environment,
+                    oauth_store=oauth_store,
                 )
                 async with asyncio.TaskGroup() as tg:
                     # Dynamic child admission spawns into the active group;
