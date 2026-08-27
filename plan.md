@@ -838,7 +838,7 @@ family (83 across four files), `worker.py` (29/18), `optimize.py` (26/16),
 
 Ownership is disjoint by file (20 owners, `handsoff.md` table): ipc, lm,
 diffundo src, diffundo tests b, routing, worker, optimize, supervisor,
-provider_config, repl/user-cli, oauth, analysis (stats/selection/render),
+provider_config, repl, oauth, analysis (stats/selection/render),
 store/usage, cli/auth, merge, modules, tools/ast, redact, misc src
 (architectus/bench/orchestrator/doctor/jlens/schemas/fencing),
 fixtures/misc tests.
