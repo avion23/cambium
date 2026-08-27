@@ -78,7 +78,7 @@ only the two provider message lists; `meta` holds identity, cache, loop, budget,
 usage, and wall-deadline state
 (`src/cambium/worker.py:203-234`). Legacy flat epoch files with top-level
 `provider_messages` are accepted on load and can resume, including schema-4 files
-(`src/cambium/worker.py:3728-3758`).
+(`src/cambium/worker.py:3897-3942`).
 
 The implemented summary segment is:
 
@@ -123,13 +123,13 @@ records persisted redaction; a redacted checkpoint is not exact-fork eligible.
 `provider_boundary` carries validated
 non-secret provider, endpoint, auth, model, protocol, tier, environment, and
 authorization identity
-(`src/cambium/worker.py:3455-3472`, `src/cambium/worker.py:406-461`,
-`src/cambium/worker.py:2469-2470`).
+(`src/cambium/worker.py:3568-3670`, `src/cambium/worker.py:406-461`,
+`src/cambium/worker.py:3697-3749`).
 
 These fields prove checkpoint identity and exact-context compatibility, not
 provider-cache eligibility or a cache hit. The loader recomputes the hashes and
 prefix size before use
-(`src/cambium/worker.py:3793-3852`).
+(`src/cambium/worker.py:3897-4009`).
 
 ## 4. Invariants
 
@@ -141,7 +141,7 @@ retry remains valid and receives the same request content. Matching a
 infer provider-cache eligibility or a hit. Only
 `usage_event.provider_cache_hit`, copied from
 provider-reported usage, is cache evidence
-(`src/cambium/diffundo.py:1226-1237`, `src/cambium/worker.py:2990-3005`).
+(`src/cambium/diffundo.py:1226-1237`, `src/cambium/worker.py:3153-3192`).
 
 ### C2. Immutable replay prefix
 
@@ -152,7 +152,7 @@ change. Corrections create a child epoch.
 
 Checkpoint loaders recompute message hashes, prefix size, and message count;
 descriptor or payload mismatch fails closed before a prompt is seeded
-(`src/cambium/worker.py:3793-3852`).
+(`src/cambium/worker.py:3897-4009`).
 
 ### C4. Raw history remains authoritative
 
@@ -166,7 +166,7 @@ published entry is immutable: `S1` must remain byte-identical when `S2` is
 appended, and a later flush may summarize only the new raw tail. Publication is
 fail-closed through sequence, source digest/count, checkpoint identity, and
 exclusive immutable file creation. No invalid or duplicate proposal advances the
-trunk (`src/cambium/worker.py:4455-4473`, `src/cambium/worker.py:4657-4674`).
+trunk (`src/cambium/worker.py:3568-3759`, `src/cambium/worker.py:4867-4945`).
 
 ### C6. Bounded active context
 
@@ -199,8 +199,8 @@ coordination, validation, or rejection.
 Provider/model/protocol/tool/schema/reasoning compatibility and the validated
 `provider_boundary` are hard constraints. Cache locality is a soft outcome
 inside that feasible class; credential readiness is checked before provider
-admission (`src/cambium/worker.py:2571-2618`,
-`src/cambium/supervisor.py:7553-7585`).
+admission (`src/cambium/worker.py:2749-2801`,
+`src/cambium/supervisor.py:7447-7528`).
 
 ### C10. Accounting dimensions stay separate
 
@@ -209,7 +209,7 @@ cumulative, latency, and estimated cost. The budget prompt baseline is
 `max(0, prompt_tokens - cached_tokens)`; the charged prompt delta is that
 baseline minus the previous baseline, clamped at zero. Missing cache data treats
 the full prompt as uncached, and completions remain billable
-(`src/cambium/worker.py:1889-1926`).
+(`src/cambium/worker.py:2084-2109`).
 
 ## 5. Turn, fork, merge, and compaction protocol
 
@@ -221,7 +221,7 @@ the full prompt as uncached, and completions remain billable
 4. Dispatch and persist the provider usage record independently of success.
 5. Append response/tool events to the raw log.
 6. Publish the immutable checkpoint with exclusive creation so an existing file
-   cannot be replaced (`src/cambium/worker.py:3266-3299`).
+   cannot be replaced (`src/cambium/worker.py:3464-3498`).
 
 ### 5.2 Child fork
 
@@ -244,7 +244,7 @@ The context-fork descriptor is immutable. An exact-context child is eligible onl
 when the provider boundary, model/protocol/reasoning settings, tool schema,
 hashes, and prefix bytes match. Otherwise Cambium can reuse semantic summaries
 under a new provider head. Neither path claims a provider cache hit; only
-provider usage can make that claim (`src/cambium/worker.py:2487-2533`).
+provider usage can make that claim (`src/cambium/worker.py:2632-2801`).
 
 ### 5.3 Child result
 
@@ -307,14 +307,14 @@ An invalid summary entry emits `compaction_deferred`, skips the fold, and leaves
 the active checkpoint and raw tail unchanged; the loop continues. After two
 consecutive deferrals, the next invalid entry becomes `compaction_failed`.
 Other flush errors emit `compaction_failed` and the boundary caller fails the
-task (`src/cambium/worker.py:183`, `src/cambium/worker.py:4590-4604`,
-`src/cambium/worker.py:4657-4670`, `src/cambium/worker.py:5217-5225`).
+task (`src/cambium/worker.py:189`, `src/cambium/worker.py:4671-4718`,
+`src/cambium/worker.py:4751-4809`, `src/cambium/worker.py:4946-4959`).
 
 At the 90% token soft cap, the worker adds a forced-finalization instruction and
 allows bounded headroom for a terminal `finish` rather than cutting off the
-loop (`src/cambium/worker.py:237-247`, `src/cambium/worker.py:4301-4370`).
+loop (`src/cambium/worker.py:246-250`, `src/cambium/worker.py:4535-4644`).
 The live flush policy uses configured raw-tail thresholds plus delegation and
-terminal boundaries (`src/cambium/worker.py:4435-4448`).
+terminal boundaries (`src/cambium/worker.py:4671-4989`).
 
 ## 6. Provider cache capability contract
 
@@ -344,8 +344,8 @@ choose providers. Routing first constructs a feasible set from authorization,
 exact model constraints, protocol/tool support, context/output capacity,
 budget, health, rate limits, and credential readiness. An explicit authorized
 set with no credential-ready provider raises `NoCredentialFeasibleProvidersError`
-before spawn (`src/cambium/supervisor.py:2030-2031`,
-`src/cambium/supervisor.py:7553-7585`).
+before spawn (`src/cambium/supervisor.py:7524-7525`,
+`src/cambium/supervisor.py:4204-4212`).
 
 Each provider attempt gets the smaller of the call deadline and
 `base * _REASONING_EFFORT_MULTIPLIERS.get(effort, 1.0)` (the `max` effort is
@@ -371,8 +371,8 @@ cumulative usage, including cache reads/writes and context utilization. The UI
 is a projection over the canonical event stream; it does not own session or
 agent state. The TUI rail marks exact, semantic, and fresh context lineage as
 `=`, `~`, and `∅` (`src/cambium/observability.py:285-295`,
-`src/cambium/tui_screen.py:2325-2341`,
-`src/cambium/tui_screen.py:2447-2457`).
+`src/cambium/tui_screen.py:2362-2379`,
+`src/cambium/tui_screen.py:2408-2410`).
 
 See [`terminal-interface.md`](terminal-interface.md).
 
