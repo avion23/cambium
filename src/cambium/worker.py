@@ -204,6 +204,7 @@ FINAL_SYNTHESIS_DIRECTIVE = (
     'Return exactly one terminal finish action: {"type":"finish","summary":"..."} '
     "summarizing the work completed so far."
 )
+FINAL_SYNTHESIS_REMINDER = "Finalization active: return finish now."
 
 
 class TaskStatus(StrEnum):
@@ -4041,6 +4042,7 @@ async def _run_agent_loop(
         int(config.max_tokens * FINAL_SYNTHESIS_HEADROOM_RATIO),
     )
     finalized = False
+    finalization_grace_used = False
     transcript: list[dict[str, Any]] = []
     tools = _exposed_tool_schemas(config)
     lint_diag = LintDiag()
@@ -4084,12 +4086,13 @@ async def _run_agent_loop(
         return finalized or budget_new_tokens >= soft_cap or turn >= config.max_turns - 2
 
     def _arm_finalization(turn: int, *, turn_limit: bool = True) -> None:
-        nonlocal finalized
+        nonlocal finalized, finalization_grace_used
         if finalized:
             return
         if budget_new_tokens < soft_cap and (not turn_limit or turn < config.max_turns - 2):
             return
         finalized = True
+        finalization_grace_used = False
         _append_context_message(_final_synthesis_message())
 
     def _drop_finalization_directive() -> None:
@@ -4281,7 +4284,7 @@ async def _run_agent_loop(
             )
             previous_usage_source = summary_source
             budget_new_tokens += summary_charge
-            _arm_finalization(turn)
+            _arm_finalization(turn, turn_limit=False)
             if finalized and budget_new_tokens > finalization_cap:
                 raise ContextForkError(
                     _phase_failure(
@@ -4541,6 +4544,7 @@ async def _run_agent_loop(
                 # The tuple is immutable and every message is deep-copied at
                 # the prompt boundary. No later turn can rewrite the epoch
                 # prefix in place.
+                _folded = False
                 if config.context_reuse:
                     _folded, compaction_failure = await _bound_context_continuation(turn)
                     if compaction_failure is not None:
@@ -4555,7 +4559,7 @@ async def _run_agent_loop(
                             cumulative_usage,
                             transcript,
                         )
-                if finalized and not any(
+                if finalized and not _folded and not any(
                     message.get("content") == FINAL_SYNTHESIS_DIRECTIVE
                     for message in context_continuation
                 ):
@@ -4746,6 +4750,12 @@ async def _run_agent_loop(
             action_message = _canonical_action_message(action)
             if final_synthesis_call and action["type"] != "finish":
                 _append_context_message(action_message)
+                if turn < config.max_turns and not finalization_grace_used:
+                    finalization_grace_used = True
+                    _append_context_message(
+                        {"role": "user", "content": FINAL_SYNTHESIS_REMINDER}
+                    )
+                    continue
                 return _loop_result(
                     outcome,
                     "failed",
