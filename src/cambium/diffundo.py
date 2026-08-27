@@ -2408,9 +2408,17 @@ class Diffundo:
         return []
 
     def _order_candidates(self, candidates: list[ProviderConfig]) -> list[ProviderConfig]:
+        from .routing import _provider_is_quarantined
+
+        routing_debt = dict(self._debt) if self._debt is not None else None
+        candidates = [
+            provider
+            for provider in candidates
+            if not _provider_is_quarantined(provider.name, routing_debt)
+        ]
         ordered = order_candidates(
             cast(Sequence[Candidate], candidates),
-            debt=dict(self._debt) if self._debt is not None else None,
+            debt=routing_debt,
             incumbent=self._primary_provider,
             rotation_offset=self._rotation,
             now=time.time(),

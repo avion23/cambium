@@ -568,6 +568,19 @@ def _normalized_utilization(provider: Any, debt: Mapping[str, ProviderDebt] | No
     return tokens / _window_allowance(provider)
 
 
+def _provider_is_quarantined(provider_name: str, debt: Mapping[str, Any] | None) -> bool:
+    """Return whether routing debt carries a proven auth/config quarantine."""
+    if debt is None:
+        return False
+    entry = debt.get(provider_name)
+    reason = (
+        entry.get("disable_reason")
+        if isinstance(entry, Mapping)
+        else getattr(entry, "disable_reason", None)
+    )
+    return isinstance(reason, str) and reason.startswith(("auth_error:", "config_error:"))
+
+
 @dataclass(frozen=True)
 class ProviderAssignment:
     """The resolved (provider, model, tier) for one task (AUDIT-063).
@@ -653,7 +666,11 @@ def select_primary(
         if not getattr(provider, "enabled", True):
             continue
         model = getattr(provider, "model", "")
-        if isinstance(model, str) and model in candidates:
+        if (
+            isinstance(model, str)
+            and model in candidates
+            and not _provider_is_quarantined(provider.name, debt)
+        ):
             serving.append((index, provider))
     if not serving:
         raise ValueError(
@@ -924,6 +941,8 @@ def select_lane(
         if not (isinstance(model, str) and model in candidates):
             continue
         matching = True
+        if _provider_is_quarantined(provider.name, debt):
+            continue
         lane = lanes.get(provider.name)
         if lanes and lane is None:
             # An empty lane map is the legacy "capacity not tracked" value;
@@ -1117,6 +1136,8 @@ def score_providers(
         if not provider_satisfies_request(provider, capability_request):
             continue
         capability_matches += 1
+        if _provider_is_quarantined(provider.name, debt):
+            continue
         if lanes is not None:
             lane = lanes.get(provider.name)
             if lanes and lane is None:
