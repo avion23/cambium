@@ -195,7 +195,43 @@ TRANSCRIPT_KEEP_TURNS = 6
 MAX_ENVELOPE_FIELD_CHARS = 2_000
 MAX_ENVELOPE_ITEMS = 16
 MAX_CONTEXT_MESSAGES = 512
-CHECKPOINT_EPOCH_SCHEMA = 4
+CHECKPOINT_EPOCH_SCHEMA = 5
+_LEGACY_CHECKPOINT_EPOCH_SCHEMA = 4
+_CHECKPOINT_CONTENT_KEYS = frozenset({"provider_messages", "continuation_suffix"})
+
+
+def _split_checkpoint_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Nest a flat checkpoint payload into {schema, content, meta} for disk.
+
+    ``content`` is the only LLM-visible portion; everything else is harness
+    metadata (identity, cache addressing, loop counters, budget state).
+    """
+    content = {key: payload[key] for key in ("provider_messages", "continuation_suffix")}
+    meta = {
+        key: value
+        for key, value in payload.items()
+        if key != "schema" and key not in _CHECKPOINT_CONTENT_KEYS
+    }
+    return {
+        "schema": payload.get("schema", CHECKPOINT_EPOCH_SCHEMA),
+        "content": content,
+        "meta": meta,
+    }
+
+
+def _join_checkpoint_payload(data: dict[str, Any]) -> dict[str, Any]:
+    """Flatten a disk checkpoint into the flat internal layout.
+
+    Accepts both the nested {schema, content, meta} layout and the legacy
+    flat layout (top-level ``provider_messages``); legacy files are
+    structurally identical and resume transparently.
+    """
+    if "provider_messages" in data:
+        return dict(data)
+    joined = dict(data.get("meta") or {})
+    joined["schema"] = data.get("schema", CHECKPOINT_EPOCH_SCHEMA)
+    joined.update(data.get("content") or {})
+    return joined
 # Start synthesis before the hard ceiling so a bounded terminal response can
 # still be produced instead of discarding the action that crossed the edge.
 SOFT_TOKEN_CAP_RATIO = 0.9
@@ -3518,7 +3554,9 @@ def _write_epoch_checkpoint(
     payload["checkpoint_ref"] = checkpoint_ref
     directory = config.checkpoint_root / safe_task
     path = directory / f"{prefix}-{address_persisted}.json"
-    _create_epoch_checkpoint(path, json.dumps(payload, sort_keys=True, indent=2))
+    _create_epoch_checkpoint(
+        path, json.dumps(_split_checkpoint_payload(payload), sort_keys=True, indent=2)
+    )
     return replace(
         checkpoint,
         checkpoint_ref=checkpoint_ref,
@@ -3685,6 +3723,7 @@ def _load_epoch_checkpoint(
         raise ContextForkError(f"checkpoint unreadable: {exc.__class__.__name__}") from exc
     if not isinstance(data, dict):
         raise ContextForkError("checkpoint is not an object")
+    data = _join_checkpoint_payload(data)
     if _checkpoint_address(data) != address_persisted:
         raise ContextForkError("checkpoint persisted-address mismatch")
     if data.get("epoch") != ref_epoch:
@@ -3713,7 +3752,7 @@ def _load_epoch_checkpoint(
     )
     if set(data) != expected_keys:
         raise ContextForkError("checkpoint has an invalid key set")
-    if data.get("schema") != CHECKPOINT_EPOCH_SCHEMA:
+    if data.get("schema") not in (CHECKPOINT_EPOCH_SCHEMA, _LEGACY_CHECKPOINT_EPOCH_SCHEMA):
         raise ContextForkError("checkpoint schema mismatch")
     if not isinstance(data.get("task_id"), str) or not data["task_id"]:
         raise ContextForkError("checkpoint task_id invalid")

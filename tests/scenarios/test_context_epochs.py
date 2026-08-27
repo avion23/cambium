@@ -377,7 +377,7 @@ def test_epoch_checkpoint_roundtrip_and_tamper(tmp_path: Path) -> None:
 
     path = tmp_path / "ckpts" / checkpoint.checkpoint_ref
     data = json.loads(path.read_text(encoding="utf-8"))
-    data["provider_messages"][1]["content"] = "tampered"
+    data["content"]["provider_messages"][1]["content"] = "tampered"
     path.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
     with pytest.raises(ContextForkError, match="persisted-address mismatch|prefix_sha256 mismatch"):
         worker._load_epoch_checkpoint(config, checkpoint.checkpoint_ref, expect_task_id=True)
@@ -1899,3 +1899,32 @@ def test_suspended_envelope_without_flag_fails_closed(
     events = read_events(session_dir)
     assert not _kinds(events, "context_resume")
     assert not _kinds(events, "context_fork")
+
+
+def test_legacy_flat_epoch_checkpoint_still_loads(tmp_path: Path) -> None:
+    """Pre-split flat checkpoints (schema 4) resume transparently."""
+    checkpoint_root = tmp_path / "ckpts"
+    config = _agent_config(tmp_path / "wt", checkpoint_root=checkpoint_root)
+    checkpoint = _write_epoch(config)
+
+    legacy_path = checkpoint_root / checkpoint.checkpoint_ref
+    legacy = json.loads(legacy_path.read_text(encoding="utf-8"))
+    assert "content" in legacy, "new writer must emit the nested layout"
+
+    flat = worker._join_checkpoint_payload(legacy)
+    task_component = checkpoint.checkpoint_ref.split("/")[0]
+    flat4 = {**flat, "schema": 4}
+    address_pre = worker._checkpoint_address({**flat4, "checkpoint_ref": ""})
+    placeholder = f"{task_component}/epoch-{checkpoint.epoch:03d}-{address_pre}-{'0' * 16}.json"
+    flat4["checkpoint_ref"] = placeholder
+    address_persisted = worker._checkpoint_address(flat4)
+    legacy_ref = (
+        f"{task_component}/epoch-{checkpoint.epoch:03d}-{address_pre}-{address_persisted}.json"
+    )
+    flat4["checkpoint_ref"] = legacy_ref
+    legacy_path = checkpoint_root / legacy_ref
+    legacy_path.write_text(json.dumps(flat4, sort_keys=True), encoding="utf-8")
+
+    loaded = worker._load_epoch_checkpoint(config, legacy_ref, expect_task_id=True)
+    assert loaded.provider_messages == checkpoint.provider_messages
+    assert loaded.epoch == checkpoint.epoch

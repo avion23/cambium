@@ -523,6 +523,9 @@ def _validate_advanced_epoch_checkpoint(
 ) -> None:
     checkpoint_ref = msg["checkpoint_ref"]
     data = _load_epoch_checkpoint_data(session_dir, task_id, checkpoint_ref)
+    from .worker import _join_checkpoint_payload
+
+    data = _join_checkpoint_payload(data)
     expected_keys = frozenset(
         {
             "schema",
@@ -553,7 +556,7 @@ def _validate_advanced_epoch_checkpoint(
         )
     except (TypeError, ValueError) as exc:
         raise ValueError("checkpoint_ref is invalid") from exc
-    if data.get("schema") != CHECKPOINT_EPOCH_SCHEMA:
+    if data.get("schema") not in (CHECKPOINT_EPOCH_SCHEMA, 4):
         raise ValueError("checkpoint schema mismatch")
     if data.get("task_id") != task_id or data.get("generation") != generation:
         raise ValueError("checkpoint identity mismatch")
