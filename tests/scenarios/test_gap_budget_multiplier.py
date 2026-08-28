@@ -104,7 +104,7 @@ def test_soft_cap_budget_multiplier_table(
         [
             '{"type":"tool_call","name":"read_batch","arguments":{"paths":["alpha.txt"]}}',
             '{"type":"tool_call","name":"read_batch","arguments":{"paths":["beta.txt"]}}',
-            '{"type":"finish","summary":"budget bounded"}',
+            '{"type":"finish","summary":"budget bounded","objective_met":false}',
         ],
         [first_usage, second_usage, final_usage],
     )

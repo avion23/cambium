@@ -178,7 +178,7 @@ def test_valid_summary_response_does_not_defer(tmp_path: Path) -> None:
     router = _SummaryRouter()
     router.responses = [
         '{"type":"plan","steps":["continue"]}',
-        '{"type":"finish","summary":"done"}',
+        '{"type":"finish","summary":"done","objective_met":true}',
     ]
     writer = _Writer()
 
@@ -300,7 +300,9 @@ def _write_restart_worker(path: Path, wire_log: Path, prompt_log: Path, init_log
                             '{"type":"tool_call","name":"run_shell",'
                             '"arguments":{"cmd":["true"]}}'
                         )
-                    return Result('{"type":"finish","summary":"resumed"}')
+                    return Result(
+                        '{"type":"finish","summary":"resumed","objective_met":true}'
+                    )
 
             async def main():
                 init = json.loads(sys.stdin.readline())

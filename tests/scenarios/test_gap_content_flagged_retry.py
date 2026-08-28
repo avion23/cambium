@@ -181,7 +181,7 @@ def test_content_flagged_summary_retries_once_with_redacted_tail(
             (
                 200,
                 _ok_payload(
-                    json.dumps({"type": "finish", "summary": _SECRET}),
+                    json.dumps({"type": "finish", "summary": _SECRET, "objective_met": True}),
                     model="loopback-model",
                     usage=_USAGE,
                 ),
@@ -209,7 +209,7 @@ def test_content_flagged_summary_retries_once_with_redacted_tail(
         assert calls[1]["messages"] != calls[0]["messages"]
         assert calls[1]["messages"][:2] == calls[0]["messages"][:2]
         assert calls[1]["messages"][-1] == calls[0]["messages"][-1]
-        assert calls[1]["messages"][-2]["content"].startswith('{"summary":"***')
+        assert '"summary":"***' in calls[1]["messages"][-2]["content"]
         assert len(calls[1]["messages"][-2]["content"]) < len(
             calls[0]["messages"][-2]["content"]
         )
@@ -260,7 +260,7 @@ def test_content_flagged_summary_retry_fails_without_health_damage(
             (
                 200,
                 _ok_payload(
-                    json.dumps({"type": "finish", "summary": "done"}),
+                    json.dumps({"type": "finish", "summary": "done", "objective_met": True}),
                     model="loopback-model",
                     usage=_USAGE,
                 ),

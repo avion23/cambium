@@ -161,7 +161,9 @@ class _SummaryFlushRouter:
         self.all_providers_dead = all_providers_dead
         self.malformed_summaries = malformed_summaries
         self.responses = (
-            list(responses) if responses is not None else ['{"type":"finish","summary":"done"}']
+            list(responses)
+            if responses is not None
+            else ['{"type":"finish","summary":"done","objective_met":true}']
         )
         self.prompts: list[dict[str, Any]] = []
         self.allow_model_substitution: list[bool] = []
@@ -459,7 +461,7 @@ def test_malformed_summary_defers_and_task_completes(tmp_path: Path) -> None:
         malformed_summaries=1,
         responses=[
             '{"type":"plan","steps":["continue"]}',
-            '{"type":"finish","summary":"done"}',
+            '{"type":"finish","summary":"done","objective_met":true}',
         ],
     )
 
@@ -642,7 +644,7 @@ def test_cached_heavy_turn_uses_paid_tokens_not_gross_prompt(tmp_path: Path) -> 
     router = _UsageScriptedRouter(
         [
             '{"type":"tool_call","name":"read_batch","arguments":{"paths":["alpha.txt"]}}',
-            '{"type":"finish","summary":"read the file"}',
+            '{"type":"finish","summary":"read the file","objective_met":true}',
         ],
         [
             {
@@ -675,7 +677,7 @@ def test_soft_cap_injects_one_forced_finalization(tmp_path: Path) -> None:
     router = _UsageScriptedRouter(
         [
             '{"type":"tool_call","name":"read_batch","arguments":{"paths":["alpha.txt"]}}',
-            '{"type":"finish","summary":"read the file"}',
+            '{"type":"finish","summary":"read the file","objective_met":false}',
         ],
         [
             {"prompt_tokens": 90, "completion_tokens": 0, "total_tokens": 90},
@@ -705,7 +707,7 @@ def test_finalization_may_use_scaled_headroom_past_hard_cap(tmp_path: Path) -> N
     router = _UsageScriptedRouter(
         [
             '{"type":"tool_call","name":"read_batch","arguments":{"paths":["alpha.txt"]}}',
-            '{"type":"finish","summary":"best available result"}',
+            '{"type":"finish","summary":"best available result","objective_met":false}',
         ],
         [
             {"prompt_tokens": 95, "completion_tokens": 0, "total_tokens": 95},
@@ -730,7 +732,7 @@ def test_max_turns_edge_injects_the_same_finalization_directive(tmp_path: Path) 
     router = _ScriptedRouter(
         [
             '{"type":"tool_call","name":"read_batch","arguments":{"paths":["alpha.txt"]}}',
-            '{"type":"finish","summary":"read the file"}',
+            '{"type":"finish","summary":"read the file","objective_met":false}',
         ]
     )
 
@@ -847,7 +849,7 @@ def test_plan_before_act_plan_read_batch_finish(tmp_path: Path) -> None:
             '{"type":"plan","steps":["read both files","finish"]}',
             '{"type":"tool_call","name":"read_batch","arguments":'
             '{"paths":["alpha.txt","beta.txt"]}}',
-            '{"type":"finish","summary":"read both files"}',
+            '{"type":"finish","summary":"read both files","objective_met":true}',
         ]
     )
 
@@ -898,11 +900,11 @@ def test_finish_after_failed_verification_is_rejected(tmp_path: Path) -> None:
             '{"type":"tool_call","name":"write_file","arguments":'
             '{"path":"note.txt","content":"hello\\n"}}',
             '{"type":"tool_call","name":"run_shell","arguments":{"cmd":["false"]}}',
-            '{"type":"finish","summary":"tests failed anyway"}',
-            '{"type":"finish","summary":"still unverified"}',
+            '{"type":"finish","summary":"tests failed anyway","objective_met":true}',
+            '{"type":"finish","summary":"still unverified","objective_met":true}',
             '{"type":"tool_call","name":"read_batch","arguments":{"paths":["note.txt"]}}',
             '{"type":"tool_call","name":"run_shell","arguments":{"cmd":["true"]}}',
-            '{"type":"finish","summary":"verified"}',
+            '{"type":"finish","summary":"verified","objective_met":true}',
         ]
     )
 
@@ -930,9 +932,9 @@ def test_finish_after_edit_without_verification_is_rejected(tmp_path: Path) -> N
             '{"type":"plan","steps":["edit alpha.txt"]}',
             '{"type":"tool_call","name":"edit_file","arguments":'
             '{"path":"alpha.txt","old_string":"alpha-content","new_string":"ALPHA"}}',
-            '{"type":"finish","summary":"edited, no tests available"}',
+            '{"type":"finish","summary":"edited, no tests available","objective_met":true}',
             '{"type":"tool_call","name":"run_shell","arguments":{"cmd":["true"]}}',
-            '{"type":"finish","summary":"edited and verified"}',
+            '{"type":"finish","summary":"edited and verified","objective_met":true}',
         ]
     )
 
@@ -960,7 +962,7 @@ def test_finish_after_verified_change_succeeds(tmp_path: Path) -> None:
             '{"type":"tool_call","name":"edit_file","arguments":'
             '{"path":"alpha.txt","old_string":"alpha-content","new_string":"ALPHA"}}',
             '{"type":"tool_call","name":"run_shell","arguments":{"cmd":["true"]}}',
-            '{"type":"finish","summary":"verified edit"}',
+            '{"type":"finish","summary":"verified edit","objective_met":true}',
         ]
     )
 
@@ -985,17 +987,17 @@ def test_plan_and_thought_round_trip_through_parser() -> None:
         '"thought":"need context"}'
     ) == {"type": "tool_call", "name": "read_batch", "arguments": {"paths": ["a.py"]}}
     assert worker._parse_agent_action(
-        '{"type":"finish","summary":"done","thought":"verified"}'
-    ) == {"type": "finish", "summary": "done"}
+        '{"type":"finish","summary":"done","objective_met":true,"thought":"verified"}'
+    ) == {"type": "finish", "summary": "done", "objective_met": True}
 
     # Concatenated actions: the FIRST complete object is parsed; the rest is
     # surfaced via _action_trailing.
     assert worker._parse_agent_action(
-        '{"type":"finish","summary":"done"}'
+        '{"type":"finish","summary":"done","objective_met":true}'
         '{"type":"tool_call","name":"read_batch","arguments":{"paths":["a.py"]}}'
-    ) == {"type": "finish", "summary": "done"}
+    ) == {"type": "finish", "summary": "done", "objective_met": True}
     assert worker._action_trailing(
-        '{"type":"finish","summary":"done"}'
+        '{"type":"finish","summary":"done","objective_met":true}'
         '{"type":"tool_call","name":"read_batch","arguments":{"paths":["a.py"]}}'
     ).startswith('{"type":"tool_call"')
     assert worker._action_trailing('{"type":"plan","steps":["a"]}') == ""
@@ -1007,7 +1009,9 @@ def test_plan_and_thought_round_trip_through_parser() -> None:
         '{"type":"plan","steps":["ok", 3]}',
         '{"type":"plan","steps":["ok"],"extra":1}',
         '{"type":"tool_call","name":"read_batch","arguments":{},"extra":1}',
-        '{"type":"finish","summary":"done","extra":1}',
+        '{"type":"finish","summary":"done","objective_met":true,"extra":1}',
+        '{"type":"finish","summary":"done"}',
+        '{"type":"finish","summary":"done","objective_met":"yes"}',
     ):
         with pytest.raises(ValueError):
             worker._parse_agent_action(bad)
@@ -1154,7 +1158,7 @@ def test_agent_loop_bounds_transcript_before_every_provider_call(tmp_path: Path)
             f'["large{index}.txt"]}}}}'
             for index in range(7)
         ]
-        + ['{"type":"finish","summary":"bounded transcript"}']
+        + ['{"type":"finish","summary":"bounded transcript","objective_met":true}']
     )
 
     outcome = asyncio.run(_drive_loop(config, worktree, router))
@@ -1309,7 +1313,7 @@ def test_lint_feedback_visible_in_transcript(
             '{"type":"tool_call","name":"write_file","arguments":'
             '{"path":"broken.py","content":"broken(:\\n"}}',
             '{"type":"tool_call","name":"run_shell","arguments":{"cmd":["true"]}}',
-            '{"type":"finish","summary":"wrote file"}',
+            '{"type":"finish","summary":"wrote file","objective_met":true}',
         ]
     )
 
@@ -1336,7 +1340,7 @@ def test_heartbeats_report_waiting_then_streaming_tail(tmp_path: Path) -> None:
     worktree = _make_worktree(repo)
     config = _agent_config(worktree)
     router = _StreamingScriptedRouter(
-        ['{"type":"finish","summary":"done"}'],
+        ['{"type":"finish","summary":"done","objective_met":true}'],
         [("text", "answer fragment")],
         delta_delay_s=0.15,
     )
@@ -1356,7 +1360,9 @@ def test_heartbeats_stay_waiting_without_provider_deltas(tmp_path: Path) -> None
     repo = tmp_path / "repo"
     worktree = _make_worktree(repo)
     config = _agent_config(worktree)
-    router = _StreamingScriptedRouter(['{"type":"finish","summary":"done"}'])
+    router = _StreamingScriptedRouter(
+        ['{"type":"finish","summary":"done","objective_met":true}']
+    )
 
     outcome, messages = asyncio.run(_drive_loop_with_heartbeats(config, worktree, router))
 
@@ -1373,7 +1379,7 @@ def test_heartbeat_tail_is_bounded_and_terminally_safe(tmp_path: Path) -> None:
     config = _agent_config(worktree)
     fragment = "\x1b[31m" + ("x" * 200) + "\x1b[0m\nnext"
     router = _StreamingScriptedRouter(
-        ['{"type":"finish","summary":"done"}'],
+        ['{"type":"finish","summary":"done","objective_met":true}'],
         [("output_text", fragment)],
         delta_delay_s=0.15,
     )
@@ -1451,7 +1457,7 @@ def test_consecutive_plan_actions_fail_fast_with_no_progress_reason(
             '{"type":"plan","steps":["a"]}',
             '{"type":"plan","steps":["a"]}',
             '{"type":"plan","steps":["e"]}',
-            '{"type":"finish","summary":"must never be reached"}',
+            '{"type":"finish","summary":"must never be reached","objective_met":true}',
         ]
     )
 
@@ -1476,7 +1482,7 @@ def test_plan_then_tool_resets_consecutive_plan_counter(tmp_path: Path) -> None:
             '{"type":"plan","steps":["read alpha again"]}',
             '{"type":"tool_call","name":"read_batch","arguments":{"paths":["alpha.txt"]}}',
             '{"type":"plan","steps":["one more plan before finishing"]}',
-            '{"type":"finish","summary":"read the file"}',
+            '{"type":"finish","summary":"read the file","objective_met":true}',
         ]
     )
 
@@ -1500,7 +1506,7 @@ def test_concatenated_actions_first_action_parsed_trailing_noted(tmp_path: Path)
             '{"type":"plan","steps":["read both files"]}'
             '{"type":"tool_call","name":"read_batch","arguments":'
             '{"paths":["alpha.txt","beta.txt"]}}',
-            '{"type":"finish","summary":"read both files"}',
+            '{"type":"finish","summary":"read both files","objective_met":true}',
         ]
     )
 
@@ -1526,7 +1532,7 @@ def test_three_invalid_actions_fail_fast_with_no_progress(tmp_path: Path) -> Non
             '{"type":"plan"',
             '{"type":"plan"',
             '{"type":"plan"',
-            '{"type":"finish","summary":"must never be reached"}',
+            '{"type":"finish","summary":"must never be reached","objective_met":true}',
         ]
     )
 
@@ -1727,7 +1733,7 @@ def test_requires_commit_doc_only_finish_publishes_commit(
             '{"type":"tool_call","name":"run_shell","arguments":{"cmd":['
             '"sh","-c","mkdir -p docs && printf \'%s\\n\' \'release notes\' '
             '> docs/release.md"]}}',
-            '{"type":"finish","summary":"wrote release notes"}',
+            '{"type":"finish","summary":"wrote release notes","objective_met":true}',
         ]
     )
 
@@ -1763,7 +1769,7 @@ def test_requires_commit_clean_finish_fails(tmp_path: Path) -> None:
     router = _ScriptedRouter(
         [
             '{"type":"plan","steps":["finish"]}',
-            '{"type":"finish","summary":"nothing changed"}',
+            '{"type":"finish","summary":"nothing changed","objective_met":true}',
         ]
     )
 

@@ -40,7 +40,9 @@ class _CannedOpenAIServer:
                     "index": 0,
                     "message": {
                         "role": "assistant",
-                        "content": json.dumps({"type": "finish", "summary": "canned response"}),
+                        "content": json.dumps(
+                            {"type": "finish", "summary": "canned response", "objective_met": True}
+                        ),
                     },
                     "finish_reason": "stop",
                 }

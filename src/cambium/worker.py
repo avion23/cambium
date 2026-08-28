@@ -72,7 +72,7 @@ agent loop instead: it loads the provider file named by the worker's absolute
 
     {"type": "plan", "steps": [<non-empty strings>]}
     {"type": "tool_call", "name": <schema name>, "arguments": {...}}
-    {"type": "finish", "summary": <non-empty summary>}
+    {"type": "finish", "summary": <non-empty summary>, "objective_met": <boolean>}
 
 The agent is instructed to emit a short ``plan`` action before any
 ``tool_call``; the plan is kept in the transcript. With durable context reuse,
@@ -157,7 +157,7 @@ from cambium.ipc import (
 from cambium.lint_diag import LintDiag
 from cambium.provider_config import AuthMode, load_providers
 from cambium.redact import Redactor, build_session_redactor
-from cambium.schemas import TOOL_SCHEMAS
+from cambium.schemas import FINISH_ACTION_SCHEMA, TOOL_SCHEMAS, validate_tool_call
 from cambium.summary_trunk import (
     SUMMARY_CONTROL_OPEN,
     SUMMARY_PROTOCOL_LINES,
@@ -188,8 +188,8 @@ MAX_SUMMARY_CHARS = 2_000
 MAX_NO_PROGRESS_ACTIONS = 2
 # Content identities keep repeated reads from masquerading as progress without
 # retaining unbounded tool output.
-MAX_PROGRESS_CONTENT_HASHES = 32
-MAX_PROGRESS_CONTENT_BYTES = 16 * 1024
+MAX_PROGRESS_CONTENT_HASHES = 8
+MAX_PROGRESS_CONTENT_BYTES = 256 * 1024
 _READ_RESULT_HEADER_RE = re.compile(r"(?m)^--- [^\r\n]* ---\r?\n")
 # Do not retry a provider that keeps returning invalid semantic summaries.
 MAX_CONSECUTIVE_COMPACTION_DEFERRALS = 2
@@ -256,8 +256,10 @@ FINAL_SYNTHESIS_HEADROOM_RATIO = 0.1
 FINAL_SYNTHESIS_MIN_HEADROOM_TOKENS = 4_000
 FINAL_SYNTHESIS_DIRECTIVE = (
     "Forced finalization: produce the final answer NOW with no further tool use. "
-    'Return exactly one terminal finish action: {"type":"finish","summary":"..."} '
-    "summarizing the work completed so far."
+    'Return exactly one terminal finish action: {"type":"finish","summary":"...",'
+    '"objective_met":<true|false>} where objective_met is true only when the task '
+    "objective was met, including a complete review that found no defect, summarizing the "
+    "work completed so far."
 )
 FINAL_SYNTHESIS_REMINDER = "Finalization active: return finish now."
 
@@ -1977,7 +1979,7 @@ def _parse_agent_action(content: str) -> dict[str, Any]:
     reasoning; the action fields themselves must be exact):
         {"type": "plan", "steps": [<non-empty strings>]}
         {"type": "tool_call", "name": <schema name>, "arguments": {...}}
-        {"type": "finish", "summary": <non-empty str>}
+        {"type": "finish", "summary": <non-empty str>, "objective_met": <boolean>}
     """
     text = content.strip()
     if not text:
@@ -2017,12 +2019,21 @@ def _parse_agent_action(content: str) -> dict[str, Any]:
             raise ValueError(f"unknown tool: {name!r}")
         return {"type": "tool_call", "name": name, "arguments": arguments}
     if action_type == "finish":
-        if not _action_keys(parsed, frozenset({"type", "summary"})):
-            raise ValueError("finish must carry exactly type/summary (plus optional thought)")
+        if not _action_keys(parsed, frozenset({"type", "summary", "objective_met"})):
+            raise ValueError(
+                "finish must carry exactly type/summary/objective_met (plus optional thought)"
+            )
+        schema_errors = validate_tool_call(FINISH_ACTION_SCHEMA, parsed)
+        if schema_errors:
+            raise ValueError(schema_errors[0])
         summary = parsed.get("summary")
         if not isinstance(summary, str) or not summary.strip():
             raise ValueError("finish summary must be a non-empty string")
-        return {"type": "finish", "summary": summary}
+        return {
+            "type": "finish",
+            "summary": summary,
+            "objective_met": parsed["objective_met"],
+        }
     raise ValueError(f"unknown agent action type: {action_type!r}")
 
 
@@ -2886,7 +2897,8 @@ def _build_agent_prompt(
             "In normal mode, return exactly one JSON object; it must be one action:",
             '  plan:      {"type": "plan", "steps": ["...", "..."]}',
             '  tool_call: {"type": "tool_call", "name": <tool name>, "arguments": {...}}',
-            '  finish:    {"type": "finish", "summary": <non-empty summary>}',
+            '  finish:    {"type": "finish", "summary": <non-empty summary>, '
+            '"objective_met": <boolean>}',
             'An optional "thought" field may be added to the same object to record your '
             "reasoning; the action fields above must remain exact.",
             "Your FIRST action must be a short plan: list the concrete steps before any tool_call.",
@@ -2903,7 +2915,8 @@ def _build_agent_prompt(
             '"run tests"]}',
             '  {"type": "tool_call", "name": "read_batch", '
             '"arguments": {"paths": ["src/a.py", "src/b.py"]}}',
-            '  {"type": "finish", "summary": "implemented and verified the change"}',
+            '  {"type": "finish", "summary": "implemented and verified the change", '
+            '"objective_met": true}',
             "Available tools:",
             json.dumps(tools, sort_keys=True),
         ]
@@ -3047,9 +3060,11 @@ def _progress_signature(content: str | None, action: Mapping[str, Any] | None = 
 
 
 def _progress_content_hash(content: str) -> str:
-    """Hash a bounded UTF-8 prefix of one tool result."""
+    """Hash a bounded UTF-8 result body and its full byte length."""
     content = _READ_RESULT_HEADER_RE.sub("", content)
-    return hashlib.sha256(content.encode("utf-8")[:MAX_PROGRESS_CONTENT_BYTES]).hexdigest()
+    encoded = content.encode("utf-8")
+    bounded = encoded[:MAX_PROGRESS_CONTENT_BYTES]
+    return hashlib.sha256(len(encoded).to_bytes(8, "big") + bounded).hexdigest()
 
 
 class _ProgressDetector:
@@ -3366,6 +3381,7 @@ def _write_checkpoint_file(
     commits_so_far: list[str],
     *,
     compaction_deferred: bool = False,
+    code_changed: bool = False,
 ) -> Path | None:
     if config.checkpoint_root is None:
         return None
@@ -3381,6 +3397,7 @@ def _write_checkpoint_file(
         "commits_so_far": commits_so_far,
         "workspace_hash": _workspace_hash(config.worktree),
         "compaction_deferred": compaction_deferred,
+        "code_changed": code_changed,
     }
     redactor = config.redactor or _checkpoint_redactor(config.provider_env_keys)
     payload = cast(dict[str, Any], redactor.redact_mapping(payload))
@@ -3417,6 +3434,7 @@ async def _persist_checkpoint(
     commits_so_far: list[str],
     *,
     compaction_deferred: bool = False,
+    code_changed: bool = False,
 ) -> None:
     path = await asyncio.to_thread(
         _write_checkpoint_file,
@@ -3426,6 +3444,7 @@ async def _persist_checkpoint(
         usage,
         commits_so_far,
         compaction_deferred=compaction_deferred,
+        code_changed=code_changed,
     )
     if path is not None:
         await _emit_checkpoint(writer, config, turn, path, commits_so_far)
@@ -4280,7 +4299,11 @@ def _load_turn_checkpoint(config: AgentConfig, checkpoint_ref: str) -> dict[str,
         }
     )
     checkpoint_keys = set(data)
-    if checkpoint_keys not in (expected_keys, expected_keys | {"compaction_deferred"}):
+    optional_keys = checkpoint_keys - expected_keys
+    if not expected_keys <= checkpoint_keys or not optional_keys <= {
+        "compaction_deferred",
+        "code_changed",
+    }:
         raise ContextForkError("checkpoint has an invalid key set")
     if data.get("schema") != CHECKPOINT_SCHEMA:
         raise ContextForkError("checkpoint schema mismatch")
@@ -4316,6 +4339,9 @@ def _load_turn_checkpoint(config: AgentConfig, checkpoint_ref: str) -> dict[str,
     compaction_deferred = data.get("compaction_deferred", False)
     if type(compaction_deferred) is not bool:
         raise ContextForkError("checkpoint compaction_deferred invalid")
+    code_changed = data.get("code_changed", False)
+    if type(code_changed) is not bool:
+        raise ContextForkError("checkpoint code_changed invalid")
     return {
         "turn": ref_turn,
         "transcript": transcript,
@@ -4323,6 +4349,7 @@ def _load_turn_checkpoint(config: AgentConfig, checkpoint_ref: str) -> dict[str,
         "commits_so_far": list(commits),
         "workspace_hash": workspace_hash,
         "compaction_deferred": compaction_deferred,
+        "code_changed": code_changed,
     }
 
 
@@ -4969,6 +4996,7 @@ async def _run_agent_loop(
                         cumulative_usage,
                         [],
                         compaction_deferred=True,
+                        code_changed=code_changed,
                     )
                 deferred_reason = str(exc).strip() or exc.__class__.__name__
                 if writer is not None:
@@ -5105,7 +5133,7 @@ async def _run_agent_loop(
             budget_new_tokens = restored_total if restored_total is not None else 0
             restored_prompt = _usage_prompt_tokens(cumulative_usage)
             previous_prompt_tokens = restored_prompt if restored_prompt is not None else 0
-            code_changed = current_hash != _sha256_hex(b"")
+            code_changed = turn_checkpoint["code_changed"]
             progress_detector.restore(transcript)
             first_turn = turn_checkpoint["turn"] + 1
             turn_checkpoint_resumed = True
@@ -5566,7 +5594,11 @@ async def _run_agent_loop(
                     context_continuation.append(action_message)
                     _sync_context_transcript()
                 await _maybe_restore_turn_context()
-                if forced_finalization and not code_changed:
+                if (
+                    forced_finalization
+                    and not code_changed
+                    and not action.get("objective_met", False)
+                ):
                     return _loop_result(
                         outcome,
                         "failed",
@@ -5815,6 +5847,7 @@ async def _run_agent_loop(
                     cumulative_usage,
                     [],
                     compaction_deferred=compaction_deferred,
+                    code_changed=code_changed,
                 )
                 last_turn_checkpoint = turn
             if config.context_reuse and name == "delegate" and tool_result.ok and not finalized:
@@ -6298,6 +6331,7 @@ def _finalize_worktree(
             loop_outcome.get("usage", {}),
             [sha],
             compaction_deferred=bool(loop_outcome.get("compaction_deferred", False)),
+            code_changed=True,
         )
         terminal_checkpoint = _write_terminal_epoch()
         outcome.update(

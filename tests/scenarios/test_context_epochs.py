@@ -567,7 +567,7 @@ def test_finish_cuts_terminal_epoch_when_context_reuse_enabled(
     worktree = _make_worktree(tmp_path / "repo")
     config = _agent_config(worktree, checkpoint_root=tmp_path / "ckpts", context_reuse=True)
     writer = _FakeWriter()
-    router = _ScriptedRouter(['{"type":"finish","summary":"done"}'])
+    router = _ScriptedRouter(['{"type":"finish","summary":"done","objective_met":true}'])
 
     outcome = asyncio.run(_drive_loop(config, worktree, router, writer))
 
@@ -602,7 +602,7 @@ def test_cast_rollover_is_durable_before_epoch_publication(tmp_path: Path) -> No
     router = _ScriptedRouter(
         [
             '{"type":"plan","steps":["inspect"]}',
-            '{"type":"finish","summary":"done"}',
+            '{"type":"finish","summary":"done","objective_met":true}',
         ]
     )
 
@@ -639,7 +639,7 @@ def test_no_suspend_when_context_reuse_disabled(tmp_path: Path) -> None:
     router = _ScriptedRouter(
         [
             _delegate_action("child-1"),
-            '{"type":"finish","summary":"done"}',
+            '{"type":"finish","summary":"done","objective_met":true}',
         ]
     )
 
@@ -673,7 +673,9 @@ def test_resume_seeds_transcript_and_usage_epoch(tmp_path: Path) -> None:
         },
     )
     writer = _FakeWriter()
-    router = _ScriptedRouter(['{"type":"finish","summary":"resumed and done"}'])
+    router = _ScriptedRouter(
+        ['{"type":"finish","summary":"resumed and done","objective_met":true}']
+    )
 
     outcome = asyncio.run(_drive_loop(resume_config, worktree, router, writer))
 
@@ -716,7 +718,7 @@ def test_resume_continuation_guard_preserves_checkpoint_prefix(
         [
             '{"type":"tool_call","name":"read_batch","arguments":{"paths":["alpha.txt"]}}',
             '{"type":"tool_call","name":"read_batch","arguments":{"paths":["alpha.txt"]}}',
-            '{"type":"finish","summary":"done"}',
+            '{"type":"finish","summary":"done","objective_met":true}',
         ]
     )
 
@@ -881,7 +883,9 @@ def test_rolling_compact_fold_advances_epoch_and_preserves_head(
         },
         max_turns=4,
     )
-    resume_router = _ScriptedRouter(['{"type":"finish","summary":"resumed"}'])
+    resume_router = _ScriptedRouter(
+        ['{"type":"finish","summary":"resumed","objective_met":true}']
+    )
     resume_outcome = asyncio.run(_drive_loop(resumed, worktree, resume_router, _FakeWriter()))
     assert resume_outcome["status"] == "succeeded"
     assert resume_router.prompts[0]["messages"][: len(folded.full_messages)] == (
@@ -1108,7 +1112,9 @@ def test_fork_reuses_epoch_prefix(tmp_path: Path) -> None:
         },
     )
     writer = _FakeWriter()
-    router = _ScriptedRouter(['{"type":"finish","summary":"forked and done"}'])
+    router = _ScriptedRouter(
+        ['{"type":"finish","summary":"forked and done","objective_met":true}']
+    )
 
     outcome = asyncio.run(_drive_loop(fork_config, worktree, router, writer))
 
@@ -1150,7 +1156,9 @@ def test_fork_fallback_reports_skip(tmp_path: Path) -> None:
         },
     )
     writer = _FakeWriter()
-    router = _ScriptedRouter(['{"type":"finish","summary":"legacy path"}'])
+    router = _ScriptedRouter(
+        ['{"type":"finish","summary":"legacy path","objective_met":true}']
+    )
 
     outcome = asyncio.run(_drive_loop(config, worktree, router, writer))
 
@@ -1187,7 +1195,9 @@ def test_fork_descriptor_artifact_mismatch_falls_back(tmp_path: Path) -> None:
         context_fork=fork_descriptor,
     )
     writer = _FakeWriter()
-    router = _ScriptedRouter(['{"type":"finish","summary":"legacy path"}'])
+    router = _ScriptedRouter(
+        ['{"type":"finish","summary":"legacy path","objective_met":true}']
+    )
 
     outcome = asyncio.run(_drive_loop(fork_config, worktree, router, writer))
 
