@@ -143,7 +143,7 @@ def test_same_task_generation_deduplicates_while_child_is_running(tmp_path: Path
     )
     runtime.set_session_tasks([parent])
     group = _RunningTaskGroup()
-    runtime._task_group = group
+    runtime._task_group = group  # type: ignore[assignment]
     events: list[dict[str, Any]] = []
     pin_started = asyncio.Event()
     pin_release = asyncio.Event()
@@ -219,7 +219,7 @@ def test_different_child_tasks_are_admitted_with_distinct_request_ids(
     runtime = _Runtime(session_dir, None)
     runtime.set_session_tasks([parent])
     group = _RunningTaskGroup()
-    runtime._task_group = group
+    runtime._task_group = group  # type: ignore[assignment]
     events: list[dict[str, Any]] = []
     release = asyncio.Event()
     created_specs: list[dict[str, Any]] = []
@@ -270,7 +270,7 @@ def test_new_generation_request_is_not_lost_to_stale_generation_filter(
     parent = _parent(session_dir, repo, base)
     runtime = _Runtime(session_dir, None)
     runtime.set_session_tasks([parent])
-    runtime._task_group = _RunningTaskGroup()
+    runtime._task_group = _RunningTaskGroup()  # type: ignore[assignment]
     events: list[dict[str, Any]] = []
 
     async def emit(kind: str, **payload: Any) -> None:
