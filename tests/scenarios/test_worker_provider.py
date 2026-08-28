@@ -492,7 +492,8 @@ def test_worker_agent_loop_read_edit_finish_one_fenced_commit(tmp_path, monkeypa
         )
         _enqueue('{"type":"tool_call","name":"run_shell","arguments":{"cmd":["true"]}}')
         _enqueue(
-            '{"type":"finish","summary":"read target.txt and appended a provider marker"}',
+            '{"type":"finish","summary":"read target.txt and appended a provider marker",'
+            '"objective_met":true}',
             usage={"prompt_tokens": 14, "completion_tokens": 7, "total_tokens": 21},
         )
 
@@ -592,7 +593,7 @@ def test_provider_no_change_succeeds_without_merge_and_preserves_session_result(
         config_path = _provider_config(tmp_path / "providers.json", server.base_url)
         _set_provider_env(monkeypatch, config_path)
         summary = "reviewed the repository and confirmed it already satisfies the request"
-        _enqueue(json.dumps({"type": "finish", "summary": summary}))
+        _enqueue(json.dumps({"type": "finish", "summary": summary, "objective_met": True}))
 
         session_dir = tmp_path / "session"
         repo = session_dir / "repo"
@@ -657,7 +658,7 @@ def test_worker_advanced_head_no_change_fails_and_main_unchanged(tmp_path, monke
             '{"type":"tool_call","name":"run_shell","arguments":{"cmd":'
             '["git","commit","--allow-empty","-m","unfenced-provider-commit"]}}'
         )
-        _enqueue('{"type":"finish","summary":"committed directly"}')
+        _enqueue('{"type":"finish","summary":"committed directly","objective_met":true}')
 
         session_dir = tmp_path / "session"
         repo = session_dir / "repo"
@@ -724,7 +725,10 @@ def test_worker_dirty_after_unfenced_provider_commit_fails_and_main_unchanged(
             '"new_string":"output-sentinel-7x9q\\n// dirty-after-commit\\n"}}'
         )
         _enqueue('{"type":"tool_call","name":"run_shell","arguments":{"cmd":["true"]}}')
-        _enqueue('{"type":"finish","summary":"committed directly then edited"}')
+        _enqueue(
+            '{"type":"finish","summary":"committed directly then edited",'
+            '"objective_met":true}'
+        )
 
         session_dir = tmp_path / "session"
         repo = session_dir / "repo"
@@ -813,7 +817,10 @@ def test_worker_delegate_tool_proposes_and_admits_child(tmp_path, monkeypatch) -
             '{"type":"tool_call","name":"delegate","arguments":' + json.dumps(delegate_args) + "}"
         )
         _enqueue('{"type":"tool_call","name":"run_shell","arguments":{"cmd":["true"]}}')
-        _enqueue('{"type":"finish","summary":"edited target.txt and delegated a child"}')
+        _enqueue(
+            '{"type":"finish","summary":"edited target.txt and delegated a child",'
+            '"objective_met":true}'
+        )
 
         task = _task(session_dir, repo, base, config_path)
         result = asyncio.run(
@@ -907,11 +914,12 @@ def test_worker_context_reuse_fork_resume_is_byte_exact(tmp_path, monkeypatch) -
             '{"type":"tool_call","name":"delegate","arguments":' + json.dumps(delegate_args) + "}"
         )
         _enqueue(
-            '{"type":"finish","summary":"child provider call completed"}',
+            '{"type":"finish","summary":"child provider call completed",'
+            '"objective_met":true}',
             usage=cache_hit_usage,
         )
         _enqueue(
-            '{"type":"finish","summary":"resumed after child completion"}',
+            '{"type":"finish","summary":"resumed after child completion","objective_met":true}',
             usage=cache_hit_usage,
         )
 
@@ -1100,7 +1108,7 @@ def test_worker_rejects_untrusted_provider_response_model(tmp_path, monkeypatch)
     try:
         config_path = _provider_config(tmp_path / "providers.json", server.base_url)
         _set_provider_env(monkeypatch, config_path)
-        _enqueue('{"type":"finish","summary":"done"}', model=sentinel)
+        _enqueue('{"type":"finish","summary":"done","objective_met":true}', model=sentinel)
 
         session_dir = tmp_path / "untrusted-model"
         repo = session_dir / "repo"
@@ -1141,7 +1149,7 @@ def test_run_session_provider_mode_sends_task_to_worker(tmp_path, monkeypatch) -
             '"new_string":"fixture\\n// provider-alpha\\n"}}'
         )
         _enqueue('{"type":"tool_call","name":"run_shell","arguments":{"cmd":["true"]}}')
-        _enqueue('{"type":"finish","summary":"edited target.txt"}')
+        _enqueue('{"type":"finish","summary":"edited target.txt","objective_met":true}')
 
         session_dir = tmp_path / "slice-provider"
         repo = session_dir / "repo"
@@ -1374,7 +1382,10 @@ def test_worker_missing_usable_token_counts_fail_closed(tmp_path) -> None:
     server = _FakeOpenAIServer()
     try:
         config_path = _provider_config(tmp_path / "providers.json", server.base_url)
-        _enqueue('{"type":"finish","summary":"done"}', usage={"weird": 1})
+        _enqueue(
+            '{"type":"finish","summary":"done","objective_met":true}',
+            usage={"weird": 1},
+        )
 
         session_dir = tmp_path / "session"
         repo = session_dir / "repo"
@@ -1402,7 +1413,7 @@ def test_worker_expired_wall_budget_bounded_failure(tmp_path) -> None:
     server = _FakeOpenAIServer()
     try:
         config_path = _provider_config(tmp_path / "providers.json", server.base_url)
-        _enqueue('{"type":"finish","summary":"done"}')
+        _enqueue('{"type":"finish","summary":"done","objective_met":true}')
         with REQUEST_LOCK:
             global RESPONSE_DELAY_S
             RESPONSE_DELAY_S = 0.15
@@ -1443,7 +1454,7 @@ def test_worker_run_shell_denied_never_executes(tmp_path) -> None:
             '{"type":"tool_call","name":"run_shell",'
             '"arguments":{"cmd":["touch","should-not-exist"]}}'
         )
-        _enqueue('{"type":"finish","summary":"shell command denied"}')
+        _enqueue('{"type":"finish","summary":"shell command denied","objective_met":true}')
 
         session_dir = tmp_path / "session"
         repo = session_dir / "repo"
@@ -1491,7 +1502,7 @@ def test_worker_malformed_and_unknown_actions_never_dispatch(tmp_path) -> None:
             '"new_string":"fixture\\n// provider-alpha\\n"}}'
         )
         _enqueue('{"type":"tool_call","name":"run_shell","arguments":{"cmd":["true"]}}')
-        _enqueue('{"type":"finish","summary":"edited target.txt"}')
+        _enqueue('{"type":"finish","summary":"edited target.txt","objective_met":true}')
 
         session_dir = tmp_path / "session"
         repo = session_dir / "repo"
@@ -1537,7 +1548,9 @@ def test_worker_ipc_observability_tool_event_checkpoint_heartbeat(tmp_path) -> N
             '"new_string":"fixture\\n// provider-alpha\\n"}}'
         )
         _enqueue('{"type":"tool_call","name":"run_shell","arguments":{"cmd":["true"]}}')
-        _enqueue('{"type":"finish","summary":"read and edited target.txt"}')
+        _enqueue(
+            '{"type":"finish","summary":"read and edited target.txt","objective_met":true}'
+        )
         with REQUEST_LOCK:
             global RESPONSE_DELAY_S
             # 0.5s tool window vs the 0.05s heartbeat cadence: under load the

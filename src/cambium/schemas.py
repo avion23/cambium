@@ -1,4 +1,4 @@
-"""JSON Schema definitions and validation for worker tool calls.
+"""JSON Schema definitions and validation for worker actions and tool calls.
 
 The module deliberately uses only the standard library.  The schemas are
 plain dictionaries so they can be passed directly to an LLM client, while
@@ -116,6 +116,28 @@ def _parameters(properties: dict[str, dict[str, Any]], required: list[str]) -> d
         "required": required,
         "additionalProperties": False,
     }
+
+
+FINISH_ACTION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "description": (
+        "End the task with a summary and objective_met set to true only when the task's "
+        "objective was met. Set objective_met to true for a complete review that found no "
+        "defect; it is required even when no code changed."
+    ),
+    "properties": {
+        "type": {"type": "string", "enum": ["finish"]},
+        "summary": {"type": "string", "minLength": 1, "description": "Completion summary."},
+        "objective_met": {
+            "type": "boolean",
+            "description": "Whether the task objective was met.",
+        },
+        # The worker strips this optional reasoning field before persistence.
+        "thought": {},
+    },
+    "required": ["type", "summary", "objective_met"],
+    "additionalProperties": False,
+}
 
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [

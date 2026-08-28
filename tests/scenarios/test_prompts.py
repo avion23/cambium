@@ -10,7 +10,16 @@ def test_prompt_constants_match_worker_text() -> None:
 
     assert prompts.PROMPTS_VERSION == 1
     assert prompts.SEMANTIC_SUMMARIZER == "\n".join(worker.SUMMARY_PROTOCOL_LINES)
-    assert system == prompts.CODING_AGENT + "\n[]"
+    expected = prompts.CODING_AGENT.replace(
+        '  finish:    {"type": "finish", "summary": <non-empty summary>}',
+        '  finish:    {"type": "finish", "summary": <non-empty summary>, '
+        '"objective_met": <boolean>}',
+    ).replace(
+        '{"type": "finish", "summary": "implemented and verified the change"}',
+        '{"type": "finish", "summary": "implemented and verified the change", '
+        '"objective_met": true}',
+    )
+    assert system == expected + "\n[]"
 
 
 def test_semantic_summarizer_preserves_findings_and_next_actions() -> None:

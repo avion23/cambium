@@ -163,7 +163,7 @@ class _Handler(BaseHTTPRequestHandler):
 def _finish_payload(summary: str, *, model: str, total_tokens: int) -> dict[str, Any]:
     """One strict ``finish`` agent action; ``total_tokens`` sizes the usage so
     the task's single call dominates the provider's debt utilization."""
-    content = json.dumps({"type": "finish", "summary": summary})
+    content = json.dumps({"type": "finish", "summary": summary, "objective_met": True})
     return {
         "id": "chatcmpl-balance",
         "object": "chat.completion",
@@ -718,7 +718,14 @@ def test_sticky_assigned_provider_binding_all_usage_events_on_assigned_provider(
                 ),
                 0.0,
             ),
-            (200, _ok_payload('{"type":"finish","summary":"read target.txt"}', model="m1"), 0.0),
+            (
+                200,
+                _ok_payload(
+                    '{"type":"finish","summary":"read target.txt","objective_met":true}',
+                    model="m1",
+                ),
+                0.0,
+            ),
         ]
     )
     try:

@@ -376,7 +376,10 @@ def test_codex_body_leading_developer_item_is_byte_stable_as_transcript_grows() 
             {"role": "user", "content": "tool read_batch ok=true"},
             {"role": "assistant", "content": '{"type": "tool_call", "name": "write_file"}'},
             {"role": "user", "content": "tool write_file ok=true"},
-            {"role": "assistant", "content": '{"type": "finish", "summary": "done"}'},
+            {
+                "role": "assistant",
+                "content": '{"type": "finish", "summary": "done", "objective_met": true}',
+            },
             {"role": "user", "content": "Continue."},
         ]
     }
