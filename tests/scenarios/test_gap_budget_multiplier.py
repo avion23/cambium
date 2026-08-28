@@ -111,7 +111,7 @@ def test_soft_cap_budget_multiplier_table(
 
     outcome = asyncio.run(_drive_loop(config, worktree, router))
 
-    assert outcome["status"] == ("succeeded" if succeeds else "failed")
+    assert outcome["status"] == ("succeeded" if succeeds and not finalizes else "failed")
     forced_messages = [
         message
         for prompt in router.prompts

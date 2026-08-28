@@ -186,6 +186,11 @@ MAX_SUMMARY_CHARS = 2_000
 # Consecutive non-novel actions (valid plans, tool calls, and
 # invalid/unparseable actions) before the agent loop fails fast.
 MAX_NO_PROGRESS_ACTIONS = 2
+# Content identities keep repeated reads from masquerading as progress without
+# retaining unbounded tool output.
+MAX_PROGRESS_CONTENT_HASHES = 32
+MAX_PROGRESS_CONTENT_BYTES = 16 * 1024
+_READ_RESULT_HEADER_RE = re.compile(r"(?m)^--- [^\r\n]* ---\r?\n")
 # Do not retry a provider that keeps returning invalid semantic summaries.
 MAX_CONSECUTIVE_COMPACTION_DEFERRALS = 2
 # A provider-boundary lookup may fall back to the unknown boundary, but never
@@ -3041,6 +3046,12 @@ def _progress_signature(content: str | None, action: Mapping[str, Any] | None = 
     return _cap_utf8(value, MAX_ACTION_CONTENT_BYTES)
 
 
+def _progress_content_hash(content: str) -> str:
+    """Hash a bounded UTF-8 prefix of one tool result."""
+    content = _READ_RESULT_HEADER_RE.sub("", content)
+    return hashlib.sha256(content.encode("utf-8")[:MAX_PROGRESS_CONTENT_BYTES]).hexdigest()
+
+
 class _ProgressDetector:
     """Detect repeated/empty output without treating tool use as progress."""
 
@@ -3048,6 +3059,7 @@ class _ProgressDetector:
         "max_no_progress_actions",
         "progress_window",
         "_recent_signatures",
+        "_recent_content_hashes",
         "no_progress_actions",
     )
 
@@ -3057,12 +3069,32 @@ class _ProgressDetector:
         self.max_no_progress_actions = max_no_progress_actions
         self.progress_window = progress_window
         self._recent_signatures: deque[str] = deque(maxlen=progress_window)
+        self._recent_content_hashes: deque[str] = deque(maxlen=MAX_PROGRESS_CONTENT_HASHES)
         self.no_progress_actions = 0
 
-    def observe(self, content: str | None = None, action: Mapping[str, Any] | None = None) -> bool:
+    def observe(
+        self,
+        content: str | None = None,
+        action: Mapping[str, Any] | None = None,
+        result_content: str | None = None,
+    ) -> bool:
         """Record one assistant result and return whether the loop is stalled."""
         signature = _progress_signature(content, action)
-        novel = bool(signature) and signature not in self._recent_signatures
+        repeated_read = False
+        if (
+            isinstance(action, Mapping)
+            and action.get("type") == "tool_call"
+            and action.get("name") in _READ_TOOL_NAMES
+            and isinstance(result_content, str)
+        ):
+            result_hash = _progress_content_hash(result_content)
+            repeated_read = result_hash in self._recent_content_hashes
+            self._recent_content_hashes.append(result_hash)
+        novel = (
+            bool(signature)
+            and signature not in self._recent_signatures
+            and not repeated_read
+        )
         self.no_progress_actions = 0 if novel else self.no_progress_actions + 1
         self._recent_signatures.append(signature)
         return (
@@ -3072,18 +3104,34 @@ class _ProgressDetector:
 
     def restore(self, messages: Sequence[Mapping[str, Any]]) -> None:
         """Seed recent assistant signatures from a resumed checkpoint."""
+        pending_read_result = False
         for message in messages:
+            if message.get("role") == "user" and pending_read_result:
+                content = message.get("content")
+                if isinstance(content, str):
+                    _, separator, result = content.partition("\n")
+                    self._recent_content_hashes.append(
+                        _progress_content_hash(result if separator else content)
+                    )
+                pending_read_result = False
+                continue
             if message.get("role") != "assistant":
                 continue
             content = message.get("content")
             if not isinstance(content, str):
+                pending_read_result = False
                 continue
             try:
                 action = _parse_agent_action(content)
             except ValueError:
                 signature = _progress_signature(content)
+                pending_read_result = False
             else:
                 signature = _progress_signature(None, action=action)
+                pending_read_result = (
+                    action.get("type") == "tool_call"
+                    and action.get("name") in _READ_TOOL_NAMES
+                )
             if signature:
                 self._recent_signatures.append(signature)
 
@@ -3149,6 +3197,16 @@ async def _emit_tool_event(
     )
 
 
+def _canonical_message_list_bytes(messages: Sequence[Mapping[str, Any]]) -> int:
+    """Return the byte size of one canonical message-list projection."""
+    if not messages:
+        return 0
+    try:
+        return len(_canonical_json_bytes(list(messages)))
+    except (RecursionError, TypeError, UnicodeEncodeError, ValueError):
+        return 0
+
+
 def _prompt_context_usage_fields(prompt: Mapping[str, Any], *, call_kind: str) -> dict[str, Any]:
     """Describe the active prompt shape without exposing prompt content.
 
@@ -3162,23 +3220,14 @@ def _prompt_context_usage_fields(prompt: Mapping[str, Any], *, call_kind: str) -
         isinstance(message, Mapping) for message in messages
     ):
         return {"call_kind": call_kind}
-    active_bytes = prompt_prefix_bytes(dict(prompt))
-    if active_bytes is None:
-        try:
-            active_bytes = len(_canonical_json_bytes(list(messages)))
-        except (TypeError, ValueError):
-            active_bytes = 0
+    active_bytes = _canonical_message_list_bytes(messages)
     try:
-        trunk, _ = partition_summary_trunk(messages)
+        trunk, raw_tail = partition_summary_trunk(messages)
     except SummaryTrunkError:
         trunk = list(messages[:2])
-    trunk_bytes = prompt_prefix_bytes({"messages": trunk})
-    if trunk_bytes is None:
-        try:
-            trunk_bytes = len(_canonical_json_bytes(trunk))
-        except (TypeError, ValueError):
-            trunk_bytes = 0
-    raw_tail_bytes = max(0, active_bytes - trunk_bytes)
+        raw_tail = list(messages[2:])
+    trunk_bytes = _canonical_message_list_bytes(trunk)
+    raw_tail_bytes = _canonical_message_list_bytes(raw_tail)
     summary_segments = max(0, len(trunk) - 2)
     return {
         "call_kind": call_kind,
@@ -4578,6 +4627,7 @@ async def _run_agent_loop(
         int(config.max_tokens * FINAL_SYNTHESIS_HEADROOM_RATIO),
     )
     finalized = False
+    forced_finalization = False
     finalization_grace_used = False
     transcript: list[dict[str, Any]] = []
     tools = _exposed_tool_schemas(config)
@@ -4666,7 +4716,7 @@ async def _run_agent_loop(
         return finalized or budget_new_tokens >= soft_cap or turn >= config.max_turns - 2
 
     def _arm_finalization(turn: int, *, turn_limit: bool = True) -> None:
-        nonlocal finalized, finalization_grace_used
+        nonlocal finalized, forced_finalization, finalization_grace_used
         if (
             base_messages is not None
             and config.resume is not None
@@ -4680,6 +4730,7 @@ async def _run_agent_loop(
         if budget_new_tokens < soft_cap and (not turn_limit or turn < config.max_turns - 2):
             return
         finalized = True
+        forced_finalization = True
         finalization_grace_used = False
         _append_context_message(_final_synthesis_message())
 
@@ -4690,10 +4741,12 @@ async def _run_agent_loop(
         _sync_context_transcript()
 
     def _observe_progress(
-        content: str | None = None, action: Mapping[str, Any] | None = None
+        content: str | None = None,
+        action: Mapping[str, Any] | None = None,
+        result_content: str | None = None,
     ) -> bool:
         nonlocal no_progress_actions
-        stalled = progress_detector.observe(content, action)
+        stalled = progress_detector.observe(content, action, result_content)
         no_progress_actions = progress_detector.no_progress_actions
         return stalled
 
@@ -5484,7 +5537,10 @@ async def _run_agent_loop(
                         transcript,
                     )
                 break
-            if _observe_progress(action=action) and not _finalization_due(turn):
+            read_action = (
+                action["type"] == "tool_call" and action.get("name") in _READ_TOOL_NAMES
+            )
+            if not read_action and _observe_progress(action=action) and not _finalization_due(turn):
                 return _no_progress_failure(turn)
             if action["type"] == "plan":
                 if base_messages is None:
@@ -5510,6 +5566,15 @@ async def _run_agent_loop(
                     context_continuation.append(action_message)
                     _sync_context_transcript()
                 await _maybe_restore_turn_context()
+                if forced_finalization and not code_changed:
+                    return _loop_result(
+                        outcome,
+                        "failed",
+                        "forced finalization: investigation incomplete, no changes made",
+                        turn,
+                        cumulative_usage,
+                        transcript,
+                    )
                 if code_changed and not verified_after_change:
                     reason = (
                         "finish rejected: you changed code but did not run a "
@@ -5706,6 +5771,11 @@ async def _run_agent_loop(
             elif name == "run_shell":
                 verification_failed = True
                 verified_after_change = False
+            result_content = (
+                tool_result.output
+                if tool_result.ok
+                else (tool_result.error or tool_result.output or "")
+            )
             observation = {"role": "user", "content": _tool_observation(name, tool_result)}
             if base_messages is None:
                 transcript.append(action_message)
@@ -5729,6 +5799,10 @@ async def _run_agent_loop(
                 continuation_suffix.append(state_message)
                 context_continuation.extend(copy.deepcopy(continuation_suffix))
                 _sync_context_transcript()
+            if read_action and _observe_progress(
+                action=action, result_content=result_content
+            ) and not _finalization_due(turn):
+                return _no_progress_failure(turn)
             await _maybe_restore_turn_context()
             _arm_finalization(turn)
             if writer is not None:
