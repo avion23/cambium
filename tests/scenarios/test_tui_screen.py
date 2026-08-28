@@ -167,6 +167,11 @@ def test_full_operator_rail_rows_have_stable_golden_strings() -> None:
     assert [text for _, text in rows] == [
         " LANES",
         "└●= root E3",
+        "",
+        "",
+        "",
+        "",
+        "   status active",
         "  └✗∅ child E3",
         " CONTEXT",
         " epoch e4 · segments 2",

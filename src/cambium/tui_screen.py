@@ -2632,6 +2632,8 @@ def _rail_detail_rows(
 ) -> list[tuple[str, str]]:
     """Render the selected run's live details as bounded child rows."""
     panel_width = max(1, width)
+    if panel_width < _RAIL_DETAIL_MIN_WIDTH:
+        return []
     phase_match = _ACTIVITY_PHASE_RE.match(
         sanitize_terminal_text(activity_line, single_line=True).strip()
     )
@@ -2654,7 +2656,8 @@ def _rail_detail_rows(
     if duration is None and phase_match is not None:
         duration = max(0.0, _usage_float(phase_match.group(2)))
 
-    tool = _side_clean(getattr(agent, "current_tool", None) or getattr(agent, "tool", "")).strip()
+    tool_value = getattr(agent, "current_tool", None) or getattr(agent, "tool", None)
+    tool = _side_clean(tool_value).strip() if tool_value is not None else ""
     running = _running_tool(activity_line)
     if running is not None:
         tool = running[0]
@@ -2667,22 +2670,19 @@ def _rail_detail_rows(
     tool_ok = getattr(agent, "tool_ok", None)
     if type(tool_ok) is not bool:
         tool_ok = None
-    if not (phase or tail or duration is not None or tool_duration_ms is not None):
-        return []
 
     status = _side_clean(getattr(agent, "status", None) or getattr(agent, "state", "")).strip()
     prefix = "   "
+    blank = _side_row("dim", "", panel_width)
     rows: list[tuple[str, str]] = []
-    if phase:
-        rows.append(
-            _side_row(
-                "active",
-                f"{prefix}phase {_ACTIVITY_PHASE_GLYPHS[phase]} {phase}",
-                panel_width,
-            )
+    rows.append(
+        _side_row(
+            "active" if phase else "dim",
+            f"{prefix}phase {_ACTIVITY_PHASE_GLYPHS[phase]} {phase}" if phase else "",
+            panel_width,
         )
-    if tail:
-        rows.append(_side_row("dim", f"{prefix}tail {tail}", panel_width))
+    )
+    rows.append(_side_row("dim", f"{prefix}tail {tail}" if tail else "", panel_width))
     if tool:
         entry = TranscriptEntry(
             role="tool",
@@ -2692,10 +2692,22 @@ def _rail_detail_rows(
             duration_ms=tool_duration_ms,
         )
         rows.append(_side_row("active", prefix + _tool_line(entry), panel_width))
-    if duration is not None:
-        rows.append(_side_row("dim", f"{prefix}duration {_fmt_secs(duration)}", panel_width))
-    if status:
-        rows.append(_side_row(status.casefold(), f"{prefix}status {status}", panel_width))
+    else:
+        rows.append(blank)
+    rows.append(
+        _side_row(
+            "dim",
+            f"{prefix}duration {_fmt_secs(duration)}" if duration is not None else "",
+            panel_width,
+        )
+    )
+    rows.append(
+        _side_row(
+            status.casefold() if status else "dim",
+            f"{prefix}status {status}" if status else "",
+            panel_width,
+        )
+    )
     return rows
 
 
