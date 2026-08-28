@@ -3576,6 +3576,7 @@ class Cockpit:
         self._frame_size: os.terminal_size | None = None
         self._frame_show_detail: bool | None = None
         self._activity_line = ""
+        self._activity_only_update = False
         self._show_detail = True
 
     @property
@@ -3745,6 +3746,9 @@ class Cockpit:
             input_label,
             activity_line,
         ) = request
+        previous_request = self._last_request
+        activity_only_update = self._activity_only_update
+        self._activity_only_update = False
         self._last_request = request
         self._activity_line = activity_line
         if self._last_size.lines < _FIXED_MIN_HEIGHT:
@@ -3838,11 +3842,19 @@ class Cockpit:
 
         if rows != self._last_primary_rows:
             # Conversation changes are committed as a fresh normal-buffer
-            # frame; status-only changes use the in-place path below.
-            self.stream.write("\x1b[1B\r\n")
-            self._fixed_frame = False
-            self._draw_now(request)
-            return
+            # frame. Heartbeat activity only changes the fixed rail cells;
+            # repaint those in place so elapsed seconds cannot move the frame.
+            activity_changed = (
+                activity_only_update
+                or (previous_request is not None and activity_line != previous_request[-1])
+            )
+            if conversation_rows == self._last_conversation_rows and activity_changed:
+                self._redraw_rail(conversation_rows, rail_rows)
+            else:
+                self.stream.write("\x1b[1B\r\n")
+                self._fixed_frame = False
+                self._draw_now(request)
+                return
         if status_rows != self._last_status_rows:
             self._redraw_bottom(request, status_rows)
         self._last_primary_rows = rows
@@ -4028,6 +4040,7 @@ class Cockpit:
         self._redraw_bottom(request, status_rows)
         self._last_request = request
         self._last_status_rows = status_rows
+        self._activity_only_update = True
 
     def move_to_input(self, *, label: str = "›", native: bool = False) -> None:
         if not self.enabled:

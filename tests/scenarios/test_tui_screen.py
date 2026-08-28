@@ -262,6 +262,47 @@ def test_operator_rail_change_uses_a_fresh_frame(monkeypatch) -> None:
     assert "\x1b[s" not in delta
 
 
+def test_activity_rail_ticks_redraw_in_place_at_duration_width_change(monkeypatch) -> None:
+    class _Tty(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    monkeypatch.setattr(
+        tui_screen.shutil,
+        "get_terminal_size",
+        lambda _fallback: os.terminal_size((110, 24)),
+    )
+    stream = _Tty()
+    cockpit = Cockpit(stream)
+    snapshot = _snapshot()
+    with cockpit:
+        cockpit.draw(
+            snapshot,
+            Transcript(),
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+            activity_line="◌ thinking 9s · read config",
+            turn_active=True,
+        )
+        first = stream.getvalue()
+        cockpit.draw_activity("◌ thinking 10s · read config")
+        cockpit.draw(
+            snapshot,
+            Transcript(),
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+            activity_line="◌ thinking 10s · read config",
+            turn_active=True,
+        )
+        delta = stream.getvalue()[len(first) :]
+
+    assert "┌ Cambium · conversation" not in delta
+    assert "duration 10s" in delta
+    assert "thinking 10s" in delta
+
+
 def test_replaying_events_after_snapshot_is_idempotent() -> None:
     events = (
         {
