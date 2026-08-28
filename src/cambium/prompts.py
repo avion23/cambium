@@ -7,6 +7,8 @@ and tool-schema text are intentionally not part of the fixed coding-agent
 constant.
 """
 
+from .summary_trunk import SUMMARY_FINDING_PRESERVATION_CONTRACT
+
 PROMPTS_VERSION = 1
 
 SEMANTIC_SUMMARIZER = "\n".join(
@@ -18,9 +20,12 @@ SEMANTIC_SUMMARIZER = "\n".join(
         "In summary mode, summarize only the raw messages after the last "
         "<cambium-summary-entry> and before the control block. Existing summary entries "
         "are immutable history: do not rewrite, restate, or summarize them.",
-        "Discard transient execution noise: malformed actions, routine command mistakes, "
-        "repeated reads, superseded outputs, and abandoned scratch plans. Preserve failed "
-        "approaches only when they constrain future work.",
+        SUMMARY_FINDING_PRESERVATION_CONTRACT,
+        "Discard only transient execution noise: malformed actions, routine command mistakes, "
+        "repeated reads, superseded outputs, and abandoned scratch plans. Never discard "
+        "preserved findings inside those messages: file:line references, defect hypotheses "
+        "or their evidence, approaches and outcomes, reproduction steps/status, expensive "
+        "tool findings, or open questions.",
         "Use decisions_superseded and facts_invalidated to make changed conclusions explicit.",
         "The summary_entry object has exactly: type, sequence, source_sha256, "
         "source_message_count, through_turn, objective, outcome, decisions_added, "

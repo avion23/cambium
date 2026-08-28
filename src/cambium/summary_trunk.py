@@ -36,6 +36,17 @@ SUMMARY_TRUNCATION_MARKER = "…[truncated]"
 _SUMMARY_DIGEST_LENGTH = 64
 _SUMMARY_DEEP_PLACEHOLDER = "<deep:unrepresentable>"
 
+SUMMARY_FINDING_PRESERVATION_CONTRACT = (
+    "PRESERVE concrete file:line references encountered; defect hypotheses with evidence "
+    "for/against; "
+    "approaches tried and outcomes; exact reproduction steps/status; expensive-to-re-derive "
+    "tool findings (measurements, test results, thresholds); and open questions with what "
+    "is needed to answer them. For open_items, state the NEXT ACTION precisely, naming "
+    "which file, symbol, or exact lines to inspect next and the evidence needed; never "
+    "repeat a vague goal verbatim. If evidence had to be dropped for space, add a "
+    "truncation note naming exactly what was dropped so it can be re-derived."
+)
+
 SUMMARY_LIST_FIELDS = (
     "decisions_added",
     "decisions_superseded",
@@ -67,9 +78,12 @@ SUMMARY_PROTOCOL_LINES = (
     "In summary mode, summarize only the raw messages after the last "
     "<cambium-summary-entry> and before the control block. Existing summary entries "
     "are immutable history: do not rewrite, restate, or summarize them.",
-    "Discard transient execution noise: malformed actions, routine command mistakes, "
-    "repeated reads, superseded outputs, and abandoned scratch plans. Preserve failed "
-    "approaches only when they constrain future work.",
+    SUMMARY_FINDING_PRESERVATION_CONTRACT,
+    "Discard only transient execution noise: malformed actions, routine command mistakes, "
+    "repeated reads, superseded outputs, and abandoned scratch plans. Never discard "
+    "preserved findings inside those messages: file:line references, defect hypotheses "
+    "or their evidence, approaches and outcomes, reproduction steps/status, expensive "
+    "tool findings, or open questions.",
     "Use decisions_superseded and facts_invalidated to make changed conclusions explicit.",
     "The summary_entry object has exactly: type, sequence, source_sha256, "
     "source_message_count, through_turn, objective, outcome, decisions_added, "
@@ -874,6 +888,7 @@ def build_summary_request(
         "source_sha256": expectation.source_sha256,
         "source_message_count": expectation.source_message_count,
         "through_turn": expectation.through_turn,
+        "finding_preservation_contract": SUMMARY_FINDING_PRESERVATION_CONTRACT,
     }
     control_message = {
         "role": "user",
@@ -972,6 +987,7 @@ def append_summary_entry(
 
 __all__ = [
     "SUMMARY_ENTRY_PROVENANCE",
+    "SUMMARY_FINDING_PRESERVATION_CONTRACT",
     "SUMMARY_PROTOCOL_LINES",
     "K0Projection",
     "SummaryEntry",

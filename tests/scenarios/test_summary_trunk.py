@@ -11,6 +11,7 @@ from cambium.summary_trunk import (
     SUMMARY_ENTRY_CLOSE,
     SUMMARY_ENTRY_OPEN,
     SUMMARY_ENTRY_PROVENANCE,
+    SUMMARY_FINDING_PRESERVATION_CONTRACT,
     SUMMARY_LIST_FIELDS,
     SUMMARY_MAX_ENTRY_BYTES,
     SUMMARY_MAX_ITEMS,
@@ -103,6 +104,21 @@ def test_summary_request_keeps_existing_trunk_as_exact_prefix() -> None:
     assert request["messages"][: len(trunk)] == trunk
     assert request["messages"][len(trunk) : -1] == TAIL_2
     assert expectation.sequence == 2
+
+
+def test_summary_request_control_is_json_with_finding_contract() -> None:
+    request, _expectation = build_summary_request(HEAD, TAIL_1, through_turn=2)
+    control_message = request["messages"][-1]
+    control_content = control_message["content"]
+    control = json.loads(
+        control_content.removeprefix("<cambium-summary-control>\n").removesuffix(
+            "\n</cambium-summary-control>"
+        )
+    )
+
+    assert control_message["role"] == "user"
+    assert control["type"] == "summarize_tail"
+    assert control["finding_preservation_contract"] == SUMMARY_FINDING_PRESERVATION_CONTRACT
 
 
 def test_legacy_checkpoint_tail_is_migrated_on_next_flush() -> None:
