@@ -424,7 +424,11 @@ def test_run_tool_validates_before_dispatch_and_rejects_unknown_tools(tmp_path: 
 def test_delegate_rejects_unknown_task_kind_at_call_time(tmp_path: Path) -> None:
     invalid = _run(
         "delegate",
-        {"child_task_id": "child", "kind": "message", "spec": {}},
+        {
+            "child_task_id": "child",
+            "kind": "message",
+            "spec": {"task": "child task"},
+        },
         ToolContext(tmp_path),
     )
     assert not invalid.ok
@@ -435,7 +439,11 @@ def test_delegate_rejects_unknown_task_kind_at_call_time(tmp_path: Path) -> None
 
     valid = _run(
         "delegate",
-        {"child_task_id": "child", "kind": "test", "spec": {}},
+        {
+            "child_task_id": "child",
+            "kind": "test",
+            "spec": {"task": "child task"},
+        },
         ToolContext(tmp_path),
     )
     assert valid.ok

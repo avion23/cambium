@@ -229,9 +229,17 @@ monitor never mutates or cancels the runtime.
 
 ## Source and executable proof
 
-- Frame construction and breakpoints: `src/cambium/tui_screen.py`
+- Frame construction and breakpoints: `_cockpit_frame_lines`, `_rail_width`,
+  `_rail_rows`, and `_side_sections` in `src/cambium/tui_screen.py`
+- Heartbeat phase state and emission: `AgentProgress` and `_heartbeat_loop` in
+  `src/cambium/worker.py`
+- Activity heartbeat and ticker rendering: `ActivityState._observe_heartbeat`,
+  `_activity_status`, `_activity_row`, and `render_cockpit` in
+  `src/cambium/tui_screen.py`
 - Session command loop and input handling: `src/cambium/tui.py`
 - Durable operator reducer: `src/cambium/observability.py`
 - Interactive manifest ownership: `src/cambium/interactive.py`
-- Width, resize, scrollback, paste, cancellation, shutdown, and reconnect:
-  `tests/scenarios/test_tui_*.py`
+- Width proof: `test_side_sections_are_width_safe` in
+  `tests/scenarios/test_tui_screen.py`
+- Resize, scrollback, paste, cancellation, shutdown, and reconnect proofs:
+  named `test_*` functions in `tests/scenarios/test_tui_*.py`
