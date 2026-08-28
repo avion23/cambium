@@ -685,7 +685,10 @@ def test_soft_cap_injects_one_forced_finalization(tmp_path: Path) -> None:
 
     outcome = asyncio.run(_drive_loop(config, worktree, router))
 
-    assert outcome["status"] == "succeeded"
+    assert outcome["status"] == "failed"
+    assert outcome["failure_reason"] == (
+        "forced finalization: investigation incomplete, no changes made"
+    )
     assert len(router.prompts) == 2
     injected = [
         message
@@ -712,7 +715,10 @@ def test_finalization_may_use_scaled_headroom_past_hard_cap(tmp_path: Path) -> N
 
     outcome = asyncio.run(_drive_loop(config, worktree, router))
 
-    assert outcome["status"] == "succeeded"
+    assert outcome["status"] == "failed"
+    assert outcome["failure_reason"] == (
+        "forced finalization: investigation incomplete, no changes made"
+    )
     assert worker.FINAL_SYNTHESIS_MIN_HEADROOM_TOKENS == 4_000
     assert 4_000 > config.max_tokens
 
@@ -730,7 +736,10 @@ def test_max_turns_edge_injects_the_same_finalization_directive(tmp_path: Path) 
 
     outcome = asyncio.run(_drive_loop(config, worktree, router))
 
-    assert outcome["status"] == "succeeded"
+    assert outcome["status"] == "failed"
+    assert outcome["failure_reason"] == (
+        "forced finalization: investigation incomplete, no changes made"
+    )
     assert len(router.prompts) == 2
     assert (
         sum(
@@ -1131,11 +1140,13 @@ def test_agent_loop_bounds_transcript_before_every_provider_call(tmp_path: Path)
     worktree = _make_worktree(repo)
     (worktree / "large.txt").write_text("x" * 20_000, encoding="utf-8")
     budget = 5_000
-    config = replace(_agent_config(worktree), max_transcript_chars=budget)
-    # Distinct paths keep every action novel under content-based progress
-    # detection while still growing the transcript past the budget.
+    config = replace(_agent_config(worktree, max_turns=20), max_transcript_chars=budget)
+    # Distinct contents keep every action novel while still growing the
+    # transcript past the budget.
     for index in range(8):
-        (worktree / f"large{index}.txt").write_text("x" * 20_000, encoding="utf-8")
+        (worktree / f"large{index}.txt").write_text(
+            f"file-{index}\n" + "x" * 20_000, encoding="utf-8"
+        )
     router = _ScriptedRouter(
         ['{"type":"plan","steps":["inspect repeatedly","finish"]}']
         + [
