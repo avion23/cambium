@@ -103,7 +103,6 @@ import errno
 import hashlib
 import json
 import math
-import os
 import random
 import re
 import socket
@@ -664,6 +663,7 @@ class ProviderConfig:
     tier: ProviderTier
     base_url: str
     api_key_env: str
+    api_key: str | None = field(default=None, repr=False)
     timeout_s: float = 30.0
     max_retries: int = 2
     # ``rpm`` is the legacy transport-rate spelling.  New routing code uses
@@ -773,7 +773,7 @@ class ProviderConfig:
 
 def _attempt_budget(base: float, provider: ProviderConfig) -> float:
     """Return the per-attempt budget for a provider's reasoning effort."""
-    return base * _REASONING_EFFORT_MULTIPLIERS.get(provider.reasoning_effort, 1.0)
+    return base * _REASONING_EFFORT_MULTIPLIERS.get(provider.reasoning_effort or "", 1.0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -3029,7 +3029,7 @@ class Diffundo:
                 ProviderOutcome.AUTH_ERROR,
                 "http transport is allowed only for loopback hosts; remote providers require https",
             )
-        api_key = os.environ.get(provider.api_key_env)
+        api_key = provider.api_key
         if not api_key:
             raise ProviderError(
                 provider.name,
@@ -3432,7 +3432,7 @@ class Diffundo:
                     + (credential.account_id or "").encode("utf-8")
                 )
         else:
-            api_key = os.environ.get(provider.api_key_env)
+            api_key = provider.api_key
             material = (
                 b"api-key:missing" if api_key is None else b"api-key:" + api_key.encode("utf-8")
             )
