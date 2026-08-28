@@ -90,6 +90,7 @@ _PROVIDER_FIELDS = frozenset(
         "name",
         "tier",
         "base_url",
+        "api_key",
         "api_key_env",
         "required",
         "timeout_s",
@@ -182,6 +183,7 @@ class _ProviderMapping(TypedDict):
     name: str
     tier: str
     base_url: str
+    api_key: str | None
     api_key_env: str
     required: bool
     timeout_s: float
@@ -294,6 +296,7 @@ class ProviderEnvSpec:
     name: str
     api_key_env: str
     required: bool
+    api_key: str | None = None
 
 
 def _error(location: str, message: str) -> ValueError:
@@ -429,7 +432,7 @@ def _sanitize_quarantine_entry(entry: object) -> object:
                 if isinstance(output, dict):
                     output[safe_key] = safe_child
                 else:
-                    output.append(safe_child)
+                    cast(list[object], output).append(safe_child)
                 active.add(id(child))
                 nodes += 1
                 frames.append(
@@ -448,7 +451,7 @@ def _sanitize_quarantine_entry(entry: object) -> object:
         if isinstance(output, dict):
             output[safe_key] = safe_child
         else:
-            output.append(safe_child)
+            cast(list[object], output).append(safe_child)
     return root
 
 
@@ -764,6 +767,10 @@ def _validate_api_key_env(value: object, location: str, provider: str) -> str:
         raise _error(location, "must be the derived CAMBIUM provider environment name") from exc
 
 
+def _validate_api_key(value: object, location: str) -> str:
+    return _require_string(value, location)
+
+
 def _diffundo_types() -> tuple[type[ProviderConfig], type[ProviderTier]]:
     from .diffundo import ProviderConfig, ProviderTier
 
@@ -931,6 +938,11 @@ def _validate_provider_mapping(raw: object, index: int) -> _ProviderMapping:
         raise _error(f"{location}.tier", f"invalid tier {tier_value!r}; expected {choices}")
 
     auth = _parse_auth_mode(raw, location)
+    api_key = (
+        _validate_api_key(raw["api_key"], f"{location}.api_key")
+        if "api_key" in raw
+        else None
+    )
     protocol = _parse_protocol(raw, location)
     if protocol is Protocol.CODEX_RESPONSES and auth is not AuthMode.CODEX_CHATGPT:
         raise _error(
@@ -1161,6 +1173,7 @@ def _validate_provider_mapping(raw: object, index: int) -> _ProviderMapping:
         "name": name,
         "tier": tier_value,
         "base_url": base_url,
+        "api_key": api_key,
         "api_key_env": api_key_env,
         "required": required,
         "timeout_s": timeout_s,
@@ -1274,6 +1287,7 @@ def validate_provider_specs(raw: object) -> tuple[ProviderEnvSpec, ...]:
             name=mapping["name"],
             api_key_env=mapping["api_key_env"],
             required=mapping["required"],
+            api_key=mapping["api_key"],
         )
         for mapping in _validated_provider_mappings(raw)
     )
@@ -1295,6 +1309,7 @@ def _provider_from_values(values: _ProviderMapping, index: int) -> ProviderConfi
         "name": values["name"],
         "tier": tier,
         "base_url": values["base_url"],
+        "api_key": values["api_key"],
         "api_key_env": values["api_key_env"],
         "timeout_s": values["timeout_s"],
         "max_retries": values["max_retries"],
@@ -1387,6 +1402,7 @@ def load_provider_specs(source: str | Path | None = None) -> tuple[ProviderEnvSp
             name=mapping["name"],
             api_key_env=mapping["api_key_env"],
             required=mapping["required"],
+            api_key=mapping["api_key"],
         )
         for mapping in mappings
     )
@@ -1472,14 +1488,12 @@ def select_provider(
 def env_report(
     providers: Sequence[ProviderConfig | ProviderEnvSpec],
 ) -> dict[str, bool]:
-    """Return whether each provider's key environment variable is usable.
+    """Return whether each provider's file-backed key is usable.
 
-    A variable is usable only when set to a non-empty value, matching
-    Diffundo's call-time check: ``_post_sync`` rejects an empty key with
-    ``ProviderOutcome.AUTH_ERROR``. The report contains only provider names and
-    booleans. It never returns an environment-variable name or value.
+    The report contains only provider names and booleans. It never returns an
+    environment-variable name or credential value.
     """
-    return {provider.name: bool(os.environ.get(provider.api_key_env)) for provider in providers}
+    return {provider.name: bool(provider.api_key) for provider in providers}
 
 
 __all__ = [

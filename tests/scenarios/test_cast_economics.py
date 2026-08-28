@@ -22,6 +22,7 @@ def _provider(**overrides: object) -> dict[str, object]:
         "tier": "fast",
         "base_url": "http://127.0.0.1:1",
         "api_key_env": "CAMBIUM_PROVIDER_CACHE_PROVIDER_API_KEY",
+        "api_key": "sk-cache-provider",
         "model": "cache-model",
     }
     value.update(overrides)

@@ -157,6 +157,7 @@ def _config(
         tier=ProviderTier.FAST,
         base_url=server.base_url,
         api_key_env=env_name,
+        api_key=f"sk-storm-{name}",
         timeout_s=timeout_s,
         max_retries=max_retries,
         rpm=rpm,
@@ -165,11 +166,6 @@ def _config(
         cooldown_s=cooldown_s,
         quota_windows=quota_windows,
     )
-
-
-def _set_key(monkeypatch: pytest.MonkeyPatch, env_name: str) -> None:
-    monkeypatch.setenv(env_name, "sk-storm-test")
-
 
 def _quota_state(path: str, provider: str) -> tuple[int, int, int]:
     """Return pending reservations, reconciled reservations, used requests."""
@@ -221,7 +217,6 @@ def test_429_storm_cools_lane_releases_quota_and_replays_idempotently(
     )
     quota_db = tmp_path / "quota.db"
     monkeypatch.setenv("CAMBIUM_QUOTA_DB", str(quota_db))
-    _set_key(monkeypatch, "K_STORM")
     provider = _config(
         "storm-provider",
         server,
@@ -310,7 +305,6 @@ def test_429_storm_respects_wall_and_retry_budgets(
     )
     quota_db = tmp_path / "quota.db"
     monkeypatch.setenv("CAMBIUM_QUOTA_DB", str(quota_db))
-    _set_key(monkeypatch, "K_BOUNDED_STORM")
     max_retries = 50
     router = Diffundo(
         (
@@ -372,7 +366,6 @@ def test_mixed_storm_policy_refusal_is_terminal_but_health_neutral(monkeypatch, 
     )
     quota_db = tmp_path / "quota.db"
     monkeypatch.setenv("CAMBIUM_QUOTA_DB", str(quota_db))
-    _set_key(monkeypatch, "K_MIXED_STORM")
     provider = _config(
         "mixed-storm",
         server,
@@ -443,8 +436,6 @@ def test_terminal_dead_lane_does_not_starve_optimizer_style_burst(monkeypatch) -
     """A dead incumbent is not retried ahead of a healthy burst lane."""
     dead = _StormServer([_Behavior(503, _error_payload("endpoint unavailable"))])
     healthy = _StormServer([_Behavior(200, _ok_payload("healthy"))])
-    _set_key(monkeypatch, "K_BURST_DEAD")
-    _set_key(monkeypatch, "K_BURST_HEALTHY")
     dead_provider = _config(
         "burst-dead",
         dead,

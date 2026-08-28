@@ -174,6 +174,7 @@ def _provider_config(path: Path, base_url: str) -> Path:
                         "tier": "fast",
                         "base_url": base_url,
                         "api_key_env": PROVIDER_KEY,
+                        "api_key": PROVIDER_SECRET,
                         "timeout_s": 2.0,
                         "max_retries": 0,
                         "rpm": 120,
@@ -201,6 +202,7 @@ def _weighted_provider_config(path: Path) -> Path:
                         "tier": "fast",
                         "base_url": "http://127.0.0.1:1",
                         "api_key_env": f"CAMBIUM_PROVIDER_{name.upper()}_API_KEY",
+                        "api_key": PROVIDER_SECRET,
                         "timeout_s": 1.0,
                         "max_retries": 0,
                         "rpm": 120,
@@ -249,7 +251,6 @@ def _task(session_dir: Path, repo: Path, base: str, config_path: Path) -> dict[s
 
 def _set_provider_env(monkeypatch: pytest.MonkeyPatch, config_path: Path) -> None:
     monkeypatch.setenv("CAMBIUM_PROVIDERS", str(config_path.resolve()))
-    monkeypatch.setenv(PROVIDER_KEY, PROVIDER_SECRET)
     monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
     monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
     monkeypatch.setenv(
@@ -261,7 +262,6 @@ def _set_provider_env(monkeypatch: pytest.MonkeyPatch, config_path: Path) -> Non
 def _worker_env(config_path: Path, session_dir: Path) -> dict[str, str]:
     env = dict(os.environ)
     env["CAMBIUM_PROVIDERS"] = str(config_path.resolve())
-    env[PROVIDER_KEY] = PROVIDER_SECRET
     env["NO_PROXY"] = "127.0.0.1,localhost"
     env["no_proxy"] = "127.0.0.1,localhost"
     env["PYTHONPATH"] = os.pathsep.join(
@@ -474,7 +474,6 @@ def test_worker_agent_loop_read_edit_finish_one_fenced_commit(tmp_path, monkeypa
         config_path = _provider_config(project / "providers.json", server.base_url)
         monkeypatch.chdir(project)
         monkeypatch.setenv("CAMBIUM_PROVIDERS", str(config_path))
-        monkeypatch.setenv(PROVIDER_KEY, PROVIDER_SECRET)
         monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
         monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
         monkeypatch.setenv(
@@ -781,7 +780,6 @@ def test_worker_delegate_tool_proposes_and_admits_child(tmp_path, monkeypatch) -
         config_path = _provider_config(project / "providers.json", server.base_url)
         monkeypatch.chdir(project)
         monkeypatch.setenv("CAMBIUM_PROVIDERS", str(config_path))
-        monkeypatch.setenv(PROVIDER_KEY, PROVIDER_SECRET)
         monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
         monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
         monkeypatch.setenv(

@@ -8,8 +8,6 @@ import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, cast
 
-import pytest
-
 from cambium.diffundo import ProviderConfig, ProviderTier
 
 
@@ -154,11 +152,19 @@ def _config(
     model: str = "",
     **overrides: Any,
 ) -> ProviderConfig:
-    base: dict[str, Any] = dict(timeout_s=5.0, max_retries=0, rpm=60, enabled=True, model=model)
+    base: dict[str, Any] = dict(
+        timeout_s=5.0,
+        max_retries=0,
+        rpm=60,
+        enabled=True,
+        model=model,
+        api_key=f"sk-test-{env}",
+    )
     base.update(overrides)
-    return ProviderConfig(name=name, tier=tier, base_url=server.base_url, api_key_env=env, **base)
-
-
-def _set_keys(monkeypatch: pytest.MonkeyPatch, *names: str) -> None:
-    for name in names:
-        monkeypatch.setenv(name, f"sk-test-{name}")
+    return ProviderConfig(
+        name=name,
+        tier=tier,
+        base_url=server.base_url,
+        api_key_env=env,
+        **base,
+    )

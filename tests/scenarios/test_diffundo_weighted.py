@@ -28,7 +28,7 @@ import asyncio
 import time
 from typing import cast
 
-from diffundo_helpers import PROMPT, FakeServer, _config, _error_payload, _ok_payload, _set_keys
+from diffundo_helpers import PROMPT, FakeServer, _config, _error_payload, _ok_payload
 
 from cambium.diffundo import (
     CallResult,
@@ -127,7 +127,6 @@ def test_quality_score_ranks_measured_data_and_neutral_defaults() -> None:
 
 def test_measured_debt_reorders_equal_priority_candidates(monkeypatch) -> None:
     codex, zai, opencode_go = _three_servers()
-    _set_keys(monkeypatch, "K_CODEX", "K_ZAI", "K_OPG")
     try:
         # config order carries codex FIRST, but all three are equal priority 0
         router = Diffundo(
@@ -149,7 +148,6 @@ def test_measured_debt_reorders_equal_priority_candidates(monkeypatch) -> None:
 def test_config_priority_order_preserved_without_debt(monkeypatch) -> None:
     first = FakeServer([(200, _ok_payload("first"), 0.0)])
     second = FakeServer([(200, _ok_payload("second"), 0.0)])
-    _set_keys(monkeypatch, "K_1", "K_2")
     try:
         debt_options: tuple[dict[str, ProviderDebt] | None, ...] = (None, {})
         for debt in debt_options:
@@ -174,7 +172,6 @@ def test_unknown_provider_keeps_priority_position_not_bottom(monkeypatch) -> Non
     unknown = FakeServer([(200, _ok_payload("unknown"), 0.0)])
     bad = FakeServer([(200, _ok_payload("bad"), 0.0)])
     later = FakeServer([(200, _ok_payload("later"), 0.0)])
-    _set_keys(monkeypatch, "K_UNKNOWN", "K_BAD", "K_LATER")
     now = time.time()
     debt = {
         "bad": ProviderDebt(
@@ -217,7 +214,6 @@ def test_cascade_prefers_best_measured_provider_then_next_best(monkeypatch) -> N
     opencode_go = FakeServer(
         [(200, _ok_payload("opencode-go answer"), 0.0), (500, _error_payload("opg down"), 0.0)]
     )
-    _set_keys(monkeypatch, "K_CODEX", "K_ZAI", "K_OPG")
     router = Diffundo(
         (
             _config("codex", codex, "K_CODEX"),
@@ -262,7 +258,6 @@ def test_cooldown_skips_best_quality_provider(monkeypatch) -> None:
     # quality.
     good = FakeServer([(500, _error_payload("good down"), 0.0)])
     bad = FakeServer([(200, _ok_payload("bad answer"), 0.0)])
-    _set_keys(monkeypatch, "K_GOOD", "K_BAD")
     now = time.time()
     debt = {
         "p_good": ProviderDebt(
@@ -309,7 +304,6 @@ def test_primary_association_leads_despite_worse_quality(monkeypatch) -> None:
     # the quality weight refines order among the remaining candidates and must
     # never override the task's associated provider (prompt-prefix caching).
     codex, zai, opencode_go = _three_servers()
-    _set_keys(monkeypatch, "K_CODEX", "K_ZAI", "K_OPG")
     router = Diffundo(
         (
             _config("codex", codex, "K_CODEX"),

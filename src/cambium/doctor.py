@@ -269,6 +269,7 @@ class _DoctorProvider:
     name: str
     required: bool
     api_key_env: str
+    api_key: str | None
     auth: AuthMode | None
     model: str
 
@@ -291,6 +292,7 @@ def _doctor_providers(
             spec.name,
             spec.required,
             spec.api_key_env,
+            getattr(provider, "api_key", spec.api_key),
             getattr(provider, "auth", None),
             str(getattr(provider, "model", "") or ""),
         )
@@ -351,7 +353,7 @@ def check_provider_env(cwd: Path) -> tuple[Status, str]:
             p.name: (
                 _oauth_session_present(oauth_store, p.name)
                 if p.auth is AuthMode.CODEX_CHATGPT
-                else bool(os.environ.get(p.api_key_env))
+                else bool(p.api_key)
             )
             for p in providers
         }
@@ -536,7 +538,7 @@ def check_provider_runnable(cwd: Path, path: Path | None = None) -> tuple[Status
             p.name: (
                 _oauth_session_present(oauth_store, p.name)
                 if p.auth is AuthMode.CODEX_CHATGPT
-                else bool(os.environ.get(p.api_key_env)) or p.name in auth_names
+                else bool(p.api_key) or p.name in auth_names
             )
             for p in providers
         }

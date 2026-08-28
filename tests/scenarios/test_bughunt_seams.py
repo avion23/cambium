@@ -16,7 +16,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
-from diffundo_helpers import PROMPT, FakeServer, _config, _ok_payload, _set_keys
+from diffundo_helpers import PROMPT, FakeServer, _config, _ok_payload
 
 from cambium import tui, worker
 from cambium.diffundo import Diffundo, ProviderTier
@@ -233,7 +233,6 @@ def test_bound_provider_lease_rotates_on_timeout_failover(monkeypatch: pytest.Mo
         ]
     )
     sibling = FakeServer([(200, _ok_payload("fallback", model="m-b"), 0.0)])
-    _set_keys(monkeypatch, "BUGHUNT_A", "BUGHUNT_B")
     router = Diffundo(
         (
             _config("a", primary, "BUGHUNT_A", model="m-a", timeout_s=0.03, priority=0),
@@ -270,7 +269,6 @@ def test_timeout_fallback_does_not_reclaim_a_recovered_old_provider(
             (200, _ok_payload("stay-on-sibling", model="m-b"), 0.0),
         ]
     )
-    _set_keys(monkeypatch, "BUGHUNT_A2", "BUGHUNT_B2")
     router = Diffundo(
         (
             _config("a", primary, "BUGHUNT_A2", model="m-a", timeout_s=0.03, priority=0),

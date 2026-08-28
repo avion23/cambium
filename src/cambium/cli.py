@@ -1472,8 +1472,7 @@ def _live_architectus_llm(
             account_id=account_id,
         )
     else:
-        env_name = selected.api_key_env
-        if not os.environ.get(env_name):
+        if not selected.api_key:
             raise ValueError("API-key Architectus calls require a credential-source interface")
 
     diffundo = Diffundo(providers, **options)

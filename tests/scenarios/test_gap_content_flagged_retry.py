@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from diffundo_helpers import FakeServer, _config, _ok_payload, _set_keys
+from diffundo_helpers import FakeServer, _config, _ok_payload
 
 from cambium import worker
 from cambium.diffundo import (
@@ -99,7 +99,6 @@ class _ObservedDiffundo(Diffundo):
 
 def _summary_server(monkeypatch: pytest.MonkeyPatch, behaviors: list[Any]) -> FakeServer:
     server = FakeServer(behaviors)
-    _set_keys(monkeypatch, "K_SUMMARY")
     return server
 
 

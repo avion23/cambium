@@ -22,6 +22,7 @@ def _provider(name: str, model: str) -> ProviderConfig:
         tier=ProviderTier.FAST,
         base_url="http://127.0.0.1:1",
         api_key_env=f"KEY_{name.upper()}",
+        api_key=f"sk-edges-{name}",
         model=model,
     )
 

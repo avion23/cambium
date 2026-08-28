@@ -41,6 +41,7 @@ def _pc(name: str, model: str, **overrides: Any) -> ProviderConfig:
         tier=ProviderTier.FAST,
         base_url="http://127.0.0.1:1",
         api_key_env=f"CAMBIUM_PROVIDER_{name.upper()}_API_KEY",
+        api_key=f"sk-scored-{name}",
         model=model,
     )
     base.update(overrides)
@@ -59,6 +60,7 @@ def _config_file(path: Path, providers: list[tuple[str, str, str, int]]) -> Path
                         "tier": tier,
                         "base_url": "http://127.0.0.1:1",
                         "api_key_env": f"CAMBIUM_PROVIDER_{name.upper()}_API_KEY",
+                        "api_key": f"sk-scored-{name}",
                         "rpm": rpm,
                         "enabled": True,
                         "model": model,
@@ -384,8 +386,6 @@ def test_task_assigned_event_carries_requirements(tmp_path, monkeypatch) -> None
     from cambium.supervisor import read_events, run_plan
 
     server = _FakeServer([(200, _finish_payload("m1"), 0.0)])
-    monkeypatch.setenv("CAMBIUM_PROVIDER_STRONG_API_KEY", "scored-secret-strong")
-    monkeypatch.setenv("CAMBIUM_PROVIDER_WEAK_API_KEY", "scored-secret-weak")
     monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
     monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
     config_path = _config_file(

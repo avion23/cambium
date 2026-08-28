@@ -25,10 +25,8 @@ from typing import Any
 
 from . import supervisor
 from .auth import (
-    AuthError,
     AuthStore,
     effective_home,
-    is_provider_env_name,
     scrub_environment,
 )
 from .ipc import MAX_LINE_BYTES
@@ -503,23 +501,24 @@ def _apply_interactive_wall_budget(
 
 
 def _stored_provider_environment(
-    env_name: str, auth_store: AuthStore | None = None
+    provider_name: str,
+    auth_store: AuthStore | None = None,
+    *,
+    provider_config_path: str | Path | None = None,
 ) -> dict[str, str]:
     """Return one selected credential without changing ``os.environ``."""
-    if not is_provider_env_name(env_name):
-        raise ValueError("provider credential is not configured")
-    value = os.environ.get(env_name)
-    if value:
-        return {env_name: value}
-    store = auth_store if auth_store is not None else AuthStore()
+    del auth_store
     try:
-        launch_environment = store.launch_environment(base={})
-    except AuthError as exc:
-        raise ValueError("provider credential is unavailable") from exc
-    value = launch_environment.get(env_name)
-    if not value:
+        provider = next(
+            provider
+            for provider in load_providers(provider_config_path)
+            if provider.name == provider_name
+        )
+    except StopIteration:
+        raise ValueError("provider credential is not configured") from None
+    if not provider.api_key:
         raise ValueError("provider credential is not configured")
-    return {env_name: value}
+    return {provider.api_key_env: provider.api_key}
 
 
 def _is_codex_oauth_provider(provider: Any) -> bool:
@@ -560,16 +559,8 @@ def _provider_credential_ready(provider: Any, auth_store: AuthStore) -> bool:
     """
     if _is_codex_oauth_provider(provider):
         return _oauth_doc_present(provider.name)
-    env_name = getattr(provider, "api_key_env", "")
-    if not is_provider_env_name(env_name):
-        return False
-    if os.environ.get(env_name):
-        return True
-    try:
-        launch_environment = auth_store.launch_environment(base={})
-    except AuthError:
-        return False
-    return bool(launch_environment.get(env_name))
+    del auth_store
+    return bool(getattr(provider, "api_key", None))
 
 
 def _authorized_provider_names(providers: list[Any], auth_store: AuthStore) -> list[Any]:
@@ -646,7 +637,9 @@ def _resolve_provider(
         for candidate in authorized:
             if _is_codex_oauth_provider(candidate):
                 continue
-            environment.update(_stored_provider_environment(candidate.api_key_env, store))
+            environment.update(
+                _stored_provider_environment(candidate.name, provider_config_path=config_path)
+            )
         resolved = replace(
             config,
             provider=None,
@@ -676,8 +669,12 @@ def _resolve_provider(
 
     if config.provider is None and config.provider_env_keys:
         environment = {}
-        for env_name in config.provider_env_keys:
-            environment.update(_stored_provider_environment(env_name, auth_store))
+        for provider_name in config.provider_env_keys:
+            environment.update(
+                _stored_provider_environment(
+                    provider_name, provider_config_path=config.provider_config_path
+                )
+            )
         return _apply_interactive_wall_budget(config, ()), environment
 
     config_path = _provider_config_path(config, repo)
@@ -738,7 +735,9 @@ def _resolve_provider(
     environment = {}
     for candidate in authorized:
         if not _is_codex_oauth_provider(candidate):
-            environment.update(_stored_provider_environment(candidate.api_key_env, store))
+            environment.update(
+                _stored_provider_environment(candidate.name, provider_config_path=config_path)
+            )
     resolved = replace(
         config,
         provider=selected.name,

@@ -65,6 +65,7 @@ def _provider_entry(
         "tier": tier,
         "base_url": "http://127.0.0.1:8080/v1",
         "api_key_env": derived_env_name(name),
+        "api_key": f"sk-cli-{name}",
         "model": model,
         "priority": priority,
         "enabled": enabled,
@@ -357,20 +358,20 @@ def test_implicit_provider_selection_uses_stored_credential_without_plan_leak(
 ) -> None:
     repo = _repo(tmp_path / "repo")
     trusted_home = tmp_path / "home"
+    secret = "implicit-selection-secret"
     config_path = _write_provider_file(
         trusted_home / ".config" / "cambium" / "providers.json",
         [
             _provider_entry("disabled", priority=0, enabled=False),
-            _provider_entry("selected", tier="balanced", model="selected-model", priority=1),
-            _provider_entry("later", priority=2),
+            _provider_entry(
+                "selected", tier="balanced", model="selected-model", priority=1
+            )
+            | {"api_key": secret},
+            _provider_entry("later", priority=2) | {"api_key": ""},
         ],
     )
     env_name = derived_env_name("selected")
-    secret = "implicit-selection-secret"
-    store = AuthStore(trusted_home / ".local" / "share" / "cambium" / "auth.json")
-    store.set_provider("selected", secret)
     monkeypatch.setattr(oneshot, "effective_home", lambda: trusted_home)
-    monkeypatch.setattr(oneshot, "AuthStore", lambda: store)
     monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
     monkeypatch.delenv(env_name, raising=False)
     environment_before = dict(os.environ)
@@ -431,11 +432,9 @@ def test_implicit_provider_selection_fails_before_launch_without_credential(
     trusted_home = tmp_path / "home"
     _write_provider_file(
         trusted_home / ".config" / "cambium" / "providers.json",
-        [_provider_entry("selected")],
+        [_provider_entry("selected") | {"api_key": ""}],
     )
-    store = AuthStore(trusted_home / ".local" / "share" / "cambium" / "auth.json")
     monkeypatch.setattr(oneshot, "effective_home", lambda: trusted_home)
-    monkeypatch.setattr(oneshot, "AuthStore", lambda: store)
     monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
     monkeypatch.delenv(derived_env_name("selected"), raising=False)
     launched = False
@@ -715,15 +714,12 @@ def test_stored_auth_is_handed_to_provider_worker_without_plan_leak(
     repo = _repo(tmp_path / "repo")
     provider = "demo"
     env_name = derived_env_name(provider)
-    config_path = _write_provider_file(
-        tmp_path / "trusted" / "providers.json", [_provider_entry(provider)]
-    )
     secret = "stored-secret-never-in-plan"
-    auth_path = tmp_path / "home" / ".local" / "share" / "cambium" / "auth.json"
-    store = AuthStore(auth_path)
-    store.set_provider(provider, secret)
+    config_path = _write_provider_file(
+        tmp_path / "trusted" / "providers.json",
+        [_provider_entry(provider) | {"api_key": secret}],
+    )
     monkeypatch.setattr(oneshot, "effective_home", lambda: tmp_path / "home")
-    monkeypatch.setattr(oneshot, "AuthStore", lambda: store)
     monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
     monkeypatch.delenv(env_name, raising=False)
     captured: dict[str, Any] = {}
@@ -757,47 +753,24 @@ def test_stored_auth_is_handed_to_provider_worker_without_plan_leak(
     assert env_name not in os.environ
 
 
-def test_environment_only_provider_key_is_handed_without_plan_or_artifact_leak(
+def test_environment_only_provider_key_is_rejected(
     monkeypatch, tmp_path: Path
 ) -> None:
     repo = _repo(tmp_path / "repo")
     env_name = derived_env_name("environment-only")
-    secret = "environment-only-secret"
-    monkeypatch.setenv(env_name, secret)
     monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
-    environment_before = dict(os.environ)
 
-    def unexpected_auth_store():
-        raise AssertionError("an environment-only credential must not require AuthStore")
-
-    monkeypatch.setattr(oneshot, "AuthStore", unexpected_auth_store)
-    captured: dict[str, Any] = {}
-
-    async def fake_run_plan(session_dir, plan, on_event=None, **kwargs):
-        captured.update(session_dir=Path(session_dir), plan=plan, kwargs=kwargs)
-        oneshot.supervisor._write_plan(Path(session_dir), plan)
-        return _plan_result()
-
-    monkeypatch.setattr(oneshot.supervisor, "run_plan", fake_run_plan)
-    result = asyncio.run(
-        oneshot.run_oneshot(
-            oneshot.OneShotConfig(
-                prompt="use environment",
-                repo=repo,
-                provider_env_keys=(env_name,),
-                fanout_config={"tier": "fast", "model": "environment-model"},
+    with pytest.raises(ValueError, match="provider credential is not configured"):
+        asyncio.run(
+            oneshot.run_oneshot(
+                oneshot.OneShotConfig(
+                    prompt="use environment",
+                    repo=repo,
+                    provider_env_keys=(env_name,),
+                    fanout_config={"tier": "fast", "model": "environment-model"},
+                )
             )
         )
-    )
-
-    assert result.exit_code == 0
-    assert captured["kwargs"]["provider_environment"] == {env_name: secret}
-    plan_text = json.dumps(captured["plan"])
-    artifact_text = Path(captured["session_dir"] / "plan.json").read_text(encoding="utf-8")
-    assert secret not in plan_text
-    assert secret not in repr(captured["plan"])
-    assert secret not in artifact_text
-    assert dict(os.environ) == environment_before
 
 
 def test_provider_run_persists_real_plan_without_credential(monkeypatch, tmp_path: Path) -> None:
@@ -809,14 +782,10 @@ def test_provider_run_persists_real_plan_without_credential(monkeypatch, tmp_pat
     env_name = derived_env_name(provider)
     _write_provider_file(
         tmp_path / "home" / ".config" / "cambium" / "providers.json",
-        [_provider_entry(provider)],
+        [_provider_entry(provider) | {"api_key": "persistent-plan-secret"}],
     )
     secret = "persistent-plan-secret"
-    auth_path = tmp_path / "home" / ".local" / "share" / "cambium" / "auth.json"
-    store = AuthStore(auth_path)
-    store.set_provider(provider, secret)
     monkeypatch.setattr(oneshot, "effective_home", lambda: tmp_path / "home")
-    monkeypatch.setattr(oneshot, "AuthStore", lambda: store)
     monkeypatch.delenv(env_name, raising=False)
     monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
 

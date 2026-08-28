@@ -63,6 +63,7 @@ def _provider(name: str) -> dict[str, Any]:
         "tier": "fast",
         "base_url": "http://127.0.0.1:1",
         "api_key_env": f"CAMBIUM_PROVIDER_{name.upper().replace('-', '_')}_API_KEY",
+        "api_key": f"sk-admission-{name}",
         "model": "m1",
     }
 
@@ -307,14 +308,13 @@ def test_new_generation_request_is_not_lost_to_stale_generation_filter(
 
 def test_credential_feasible_admission_books_only_ready_provider(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     missing = "missing-provider"
     ready = "ready-provider"
-    missing_env = "CAMBIUM_PROVIDER_MISSING_PROVIDER_API_KEY"
-    ready_env = "CAMBIUM_PROVIDER_READY_PROVIDER_API_KEY"
-    monkeypatch.delenv(missing_env, raising=False)
-    config = _provider_config(tmp_path / "providers.json", [_provider(missing), _provider(ready)])
+    config = _provider_config(
+        tmp_path / "providers.json",
+        [_provider(missing) | {"api_key": ""}, _provider(ready)],
+    )
     spec = {
         "task_id": "candidate",
         "fanout_config": {},
@@ -326,7 +326,6 @@ def test_credential_feasible_admission_books_only_ready_provider(
     runtime = _Runtime(
         tmp_path / "session",
         None,
-        provider_environment={ready_env: "usable-key"},
         debt_store=DebtStore(tmp_path / "routing.json"),
     )
 
@@ -342,13 +341,12 @@ def test_credential_feasible_admission_books_only_ready_provider(
 
 def test_empty_credential_feasible_set_fails_before_worker_spawn(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     provider_name = "missing-provider"
-    provider_env = "CAMBIUM_PROVIDER_MISSING_PROVIDER_API_KEY"
-    monkeypatch.delenv(provider_env, raising=False)
     repo, base = _repo(tmp_path)
-    config = _provider_config(tmp_path / "providers.json", [_provider(provider_name)])
+    config = _provider_config(
+        tmp_path / "providers.json", [_provider(provider_name) | {"api_key": ""}]
+    )
     session_dir = tmp_path / "session"
     task = {
         "task_id": "no-credentials",
@@ -369,7 +367,6 @@ def test_empty_credential_feasible_set_fails_before_worker_spawn(
         run_plan(
             session_dir,
             {"tasks": [task]},
-            provider_environment={},
         )
     )
     events = read_events(session_dir)

@@ -30,6 +30,7 @@ def _provider(name: object = "openai", **overrides: object) -> dict[str, object]
         "tier": "strong",
         "base_url": "https://api.example.test/v1",
         "api_key_env": derived_env_name(cast(str, name)),
+        "api_key": f"sk-config-{name}",
         "timeout_s": 30.0,
         "max_retries": 2,
         "rpm": 60,
@@ -90,6 +91,7 @@ def test_valid_config_loads_without_key_in_environment(tmp_path: Path) -> None:
     assert len(providers) == 1
     assert providers[0].name == "openai"
     assert providers[0].tier is diffundo.ProviderTier.STRONG
+    assert providers[0].api_key == "sk-config-openai"
     assert providers[0].api_key_env == "CAMBIUM_PROVIDER_OPENAI_API_KEY"
 
 
@@ -139,12 +141,10 @@ def test_env_report_only_returns_presence_booleans(
     path = _write(
         tmp_path / "providers.json",
         [
-            _provider("present"),
-            _provider("missing"),
+            _provider("present", api_key="sk-present-secret"),
+            _provider("missing", api_key=""),
         ],
     )
-    monkeypatch.setenv("CAMBIUM_PROVIDER_PRESENT_API_KEY", "secret-value-that-must-not-be-reported")
-    monkeypatch.delenv("CAMBIUM_PROVIDER_MISSING_API_KEY", raising=False)
 
     providers = load_providers(path)
 
@@ -157,12 +157,10 @@ def test_env_report_treats_empty_value_as_unconfigured(
     path = _write(
         tmp_path / "providers.json",
         [
-            _provider("empty"),
-            _provider("present"),
+            _provider("empty", api_key=""),
+            _provider("present", api_key="sk-present-secret"),
         ],
     )
-    monkeypatch.setenv("CAMBIUM_PROVIDER_EMPTY_API_KEY", "")
-    monkeypatch.setenv("CAMBIUM_PROVIDER_PRESENT_API_KEY", "non-empty-secret")
 
     providers = load_providers(path)
 
@@ -248,6 +246,7 @@ def test_valid_config_round_trips_all_fields(tmp_path: Path) -> None:
                 "tier": "strong",
                 "base_url": "https://api.example.test/v1",
                 "api_key_env": "CAMBIUM_PROVIDER_OPENAI_API_KEY",
+                "api_key": "sk-provider-config",
                 "required": True,
                 "timeout_s": 45.5,
                 "max_retries": 3,
@@ -269,6 +268,7 @@ def test_valid_config_round_trips_all_fields(tmp_path: Path) -> None:
             tier=diffundo.ProviderTier.STRONG,
             base_url="https://api.example.test/v1",
             api_key_env="CAMBIUM_PROVIDER_OPENAI_API_KEY",
+            api_key="sk-provider-config",
             timeout_s=45.5,
             max_retries=3,
             rpm=120,
@@ -481,7 +481,11 @@ def test_valid_entries_continue_after_invalid_entry_is_quarantined(
 
     assert [provider.name for provider in providers] == ["healthy"]
     records = json.loads(path.with_name(path.name + ".quarantine").read_text(encoding="utf-8"))
-    expected_entry = {**invalid, "api_key_env": "<redacted:14>"}
+    expected_entry = {
+        **invalid,
+        "api_key": "<redacted:16>",
+        "api_key_env": "<redacted:14>",
+    }
     assert records[0]["entry"] == expected_entry
     assert records[0]["reason"] == (
         "provider config providers[1].api_key_env: "

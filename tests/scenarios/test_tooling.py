@@ -44,6 +44,7 @@ def _provider(
         "tier": "fast",
         "base_url": "https://api.example.test/v1",
         "api_key_env": api_key_env,
+        "api_key": "",
         "required": required,
         "timeout_s": 30.0,
         "max_retries": 2,
