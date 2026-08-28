@@ -35,6 +35,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from cambium.store import read_events_file  # noqa: E402
 from cambium.supervisor import read_events  # noqa: E402
 
 UNKNOWN_PROVIDER = "<unknown>"
@@ -125,10 +126,24 @@ def _provider_name(payload: dict[str, Any]) -> str:
 
 
 def _session_usage_events(session_dir: Path) -> list[dict[str, Any]] | None:
-    """Durable usage_event rows for one session; None when the DB is missing."""
-    if not (session_dir / ".cambium" / "events.db").is_file():
+    """Durable usage rows from a session root or its per-turn stores.
+
+    Interactive sessions keep one EventStore under each ``turn-NNNN``
+    directory, while one-shot sessions keep it directly under ``.cambium``.
+    Some archived sessions use ``turn-NNNN/events.db`` without the state
+    directory, so read those stores directly as a compatibility fallback.
+    """
+    root_db = session_dir / ".cambium" / "events.db"
+    nested_turn_dbs = sorted(session_dir.glob("turn-*/.cambium/events.db"))
+    direct_turn_dbs = sorted(session_dir.glob("turn-*/events.db"))
+    direct_db = session_dir / "events.db"
+    if not (root_db.is_file() or nested_turn_dbs or direct_turn_dbs or direct_db.is_file()):
         return None
     events = read_events(session_dir)
+    if direct_db.is_file():
+        events.extend(read_events_file(direct_db))
+    for event_db in direct_turn_dbs:
+        events.extend(read_events_file(event_db))
     return [event for event in events if event.get("kind") == "usage_event"]
 
 

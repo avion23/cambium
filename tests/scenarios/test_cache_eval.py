@@ -25,31 +25,46 @@ _EVENTS_SCHEMA = """CREATE TABLE events (
 
 def _fixture_session(tmp_path: Path) -> tuple[Path, Path]:
     session = tmp_path / "session"
-    database = session / ".cambium" / "events.db"
-    database.parent.mkdir(parents=True)
-    with sqlite3.connect(database) as connection:
-        connection.execute(_EVENTS_SCHEMA)
-        events = [
-            {
-                "provider": "priced",
-                "usage": {"prompt_tokens": 1_000, "cached_tokens": 250, "completion_tokens": 100},
-            },
-            {
-                "provider": "priced",
-                "usage": {"prompt_tokens": 200, "cached_tokens": 100, "completion_tokens": 50},
-            },
-            {
-                "provider": "unpriced",
-                "usage": {"prompt_tokens": 100, "cached_tokens": 50, "completion_tokens": 25},
-            },
-            {"status": "succeeded"},
-        ]
-        for sequence, payload in enumerate(events, 1):
-            kind = "result" if sequence == len(events) else "usage_event"
-            connection.execute(
-                "INSERT INTO events(seq, kind, payload) VALUES (?, ?, ?)",
-                (sequence, kind, json.dumps(payload)),
-            )
+    turn_events = (
+        (
+            session / "turn-0001" / "events.db",
+            [
+                {
+                    "provider": "priced",
+                    "usage": {
+                        "prompt_tokens": 1_000,
+                        "cached_tokens": 250,
+                        "completion_tokens": 100,
+                    },
+                },
+                {
+                    "provider": "priced",
+                    "usage": {"prompt_tokens": 200, "cached_tokens": 100, "completion_tokens": 50},
+                },
+                {"status": "succeeded"},
+            ],
+        ),
+        (
+            session / "turn-0002" / "events.db",
+            [
+                {
+                    "provider": "unpriced",
+                    "usage": {"prompt_tokens": 100, "cached_tokens": 50, "completion_tokens": 25},
+                },
+                {"status": "succeeded"},
+            ],
+        ),
+    )
+    for database, events in turn_events:
+        database.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(database) as connection:
+            connection.execute(_EVENTS_SCHEMA)
+            for sequence, payload in enumerate(events, 1):
+                kind = "result" if sequence == len(events) else "usage_event"
+                connection.execute(
+                    "INSERT INTO events(seq, kind, payload) VALUES (?, ?, ?)",
+                    (sequence, kind, json.dumps(payload)),
+                )
     provider_config = tmp_path / "providers.json"
     provider_config.write_text(
         json.dumps(
