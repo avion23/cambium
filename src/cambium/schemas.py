@@ -12,7 +12,7 @@ import types
 from dataclasses import MISSING, fields, is_dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Annotated, Any, Literal, Union, get_args, get_origin, get_type_hints
+from typing import Annotated, Any, Literal, Union, cast, get_args, get_origin, get_type_hints
 
 
 def _enum_schema(enum_type: type[Enum]) -> dict[str, Any]:
@@ -196,6 +196,17 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "items": {"type": "string"},
                     "description": "File paths to read, in order.",
                 },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional 1-based starting line for a read window.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100 * 1024,
+                    "description": "Optional maximum number of lines in a read window.",
+                },
             },
             ["paths"],
         ),
@@ -355,27 +366,36 @@ def _validate_value(schema: dict[str, Any], value: Any, label: str) -> list[str]
                 errors.append(f"validation failed: '{label}' must match pattern {pattern!r}")
 
     if type(value) in (int, float):
+        numeric_value = cast(int | float, value)
         minimum = schema.get("minimum")
         if isinstance(minimum, int | float) and not isinstance(minimum, bool):
-            if value < minimum:
+            if numeric_value < minimum:
                 errors.append(f"validation failed: '{label}' must be >= {minimum}")
         exclusive_minimum = schema.get("exclusiveMinimum")
         if isinstance(exclusive_minimum, bool):
-            if exclusive_minimum and isinstance(minimum, int | float) and value <= minimum:
+            if (
+                exclusive_minimum
+                and isinstance(minimum, int | float)
+                and numeric_value <= minimum
+            ):
                 errors.append(f"validation failed: '{label}' must be > {minimum}")
         elif isinstance(exclusive_minimum, int | float) and not isinstance(exclusive_minimum, bool):
-            if value <= exclusive_minimum:
+            if numeric_value <= exclusive_minimum:
                 errors.append(f"validation failed: '{label}' must be > {exclusive_minimum}")
         maximum = schema.get("maximum")
         if isinstance(maximum, int | float) and not isinstance(maximum, bool):
-            if value > maximum:
+            if numeric_value > maximum:
                 errors.append(f"validation failed: '{label}' must be <= {maximum}")
         exclusive_maximum = schema.get("exclusiveMaximum")
         if isinstance(exclusive_maximum, bool):
-            if exclusive_maximum and isinstance(maximum, int | float) and value >= maximum:
+            if (
+                exclusive_maximum
+                and isinstance(maximum, int | float)
+                and numeric_value >= maximum
+            ):
                 errors.append(f"validation failed: '{label}' must be < {maximum}")
         elif isinstance(exclusive_maximum, int | float) and not isinstance(exclusive_maximum, bool):
-            if value >= exclusive_maximum:
+            if numeric_value >= exclusive_maximum:
                 errors.append(f"validation failed: '{label}' must be < {exclusive_maximum}")
 
     if isinstance(value, list):

@@ -165,13 +165,38 @@ def _atomic_write(path: Path, content: str) -> None:
                 pass
 
 
-def _read_file_sync(path: Path, display_path: str) -> _Outcome:
+def _read_file_sync(
+    path: Path,
+    display_path: str,
+    offset: int | None = None,
+    limit: int | None = None,
+) -> _Outcome:
     try:
         mode = path.stat().st_mode
         if stat.S_ISDIR(mode):
             raise IsADirectoryError(path)
         if not stat.S_ISREG(mode):
             raise _ToolFailure(f"path is not a regular file: {display_path}")
+
+        if offset is not None or limit is not None:
+            start_line = offset if offset is not None else 1
+            max_lines = limit if limit is not None else MAX_READ_BYTES
+            selected: list[str] = []
+            total_lines = 0
+            with path.open("r", encoding="utf-8", newline="") as handle:
+                for line_number, line in enumerate(handle, start=1):
+                    total_lines = line_number
+                    if start_line <= line_number < start_line + max_lines:
+                        selected.append(line)
+            end_line = min(start_line + max_lines - 1, total_lines)
+            return _Outcome(
+                ok=True,
+                output=(
+                    f"showing lines {start_line}-{end_line} of {total_lines}\n"
+                    + "".join(selected)
+                ),
+            )
+
         with path.open("rb") as handle:
             raw = handle.read(MAX_READ_BYTES + 1)
     except FileNotFoundError as exc:
@@ -194,6 +219,10 @@ def _read_file_sync(path: Path, display_path: str) -> _Outcome:
 async def _read_file(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
     path = (Path(ctx.cwd) / Path(args["path"]).expanduser()).resolve()
     display_path = _display_path(ctx, path)
+    offset = args.get("offset")
+    limit = args.get("limit")
+    if offset is not None or limit is not None:
+        return await asyncio.to_thread(_read_file_sync, path, display_path, offset, limit)
     return await asyncio.to_thread(_read_file_sync, path, display_path)
 
 
@@ -415,7 +444,11 @@ async def _read_batch(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
 
     async def _bounded_read(path: str) -> ToolResult:
         async with semaphore:
-            return await _run_read_result({"path": path}, ctx)
+            read_args: dict[str, Any] = {"path": path}
+            for key in ("offset", "limit"):
+                if key in args:
+                    read_args[key] = args[key]
+            return await _run_read_result(read_args, ctx)
 
     results = await asyncio.gather(*(_bounded_read(path) for path in paths))
     parts: list[str] = []
@@ -566,7 +599,11 @@ async def run_read_batch(
             )
             continue
         raw_path = arguments.get("path")
-        errors = validate_tool_call(schema, {"paths": [raw_path]})
+        schema_arguments: dict[str, Any] = {"paths": [raw_path]}
+        for key in ("offset", "limit"):
+            if key in arguments:
+                schema_arguments[key] = arguments[key]
+        errors = validate_tool_call(schema, schema_arguments)
         preflight_errors.extend(f"batch_index {batch_index}: {error}" for error in errors)
     if preflight_errors:
         reason = "read_batch batch rejected atomically: " + "\n".join(preflight_errors)

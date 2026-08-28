@@ -46,6 +46,60 @@ def test_read_batch_happy_path_and_cap(tmp_path: Path) -> None:
     assert len(capped.output.encode()) <= MAX_OUTPUT_BYTES
 
 
+def test_read_batch_reads_line_window_with_total_header(tmp_path: Path) -> None:
+    (tmp_path / "lines.txt").write_text(
+        "".join(f"line {number}\n" for number in range(1, 6)), encoding="utf-8"
+    )
+
+    result = _run(
+        "read_batch",
+        {"paths": ["lines.txt"], "offset": 2, "limit": 2},
+        ToolContext(tmp_path),
+    )
+
+    assert result.ok
+    assert result.output == (
+        "--- lines.txt ---\n"
+        "showing lines 2-3 of 5\n"
+        "line 2\n"
+        "line 3\n"
+    )
+
+
+def test_read_batch_line_window_past_eof_is_empty(tmp_path: Path) -> None:
+    (tmp_path / "lines.txt").write_text("one\ntwo\n", encoding="utf-8")
+
+    result = _run(
+        "read_batch",
+        {"paths": ["lines.txt"], "offset": 10, "limit": 2},
+        ToolContext(tmp_path),
+    )
+
+    assert result.ok
+    assert result.output == "--- lines.txt ---\nshowing lines 10-2 of 2\n"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("offset", 0), ("limit", 0), ("limit", MAX_READ_BYTES + 1)],
+)
+def test_read_batch_rejects_invalid_line_window(
+    tmp_path: Path, field: str, value: int
+) -> None:
+    (tmp_path / "lines.txt").write_text("line\n", encoding="utf-8")
+
+    result = _run(
+        "read_batch",
+        {"paths": ["lines.txt"], field: value},
+        ToolContext(tmp_path),
+    )
+
+    assert not result.ok
+    assert result.output == ""
+    assert result.error is not None
+    assert f"'{field}'" in result.error
+
+
 def test_read_batch_allows_absolute_path(tmp_path: Path) -> None:
     outside = tmp_path.parent / "outside.txt"
     outside.write_text("outside\n", encoding="utf-8")
