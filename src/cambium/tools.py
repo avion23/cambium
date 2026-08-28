@@ -27,6 +27,7 @@ from .schemas import TOOL_SCHEMAS, validate_tool_call
 from .tasktree import TaskKind
 
 MAX_READ_BYTES = 100 * 1024
+MAX_READ_LINES = 2_000
 MAX_OUTPUT_BYTES = 64 * 1024
 GIT_TIMEOUT_S = 30
 BATCH_READ_MAX_CONCURRENCY = 4
@@ -104,6 +105,17 @@ def _truncate_bytes(raw: bytes, limit: int, marker: str) -> str:
     return prefix + marker
 
 
+def _utf8_failure(display_path: str, exc: UnicodeDecodeError) -> _ToolFailure:
+    return _ToolFailure(f"file is not valid UTF-8: {display_path}")
+
+
+def _decode_utf8(raw: bytes, display_path: str) -> str:
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _utf8_failure(display_path, exc) from exc
+
+
 def _truncate_text(text: str, limit: int, marker: str) -> str:
     return _truncate_bytes(text.encode("utf-8"), limit, marker)
 
@@ -138,10 +150,7 @@ def _read_text(path: Path) -> str:
         raise _ToolFailure(
             f"edit_file source exceeds MAX_READ_BYTES ({MAX_READ_BYTES} bytes): {path}"
         )
-    try:
-        return raw.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise _ToolFailure(f"file is not valid UTF-8: {path}") from exc
+    return _decode_utf8(raw, str(path))
 
 
 def _atomic_write(path: Path, content: str) -> None:
@@ -180,7 +189,7 @@ def _read_file_sync(
 
         if offset is not None or limit is not None:
             start_line = offset if offset is not None else 1
-            max_lines = limit if limit is not None else MAX_READ_BYTES
+            max_lines = limit if limit is not None else MAX_READ_LINES
             selected: list[str] = []
             total_lines = 0
             with path.open("r", encoding="utf-8", newline="") as handle:
@@ -203,16 +212,15 @@ def _read_file_sync(
         raise _ToolFailure(f"file not found: {display_path}") from exc
     except IsADirectoryError as exc:
         raise _ToolFailure(f"path is a directory: {display_path}") from exc
+    except UnicodeDecodeError as exc:
+        raise _utf8_failure(display_path, exc) from exc
     except OSError as exc:
         raise _ToolFailure(f"could not read {display_path}: {exc}") from exc
 
     if len(raw) > MAX_READ_BYTES:
         output = _truncate_bytes(raw, MAX_READ_BYTES, READ_TRUNCATION_MARKER)
     else:
-        try:
-            output = raw.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise _ToolFailure(f"file is not valid UTF-8: {display_path}") from exc
+        output = _decode_utf8(raw, display_path)
     return _Outcome(ok=True, output=output)
 
 
@@ -691,6 +699,7 @@ __all__ = [
     "BATCH_READ_MAX_CONCURRENCY",
     "MAX_OUTPUT_BYTES",
     "MAX_READ_BYTES",
+    "MAX_READ_LINES",
     "TOOL_DISPATCH",
     "TOOL_SCHEMAS",
     "ToolContext",

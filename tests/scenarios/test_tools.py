@@ -18,6 +18,7 @@ from cambium.lint_diag import LintDiag
 from cambium.tools import (
     MAX_OUTPUT_BYTES,
     MAX_READ_BYTES,
+    MAX_READ_LINES,
     ToolContext,
     run_read_batch,
     run_tool,
@@ -77,6 +78,40 @@ def test_read_batch_line_window_past_eof_is_empty(tmp_path: Path) -> None:
 
     assert result.ok
     assert result.output == "--- lines.txt ---\nshowing lines 10-2 of 2\n"
+
+
+def test_read_batch_offset_only_uses_default_line_cap(tmp_path: Path) -> None:
+    path = tmp_path / "lines.txt"
+    path.write_text(
+        "".join(f"line {number}\n" for number in range(1, MAX_READ_LINES + 2)),
+        encoding="utf-8",
+    )
+
+    result = _run(
+        "read_batch",
+        {"paths": ["lines.txt"], "offset": 1},
+        ToolContext(tmp_path),
+    )
+
+    assert result.ok
+    assert f"showing lines 1-{MAX_READ_LINES} of {MAX_READ_LINES + 1}" in result.output
+    assert f"line {MAX_READ_LINES}\n" in result.output
+    assert f"line {MAX_READ_LINES + 1}\n" not in result.output
+
+
+def test_read_batch_window_rejects_non_utf8_file_cleanly(tmp_path: Path) -> None:
+    (tmp_path / "binary.bin").write_bytes(b"valid\n\xff\n")
+
+    result = _run(
+        "read_batch",
+        {"paths": ["binary.bin"], "offset": 1},
+        ToolContext(tmp_path),
+    )
+
+    assert not result.ok
+    assert result.error is None
+    assert result.output == "--- binary.bin ---\nfile is not valid UTF-8: binary.bin"
+    assert "codec can't decode" not in result.output
 
 
 @pytest.mark.parametrize(
