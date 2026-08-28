@@ -203,8 +203,14 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "delegate",
         "description": (
-            "Propose a child task for supervisor validation; the child is admitted "
-            "only after this task completes with a result envelope."
+            "Propose one scoped child workload. A child is a normal Cambium worker in an "
+            "isolated git worktree, not a provider-native agent. Put the objective, ownership "
+            "boundary, completion criteria, and verification in spec.task. Provider/model "
+            "selection is supervisor-owned: requirements, model_candidates, and "
+            "authorized_providers constrain it. An exact compatible fork may reuse the "
+            "parent provider cache; otherwise the child starts from immutable semantic "
+            "summaries. Admission occurs only after the parent reaches a permitted terminal "
+            "boundary."
         ),
         "parameters": _parameters(
             {
@@ -217,16 +223,49 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "type": "string",
                     "minLength": 1,
                     "description": (
-                        "Tree kind of the proposed child task. Allowed values: feature, "
-                        "bugfix, refactor, test, docs, investigation."
+                        "Structural task-tree kind; it does not select a prompt. "
+                        "The supervisor validates it against TaskKind."
                     ),
                 },
                 "spec": {
                     "type": "object",
                     "description": (
-                        "The child's task spec (task, repo, worktree_path, branch, "
-                        "target_file, marker); the supervisor re-validates it."
+                        "Spawnable child task spec. task is the workload contract. Provider "
+                        "fields are constraints, never an instruction to bypass admission."
                     ),
+                    "properties": {
+                        "task": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": (
+                                "Scoped objective, owned files/symbols or investigation area, "
+                                "definition of done, and required verification."
+                            ),
+                        },
+                        "requirements": {
+                            "type": "object",
+                            "description": (
+                                "Capability constraints used by supervisor admission."
+                            ),
+                        },
+                        "model_candidates": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {"type": "string", "minLength": 1},
+                            "description": "Allowed model ids, in caller preference order.",
+                        },
+                        "authorized_providers": {
+                            "type": "array",
+                            "items": {"type": "string", "minLength": 1},
+                            "description": "Provider allowlist inherited within parent authority.",
+                        },
+                        "authorized_providers_explicit": {
+                            "type": "boolean",
+                            "description": "Whether an empty allowlist means deny all.",
+                        },
+                    },
+                    "required": ["task"],
+                    "additionalProperties": True,
                 },
             },
             ["child_task_id", "kind", "spec"],

@@ -6,6 +6,9 @@ Source and tests define current behavior.
 
 - [`architecture/architecture.md`](architecture/architecture.md) — runtime,
   ownership, publication, and concurrency.
+- [`architecture/subagents.md`](architecture/subagents.md) — task decomposition,
+  child prompts, same-provider cache-affine children, cross-provider semantic
+  children, fork-join lifecycle, and artifact integration.
 - [`architecture/context-engine.md`](architecture/context-engine.md) —
   append-only summary trunks, epochs, forks, resume, and accounting.
 - [`architecture/events.md`](architecture/events.md) — durable event-kind
@@ -13,11 +16,13 @@ Source and tests define current behavior.
 - [`architecture/operations.md`](architecture/operations.md) — operator
   lifecycle, admission, recovery, and success behavior.
 - [`architecture/provider-routing.md`](architecture/provider-routing.md) —
-  provider feasibility, routing, cache affinity, and debt.
+  provider feasibility, leases, child-provider selection, cache affinity, and
+  debt.
 - [`architecture/terminal-interface.md`](architecture/terminal-interface.md) —
-  persistent interactive TUI, event-sourced dashboard, and monitor.
+  persistent interactive TUI, layout contract, event-sourced dashboard, and
+  monitor.
 - [`architecture/interactive-tui.md`](architecture/interactive-tui.md) —
-  interactive branch lifecycle and commands.
+  interactive branch lifecycle, subagent visibility, and commands.
 - [`architecture/optimization.md`](architecture/optimization.md) — DSPy and
   OpenCode-data gates.
 

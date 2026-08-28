@@ -5,32 +5,132 @@
 ## Interactive session
 
 `cambium tui` keeps one persistent CAST branch across operator turns. Each turn
-gets a fresh worker leaf under `turn-000N`, and a successful checkpoint seeds the
-next turn. (`src/cambium/interactive.py:368-405,1216-1274`)
+gets a fresh worker leaf under `turn-NNNN`; a successful immutable checkpoint
+seeds the next turn. `-c`/`--continue` reopens the latest or a named durable
+interactive root. Without it, Cambium allocates a new root.
 
-Use `-c`/`--continue` to reopen the latest or a named durable interactive
-session; without it, Cambium allocates a new root.
-(`src/cambium/cli.py:459-475,1133-1164`; `src/cambium/interactive.py:408-485`)
+The frontend is persistent. Worker execution remains isolated:
+
+```text
+interactive root
+    |
+    +--> turn-0001 / worker worktree / checkpoint C1
+    |
+    +--> turn-0002 / worker worktree / checkpoint C2
+    |
+    +--> turn-0003 / worker worktree / checkpoint C3
+```
 
 ## Turn lifecycle
 
-- Each operator turn starts a fresh worker in an isolated supervisor leaf.
-  (`src/cambium/interactive.py:1221-1235,1276-1309`; `src/cambium/tui.py:935-1006`)
-- Checkpoint resume/reuse requires matching `workspace_hash` and cache identity:
-  the supervisor gates turn resume by workspace hash, and the worker validates
-  context-fork identity. (`src/cambium/supervisor.py:2860-2877`;
-  `src/cambium/worker.py:2628-2713`)
-- On mismatch, the runtime uses a semantic summary fork when possible; an exact
-  fork skipped for `model mismatch` starts a fresh provider-specific turn, or a
-  fresh prompt when no summary is usable. (`src/cambium/worker.py:2688-2713,4983-5044`;
-  `src/cambium/observability.py:285-294`)
-- Turn finalization completes before its result/checkpoint can publish the next
-  branch head. (`src/cambium/worker.py:5776-5820`;
-  `src/cambium/interactive.py:1313-1382`)
-- Abnormal-exit recovery salvages dirty worktree state before cleanup or reset.
-  (`src/cambium/supervisor.py:2758-2816,2940-2977`)
+1. The single interactive-session writer allocates a fresh turn leaf.
+2. The turn starts from the latest compatible checkpoint.
+3. A worker executes inside the canonical supervisor/worktree boundary.
+4. Checkpoint and result events are observed durably.
+5. Successful finalization atomically advances the branch manifest.
+6. Failure or cancellation keeps the previous valid context seed.
 
-## Pointers
+Checkpoint reuse requires compatible workspace and provider-cache identity. On
+incompatibility, the runtime uses provider-neutral semantic summaries when
+legal; otherwise it starts fresh. No frontend path edits an existing checkpoint.
 
-- Rendering contract: see [`terminal-interface.md`](terminal-interface.md).
-- Operations: see [`operations.md`](operations.md).
+## Subagents in the cockpit
+
+Subagents are supervised worker tasks, not provider-native agents. The operator
+rail projects their task-tree and lifecycle state from durable events:
+
+```text
+main
+├─ review-routing   ~ active
+├─ add-tests        = merging
+└─ inspect-tui      ∅ succeeded
+```
+
+Lineage glyphs mean:
+
+- `=` exact cache-affine checkpoint lineage;
+- `~` semantic-summary reuse with a fresh provider head;
+- `∅` fresh context;
+- `?` lineage not yet known.
+
+Lifecycle glyphs are redundant with text in the full rail so color is never the
+only signal. The compact rail is an overview; `/agents`, `/events`, and the full
+rail are the inspection surfaces.
+
+Subagent workload, provider selection, prompt construction, and join behavior
+are defined in [`subagents.md`](subagents.md).
+
+## Layout contract
+
+The cockpit uses the terminal primary buffer so normal scrollback remains
+available. At twelve or more rows it renders conversation/status/input on the
+left and an operator rail on the right.
+
+| Width | Layout |
+| --- | --- |
+| `>=100` columns | Full 32-column operator rail |
+| `80-99` columns | Compact six-column glyph rail |
+| `<80` columns | Conversation-first single pane |
+
+A resize invalidates geometry and repaints one complete deterministic frame.
+Terminals shorter than twelve rows use bounded unframed output. Non-TTY and
+`NO_COLOR` modes remain line-oriented and free of cursor control.
+
+The detailed layout and usability checklist are in
+[`terminal-interface.md`](terminal-interface.md).
+
+## Input and commands
+
+The input row remains at a stable location after updates and resizes. Bracketed
+paste preserves embedded newlines. A trailing backslash continues input on the
+next line. Explicit multiline mode is:
+
+```text
+<<<
+first line
+second line
+>>>
+```
+
+Operator commands include:
+
+```text
+/help       command help
+/status     compact session status
+/dashboard  repaint the dashboard
+/events     recent durable events
+/agents     main/subagent lifecycle
+/context    checkpoint, epoch, trunk, and raw tail
+/session    interactive root and branch lease
+/branches   persistent branch list
+/fork       fork the current checkpoint
+/compact    compact the active context
+/model      inspect or change provider/model preference
+/quota      provider quota windows
+/cancel     explain active-turn cancellation
+/new        start a fresh semantic branch
+/clear      clear visible transcript
+/exit       close the frontend
+```
+
+Ctrl-C during an active turn cancels it and returns to the prompt. Input entered
+while a turn is active is queued as a follow-up rather than lost.
+
+## Correctness boundaries
+
+- `InteractiveSession` is the single manifest writer.
+- Each operator turn uses one isolated supervisor leaf.
+- Durable events, not widget state, drive the operator projection.
+- Exact cache reuse and semantic reuse are distinct states.
+- Model/tool text is sanitized before terminal rendering.
+- A failed turn cannot replace the last successful branch checkpoint.
+- Monitor attachment is read-only and cannot cancel or mutate the session.
+
+## Source map
+
+- Interactive branch ownership: `src/cambium/interactive.py`
+- Frontend command loop: `src/cambium/tui.py`
+- Deterministic frame rendering: `src/cambium/tui_screen.py`
+- Event reducer and agent snapshots: `src/cambium/observability.py`
+- Session event aggregation: `src/cambium/supervisor.py`
+- TTY and PTY behavior: `tests/scenarios/test_tui_*.py`
