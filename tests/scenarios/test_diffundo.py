@@ -20,9 +20,9 @@ and cascade-design contracts:
 from __future__ import annotations
 
 import asyncio
-from dataclasses import replace
 import time
 import urllib.request
+from dataclasses import replace
 from typing import Any, cast
 
 import pytest

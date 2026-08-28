@@ -9,8 +9,6 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-import pytest
-
 from cambium.routing import DebtStore
 from cambium.supervisor import (
     _release_lane,
