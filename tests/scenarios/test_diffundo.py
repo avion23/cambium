@@ -20,12 +20,13 @@ and cascade-design contracts:
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import time
 import urllib.request
 from typing import Any, cast
 
 import pytest
-from diffundo_helpers import PROMPT, FakeServer, _config, _error_payload, _ok_payload, _set_keys
+from diffundo_helpers import PROMPT, FakeServer, _config, _error_payload, _ok_payload
 
 from cambium.diffundo import (
     AllProvidersFailed,
@@ -124,7 +125,6 @@ def test_prompt_prefix_token_estimate_uses_utf8_bytes() -> None:
 def test_cascade_falls_through_500_to_next_provider(tmp_path, monkeypatch) -> None:
     bad = FakeServer([(500, _error_payload("boom"), 0.0)])
     good = FakeServer([(200, _ok_payload("from good", model="m-good"), 0.0)])
-    _set_keys(monkeypatch, "K_BAD", "K_GOOD")
     router = Diffundo(
         (
             _config("p_bad", bad, "K_BAD"),
@@ -152,7 +152,6 @@ def test_pinned_endpoint_death_falls_back_same_tier_and_records_origin(monkeypat
     pinned = FakeServer([(503, _error_payload("Endpoint is unavailable"), 0.0)])
     same_tier = FakeServer([(200, _ok_payload("served by sibling", model="m-sibling"), 0.0)])
     other_tier = FakeServer([(200, _ok_payload("must not be reached", model="m-strong"), 0.0)])
-    _set_keys(monkeypatch, "K_PINNED_DEAD", "K_SIBLING", "K_STRONG")
     router = Diffundo(
         (
             _config("p_pinned", pinned, "K_PINNED_DEAD", model="m-pinned"),
@@ -188,7 +187,6 @@ def test_pinned_death_stays_on_sibling_on_next_call(monkeypatch) -> None:
             (200, _ok_payload("second sibling response", model="m-sibling"), 0.0),
         ]
     )
-    _set_keys(monkeypatch, "K_PINNED_DEATH", "K_HEALTHY_SIBLING")
     router = Diffundo(
         (
             _config("p_pinned", dead, "K_PINNED_DEATH", model="m-pinned"),
@@ -225,7 +223,6 @@ def test_pinned_death_stays_on_sibling_on_next_call(monkeypatch) -> None:
 def test_pinned_timeout_falls_back_to_sibling_and_records_origin(monkeypatch) -> None:
     pinned = FakeServer([(200, _ok_payload("late", model="m-pinned"), 0.1)])
     sibling = FakeServer([(200, _ok_payload("served by sibling", model="m-sibling"), 0.0)])
-    _set_keys(monkeypatch, "K_TIMEOUT_PIN", "K_TIMEOUT_SIBLING")
     router = Diffundo(
         (
             _config(
@@ -256,7 +253,6 @@ def test_pinned_timeout_falls_back_to_sibling_and_records_origin(monkeypatch) ->
 def test_pinned_429_retry_after_does_not_trigger_fallback(monkeypatch) -> None:
     limited = FakeServer([(429, _error_payload("busy"), 0.0, {"Retry-After": "60"})])
     sibling = FakeServer([(200, _ok_payload("must not serve", model="m-sibling"), 0.0)])
-    _set_keys(monkeypatch, "K_LIMITED_PIN", "K_429_SIBLING")
     router = Diffundo(
         (
             _config("p_limited", limited, "K_LIMITED_PIN", model="m-pinned"),
@@ -279,7 +275,6 @@ def test_pinned_429_retry_after_does_not_trigger_fallback(monkeypatch) -> None:
 
 def test_pinned_endpoint_death_without_alternative_remains_fatal(monkeypatch) -> None:
     dead = FakeServer([(503, _error_payload("server_error"), 0.0)])
-    _set_keys(monkeypatch, "K_ONLY_PIN")
     router = Diffundo(
         (_config("p_only", dead, "K_ONLY_PIN", model="m-pinned"),),
         primary_provider="p_only",
@@ -303,7 +298,6 @@ def test_leased_provider_death_releases_lease_for_healthy_sibling(monkeypatch) -
         ]
     )
     sibling = FakeServer([(200, _ok_payload("sibling", model="m-sibling"), 0.0)])
-    _set_keys(monkeypatch, "K_LEASE_INCUMBENT", "K_LEASE_SIBLING")
     router = Diffundo(
         (
             _config("p_incumbent", incumbent, "K_LEASE_INCUMBENT", model="m-incumbent"),
@@ -342,7 +336,6 @@ def test_healthy_incumbent_keeps_lease_sticky(monkeypatch) -> None:
         ]
     )
     sibling = FakeServer([(200, _ok_payload("must not serve", model="m-sibling"), 0.0)])
-    _set_keys(monkeypatch, "K_STICKY_INCUMBENT", "K_STICKY_SIBLING")
     router = Diffundo(
         (
             _config("p_incumbent", incumbent, "K_STICKY_INCUMBENT", model="m-incumbent"),
@@ -375,7 +368,6 @@ def test_transient_429_keeps_lease_through_cooldown(monkeypatch) -> None:
         ]
     )
     sibling = FakeServer([(200, _ok_payload("must not serve", model="m-sibling"), 0.0)])
-    _set_keys(monkeypatch, "K_TRANSIENT_INCUMBENT", "K_TRANSIENT_SIBLING")
     router = Diffundo(
         (
             _config("p_incumbent", incumbent, "K_TRANSIENT_INCUMBENT", model="m-incumbent"),
@@ -411,7 +403,6 @@ def test_terminal_endpoint_death_is_skipped_until_a_new_router(monkeypatch) -> N
         ]
     )
     healthy = FakeServer([(200, _ok_payload("healthy sibling"), 0.0)])
-    _set_keys(monkeypatch, "K_TERMINAL_DEAD", "K_TERMINAL_HEALTHY")
     providers = (
         _config("p_terminal_dead", dead, "K_TERMINAL_DEAD", model="m"),
         _config("p_terminal_healthy", healthy, "K_TERMINAL_HEALTHY", model="m"),
@@ -466,7 +457,6 @@ def test_tier_filtering_and_model_pin(tmp_path, monkeypatch) -> None:
     fast2 = FakeServer([(200, _ok_payload("fast m2", model="m2"), 0.0)])
     strong = FakeServer([(200, _ok_payload("strong", model="m-s"), 0.0)])
     balanced = FakeServer([(200, _ok_payload("balanced", model="m-b"), 0.0)])
-    _set_keys(monkeypatch, "K_FAST", "K_FAST2", "K_STRONG", "K_BAL")
     router = Diffundo(
         (
             _config("p_fast", fast, "K_FAST", model="m1"),
@@ -508,7 +498,6 @@ def test_model_pin_falls_through_to_sibling_when_matching_provider_fails(
     model lane fails; substitution is never an implicit fallback."""
     bad = FakeServer([(500, _error_payload("boom"), 0.0)])
     sibling = FakeServer([(200, _ok_payload("sibling served", model="m-other"), 0.0)])
-    _set_keys(monkeypatch, "K_M2", "K_OTHER")
     router = Diffundo(
         (
             _config("p_m2", bad, "K_M2", model="m2"),
@@ -546,7 +535,6 @@ def test_model_pin_does_not_authorize_provider_global_substitution(tmp_path, mon
     """A provider opt-in cannot override a task's exact-model pin."""
     bad = FakeServer([(500, _error_payload("boom"), 0.0)])
     sibling = FakeServer([(200, _ok_payload("must not serve", model="m-other"), 0.0)])
-    _set_keys(monkeypatch, "K_PINNED", "K_SUBSTITUTE")
     router = Diffundo(
         (
             _config("p_pinned", bad, "K_PINNED", model="m2"),
@@ -575,7 +563,6 @@ def test_model_pin_unavailable_at_selection_falls_through_to_sibling(tmp_path, m
     exact model lane is in cooldown."""
     bad = FakeServer([(500, _error_payload("boom"), 0.0)])
     sibling = FakeServer([(200, _ok_payload("sibling served", model="m-other"), 0.0)])
-    _set_keys(monkeypatch, "K_M2", "K_OTHER")
     router = Diffundo(
         (
             _config("p_m2", bad, "K_M2", model="m2", cooldown_s=60),
@@ -621,7 +608,6 @@ def test_model_pin_unavailable_at_selection_falls_through_to_sibling(tmp_path, m
 def test_clear_provider_lease_also_clears_sticky_primary(monkeypatch) -> None:
     first = FakeServer([(200, _ok_payload("first"), 0.0)])
     second = FakeServer([(200, _ok_payload("second"), 0.0)])
-    _set_keys(monkeypatch, "K_LEASE_FIRST", "K_LEASE_SECOND")
     router = Diffundo(
         (
             _config("p_first", first, "K_LEASE_FIRST", model="m"),
@@ -656,6 +642,7 @@ def test_duplicate_half_open_probe_rejection_is_benign(monkeypatch) -> None:
         tier=ProviderTier.FAST,
         base_url="http://127.0.0.1:1",
         api_key_env="K_PROBE",
+        api_key="sk-test-probe",
     )
     router = Diffundo((provider,))
     runtime = router._runtime(provider.name)
@@ -680,7 +667,6 @@ def test_duplicate_half_open_probe_rejection_is_benign(monkeypatch) -> None:
 def test_breaker_three_failures_put_provider_in_cooldown_and_skip(tmp_path, monkeypatch) -> None:
     flaky = FakeServer([(500, _error_payload("intermittent"), 0.0)])
     good = FakeServer([(200, _ok_payload("good"), 0.0)])
-    _set_keys(monkeypatch, "K_FLAKY", "K_GOOD")
     router = Diffundo(
         (
             _config("p_flaky", flaky, "K_FLAKY", max_retries=2, cooldown_s=60.0),
@@ -708,7 +694,6 @@ def test_breaker_three_failures_put_provider_in_cooldown_and_skip(tmp_path, monk
 def test_breaker_auth_error_first_call_disables(tmp_path, monkeypatch) -> None:
     auth = FakeServer([(401, _error_payload("unauthorized"), 0.0)])
     good = FakeServer([(200, _ok_payload("ok"), 0.0)])
-    _set_keys(monkeypatch, "K_AUTH", "K_GOOD")
     router = Diffundo((_config("p_auth", auth, "K_AUTH"), _config("p_good", good, "K_GOOD")))
     try:
         result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
@@ -728,7 +713,6 @@ def test_breaker_auth_error_first_call_disables(tmp_path, monkeypatch) -> None:
 
 def test_retry_after_beyond_deadline_skips_retry_without_jitter(monkeypatch) -> None:
     server = FakeServer([(429, _error_payload("busy"), 0.0, {"Retry-After": "60"})])
-    _set_keys(monkeypatch, "K_RETRY_LONG")
     # Budget must sit comfortably ABOVE one attempt yet BELOW the 60s
     # Retry-After: under xdist load a tight wall budget starves the first
     # attempt itself, which is starvation noise rather than the behavior
@@ -758,7 +742,6 @@ def test_retry_after_beyond_deadline_skips_retry_without_jitter(monkeypatch) -> 
 def test_retry_after_is_provider_local(monkeypatch) -> None:
     limited = FakeServer([(429, _error_payload("busy"), 0.0, {"Retry-After": "60"})])
     healthy = FakeServer([(200, _ok_payload("healthy"), 0.0)])
-    _set_keys(monkeypatch, "K_RETRY_LIMITED", "K_RETRY_HEALTHY")
     router = Diffundo(
         (
             _config("p_retry_limited", limited, "K_RETRY_LIMITED"),
@@ -793,9 +776,8 @@ def test_http_error_redacts_authorization_key_from_provider_error(tmp_path, monk
         ],
         echo_authorization_in_body=True,
     )
-    monkeypatch.setenv("K_ECHO", key)
     router = Diffundo(
-        (_config("p_echo", server, "K_ECHO"),),
+        (_config("p_echo", server, "K_ECHO", api_key=key),),
         pause_timeout_s=0.01,
     )
     try:
@@ -828,8 +810,9 @@ def test_http_error_redacts_authorization_key_from_provider_error(tmp_path, monk
         [(429, _error_payload("invalid credential"), 0.0, {"Retry-After": "1"})],
         echo_authorization_in_body=True,
     )
-    monkeypatch.setenv("K_RETRY_PRIVATE", retry_key)
-    retry_router = Diffundo((_config("p_retry_private", retry_server, "K_RETRY_PRIVATE"),))
+    retry_router = Diffundo(
+        (_config("p_retry_private", retry_server, "K_RETRY_PRIVATE", api_key=retry_key),)
+    )
     try:
         with pytest.raises(AllProvidersFailed) as exc:
             asyncio.run(retry_router.call(ProviderTier.FAST, PROMPT))
@@ -855,7 +838,6 @@ def test_cloudflare_1010_forbidden_is_error_not_auth_error(tmp_path, monkeypatch
             )
         ]
     )
-    _set_keys(monkeypatch, "K_BLOCKED")
     router = Diffundo((_config("p_blocked", blocked, "K_BLOCKED"),))
     try:
         with pytest.raises(AllProvidersFailed) as exc:
@@ -878,7 +860,6 @@ def test_403_invalid_credential_is_quarantined_until_key_changes(monkeypatch) ->
             (200, _ok_payload("credential recovered"), 0.0),
         ]
     )
-    _set_keys(monkeypatch, "K_ROTATE")
     router = Diffundo(
         (_config("p_rotate", server, "K_ROTATE", max_retries=2),),
         pause_timeout_s=0.01,
@@ -897,7 +878,9 @@ def test_403_invalid_credential_is_quarantined_until_key_changes(monkeypatch) ->
         assert len(server.calls) == 1
 
         # A rotated credential is a new auth identity and may probe again.
-        monkeypatch.setenv("K_ROTATE", "sk-test-K_ROTATE-rotated")
+        rotated = replace(router._providers[0], api_key="sk-test-K_ROTATE-rotated")
+        router._providers = (rotated,)
+        router._runtime("p_rotate").provider = rotated
         result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
         assert result.content == "credential recovered"
         assert len(server.calls) == 2
@@ -921,7 +904,6 @@ def test_403_missing_model_entitlement_is_config_error(tmp_path, monkeypatch) ->
             )
         ]
     )
-    _set_keys(monkeypatch, "K_MODEL_ENTITLEMENT")
     router = Diffundo(
         (_config("p_model_entitlement", server, "K_MODEL_ENTITLEMENT", max_retries=2),),
         pause_timeout_s=0.01,
@@ -953,7 +935,6 @@ def test_403_quota_or_billing_exhaustion_cools_until_reset(monkeypatch) -> None:
             )
         ]
     )
-    _set_keys(monkeypatch, "K_BILLING")
     router = Diffundo(
         (_config("p_billing", server, "K_BILLING", max_retries=0, cooldown_s=1.0),),
         pause_timeout_s=0.01,
@@ -985,7 +966,6 @@ def test_403_policy_refusal_falls_through_without_health_damage(monkeypatch) -> 
         ]
     )
     good = FakeServer([(200, _ok_payload("safe fallback"), 0.0)])
-    _set_keys(monkeypatch, "K_POLICY", "K_POLICY_GOOD")
     router = Diffundo(
         (
             _config("p_policy", refusing, "K_POLICY"),
@@ -1006,7 +986,6 @@ def test_403_waf_block_retries_with_bounded_backoff(monkeypatch) -> None:
     blocked = FakeServer(
         [(403, _error_payload("Web Application Firewall blocked automated traffic"), 0.0)]
     )
-    _set_keys(monkeypatch, "K_WAF")
     router = Diffundo(
         (_config("p_waf", blocked, "K_WAF", max_retries=2),),
         retry_base_delay_s=0.2,
@@ -1081,7 +1060,6 @@ def test_tool_call_response_with_null_content_succeeds(tmp_path, monkeypatch) ->
         "usage": {"prompt_tokens": 2, "completion_tokens": 2},
     }
     server = FakeServer([(200, tool_payload, 0.0), (200, text_payload, 0.0)])
-    _set_keys(monkeypatch, "K_TOOL")
     router = Diffundo((_config("p_tool", server, "K_TOOL"),))
     try:
         result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
@@ -1103,7 +1081,6 @@ def test_tool_call_response_rejects_malformed_empty_tool_call(tmp_path, monkeypa
     # malformed response, not forwarded as a valid-looking (name="") call.
     # A tool call whose function.name is "" is rejected the same way.
     malformed = FakeServer([(200, _tool_call_payload([{}]), 0.0)])
-    _set_keys(monkeypatch, "K_MAL")
     router = Diffundo((_config("p_mal", malformed, "K_MAL"),))
     try:
         with pytest.raises(AllProvidersFailed) as exc:
@@ -1120,7 +1097,6 @@ def test_tool_call_response_rejects_malformed_empty_tool_call(tmp_path, monkeypa
     empty = FakeServer(
         [(200, _tool_call_payload([{"function": {"name": "", "arguments": "{}"}}]), 0.0)]
     )
-    _set_keys(monkeypatch, "K_EMPTY")
     empty_router = Diffundo((_config("p_empty", empty, "K_EMPTY"),))
     try:
         with pytest.raises(AllProvidersFailed) as exc:
@@ -1155,7 +1131,6 @@ def test_tool_call_response_rejects_malformed_arguments_json(tmp_path, monkeypat
             )
         ]
     )
-    _set_keys(monkeypatch, "K_MALARGS")
     router = Diffundo((_config("p_malargs", malformed, "K_MALARGS"),))
     try:
         with pytest.raises(AllProvidersFailed) as exc:
@@ -1193,7 +1168,6 @@ def test_tool_call_response_with_valid_read_file_args_passes(tmp_path, monkeypat
             )
         ]
     )
-    _set_keys(monkeypatch, "K_READ")
     router = Diffundo((_config("p_read", server, "K_READ"),))
     try:
         result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
@@ -1215,7 +1189,6 @@ def test_refusal_like_completion_content_passes_through(monkeypatch) -> None:
     )
     primary = FakeServer([(200, _ok_payload(content), 0.0)])
     fallback = FakeServer([(200, _ok_payload("fallback must not win"), 0.0)])
-    _set_keys(monkeypatch, "K_PRIMARY", "K_FALLBACK")
     router = Diffundo(
         (
             _config("p_primary", primary, "K_PRIMARY"),
@@ -1242,7 +1215,6 @@ def test_structural_refusals_raise_refusal_outcome(monkeypatch) -> None:
     content_filter["choices"][0]["finish_reason"] = "content_filter"
     a = FakeServer([(200, refusal_field, 0.0)])
     b = FakeServer([(200, content_filter, 0.0)])
-    _set_keys(monkeypatch, "K_A", "K_B")
     router = Diffundo((_config("p_a", a, "K_A"), _config("p_b", b, "K_B")))
     try:
         with pytest.raises(AllProvidersFailed) as exc:
@@ -1266,7 +1238,6 @@ def test_structural_refusals_raise_refusal_outcome(monkeypatch) -> None:
 def test_token_bucket_rpm_one_second_call_cascades(tmp_path, monkeypatch) -> None:
     first = FakeServer([(200, _ok_payload("first"), 0.0)])
     second = FakeServer([(200, _ok_payload("second"), 0.0)])
-    _set_keys(monkeypatch, "K_1", "K_2")
     router = Diffundo(
         (_config("p_first", first, "K_1", rpm=1), _config("p_second", second, "K_2", rpm=1))
     )
@@ -1298,7 +1269,6 @@ def test_exhaustion_pause_wakes_when_provider_recovers(tmp_path, monkeypatch) ->
     # D8f recovery monitor: after the provider's cooldown elapses mid-pause, the
     # monitor wakes dispatch, the call probes, and the provider heals.
     server = FakeServer([(500, _error_payload("boom"), 0.0), (200, _ok_payload("rec"), 0.0)])
-    _set_keys(monkeypatch, "K_REC")
     router = Diffundo(
         (_config("p", server, "K_REC", cooldown_s=1.0),),
         pause_timeout_s=2.0,
@@ -1327,7 +1297,6 @@ def test_outage_pause_actually_blocks_not_busy_spins(tmp_path, monkeypatch) -> N
     # a blocked call must keep the loop iteration count low.
     down = FakeServer([(500, _error_payload("down"), 0.0)])
     ok = FakeServer([(200, _ok_payload("ok"), 0.0)])
-    _set_keys(monkeypatch, "K_DOWN", "K_OK")
     router = Diffundo(
         (
             _config("p_down", down, "K_DOWN", rpm=1, cooldown_s=60.0),
@@ -1377,6 +1346,7 @@ def test_call_budget_outer_deadline_bounds_threaded_post(monkeypatch) -> None:
         tier=ProviderTier.FAST,
         base_url="http://127.0.0.1:1",
         api_key_env="K_THREADED_SLOW",
+        api_key="sk-test-threaded-slow",
         timeout_s=5.0,
         max_retries=0,
     )
@@ -1413,7 +1383,6 @@ def test_call_budget_bounds_slow_attempts(tmp_path, monkeypatch) -> None:
     # take ~1.6s; a 0.2s budget caps it to budget + one in-flight attempt.
     slow1 = FakeServer([(200, _ok_payload("slow1"), 0.3)])
     slow2 = FakeServer([(200, _ok_payload("slow2"), 0.3)])
-    _set_keys(monkeypatch, "K_S1", "K_S2")
     router = Diffundo(
         (
             _config("p_s1", slow1, "K_S1", timeout_s=0.4, max_retries=1),
@@ -1439,7 +1408,6 @@ def test_call_budget_bounds_slow_attempts(tmp_path, monkeypatch) -> None:
 def test_two_calls_to_static_prompt_both_hit_provider(tmp_path, monkeypatch) -> None:
     # Opposite of a cache: two byte-identical calls are two provider round-trips.
     server = FakeServer([(200, _ok_payload("same"), 0.0)])
-    _set_keys(monkeypatch, "K")
     router = Diffundo((_config("p", server, "K"),))
     try:
         r1 = asyncio.run(router.call(ProviderTier.FAST, STATIC_HEAD))
@@ -1461,8 +1429,8 @@ def test_remote_http_provider_without_config_validation_is_rejected_at_call(
         tier=ProviderTier.FAST,
         base_url="http://api.example.test/v1",
         api_key_env="K_INSECURE",
+        api_key="sk-test-insecure",
     )
-    monkeypatch.setenv("K_INSECURE", "sk-test-K_INSECURE")
     router = Diffundo((unvalidated,), pause_timeout_s=0.01)
 
     with pytest.raises(AllProvidersFailed) as exc:
@@ -1488,8 +1456,8 @@ def test_non_http_provider_schemes_are_rejected_before_urllib(
         tier=ProviderTier.FAST,
         base_url=base_url,
         api_key_env=f"K_{scheme.upper()}",
+        api_key=f"sk-{scheme}-secret",
     )
-    monkeypatch.setenv(config.api_key_env, f"sk-{scheme}-secret")
     router = Diffundo((config,), pause_timeout_s=0.01)
 
     with pytest.raises(AllProvidersFailed) as exc:
@@ -1519,7 +1487,6 @@ def test_loopback_redirect_to_non_loopback_http_never_contacts_target(
     # non-loopback http origin for the redirect target.
     target = FakeServer([(200, _ok_payload("must never arrive"), 0.0)], host="127.0.0.2")
     redirector = FakeServer([(302, {}, 0.0, {"Location": f"{target.base_url}/chat/completions"})])
-    _set_keys(monkeypatch, "K_REDIRECT")
     router = Diffundo(
         (_config("p_redirect", redirector, "K_REDIRECT"),),
         pause_timeout_s=0.01,
@@ -1551,7 +1518,6 @@ def test_loopback_http_request_bypasses_proxy_and_proxy_never_sees_key(
     # Loopback requests must go straight to the address, never via a proxy.
     server = FakeServer([(200, _ok_payload("direct"), 0.0)])
     proxy = FakeServer([(200, _ok_payload("via proxy"), 0.0)])
-    _set_keys(monkeypatch, "K_PROXY")
     for var in (
         "ALL_PROXY",
         "all_proxy",
@@ -1608,7 +1574,6 @@ def test_429_retry_after_and_quota_owner_surface_on_winning_result(monkeypatch) 
             (200, _ok_payload("recovered"), 0.0),
         ]
     )
-    _set_keys(monkeypatch, "K_QUOTA")
     router = Diffundo((_config("p_quota", limited, "K_QUOTA", max_retries=1),))
     sleeps: list[float] = []
 
@@ -1647,7 +1612,6 @@ def test_429_quota_owner_reaches_failure_error(monkeypatch) -> None:
             )
         ]
     )
-    _set_keys(monkeypatch, "K_QUOTA_FAIL")
     router = Diffundo((_config("p_quota_fail", server, "K_QUOTA_FAIL"),))
     try:
         with pytest.raises(AllProvidersFailed) as exc:
@@ -1694,7 +1658,6 @@ def test_usage_metric_fields_follow_provider_reports(tmp_path, monkeypatch) -> N
             (200, _ok_payload("no usage"), 0.0),
         ]
     )
-    _set_keys(monkeypatch, "K_METRIC")
     router = Diffundo((_config("p_metric", server, "K_METRIC"),))
     try:
         r1 = asyncio.run(router.call(ProviderTier.FAST, STATIC_HEAD))
@@ -1773,7 +1736,6 @@ def test_chat_response_larger_than_provider_cap_is_rejected(monkeypatch) -> None
 
     oversized = _ok_payload("x" * (MAX_PROVIDER_RESPONSE_BYTES + 1))
     server = FakeServer([(200, oversized, 0.0)])
-    _set_keys(monkeypatch, "K_OVERSIZED")
     router = Diffundo((_config("p_oversized", server, "K_OVERSIZED"),))
     try:
         with pytest.raises(AllProvidersFailed) as raised:

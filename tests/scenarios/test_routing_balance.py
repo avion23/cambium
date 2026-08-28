@@ -215,14 +215,22 @@ def _config(
     model: str = "",
     **overrides: Any,
 ) -> ProviderConfig:
-    base: dict[str, Any] = dict(timeout_s=5.0, max_retries=0, rpm=60, enabled=True, model=model)
+    base: dict[str, Any] = dict(
+        timeout_s=5.0,
+        max_retries=0,
+        rpm=60,
+        enabled=True,
+        model=model,
+        api_key=f"sk-test-{env}",
+    )
     base.update(overrides)
-    return ProviderConfig(name=name, tier=tier, base_url=server.base_url, api_key_env=env, **base)
-
-
-def _set_keys(monkeypatch: pytest.MonkeyPatch, *names: str) -> None:
-    for name in names:
-        monkeypatch.setenv(name, f"sk-test-{name}")
+    return ProviderConfig(
+        name=name,
+        tier=tier,
+        base_url=server.base_url,
+        api_key_env=env,
+        **base,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -235,6 +243,7 @@ def _pc(name: str, model: str, **overrides: Any) -> ProviderConfig:
         tier=ProviderTier.FAST,
         base_url="http://127.0.0.1:1",
         api_key_env=f"K_{name.upper()}",
+        api_key=f"sk-test-{name}",
         model=model,
     )
     base.update(overrides)
@@ -326,7 +335,6 @@ def test_debt_store_round_trip_and_corrupt_tolerance(tmp_path) -> None:
 def test_generic_400_is_refusal_not_retried_and_cascades(monkeypatch) -> None:
     bad = FakeServer([(400, _error_payload("messages illegal"), 0.0)])
     good = FakeServer([(200, _ok_payload("good", model="m"), 0.0)])
-    _set_keys(monkeypatch, "K_BAD", "K_GOOD")
     router = Diffundo(
         (
             _config("p_bad", bad, "K_BAD", max_retries=2),
@@ -348,7 +356,6 @@ def test_generic_400_is_refusal_not_retried_and_cascades(monkeypatch) -> None:
 
 def test_generic_400_single_provider_raises_refusal_outcome(monkeypatch) -> None:
     bad = FakeServer([(400, _error_payload("deterministic bad request"), 0.0)])
-    _set_keys(monkeypatch, "K_BAD")
     router = Diffundo((_config("p_bad", bad, "K_BAD", max_retries=2),))
     try:
         # every candidate refused -> AllProvidersFailed wrapping the terminal
@@ -365,7 +372,6 @@ def test_generic_400_single_provider_raises_refusal_outcome(monkeypatch) -> None
 def test_primary_provider_kwarg_presets_sticky_binding(monkeypatch) -> None:
     first = FakeServer([(200, _ok_payload("first", model="m"), 0.0)])
     second = FakeServer([(200, _ok_payload("second", model="m"), 0.0)])
-    _set_keys(monkeypatch, "K_FIRST", "K_SECOND")
     router = Diffundo(
         (
             _config("p_first", first, "K_FIRST", priority=0),
@@ -390,7 +396,6 @@ def test_primary_provider_kwarg_absent_name_falls_back_to_seeded_pick(
 ) -> None:
     first = FakeServer([(200, _ok_payload("first", model="m"), 0.0)])
     second = FakeServer([(200, _ok_payload("second", model="m"), 0.0)])
-    _set_keys(monkeypatch, "K_FIRST", "K_SECOND")
     router = Diffundo(
         (
             _config("p_first", first, "K_FIRST", priority=0),
@@ -444,6 +449,7 @@ def _provider_config_file(path: Path, servers: list[tuple[str, FakeServer, str, 
                         "tier": "fast",
                         "base_url": server.base_url,
                         "api_key_env": env_key,
+                        "api_key": PROVIDER_SECRET,
                         "timeout_s": 2.0,
                         "max_retries": 0,
                         "rpm": 120,
@@ -464,8 +470,6 @@ def _provider_config_file(path: Path, servers: list[tuple[str, FakeServer, str, 
 
 def _set_provider_env(monkeypatch: pytest.MonkeyPatch, config_path: Path) -> None:
     monkeypatch.setenv("CAMBIUM_PROVIDERS", str(config_path.resolve()))
-    monkeypatch.setenv(PROVIDER_KEY_A, PROVIDER_SECRET)
-    monkeypatch.setenv(PROVIDER_KEY_B, PROVIDER_SECRET)
     monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
     monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
 
@@ -686,8 +690,6 @@ class _WorkerRunner:
 def _worker_env(config_path: Path, session_dir: Path) -> dict[str, str]:
     env = dict(os.environ)
     env["CAMBIUM_PROVIDERS"] = str(config_path.resolve())
-    env[PROVIDER_KEY_A] = PROVIDER_SECRET
-    env[PROVIDER_KEY_B] = PROVIDER_SECRET
     env["NO_PROXY"] = "127.0.0.1,localhost"
     env["no_proxy"] = "127.0.0.1,localhost"
     env["PYTHONPATH"] = os.pathsep.join(

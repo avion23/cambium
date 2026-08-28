@@ -192,6 +192,7 @@ def _provider_config(path: Path, base_url: str) -> Path:
                         "tier": "fast",
                         "base_url": base_url,
                         "api_key_env": PROVIDER_KEY,
+                        "api_key": PROVIDER_SECRET,
                         "timeout_s": 2.0,
                         "max_retries": 1,
                         "rpm": 120,
@@ -239,7 +240,6 @@ def _task(session_dir: Path, repo: Path, base: str, config_path: Path) -> dict[s
 
 def _set_provider_env(monkeypatch: pytest.MonkeyPatch, config_path: Path) -> None:
     monkeypatch.setenv("CAMBIUM_PROVIDERS", str(config_path.resolve()))
-    monkeypatch.setenv(PROVIDER_KEY, PROVIDER_SECRET)
     monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
     monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
     monkeypatch.setenv(

@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 import time
 
-from diffundo_helpers import PROMPT, FakeServer, _config, _error_payload, _ok_payload, _set_keys
+from diffundo_helpers import PROMPT, FakeServer, _config, _error_payload, _ok_payload
 
 from cambium.diffundo import (
     CallResult,
@@ -42,7 +42,6 @@ def test_two_healthy_providers_distinct_priorities_try_priority_order(monkeypatc
     # priority sort, not config order, must decide the cascade winner.
     low = FakeServer([(200, _ok_payload("low"), 0.0)])
     high = FakeServer([(200, _ok_payload("high"), 0.0)])
-    _set_keys(monkeypatch, "K_LOW", "K_HIGH")
     router = Diffundo(
         (
             _config("p_high", high, "K_HIGH", priority=5),
@@ -70,7 +69,6 @@ def test_two_healthy_providers_distinct_priorities_try_priority_order(monkeypatc
 def test_equal_priority_providers_stick_to_primary_per_instance(monkeypatch) -> None:
     first = FakeServer([(200, _ok_payload("first"), 0.0)])
     second = FakeServer([(200, _ok_payload("second"), 0.0)])
-    _set_keys(monkeypatch, "K_FIRST", "K_SECOND")
     router = Diffundo(
         (
             _config("p_first", first, "K_FIRST", priority=0),
@@ -96,7 +94,6 @@ def test_rotation_seed_spreads_primaries_across_instances_and_keeps_priority_ord
     first = FakeServer([(200, _ok_payload("first"), 0.0)])
     second = FakeServer([(200, _ok_payload("second"), 0.0)])
     low = FakeServer([(200, _ok_payload("low"), 0.0)])
-    _set_keys(monkeypatch, "K_FIRST", "K_SECOND", "K_LOW")
     seeded = Diffundo(
         (
             _config("p_first", first, "K_FIRST", priority=0),
@@ -133,7 +130,6 @@ def test_fallback_moves_association_and_never_bounces_back(monkeypatch) -> None:
     primary does not reclaim the task (prompt-prefix caching preserved)."""
     first = FakeServer([(500, {"error": "boom"}, 0.0), (200, _ok_payload("first"), 0.0)])
     second = FakeServer([(200, _ok_payload("second"), 0.0)])
-    _set_keys(monkeypatch, "K_FIRST", "K_SECOND")
     router = Diffundo(
         (
             _config("p_first", first, "K_FIRST", priority=0, cooldown_s=0.05, max_retries=0),
@@ -166,7 +162,6 @@ def test_fallback_moves_association_and_never_bounces_back(monkeypatch) -> None:
 def test_rate_limited_priority_provider_falls_through_to_next(monkeypatch) -> None:
     first = FakeServer([(200, _ok_payload("first"), 0.0)])
     second = FakeServer([(200, _ok_payload("second"), 0.0)])
-    _set_keys(monkeypatch, "K_1", "K_2")
     router = Diffundo(
         (
             _config("p_first", first, "K_1", rpm=1, priority=0),
@@ -198,7 +193,6 @@ def test_rate_limited_priority_provider_falls_through_to_next(monkeypatch) -> No
 def test_provider_outcome_does_not_change_selection_order(monkeypatch) -> None:
     flaky = FakeServer([(500, _error_payload("boom"), 0.0)])
     good = FakeServer([(200, _ok_payload("good"), 0.0)])
-    _set_keys(monkeypatch, "K_FLAKY", "K_GOOD")
     router = Diffundo(
         (
             _config("p_flaky", flaky, "K_FLAKY", priority=0),

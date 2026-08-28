@@ -1,9 +1,9 @@
-"""Doctor provider-env checks: an empty provider key is not configured.
+"""Doctor provider checks: an empty file-backed key is not configured.
 
-Diffundo rejects an empty ``api_key_env`` value at call time with
+Diffundo rejects an empty ``api_key`` value at call time with
 ``ProviderOutcome.AUTH_ERROR``. ``cambium doctor`` must report the same
-failure for a required key set to ``""`` that it reports for a missing key,
-and keep a non-required empty key a WARN.
+failure for a required file-backed key set to ``""`` that it reports for a
+missing key, and keep a non-required empty key a WARN.
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ def _provider(*, required: bool) -> dict[str, object]:
         "tier": "fast",
         "base_url": "https://api.example.test/v1",
         "api_key_env": "CAMBIUM_PROVIDER_TEST_PROVIDER_API_KEY",
+        "api_key": "",
         "required": required,
         "timeout_s": 30.0,
         "max_retries": 2,
@@ -64,7 +65,6 @@ def _run_doctor(cwd: Path) -> subprocess.CompletedProcess[str]:
 def test_doctor_fails_on_empty_required_provider_key(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
     _write_config(tmp_path, required=True)
-    monkeypatch.setenv("CAMBIUM_PROVIDER_TEST_PROVIDER_API_KEY", "")
 
     result = _run_doctor(tmp_path)
 
@@ -77,7 +77,6 @@ def test_doctor_fails_on_empty_required_provider_key(tmp_path, monkeypatch) -> N
 def test_doctor_warns_on_empty_optional_provider_key(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
     _write_config(tmp_path, required=False)
-    monkeypatch.setenv("CAMBIUM_PROVIDER_TEST_PROVIDER_API_KEY", "")
 
     result = _run_doctor(tmp_path)
 
@@ -89,7 +88,6 @@ def test_doctor_warns_on_empty_optional_provider_key(tmp_path, monkeypatch) -> N
 def test_doctor_provider_row_shows_configured_model(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
     _write_config(tmp_path, required=False)
-    monkeypatch.setenv("CAMBIUM_PROVIDER_TEST_PROVIDER_API_KEY", "")
 
     status, detail = doctor.check_provider_env(tmp_path)
 
@@ -100,7 +98,6 @@ def test_doctor_provider_row_shows_configured_model(tmp_path, monkeypatch) -> No
 def test_doctor_provider_row_surfaces_durable_quarantine_reason(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
     _write_config(tmp_path, required=False)
-    monkeypatch.setenv("CAMBIUM_PROVIDER_TEST_PROVIDER_API_KEY", "")
     ledger_path = tmp_path / "routing-state.json"
     ledger = DebtStore(ledger_path)
     ledger.record(
@@ -121,7 +118,6 @@ def test_doctor_provider_row_surfaces_durable_quarantine_reason(tmp_path, monkey
 def test_doctor_ignores_corrupt_routing_ledger(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
     _write_config(tmp_path, required=False)
-    monkeypatch.setenv("CAMBIUM_PROVIDER_TEST_PROVIDER_API_KEY", "")
     ledger_path = tmp_path / "routing-state.json"
     ledger_path.write_text("{not valid json", encoding="utf-8")
     monkeypatch.setattr(routing, "DEFAULT_ROUTING_STATE_PATH", ledger_path)

@@ -119,6 +119,7 @@ def _provider_file(path: Path, base_url: str) -> Path:
                         "tier": "fast",
                         "base_url": base_url,
                         "api_key_env": "CAMBIUM_PROVIDER_PTY_PROVIDER_API_KEY",
+                        "api_key": "pty-secret",
                         "timeout_s": 2.0,
                         "max_retries": 0,
                         "rpm": 120,
@@ -139,7 +140,6 @@ def _spawn_tui(repo: Path, provider_file: Path) -> tuple[subprocess.Popen[bytes]
     env.update(
         {
             "CAMBIUM_PROVIDERS": str(provider_file),
-            "CAMBIUM_PROVIDER_PTY_PROVIDER_API_KEY": "pty-secret",
             "NO_PROXY": "127.0.0.1,localhost",
             "no_proxy": "127.0.0.1,localhost",
         }

@@ -58,6 +58,7 @@ def _provider_config(path: Path) -> Path:
                         "tier": "balanced",
                         "base_url": "http://127.0.0.1:9999/v1",
                         "api_key_env": "CAMBIUM_PROVIDER_READY_A_API_KEY",
+                        "api_key": "sk-tui-ready-a",
                         "model": "model-a",
                     },
                     {
@@ -65,6 +66,7 @@ def _provider_config(path: Path) -> Path:
                         "tier": "strong",
                         "base_url": "http://127.0.0.1:9999/v1",
                         "api_key_env": "CAMBIUM_PROVIDER_READY_B_API_KEY",
+                        "api_key": "sk-tui-ready-b",
                         "model": "model-b",
                     },
                     {
@@ -72,6 +74,7 @@ def _provider_config(path: Path) -> Path:
                         "tier": "fast",
                         "base_url": "http://127.0.0.1:9999/v1",
                         "api_key_env": "CAMBIUM_PROVIDER_MISSING_API_KEY",
+                        "api_key": "",
                         "model": "model-missing",
                     },
                     {
@@ -79,6 +82,7 @@ def _provider_config(path: Path) -> Path:
                         "tier": "fast",
                         "base_url": "http://127.0.0.1:9999/v1",
                         "api_key_env": "CAMBIUM_PROVIDER_DISABLED_API_KEY",
+                        "api_key": "sk-tui-disabled",
                         "model": "model-disabled",
                         "enabled": False,
                     },
@@ -183,10 +187,6 @@ def test_tui_quota_command_renders_seeded_ledger_rows(monkeypatch, tmp_path: Pat
 
 def test_model_lists_ready_targets_and_marks_current(monkeypatch, tmp_path: Path) -> None:
     provider_config = _provider_config(tmp_path / "providers.json")
-    monkeypatch.setenv("CAMBIUM_PROVIDER_READY_A_API_KEY", "test-key-a-not-output")
-    monkeypatch.setenv("CAMBIUM_PROVIDER_READY_B_API_KEY", "test-key-b-not-output")
-    monkeypatch.delenv("CAMBIUM_PROVIDER_MISSING_API_KEY", raising=False)
-    monkeypatch.delenv("CAMBIUM_PROVIDER_DISABLED_API_KEY", raising=False)
     output = _Tty()
     error = io.StringIO()
 
@@ -212,8 +212,6 @@ def test_model_lists_ready_targets_and_marks_current(monkeypatch, tmp_path: Path
 
 def test_model_switch_persists_for_subsequent_turns(monkeypatch, tmp_path: Path) -> None:
     provider_config = _provider_config(tmp_path / "providers.json")
-    monkeypatch.setenv("CAMBIUM_PROVIDER_READY_A_API_KEY", "test-key-a-not-output")
-    monkeypatch.setenv("CAMBIUM_PROVIDER_READY_B_API_KEY", "test-key-b-not-output")
     config = _model_config(tmp_path, provider_config)
 
     output = _Tty()

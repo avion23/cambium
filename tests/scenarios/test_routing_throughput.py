@@ -26,6 +26,7 @@ def _provider(name: str, model: str, **overrides: Any) -> ProviderConfig:
         "tier": ProviderTier.FAST,
         "base_url": "http://127.0.0.1:1",
         "api_key_env": f"CAMBIUM_PROVIDER_{name.upper()}_API_KEY",
+        "api_key": f"sk-throughput-{name}",
         "model": model,
     }
     values.update(overrides)
@@ -38,6 +39,7 @@ def _config_provider(name: str, model: str, **overrides: Any) -> dict[str, objec
         "tier": "fast",
         "base_url": "http://127.0.0.1:1",
         "api_key_env": f"CAMBIUM_PROVIDER_{name.upper()}_API_KEY",
+        "api_key": f"sk-throughput-{name}",
         "model": model,
     }
     values.update(overrides)

@@ -65,7 +65,13 @@ def _checkpoint_event(
     }
 
 
-def _two_provider_config(path: Path, *, first_enabled: bool = True) -> Path:
+def _two_provider_config(
+    path: Path,
+    *,
+    first_enabled: bool = True,
+    first_api_key: str = "sk-interactive-dead",
+    second_api_key: str = "sk-interactive-healthy",
+) -> Path:
     path.write_text(
         json.dumps(
             {
@@ -75,6 +81,7 @@ def _two_provider_config(path: Path, *, first_enabled: bool = True) -> Path:
                         "tier": "balanced",
                         "base_url": "http://127.0.0.1:9999/v1",
                         "api_key_env": "CAMBIUM_PROVIDER_DEAD_ZEN_API_KEY",
+                        "api_key": first_api_key,
                         "model": "zen-model",
                         "enabled": first_enabled,
                     },
@@ -83,6 +90,7 @@ def _two_provider_config(path: Path, *, first_enabled: bool = True) -> Path:
                         "tier": "strong",
                         "base_url": "http://127.0.0.1:9998/v1",
                         "api_key_env": "CAMBIUM_PROVIDER_HEALTHY_CODEX_API_KEY",
+                        "api_key": second_api_key,
                         "model": "codex-model",
                     },
                 ]
@@ -363,6 +371,7 @@ def test_tui_model_preference_is_validated_and_applies_to_next_turn(tmp_path: Pa
                         "tier": "balanced",
                         "base_url": "http://127.0.0.1:9999/v1",
                         "api_key_env": "CAMBIUM_PROVIDER_PROVIDER_A_API_KEY",
+                        "api_key": "sk-interactive-provider-a",
                         "model": "model-b",
                     }
                 ]
@@ -383,14 +392,13 @@ def test_tui_model_preference_is_validated_and_applies_to_next_turn(tmp_path: Pa
     result = session.set_model_preference("model-b")
     turn = session.prepare_turn("continue")
 
-    assert "preference set" in result
+    assert "preference unchanged" in result
     assert turn.config.provider == "provider-a"
     assert turn.config.model == "model-b"
 
 
 def test_tui_model_preference_refusals_name_provider_config(monkeypatch, tmp_path: Path) -> None:
     provider_config = _two_provider_config(tmp_path / "providers.json")
-    monkeypatch.setenv("CAMBIUM_PROVIDER_DEAD_ZEN_API_KEY", "offline")
     session = InteractiveSession(
         OneShotConfig(
             repo=tmp_path,
@@ -407,7 +415,7 @@ def test_tui_model_preference_refusals_name_provider_config(monkeypatch, tmp_pat
         f"add/change the entry in {path} then rerun /model"
     )
 
-    monkeypatch.delenv("CAMBIUM_PROVIDER_DEAD_ZEN_API_KEY")
+    _two_provider_config(provider_config, first_api_key="")
     assert session.set_model_preference("dead-zen:zen-model") == (
         "model: provider 'dead-zen' is not eligible "
         f"(disabled or credential unavailable); add/change the entry in {path} then rerun /model"
@@ -430,8 +438,6 @@ def test_resume_reselects_healthy_provider_and_reconciles_model(
     monkeypatch, tmp_path: Path
 ) -> None:
     provider_config = _two_provider_config(tmp_path / "providers.json")
-    monkeypatch.setenv("CAMBIUM_PROVIDER_DEAD_ZEN_API_KEY", "offline")
-    monkeypatch.setenv("CAMBIUM_PROVIDER_HEALTHY_CODEX_API_KEY", "offline")
     config = OneShotConfig(
         repo=tmp_path,
         session_root=tmp_path / "interactive",
@@ -447,7 +453,6 @@ def test_resume_reselects_healthy_provider_and_reconciles_model(
     session.complete_turn(first, succeeded=True)
 
     provider_config = _two_provider_config(provider_config, first_enabled=False)
-    monkeypatch.delenv("CAMBIUM_PROVIDER_DEAD_ZEN_API_KEY")
 
     resumed = InteractiveSession(config)
     assert resumed.provider == "healthy-codex"
@@ -499,8 +504,6 @@ def test_serving_reconciliation_preserves_per_provider_model_choices(
     monkeypatch, tmp_path: Path
 ) -> None:
     provider_config = _two_provider_config(tmp_path / "providers.json")
-    monkeypatch.setenv("CAMBIUM_PROVIDER_DEAD_ZEN_API_KEY", "offline")
-    monkeypatch.setenv("CAMBIUM_PROVIDER_HEALTHY_CODEX_API_KEY", "offline")
     session = InteractiveSession(
         OneShotConfig(
             repo=tmp_path,

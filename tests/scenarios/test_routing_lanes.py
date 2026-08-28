@@ -38,6 +38,7 @@ def _pc(name: str, model: str, **overrides: Any) -> ProviderConfig:
         tier=ProviderTier.FAST,
         base_url="http://127.0.0.1:1",
         api_key_env=f"CAMBIUM_PROVIDER_{name.upper()}_API_KEY",
+        api_key=f"sk-lanes-{name}",
         model=model,
     )
     base.update(overrides)
@@ -56,6 +57,7 @@ def _config_file(path: Path, providers: list[tuple[str, str, int]]) -> Path:
                         "tier": "fast",
                         "base_url": "http://127.0.0.1:1",
                         "api_key_env": f"CAMBIUM_PROVIDER_{name.upper()}_API_KEY",
+                        "api_key": f"sk-lanes-{name}",
                         "rpm": rpm,
                         "enabled": True,
                         "model": model,

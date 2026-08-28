@@ -185,10 +185,10 @@ def test_interactive_run_plan_receives_computed_wall_budget(
         '{"providers":[{"name":"slow","tier":"fast",'
         '"base_url":"https://api.example.test/v1",'
         '"api_key_env":"CAMBIUM_PROVIDER_SLOW_API_KEY",'
+        '"api_key":"test-secret-not-emitted",'
         '"model":"slow-model","throughput_hint_tps":10}]}',
         encoding="utf-8",
     )
-    monkeypatch.setenv("CAMBIUM_PROVIDER_SLOW_API_KEY", "test-secret-not-emitted")
     captured: dict[str, object] = {}
 
     async def fake_run_plan(session_dir, plan, **_kwargs):
@@ -226,6 +226,7 @@ def test_provider_config_budget_override_is_loaded(tmp_path: Path) -> None:
                         "tier": "strong",
                         "base_url": "https://api.example.test/v1",
                         "api_key_env": "CAMBIUM_PROVIDER_SLOW_API_KEY",
+                        "api_key": "sk-interactive-slow",
                         "model": "slow-model",
                         "interactive_wall_budget_s": 1_111,
                         "throughput_hint_tps": 1,

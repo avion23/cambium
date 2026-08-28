@@ -18,6 +18,7 @@ def test_provider_config_loads_subscription_resource_dimensions(tmp_path: Path) 
                         "tier": "fast",
                         "base_url": "https://example.com/v1",
                         "api_key_env": "CAMBIUM_PROVIDER_ZAI_API_KEY",
+                        "api_key": "sk-test-zai",
                         "model": "glm",
                         "rpm": 100,
                         "max_concurrency": 3,
@@ -60,6 +61,7 @@ def test_diffundo_lease_filters_candidates_to_one_continuous_branch() -> None:
             tier=ProviderTier.FAST,
             base_url="http://127.0.0.1:1/v1",
             api_key_env="A",
+            api_key="sk-test-a",
             model="m",
         ),
         ProviderConfig(
@@ -67,6 +69,7 @@ def test_diffundo_lease_filters_candidates_to_one_continuous_branch() -> None:
             tier=ProviderTier.FAST,
             base_url="http://127.0.0.1:2/v1",
             api_key_env="B",
+            api_key="sk-test-b",
             model="m",
         ),
     ]

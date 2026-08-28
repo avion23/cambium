@@ -158,6 +158,7 @@ def test_sync_lm_calls_can_cross_event_loops(monkeypatch: pytest.MonkeyPatch) ->
         tier=ProviderTier.FAST,
         base_url="http://127.0.0.1:1",
         api_key_env="K_LOOP_LOCAL",
+        api_key="sk-test-loop-local",
         model="m-loop-local",
         timeout_s=1.0,
         max_retries=0,
@@ -824,6 +825,7 @@ def test_state_round_trip_loads_in_a_fresh_process(tmp_path: Path) -> None:
                 tier=ProviderTier.FAST,
                 base_url="https://fake.invalid",
                 api_key_env="K_FAKE",
+                api_key="sk-test-fake",
                 model="m",
             )
         ]
@@ -871,6 +873,7 @@ def test_state_serialization_rejects_userinfo_base_url_raw_state_canary() -> Non
                 tier=ProviderTier.FAST,
                 base_url=f"https://{url_secret}_user:{url_secret}_pass@fake.invalid",
                 api_key_env="K_FAKE",
+                api_key="sk-test-fake",
                 model="m",
             )
         ]
@@ -887,6 +890,7 @@ def test_state_serialization_rejects_userinfo_base_url_raw_state_canary() -> Non
                 tier=ProviderTier.FAST,
                 base_url="https://api.example.invalid/v1",
                 api_key_env="K_FAKE",
+                api_key="sk-test-fake",
                 model="m",
             )
         ]
@@ -908,6 +912,7 @@ def test_state_serialization_rejects_userinfo_base_url_raw_state_canary() -> Non
                     tier=ProviderTier.FAST,
                     base_url=query_url,
                     api_key_env="K_FAKE",
+                    api_key="sk-test-fake",
                     model="m",
                 )
             ]

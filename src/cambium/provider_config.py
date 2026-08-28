@@ -1488,14 +1488,12 @@ def select_provider(
 def env_report(
     providers: Sequence[ProviderConfig | ProviderEnvSpec],
 ) -> dict[str, bool]:
-    """Return whether each provider's key environment variable is usable.
+    """Return whether each provider's file-backed key is usable.
 
-    A variable is usable only when set to a non-empty value, matching
-    Diffundo's call-time check: ``_post_sync`` rejects an empty key with
-    ``ProviderOutcome.AUTH_ERROR``. The report contains only provider names and
-    booleans. It never returns an environment-variable name or value.
+    The report contains only provider names and booleans. It never returns an
+    environment-variable name or credential value.
     """
-    return {provider.name: bool(os.environ.get(provider.api_key_env)) for provider in providers}
+    return {provider.name: bool(provider.api_key) for provider in providers}
 
 
 __all__ = [

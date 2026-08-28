@@ -8,7 +8,7 @@ from dataclasses import replace
 from typing import Any, cast
 
 import pytest
-from diffundo_helpers import FakeServer, _config, _ok_payload, _set_keys
+from diffundo_helpers import FakeServer, _config, _ok_payload
 
 from cambium.diffundo import (
     AllProvidersFailed,
@@ -257,7 +257,6 @@ def test_content_flagged_error_cascades_without_health_damage(
         ]
     )
     good = FakeServer([(200, _ok_payload("fallback"), 0.0)])
-    _set_keys(monkeypatch, "K_FLAGGED", "K_GOOD")
     router = Diffundo(
         (
             _config("p_flagged", flagged, "K_FLAGGED", max_retries=2),
@@ -288,7 +287,6 @@ def test_all_content_flagged_providers_preserve_terminal_outcome(
     }
     first = FakeServer([(400, body, 0.0)])
     second = FakeServer([(400, body, 0.0)])
-    _set_keys(monkeypatch, "K_FLAGGED_A", "K_FLAGGED_B")
     router = Diffundo(
         (
             _config("p_flagged_a", first, "K_FLAGGED_A"),

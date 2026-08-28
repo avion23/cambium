@@ -60,6 +60,7 @@ def _provider(name: str) -> dict[str, Any]:
         "tier": "fast",
         "base_url": "http://127.0.0.1:1",
         "api_key_env": f"CAMBIUM_PROVIDER_{name.upper().replace('-', '_')}_API_KEY",
+        "api_key": f"sk-delegation-{name}",
         "model": "m1",
     }
 
@@ -330,14 +331,14 @@ def test_failed_worker_reason_reaches_decision_port(tmp_path: Path) -> None:
 
 
 def test_unset_key_provider_is_skipped_and_persisted_as_infeasible(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
     missing = "missing-provider"
     ready = "ready-provider"
-    missing_env = "CAMBIUM_PROVIDER_MISSING_PROVIDER_API_KEY"
-    ready_env = "CAMBIUM_PROVIDER_READY_PROVIDER_API_KEY"
-    monkeypatch.delenv(missing_env, raising=False)
-    config = _provider_config(tmp_path / "providers.json", [_provider(missing), _provider(ready)])
+    config = _provider_config(
+        tmp_path / "providers.json",
+        [_provider(missing) | {"api_key": ""}, _provider(ready)],
+    )
     spec = {
         "task_id": "candidate",
         "fanout_config": {},
@@ -351,7 +352,6 @@ def test_unset_key_provider_is_skipped_and_persisted_as_infeasible(
         spec,
         {},
         {},
-        provider_environment={ready_env: "usable-key"},
     )
     assert spec["assigned_provider"] == ready
     assert spec["authorized_providers"] == [ready]
@@ -375,14 +375,14 @@ def test_unset_key_provider_is_skipped_and_persisted_as_infeasible(
 )
 def test_no_credential_feasible_providers_fail_before_spawn(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
     authorized_providers: list[str],
     explicit: bool,
 ) -> None:
     provider_name = "missing-provider"
-    monkeypatch.delenv("CAMBIUM_PROVIDER_MISSING_PROVIDER_API_KEY", raising=False)
     repo, base = _repo(tmp_path)
-    config = _provider_config(tmp_path / "providers.json", [_provider(provider_name)])
+    config = _provider_config(
+        tmp_path / "providers.json", [_provider(provider_name) | {"api_key": ""}]
+    )
     session_dir = tmp_path / "session"
     task = {
         "task_id": "no-credentials",

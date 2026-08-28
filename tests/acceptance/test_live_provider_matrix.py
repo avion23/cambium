@@ -558,17 +558,16 @@ def _api_router(context: _ProviderContext, monkeypatch: pytest.MonkeyPatch) -> D
             f"set {context.provider.api_key_env} or add {context.provider.name} "
             "to the supported OpenCode/pi auth stores"
         )
-    # Diffundo intentionally resolves API keys from the environment at call
-    # time. Keep the source-file read in this test process only; monkeypatch
-    # removes the derived environment value when the test returns.
-    monkeypatch.setenv(context.provider.api_key_env, api_key)
+    # ``api_key_env`` remains a live-harness discovery fallback for real
+    # operator credentials; runtime calls use the file-backed provider value.
+    provider = replace(context.provider, api_key=api_key)
     quota_db = os.environ.get(QUOTA_DB_ENV)
     if context.provider.quota_windows and not quota_db:
         pytest.skip(f"set {QUOTA_DB_ENV} to an isolated quota database path")
     if quota_db:
         monkeypatch.setenv("CAMBIUM_QUOTA_DB", quota_db)
     return Diffundo(
-        (context.provider,),
+        (provider,),
         call_budget_s=_probe_timeout(),
         pause_timeout_s=min(5.0, _probe_timeout()),
         task_id="acceptance",

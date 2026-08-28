@@ -5,8 +5,6 @@ from __future__ import annotations
 import asyncio
 import subprocess
 from pathlib import Path
-from typing import Any
-
 import pytest
 
 from cambium import oneshot
@@ -124,8 +122,8 @@ def test_default_branch_is_stable_and_explicit_branch_is_preserved(tmp_path: Pat
 # --------------------------------------------------------------------------- #
 
 
-def _write_providers(path: Path) -> Path:
-    """Two enabled providers serving different models."""
+def _write_providers(path: Path, *, pa_key: str = "secret-a", pb_key: str = "") -> Path:
+    """Two providers serving different models, with keys stored in the file."""
     import json
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -138,6 +136,7 @@ def _write_providers(path: Path) -> Path:
                         "tier": "strong",
                         "base_url": "http://127.0.0.1:1",
                         "api_key_env": "CAMBIUM_PROVIDER_PA_API_KEY",
+                        "api_key": pa_key,
                         "model": "model-a",
                         "priority": 0,
                         "enabled": True,
@@ -147,6 +146,7 @@ def _write_providers(path: Path) -> Path:
                         "tier": "strong",
                         "base_url": "http://127.0.0.1:1",
                         "api_key_env": "CAMBIUM_PROVIDER_PB_API_KEY",
+                        "api_key": pb_key,
                         "model": "model-b",
                         "priority": 0,
                         "enabled": True,
@@ -159,32 +159,20 @@ def _write_providers(path: Path) -> Path:
     return path
 
 
-def _stored_auth(tmp_path: Path) -> Any:
-    """A real AuthStore at a scratch path with one stored provider key."""
-    from cambium.auth import AuthStore
-
-    store = AuthStore(tmp_path / "auth.json")
-    store.set_provider("pa", "secret-a")
-    return store
-
-
 def test_auto_mode_candidates_and_plan_shape(tmp_path: Path) -> None:
-    """--auto builds model_candidates from providers with stored credentials
+    """--auto builds model_candidates from providers with file-backed credentials
     and leaves the (provider, model, tier) to the supervisor resolution."""
     from cambium.oneshot import _resolve_provider
 
     repo = _repo(tmp_path / "repo")
     config_path = _write_providers(tmp_path / "providers.json")
-    # only provider pa has a stored credential (real AuthStore, injected)
-    store = _stored_auth(tmp_path)
-
     config = oneshot.OneShotConfig(
         prompt="run one auto task",
         repo=repo,
         auto=True,
         provider_config_path=config_path,
     )
-    resolved, environment = _resolve_provider(config, repo, auth_store=store)
+    resolved, environment = _resolve_provider(config, repo)
 
     assert resolved.model_candidates == ("model-a",)  # pb has no stored key
     assert resolved.fanout_config == {}  # resolution fills model + tier
@@ -209,33 +197,30 @@ def test_auto_mode_rejects_pinned_provider_or_model(tmp_path: Path) -> None:
         provider_config_path=_write_providers(tmp_path / "providers.json"),
     )
     try:
-        _resolve_provider(config, repo, auth_store=_stored_auth(tmp_path))
+        _resolve_provider(config, repo)
     except ValueError as exc:
         assert "cannot be combined" in str(exc)
     else:
         raise AssertionError("auto + provider must be rejected")
 
 
-def test_auto_mode_requires_stored_credential(tmp_path: Path) -> None:
+def test_auto_mode_requires_file_credential(tmp_path: Path) -> None:
     from cambium.oneshot import _resolve_provider
 
     repo = _repo(tmp_path / "repo")
+    config_path = _write_providers(tmp_path / "providers.json", pa_key="", pb_key="")
     config = oneshot.OneShotConfig(
         prompt="p",
         repo=repo,
         auto=True,
-        provider_config_path=_write_providers(tmp_path / "providers.json"),
+        provider_config_path=config_path,
     )
-    # a real, EMPTY AuthStore: every provider's credential lookup fails
-    from cambium.auth import AuthStore
-
-    empty = AuthStore(tmp_path / "empty-auth.json")
     try:
-        _resolve_provider(config, repo, auth_store=empty)
+        _resolve_provider(config, repo)
     except ValueError as exc:
         assert "stored credentials" in str(exc)
     else:
-        raise AssertionError("auto with no stored credentials must fail closed")
+        raise AssertionError("auto with no file-backed credentials must fail closed")
 
 
 def test_explicit_provider_requires_usable_credential_and_key_in_plan(
@@ -245,7 +230,6 @@ def test_explicit_provider_requires_usable_credential_and_key_in_plan(
 
     repo = _repo(tmp_path / "repo")
     config_path = _write_providers(tmp_path / "providers.json")
-    store = _stored_auth(tmp_path)  # only pa is authorized initially
     config = oneshot.OneShotConfig(
         prompt="p",
         repo=repo,
@@ -254,10 +238,10 @@ def test_explicit_provider_requires_usable_credential_and_key_in_plan(
     )
 
     with pytest.raises(ValueError, match="not authorized"):
-        _resolve_provider(config, repo, auth_store=store)
+        _resolve_provider(config, repo)
 
-    store.set_provider("pb", "secret-b")
-    resolved, environment = _resolve_provider(config, repo, auth_store=store)
+    _write_providers(config_path, pb_key="secret-b")
+    resolved, environment = _resolve_provider(config, repo)
     assert "CAMBIUM_PROVIDER_PB_API_KEY" in resolved.provider_env_keys
     assert environment["CAMBIUM_PROVIDER_PB_API_KEY"] == "secret-b"
 
@@ -270,8 +254,7 @@ def test_pinned_provider_router_keeps_ready_siblings_for_terminal_fallback(
 
     repo = _repo(tmp_path / "repo")
     config_path = _write_providers(tmp_path / "providers.json")
-    store = _stored_auth(tmp_path)
-    store.set_provider("pb", "secret-b")
+    _write_providers(config_path, pb_key="secret-b")
     config = oneshot.OneShotConfig(
         prompt="p",
         repo=repo,
@@ -279,7 +262,7 @@ def test_pinned_provider_router_keeps_ready_siblings_for_terminal_fallback(
         provider_config_path=config_path,
     )
 
-    resolved, _environment = _resolve_provider(config, repo, auth_store=store)
+    resolved, _environment = _resolve_provider(config, repo)
     monkeypatch.setattr(worker, "_provider_path", lambda: config_path)
 
     router, _tier, _model, _identity = worker._provider_router(

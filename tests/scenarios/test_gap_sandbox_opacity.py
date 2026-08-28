@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-from diffundo_helpers import FakeServer, _config, _error_payload, _ok_payload, _set_keys
+from diffundo_helpers import FakeServer, _config, _error_payload, _ok_payload
 
 from cambium.diffundo import (
     AllProvidersFailed,
@@ -30,6 +30,7 @@ def _provider(name: str = "p_sandbox") -> ProviderConfig:
         tier=ProviderTier.FAST,
         base_url="https://provider.example",
         api_key_env="CAMBIUM_PROVIDER_KEY",
+        api_key="sk-test-sandbox",
         model="test-model",
     )
 
@@ -80,7 +81,6 @@ def test_os_restriction_causes_are_classified(cause: BaseException) -> None:
 def test_sandbox_failure_cascades_without_health_damage(monkeypatch: pytest.MonkeyPatch) -> None:
     blocked = FakeServer([(500, _error_payload("sandbox blocked network access"), 0.0)])
     good = FakeServer([(200, _ok_payload("fallback"), 0.0)])
-    _set_keys(monkeypatch, "K_SANDBOX", "K_GOOD")
     router = Diffundo(
         (
             _config("p_sandbox", blocked, "K_SANDBOX", max_retries=2),

@@ -159,6 +159,7 @@ def _write_provider_config(
                         "tier": "fast",
                         "base_url": base_url,
                         "api_key_env": derived_env_name(name),
+                        "api_key": FAKE_API_KEY,
                         "timeout_s": 2.0,
                         "max_retries": 0,
                         "rpm": 120,
@@ -252,7 +253,6 @@ def test_m6_provider_decision_and_atomic_publish(tmp_path: Path, monkeypatch) ->
 
     try:
         _isolate_proxy_environment(monkeypatch)
-        monkeypatch.setenv("CAMBIUM_PROVIDER_M6_FAKE_FAST_API_KEY", FAKE_API_KEY)
         _set_absolute_pythonpath(monkeypatch)
         config_path = tmp_path / "providers.json"
         _write_provider_config(config_path, server.base_url)
@@ -372,8 +372,6 @@ def test_m6_forced_429_falls_back_to_next_provider(tmp_path: Path, monkeypatch) 
     try:
         with _FAKE_LOCK:
             SCRIPTED_STATUS_CODES[:] = [429, 200]
-        for provider_name in ("m6-fake-429", "m6-fake-fallback"):
-            monkeypatch.setenv(derived_env_name(provider_name), FAKE_API_KEY)
         config_path = tmp_path / "providers.json"
         _write_provider_config(
             config_path,

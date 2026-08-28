@@ -30,6 +30,7 @@ def _provider(name: str, **overrides: object) -> dict[str, object]:
         "tier": "strong",
         "base_url": "https://api.example.test/v1",
         "api_key_env": derived_env_name(name),
+        "api_key": f"sk-selection-{name}",
         "timeout_s": 30.0,
         "max_retries": 2,
         "rpm": 60,
