@@ -7,6 +7,7 @@ from dataclasses import replace
 
 import pytest
 
+import cambium.summary_trunk as summary_trunk
 from cambium.summary_trunk import (
     SUMMARY_ENTRY_CLOSE,
     SUMMARY_ENTRY_OPEN,
@@ -357,15 +358,17 @@ def test_oversize_list_item_is_truncated_with_a_visible_marker() -> None:
 def test_oversize_total_trims_low_priority_lists_before_core_fields() -> None:
     _, expectation = build_summary_request(HEAD, TAIL_1, through_turn=3)
     decoded = json.loads(_response(expectation, label="one"))
-    decoded["open_items"] = [f"open {index} " + "o" * 1_980 for index in range(32)]
+    decoded["open_items"] = [f"open {index} " + "o" * 3_000 for index in range(32)]
     decoded["relevant_failed_approaches"] = [
         f"failed {index} " + "f" * 1_980 for index in range(32)
     ]
 
     entry = parse_summary_response(json.dumps(decoded), expectation)
 
-    assert len(entry.open_items) == 1
-    assert 1 < len(entry.relevant_failed_approaches) < SUMMARY_MAX_ITEMS
+    assert 1 < len(entry.open_items) < SUMMARY_MAX_ITEMS
+    assert len(entry.relevant_failed_approaches) == 1
+    assert entry.open_items[0].startswith("open 0 ")
+    assert SUMMARY_TRUNCATION_MARKER in entry.open_items[0]
     assert entry.decisions_added == ("decision one",)
     assert entry.objective == "objective one"
     assert entry.outcome == "outcome one"
@@ -380,6 +383,36 @@ def test_oversize_total_trims_low_priority_lists_before_core_fields() -> None:
         )
         <= SUMMARY_MAX_ENTRY_BYTES
     )
+
+
+def test_pathological_valid_entry_uses_bounded_truncation_fallback(monkeypatch) -> None:
+    _, expectation = build_summary_request(HEAD, TAIL_1, through_turn=3)
+    entry = parse_summary_response(_response(expectation, label="one"), expectation)
+    entry = replace(
+        entry,
+        objective="hypothesis: inspect summary_trunk.py:_fit_entry_size",
+        outcome="outcome",
+        decisions_added=("background",) * SUMMARY_MAX_ITEMS,
+        decisions_superseded=("background",) * SUMMARY_MAX_ITEMS,
+        facts_added=("background",) * SUMMARY_MAX_ITEMS,
+        facts_invalidated=("background",) * SUMMARY_MAX_ITEMS,
+        files_and_symbols_changed=("background",) * SUMMARY_MAX_ITEMS,
+        verification_results=("background",) * SUMMARY_MAX_ITEMS,
+        relevant_failed_approaches=("background",) * SUMMARY_MAX_ITEMS,
+        open_items=("next action: inspect summary_trunk.py:_fit_entry_size",),
+    )
+
+    monkeypatch.setattr(summary_trunk, "SUMMARY_MAX_ENTRY_BYTES", 1_000)
+    fallback = summary_trunk._fallback_entry(entry)
+
+    encoded = json.dumps(
+        entry_mapping(fallback), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    assert len(encoded) <= summary_trunk.SUMMARY_MAX_ENTRY_BYTES
+    assert fallback.objective == entry.objective
+    assert fallback.open_items == entry.open_items
+    assert SUMMARY_TRUNCATION_MARKER in fallback.outcome
+    assert "decisions_added" in fallback.outcome
 
 
 def test_rendered_entry_revalidation_uses_tolerant_field_bounds() -> None:
