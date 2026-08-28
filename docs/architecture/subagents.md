@@ -27,20 +27,7 @@ filesystem isolation, cancellation, result validation, and publication.
 
 ## 1. Computer-science model
 
-The implementation combines established patterns:
-
-| Cambium concept | Existing pattern |
-| --- | --- |
-| Plan and dynamic children | Bounded task DAG |
-| One worker per admitted child | Actor/process isolation |
-| Parent waits for admitted children | Structured concurrency / fork-join |
-| Immutable context checkpoint | MVCC snapshot |
-| Generation token | Fencing token |
-| Strict child result | Typed message / capability boundary |
-| Durable proposal before spawn | Write-ahead log |
-| Serialized Git publication | Single-writer commit protocol |
-| Summary merge | Monotone fact projection where possible |
-| Code integration | Transactional artifact join |
+Patterns: bounded task DAG, fork-join, fencing token, write-ahead admission.
 
 A child receives authority through its task spec. It does not inherit arbitrary
 parent memory, sibling state, credentials, or write access.
@@ -279,10 +266,6 @@ Do not delegate when:
 - coordination cost exceeds the saved wall time;
 - the child cannot be given a precise definition of done;
 - a direct tool call is sufficient.
-
-This is the fork-join version of Amdahl’s law: parallelism helps only on the
-independent fraction, after paying dispatch, context, verification, and merge
-costs.
 
 ## 10. Source map
 
