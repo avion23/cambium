@@ -5,9 +5,10 @@ entries are quarantined to a sidecar so one typo does not disable every
 provider.
 
 Provider entries carry a tagged ``auth``/``protocol`` mode: the legacy
-``api_key`` + ``chat_completions`` pair is unchanged, and ``codex_chatgpt``
-entries are pinned to ``CODEX_CHATGPT_PROFILE`` and must not carry
-``base_url``/``api_key_env`` (the profile fixes the endpoint and token flow).
+``api_key`` + ``chat_completions`` pair is unchanged, ``none`` entries send no
+credential, and ``codex_chatgpt`` entries are pinned to
+``CODEX_CHATGPT_PROFILE`` and must not carry ``base_url``/``api_key_env`` (the
+profile fixes the endpoint and token flow).
 
 ``DEFAULT_SAMPLE`` documents the JSON shape without creating or writing a
 configuration file. Provider files contain API-key environment variable names
@@ -52,6 +53,7 @@ class AuthMode(Enum):
     """How a provider authenticates; ``API_KEY`` is the unchanged default."""
 
     API_KEY = "api_key"
+    NONE = "none"
     CODEX_CHATGPT = "codex_chatgpt"
 
 
@@ -969,11 +971,14 @@ def _validate_provider_mapping(raw: object, index: int) -> _ProviderMapping:
         base_url = ""
         api_key_env = ""
     else:
-        missing = sorted(field for field in ("base_url", "api_key_env") if field not in raw)
-        if missing:
-            raise _error(location, f"missing required field(s): {', '.join(missing)}")
+        if "base_url" not in raw:
+            raise _error(location, "missing required field(s): base_url")
         base_url = _validate_base_url(raw["base_url"], f"{location}.base_url")
-        api_key_env = _validate_api_key_env(raw["api_key_env"], f"{location}.api_key_env", name)
+        api_key_env = (
+            _validate_api_key_env(raw["api_key_env"], f"{location}.api_key_env", name)
+            if "api_key_env" in raw
+            else ""
+        )
 
     values = {**_DEFAULTS, **raw}
     timeout_s = _require_number(values["timeout_s"], f"{location}.timeout_s")

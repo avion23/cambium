@@ -645,9 +645,10 @@ class ProviderConfig:
     key value; the value is resolved from the environment at call time (D7).
 
     ``auth``/``protocol`` tag the provider mode: the legacy ``API_KEY`` +
-    ``CHAT_COMPLETIONS`` pair is unchanged; a ``CODEX_CHATGPT`` provider is
-    pinned to ``CODEX_CHATGPT_PROFILE`` and carries empty ``base_url``/
-    ``api_key_env`` (the transport derives the endpoint from the profile).
+    ``CHAT_COMPLETIONS`` pair is unchanged; ``NONE`` chat providers send no
+    credential; a ``CODEX_CHATGPT`` provider is pinned to
+    ``CODEX_CHATGPT_PROFILE`` and carries empty ``base_url``/``api_key_env``
+    (the transport derives the endpoint from the profile).
     ``reasoning_effort`` is a normal (non-secret) config field emitted as the
     Responses-API ``reasoning: {effort}`` body field on the codex path.
     ``requests_per_minute`` and ``max_in_flight`` are independent admission
@@ -1446,7 +1447,7 @@ def _tool_call_arguments(tool_call: Any) -> dict[str, Any] | None:
 
 def _redact_error_text(message: str, api_key: str) -> str:
     """Remove credentials while retaining safe provider diagnostics."""
-    redacted = message.replace(api_key, _REDACTED)
+    redacted = message.replace(api_key, _REDACTED) if api_key else message
     return _URL_CREDENTIALS_RE.sub(r"\g<scheme>" + _REDACTED + "@", redacted)
 
 
@@ -3029,8 +3030,8 @@ class Diffundo:
                 ProviderOutcome.AUTH_ERROR,
                 "http transport is allowed only for loopback hosts; remote providers require https",
             )
-        api_key = provider.api_key
-        if not api_key:
+        api_key = provider.api_key or ""
+        if provider.auth is not AuthMode.NONE and not api_key:
             raise ProviderError(
                 provider.name,
                 ProviderOutcome.AUTH_ERROR,
@@ -3061,16 +3062,13 @@ class Diffundo:
                 )
             body["tools"] = wire_tools
         data = json.dumps(body).encode("utf-8")
-        request = urllib.request.Request(
-            url,
-            data=data,
-            method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
-                "User-Agent": USER_AGENT,
-            },
-        )
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
+        }
+        if provider.auth is not AuthMode.NONE:
+            headers["Authorization"] = f"Bearer {api_key}"
+        request = urllib.request.Request(url, data=data, method="POST", headers=headers)
         # Fail-closed transport: never follow a provider redirect (urllib would
         # replay the Authorization header against the redirect target), and
         # never route loopback http through a proxy (HTTP_PROXY would capture

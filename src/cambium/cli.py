@@ -1471,7 +1471,7 @@ def _live_architectus_llm(
             access_token=access_token,
             account_id=account_id,
         )
-    else:
+    elif selected.auth is AuthMode.API_KEY:
         if not selected.api_key:
             raise ValueError("API-key Architectus calls require a credential-source interface")
 

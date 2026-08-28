@@ -54,6 +54,7 @@ from .oauth import (
     resolve_codex_client_id,
 )
 from .provider_config import (
+    DEFAULT_PROVIDER_PATH,
     DEFAULT_SAMPLE,
     AuthMode,
     load_provider_specs,
@@ -259,7 +260,7 @@ def _provider_config_path(cwd: Path) -> tuple[Path, bool]:
     if configured:
         path = Path(configured)
         return (path if path.is_absolute() else cwd / path), True
-    return cwd / ".cambium" / "providers.json", False
+    return DEFAULT_PROVIDER_PATH, False
 
 
 @dataclass(frozen=True, slots=True)
@@ -300,13 +301,22 @@ def _doctor_providers(
     )
 
 
+def _doctor_credential_label(provider: _DoctorProvider) -> str:
+    if provider.auth is AuthMode.CODEX_CHATGPT:
+        return "oauth"
+    if provider.auth is AuthMode.NONE:
+        return "none"
+    return provider.api_key_env
+
+
 def check_provider_env(cwd: Path) -> tuple[Status, str]:
     """Check provider credential presence without printing names or values.
 
-    API-key providers are present when their ``api_key_env`` variable is set;
-    OAuth (``codex_chatgpt``) providers are present when the OAuth store holds
-    a usable session. A missing credential is WARN by default; a missing
-    required provider is FAIL. Invalid provider configuration always FAILs.
+    API-key providers are present when their file-backed ``api_key`` is set;
+    ``none`` providers need no credential; OAuth (``codex_chatgpt``) providers
+    are present when the OAuth store holds a usable session. A missing
+    credential is WARN by default; a missing required provider is FAIL.
+    Invalid provider configuration always FAILs.
     """
 
     path, explicit = _provider_config_path(cwd)
@@ -353,6 +363,8 @@ def check_provider_env(cwd: Path) -> tuple[Status, str]:
             p.name: (
                 _oauth_session_present(oauth_store, p.name)
                 if p.auth is AuthMode.CODEX_CHATGPT
+                else True
+                if p.auth is AuthMode.NONE
                 else bool(p.api_key)
             )
             for p in providers
@@ -462,6 +474,8 @@ def check_auth_coverage(cwd: Path, path: Path | None = None) -> tuple[Status, st
             p.name: (
                 _oauth_session_present(oauth_store, p.name)
                 if p.auth is AuthMode.CODEX_CHATGPT
+                else True
+                if p.auth is AuthMode.NONE
                 else p.name in auth_names
             )
             for p in providers
@@ -475,7 +489,7 @@ def check_auth_coverage(cwd: Path, path: Path | None = None) -> tuple[Status, st
     missing_required = [p.name for p in providers if p.required and not covered(p)]
     missing_optional = [p.name for p in providers if not p.required and not covered(p)]
     present = [
-        f"{p.name}={'oauth' if p.auth is AuthMode.CODEX_CHATGPT else p.api_key_env}"
+        f"{p.name}={_doctor_credential_label(p)}"
         for p in providers
         if covered(p)
     ]
@@ -511,13 +525,12 @@ def check_provider_runnable(cwd: Path, path: Path | None = None) -> tuple[Status
 
     A provider is runnable when the one-shot CLI can resolve its credential
     without reading a value: an API-key provider is runnable when its
-    ``api_key_env`` variable is set or the auth store holds the provider name
-    (the fixed ``cambium auth run`` profile injects stored keys into the
-    launch environment); an OAuth (``codex_chatgpt``) provider is runnable
-    when the OAuth store holds a usable session. A configured provider that
-    is not runnable is WARN; the ``required`` flag decides FAIL in the
-    provider-env check. The report uses provider metadata and store names
-    only and never exposes a key value.
+    file-backed ``api_key`` is set or the auth store holds the provider name;
+    ``none`` providers are always runnable; an OAuth (``codex_chatgpt``)
+    provider is runnable when the OAuth store holds a usable session. A
+    configured provider that is not runnable is WARN; the ``required`` flag
+    decides FAIL in the provider-env check. The report uses provider metadata
+    and store names only and never exposes a key value.
     """
     target = _auth_path(path)
     try:
@@ -538,6 +551,8 @@ def check_provider_runnable(cwd: Path, path: Path | None = None) -> tuple[Status
             p.name: (
                 _oauth_session_present(oauth_store, p.name)
                 if p.auth is AuthMode.CODEX_CHATGPT
+                else True
+                if p.auth is AuthMode.NONE
                 else bool(p.api_key) or p.name in auth_names
             )
             for p in providers

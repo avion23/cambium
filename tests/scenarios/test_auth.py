@@ -526,6 +526,7 @@ def test_doctor_auth_checks_have_metadata_schema_and_coverage(
     path = _store_path(tmp_path / "home")
     monkeypatch.setattr(auth, "auth_store_path", lambda: path)
     config = _config(tmp_path / "repo" / ".cambium" / "providers.json")
+    monkeypatch.setenv("CAMBIUM_PROVIDERS", str(config))
 
     status, detail = doctor.check_auth_metadata()
     assert status is doctor.Status.WARN

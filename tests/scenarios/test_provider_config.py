@@ -95,6 +95,47 @@ def test_valid_config_loads_without_key_in_environment(tmp_path: Path) -> None:
     assert providers[0].api_key_env == "CAMBIUM_PROVIDER_OPENAI_API_KEY"
 
 
+def test_keyless_and_dummy_key_providers_load_and_have_expected_readiness(
+    tmp_path: Path,
+) -> None:
+    keyless = _provider("keyless")
+    del keyless["api_key"], keyless["api_key_env"]
+    dummy = _provider("dummy", api_key="mock-key")
+    path = _write(tmp_path / "providers.json", [keyless, dummy])
+
+    providers = load_providers(path)
+
+    assert [provider.name for provider in providers] == ["keyless", "dummy"]
+    assert providers[0].api_key is None
+    assert providers[0].api_key_env == ""
+    assert providers[0].auth is AuthMode.API_KEY
+    assert providers[1].api_key == "mock-key"
+    assert select_provider(providers, name="keyless").name == "keyless"
+    assert select_provider(providers, name="dummy").name == "dummy"
+
+    from cambium.oneshot import _provider_credential_ready
+    from cambium.supervisor import _provider_credential_ready_at_admission
+
+    assert _provider_credential_ready(providers[0], object()) is False
+    assert _provider_credential_ready(providers[1], object()) is True
+    assert _provider_credential_ready_at_admission(providers[0]) is False
+    assert _provider_credential_ready_at_admission(providers[1]) is True
+
+
+def test_no_auth_provider_without_credentials_is_ready(tmp_path: Path) -> None:
+    value = _provider("anonymous", auth="none")
+    del value["api_key"], value["api_key_env"]
+
+    providers = load_providers(_write(tmp_path / "providers.json", [value]))
+
+    assert providers[0].auth is AuthMode.NONE
+    from cambium.oneshot import _provider_credential_ready
+    from cambium.supervisor import _provider_credential_ready_at_admission
+
+    assert _provider_credential_ready(providers[0], object()) is True
+    assert _provider_credential_ready_at_admission(providers[0]) is True
+
+
 def test_enabled_defaults_to_true_when_omitted(tmp_path: Path) -> None:
     entry = _provider()
     del entry["enabled"]
@@ -368,14 +409,17 @@ def test_codex_chatgpt_api_key_env_in_file_is_quarantined(
     _assert_quarantined(path, "must not be set with auth 'codex_chatgpt'", caplog)
 
 
-def test_api_key_provider_without_api_key_env_is_quarantined(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+def test_provider_without_api_key_env_loads_with_empty_env(
+    tmp_path: Path,
 ) -> None:
     value = _provider()
     del value["api_key_env"]
     path = _write(tmp_path / "providers.json", [value])
 
-    _assert_quarantined(path, r"missing required field\(s\).*api_key_env", caplog)
+    providers = load_providers(path)
+
+    assert providers[0].api_key == "sk-config-openai"
+    assert providers[0].api_key_env == ""
 
 
 @pytest.mark.parametrize("model", ["", "   ", "\t\n"])

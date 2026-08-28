@@ -1060,6 +1060,9 @@ def _provider_credential_ready_at_admission(
         except OAuthMissingError:
             return False
 
+    if getattr(auth, "value", auth) == AuthMode.NONE.value:
+        return True
+
     env_name = getattr(provider, "api_key_env", "")
     if provider_environment is not None and env_name in provider_environment:
         return bool(provider_environment[env_name])

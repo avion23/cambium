@@ -64,7 +64,8 @@ def _run_doctor(cwd: Path) -> subprocess.CompletedProcess[str]:
 
 def test_doctor_fails_on_empty_required_provider_key(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
-    _write_config(tmp_path, required=True)
+    config = _write_config(tmp_path, required=True)
+    monkeypatch.setenv("CAMBIUM_PROVIDERS", str(config))
 
     result = _run_doctor(tmp_path)
 
@@ -76,7 +77,8 @@ def test_doctor_fails_on_empty_required_provider_key(tmp_path, monkeypatch) -> N
 
 def test_doctor_warns_on_empty_optional_provider_key(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
-    _write_config(tmp_path, required=False)
+    config = _write_config(tmp_path, required=False)
+    monkeypatch.setenv("CAMBIUM_PROVIDERS", str(config))
 
     result = _run_doctor(tmp_path)
 
@@ -87,7 +89,8 @@ def test_doctor_warns_on_empty_optional_provider_key(tmp_path, monkeypatch) -> N
 
 def test_doctor_provider_row_shows_configured_model(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
-    _write_config(tmp_path, required=False)
+    config = _write_config(tmp_path, required=False)
+    monkeypatch.setenv("CAMBIUM_PROVIDERS", str(config))
 
     status, detail = doctor.check_provider_env(tmp_path)
 
@@ -95,9 +98,39 @@ def test_doctor_provider_row_shows_configured_model(tmp_path, monkeypatch) -> No
     assert "test-provider(model=example-model)=missing" in detail
 
 
+def test_doctor_default_path_reports_keyless_and_dummy_key_providers(
+    tmp_path: Path, monkeypatch
+) -> None:
+    keyless = _provider(required=False)
+    keyless["name"] = "keyless"
+    del keyless["api_key"], keyless["api_key_env"]
+    dummy = _provider(required=False)
+    dummy["name"] = "dummy"
+    dummy["api_key_env"] = "CAMBIUM_PROVIDER_DUMMY_API_KEY"
+    dummy["api_key"] = "mock-key"
+    config = tmp_path / "providers.json"
+    config.write_text(json.dumps({"providers": [keyless, dummy]}), encoding="utf-8")
+    monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
+    monkeypatch.setattr(doctor, "DEFAULT_PROVIDER_PATH", config)
+
+    status, detail = doctor.check_provider_env(tmp_path)
+
+    assert status is doctor.Status.WARN, detail
+    assert f"{config}:" in detail
+    assert "keyless(model=example-model)=missing" in detail
+    assert "dummy(model=example-model)=set" in detail
+
+    status, detail = doctor.check_provider_runnable(tmp_path)
+
+    assert status is doctor.Status.WARN, detail
+    assert "configured but not runnable: keyless" in detail
+    assert "runnable: dummy" in detail
+
+
 def test_doctor_provider_row_surfaces_durable_quarantine_reason(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
-    _write_config(tmp_path, required=False)
+    config = _write_config(tmp_path, required=False)
+    monkeypatch.setenv("CAMBIUM_PROVIDERS", str(config))
     ledger_path = tmp_path / "routing-state.json"
     ledger = DebtStore(ledger_path)
     ledger.record(
@@ -117,7 +150,8 @@ def test_doctor_provider_row_surfaces_durable_quarantine_reason(tmp_path, monkey
 
 def test_doctor_ignores_corrupt_routing_ledger(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
-    _write_config(tmp_path, required=False)
+    config = _write_config(tmp_path, required=False)
+    monkeypatch.setenv("CAMBIUM_PROVIDERS", str(config))
     ledger_path = tmp_path / "routing-state.json"
     ledger_path.write_text("{not valid json", encoding="utf-8")
     monkeypatch.setattr(routing, "DEFAULT_ROUTING_STATE_PATH", ledger_path)

@@ -132,6 +132,7 @@ def test_doctor_warns_on_missing_optional_provider_key(tmp_path, monkeypatch) ->
     config = tmp_path / ".cambium" / "providers.json"
     config.parent.mkdir(parents=True)
     config.write_text(json.dumps({"providers": [_provider()]}), encoding="utf-8")
+    monkeypatch.setenv("CAMBIUM_PROVIDERS", str(config))
 
     result = _run_doctor(cwd=tmp_path)
 
@@ -150,6 +151,7 @@ def test_doctor_fails_on_missing_required_provider_key(tmp_path, monkeypatch) ->
     config = tmp_path / ".cambium" / "providers.json"
     config.parent.mkdir(parents=True)
     config.write_text(json.dumps({"providers": [_provider(required=True)]}), encoding="utf-8")
+    monkeypatch.setenv("CAMBIUM_PROVIDERS", str(config))
 
     result = _run_doctor(cwd=tmp_path)
 
@@ -170,6 +172,7 @@ def test_doctor_quarantines_invalid_provider_config(tmp_path, monkeypatch) -> No
     config = tmp_path / ".cambium" / "providers.json"
     config.parent.mkdir(parents=True)
     config.write_text(json.dumps({"providers": [invalid]}), encoding="utf-8")
+    monkeypatch.setenv("CAMBIUM_PROVIDERS", str(config))
 
     result = _run_doctor(cwd=tmp_path)
 

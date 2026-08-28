@@ -59,7 +59,6 @@ def _assert_quarantined(path: Path, match: str, caplog: pytest.LogCaptureFixture
         ("name", r"providers\[0\]: missing required field\(s\): name"),
         ("tier", r"providers\[0\]: missing required field\(s\): tier"),
         ("base_url", r"providers\[0\]: missing required field\(s\): base_url"),
-        ("api_key_env", r"providers\[0\]: missing required field\(s\): api_key_env"),
     ],
 )
 def test_missing_required_provider_fields_are_quarantined(
@@ -105,7 +104,7 @@ def test_unknown_top_level_fields_remain_structural_failure(tmp_path: Path) -> N
 def test_unknown_auth_mode_is_quarantined(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     _assert_quarantined(
         _write(tmp_path / "providers.json", {"providers": [_provider(auth="unknown")]}),
-        r"providers\[0\]\.auth: invalid auth mode 'unknown'; expected api_key, codex_chatgpt",
+        r"providers\[0\]\.auth: invalid auth mode 'unknown'; expected api_key, codex_chatgpt, none",
         caplog,
     )
 

@@ -518,7 +518,7 @@ def _stored_provider_environment(
         raise ValueError("provider credential is not configured") from None
     if not provider.api_key:
         raise ValueError("provider credential is not configured")
-    return {provider.api_key_env: provider.api_key}
+    return {provider.api_key_env: provider.api_key} if provider.api_key_env else {}
 
 
 def _is_codex_oauth_provider(provider: Any) -> bool:
@@ -552,13 +552,15 @@ def _oauth_doc_present(provider_name: str) -> bool:
 def _provider_credential_ready(provider: Any, auth_store: AuthStore) -> bool:
     """One credential-availability boundary over the separate stores.
 
-    API-key providers are ready when their environment name resolves to a
-    stored or in-env credential; OAuth providers are ready when the local
-    OAuth store holds a document for them. The function never returns a
+    API-key providers are ready when their file-backed key is non-empty;
+    ``none`` providers need no credential; OAuth providers are ready when the
+    local OAuth store holds a document for them. The function never returns a
     credential value and never changes process-global state.
     """
     if _is_codex_oauth_provider(provider):
         return _oauth_doc_present(provider.name)
+    if getattr(provider, "auth", None) is AuthMode.NONE:
+        return True
     del auth_store
     return bool(getattr(provider, "api_key", None))
 
@@ -635,7 +637,7 @@ def _resolve_provider(
             )
         environment: dict[str, str] = {}
         for candidate in authorized:
-            if _is_codex_oauth_provider(candidate):
+            if _is_codex_oauth_provider(candidate) or candidate.auth is AuthMode.NONE:
                 continue
             environment.update(
                 _stored_provider_environment(candidate.name, provider_config_path=config_path)
@@ -654,7 +656,11 @@ def _resolve_provider(
             provider_env_keys=tuple(
                 candidate.api_key_env
                 for candidate in authorized
-                if not _is_codex_oauth_provider(candidate) and candidate.api_key_env
+                if (
+                    not _is_codex_oauth_provider(candidate)
+                    and candidate.auth is not AuthMode.NONE
+                    and candidate.api_key_env
+                )
             ),
             model_candidates=tuple(sorted({candidate.model for candidate in authorized})),
         )
@@ -700,7 +706,7 @@ def _resolve_provider(
     # check: their credential is an OAuth document, not an api_key_env key.
     store = auth_store if auth_store is not None else AuthStore()
     authorized = _authorized_provider_names(providers, store)
-    if not _is_codex_oauth_provider(selected) and not selected.api_key_env:
+    if selected.auth is AuthMode.API_KEY and not selected.api_key:
         raise ValueError(
             f"selected provider {selected.name!r} is not authorized: "
             "no credential key is configured"
@@ -734,7 +740,7 @@ def _resolve_provider(
     fanout_config["model"] = effective_model
     environment = {}
     for candidate in authorized:
-        if not _is_codex_oauth_provider(candidate):
+        if not _is_codex_oauth_provider(candidate) and candidate.auth is not AuthMode.NONE:
             environment.update(
                 _stored_provider_environment(candidate.name, provider_config_path=config_path)
             )
@@ -748,7 +754,11 @@ def _resolve_provider(
         provider_env_keys=tuple(
             candidate.api_key_env
             for candidate in authorized
-            if not _is_codex_oauth_provider(candidate) and candidate.api_key_env
+            if (
+                not _is_codex_oauth_provider(candidate)
+                and candidate.auth is not AuthMode.NONE
+                and candidate.api_key_env
+            )
         ),
         model_candidates=tuple(sorted({candidate.model for candidate in authorized})),
         fanout_config=fanout_config,
