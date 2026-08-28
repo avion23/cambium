@@ -4602,6 +4602,785 @@ def _loop_result(
     }
 
 
+def _sync_context_transcript(
+    base_messages: tuple[dict[str, Any], ...] | None,
+    context_continuation: list[dict[str, Any]],
+    transcript: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if base_messages is not None:
+        return copy.deepcopy([*base_messages[1:], *context_continuation])
+    return transcript
+
+
+def _restore_turn_context(
+    transcript_snapshot: list[dict[str, Any]],
+    config: AgentConfig,
+    tools: list[dict[str, Any]],
+    model_identity: str,
+) -> tuple[tuple[dict[str, Any], ...], list[dict[str, Any]], list[dict[str, Any]]]:
+    initial_prompt = _build_agent_prompt(
+        config.task,
+        tools,
+        [],
+        model_identity,
+        parent_envelope=config.parent_envelope,
+    )
+    initial_trunk, _initial_tail = partition_summary_trunk(initial_prompt["messages"])
+    context_continuation = copy.deepcopy(transcript_snapshot)
+    if (
+        len(initial_trunk) > 1
+        and context_continuation
+        and context_continuation[0] == initial_trunk[1]
+    ):
+        context_continuation = context_continuation[1:]
+    return (
+        tuple(copy.deepcopy(initial_trunk)),
+        context_continuation,
+        copy.deepcopy([*initial_trunk[1:], *context_continuation]),
+    )
+
+
+async def _maybe_restore_turn_context(
+    *,
+    turn_checkpoint_resumed: bool,
+    compaction_deferred: bool,
+    base_messages: tuple[dict[str, Any], ...] | None,
+    context_continuation: list[dict[str, Any]],
+    transcript: list[dict[str, Any]],
+    config: AgentConfig,
+    tools: list[dict[str, Any]],
+    model_identity: str,
+) -> tuple[tuple[dict[str, Any], ...] | None, list[dict[str, Any]], list[dict[str, Any]]]:
+    if (
+        turn_checkpoint_resumed
+        and compaction_deferred
+        and base_messages is None
+        and config.context_reuse
+        and config.checkpoint_root is not None
+    ):
+        return await asyncio.to_thread(
+            _restore_turn_context,
+            transcript,
+            config,
+            tools,
+            model_identity,
+        )
+    return base_messages, context_continuation, transcript
+
+
+def _append_context_message(
+    message: dict[str, str],
+    base_messages: tuple[dict[str, Any], ...] | None,
+    context_continuation: list[dict[str, Any]],
+    transcript: list[dict[str, Any]],
+    config: AgentConfig,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if base_messages is None:
+        transcript.append(message)
+        if message.get("content") == FINAL_SYNTHESIS_DIRECTIVE:
+            transcript = _summarize_transcript(transcript, config.max_transcript_chars)
+        return context_continuation, transcript
+    context_continuation.append(message)
+    return context_continuation, _sync_context_transcript(
+        base_messages, context_continuation, transcript
+    )
+
+
+def _finalization_due(
+    turn: int,
+    finalized: bool,
+    budget_new_tokens: int,
+    soft_cap: int,
+    config: AgentConfig,
+) -> bool:
+    return finalized or budget_new_tokens >= soft_cap or turn >= config.max_turns - 2
+
+
+def _arm_finalization(
+    turn: int,
+    *,
+    turn_limit: bool = True,
+    base_messages: tuple[dict[str, Any], ...] | None,
+    context_continuation: list[dict[str, Any]],
+    transcript: list[dict[str, Any]],
+    config: AgentConfig,
+    budget_new_tokens: int,
+    soft_cap: int,
+    finalized: bool,
+    forced_finalization: bool,
+    finalization_grace_used: bool,
+) -> tuple[bool, bool, bool, list[dict[str, Any]], list[dict[str, Any]]]:
+    if (
+        base_messages is not None
+        and config.resume is not None
+        and turn_limit
+        and budget_new_tokens < soft_cap
+        and turn >= config.max_turns - 2
+    ):
+        return (
+            finalized,
+            forced_finalization,
+            finalization_grace_used,
+            context_continuation,
+            transcript,
+        )
+    if finalized:
+        return (
+            finalized,
+            forced_finalization,
+            finalization_grace_used,
+            context_continuation,
+            transcript,
+        )
+    if budget_new_tokens < soft_cap and (not turn_limit or turn < config.max_turns - 2):
+        return (
+            finalized,
+            forced_finalization,
+            finalization_grace_used,
+            context_continuation,
+            transcript,
+        )
+    finalized = True
+    forced_finalization = True
+    finalization_grace_used = False
+    context_continuation, transcript = _append_context_message(
+        _final_synthesis_message(),
+        base_messages,
+        context_continuation,
+        transcript,
+        config,
+    )
+    return (
+        finalized,
+        forced_finalization,
+        finalization_grace_used,
+        context_continuation,
+        transcript,
+    )
+
+
+def _drop_finalization_directive(
+    context_continuation: list[dict[str, Any]],
+    transcript: list[dict[str, Any]],
+    base_messages: tuple[dict[str, Any], ...] | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    context_continuation = _strip_finalization_directive(context_continuation)
+    transcript = _strip_finalization_directive(transcript)
+    transcript = _sync_context_transcript(base_messages, context_continuation, transcript)
+    return context_continuation, transcript
+
+
+def _observe_progress(
+    progress_detector: _ProgressDetector,
+    content: str | None = None,
+    action: Mapping[str, Any] | None = None,
+    result_content: str | None = None,
+) -> bool:
+    return progress_detector.observe(content, action, result_content)
+
+
+def _no_progress_failure(
+    outcome: dict[str, Any],
+    no_progress_actions: int,
+    turn: int,
+    cumulative_usage: dict[str, int],
+    transcript: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return _loop_result(
+        outcome,
+        "failed",
+        f"agent made no progress: {no_progress_actions} consecutive actions "
+        "with no novel content",
+        turn,
+        cumulative_usage,
+        transcript,
+    )
+
+
+async def _bound_context_continuation(
+    turn: int,
+    *,
+    force: bool = False,
+    config: AgentConfig,
+    router: Diffundo,
+    tier: ProviderTier,
+    model: str,
+    writer: asyncio.StreamWriter | None,
+    progress: AgentProgress,
+    run_request_id: str | None,
+    outcome: dict[str, Any],
+    tools: list[dict[str, Any]],
+    budget_usd: float | None,
+    absolute_wall_deadline: float,
+    wall_deadline: float,
+    base_messages: tuple[dict[str, Any], ...] | None,
+    context_continuation: list[dict[str, Any]],
+    current_epoch_checkpoint: ContextCheckpoint | None,
+    epoch_count: int,
+    compaction_armed: bool,
+    compaction_deferred: bool,
+    consecutive_compaction_deferrals: int,
+    usage_epoch: int | None,
+    usage_fork_of: str | None,
+    cumulative_usage: dict[str, int],
+    budget_new_tokens: int,
+    previous_prompt_tokens: int,
+    previous_usage_source: tuple[str, str] | None,
+    no_progress_actions: int,
+    code_changed: bool,
+    verified_after_change: bool,
+    verification_failed: bool,
+    provider_compat: Mapping[str, tuple[str, str | None]],
+    provider_boundaries: Mapping[str, Mapping[str, Any]],
+    finalization_cap: int,
+    soft_cap: int,
+    finalized: bool,
+    forced_finalization: bool,
+    finalization_grace_used: bool,
+    last_turn_checkpoint: int | None,
+    transcript: list[dict[str, Any]],
+) -> tuple[bool, str | None, tuple[Any, ...]]:
+    """Flush only the raw tail into one immutable semantic summary entry.
+
+    Existing summary entries remain byte-identical and are never model
+    input to the summarized range. Legacy checkpoint transcript material
+    is treated as raw tail once, then replaced by the first summary entry.
+    """
+    if base_messages is None:
+        return (
+            False,
+            None,
+            (
+                base_messages,
+                context_continuation,
+                current_epoch_checkpoint,
+                epoch_count,
+                compaction_armed,
+                compaction_deferred,
+                usage_epoch,
+                cumulative_usage,
+                budget_new_tokens,
+                previous_prompt_tokens,
+                previous_usage_source,
+                consecutive_compaction_deferrals,
+                finalized,
+                forced_finalization,
+                finalization_grace_used,
+                transcript,
+            ),
+        )
+    try:
+        trunk_messages, legacy_tail = partition_summary_trunk(base_messages)
+    except SummaryTrunkError as exc:
+        return (
+            False,
+            str(exc),
+            (
+                base_messages,
+                context_continuation,
+                current_epoch_checkpoint,
+                epoch_count,
+                compaction_armed,
+                compaction_deferred,
+                usage_epoch,
+                cumulative_usage,
+                budget_new_tokens,
+                previous_prompt_tokens,
+                previous_usage_source,
+                consecutive_compaction_deferrals,
+                finalized,
+                forced_finalization,
+                finalization_grace_used,
+                transcript,
+            ),
+        )
+    raw_tail = [*legacy_tail, *copy.deepcopy(context_continuation)]
+    rolling_gate = (
+        config.rolling_compact and config.context_reuse and config.checkpoint_root is not None
+    )
+    raw_size = _transcript_chars(raw_tail)
+    if not force:
+        if not rolling_gate:
+            bounded = _summarize_transcript(
+                context_continuation,
+                config.max_transcript_chars,
+                max_messages=MAX_CONTEXT_MESSAGES,
+            )
+            if bounded == context_continuation:
+                return (
+                    False,
+                    None,
+                    (
+                        base_messages,
+                        context_continuation,
+                        current_epoch_checkpoint,
+                        epoch_count,
+                        compaction_armed,
+                        compaction_deferred,
+                        usage_epoch,
+                        cumulative_usage,
+                        budget_new_tokens,
+                        previous_prompt_tokens,
+                        previous_usage_source,
+                        consecutive_compaction_deferrals,
+                        finalized,
+                        forced_finalization,
+                        finalization_grace_used,
+                        transcript,
+                    ),
+                )
+            context_continuation = bounded
+            transcript = _sync_context_transcript(
+                base_messages, context_continuation, transcript
+            )
+            return (
+                True,
+                None,
+                (
+                    base_messages,
+                    context_continuation,
+                    current_epoch_checkpoint,
+                    epoch_count,
+                    compaction_armed,
+                    compaction_deferred,
+                    usage_epoch,
+                    cumulative_usage,
+                    budget_new_tokens,
+                    previous_prompt_tokens,
+                    previous_usage_source,
+                    consecutive_compaction_deferrals,
+                    finalized,
+                    forced_finalization,
+                    finalization_grace_used,
+                    transcript,
+                ),
+            )
+        if raw_size <= config.rolling_compact_threshold_low:
+            compaction_armed = True
+        if not (
+            compaction_armed
+            and (
+                raw_size > config.rolling_compact_threshold_high
+                or len(raw_tail) > MAX_CONTEXT_MESSAGES
+            )
+        ):
+            return (
+                False,
+                None,
+                (
+                    base_messages,
+                    context_continuation,
+                    current_epoch_checkpoint,
+                    epoch_count,
+                    compaction_armed,
+                    compaction_deferred,
+                    usage_epoch,
+                    cumulative_usage,
+                    budget_new_tokens,
+                    previous_prompt_tokens,
+                    previous_usage_source,
+                    consecutive_compaction_deferrals,
+                    finalized,
+                    forced_finalization,
+                    finalization_grace_used,
+                    transcript,
+                ),
+            )
+    elif not config.context_reuse or config.checkpoint_root is None:
+        return (
+            False,
+            None,
+            (
+                base_messages,
+                context_continuation,
+                current_epoch_checkpoint,
+                epoch_count,
+                compaction_armed,
+                compaction_deferred,
+                usage_epoch,
+                cumulative_usage,
+                budget_new_tokens,
+                previous_prompt_tokens,
+                previous_usage_source,
+                consecutive_compaction_deferrals,
+                finalized,
+                forced_finalization,
+                finalization_grace_used,
+                transcript,
+            ),
+        )
+    if not raw_tail:
+        return (
+            False,
+            None,
+            (
+                base_messages,
+                context_continuation,
+                current_epoch_checkpoint,
+                epoch_count,
+                compaction_armed,
+                compaction_deferred,
+                usage_epoch,
+                cumulative_usage,
+                budget_new_tokens,
+                previous_prompt_tokens,
+                previous_usage_source,
+                consecutive_compaction_deferrals,
+                finalized,
+                forced_finalization,
+                finalization_grace_used,
+                transcript,
+            ),
+        )
+
+    request_id = (
+        run_request_id
+        if isinstance(run_request_id, str) and run_request_id
+        else make_request_id("run")
+    )
+    prior_epoch = epoch_count
+    local_checkpoint = (
+        current_epoch_checkpoint is not None
+        and current_epoch_checkpoint.task_id == config.task_id
+        and current_epoch_checkpoint.generation == config.generation
+    )
+    rollover_reason: str | None = None
+    try:
+        summary_through_turn = turn
+        existing_entries = summary_entries(trunk_messages)
+        if existing_entries:
+            summary_through_turn = max(
+                summary_through_turn,
+                existing_entries[-1].through_turn + 1,
+            )
+        summary_prompt, expectation = build_summary_request(
+            trunk_messages,
+            raw_tail,
+            through_turn=summary_through_turn,
+        )
+        summary_result: CallResult | None = None
+        sent_summary_prompt = copy.deepcopy(summary_prompt)
+        for summary_attempt in range(2):
+            sent_summary_prompt = copy.deepcopy(summary_prompt)
+            try:
+                summary_caller = getattr(router, "summary_call", None)
+                if callable(summary_caller):
+                    assert summary_caller is not None
+                    summary_result = await _call_provider(
+                        cast(Callable[..., Any], summary_caller),
+                        progress,
+                        tier,
+                        summary_prompt,
+                        model=model,
+                        budget_usd=budget_usd,
+                        # Summary entries are provider-neutral semantic state;
+                        # unlike the agent transcript, they may be generated
+                        # by a configured sibling when the pinned endpoint is
+                        # unavailable.
+                        allow_model_substitution=True,
+                    )
+                else:
+                    summary_result = await _call_provider(
+                        router.call,
+                        progress,
+                        tier,
+                        summary_prompt,
+                        model=model,
+                        budget_usd=budget_usd,
+                        allow_model_substitution=True,
+                    )
+            except Exception as exc:
+                if writer is not None:
+                    await _emit_usage_event(
+                        writer,
+                        config,
+                        _failure_usage_event(
+                            exc,
+                            turn=turn,
+                            model=model,
+                            router=router,
+                            prompt=sent_summary_prompt,
+                            call_kind="summary",
+                        ),
+                        epoch=usage_epoch,
+                        fork_of=usage_fork_of,
+                    )
+                content_flagged = _is_content_flagged(exc)
+                if content_flagged and summary_attempt == 0:
+                    summary_prompt = _transform_content_flagged_summary_prompt(
+                        summary_prompt, config.redactor
+                    )
+                    continue
+                if content_flagged:
+                    raise ContextForkError(
+                        "summary flagged by provider content filter"
+                    ) from exc
+                detail = exc.__class__.__name__
+                if isinstance(exc, AllProvidersFailed) and exc.last_error is not None:
+                    inner = exc.last_error
+                    inner_message = str(inner).strip() or "<no message>"
+                    detail = (
+                        f"{detail}: {inner.__class__.__name__}: "
+                        f"{_cap_utf8(inner_message, MAX_ENVELOPE_FIELD_CHARS)}"
+                    )
+                raise ContextForkError(f"summary provider call failed: {detail}") from exc
+            break
+        if summary_result is None:
+            raise ContextForkError("summary provider call failed")
+        if time.monotonic() >= wall_deadline:
+            raise ContextForkError("wall budget exceeded during summary flush")
+        declared_summary_model = router.declared_model(summary_result.provider)
+        if declared_summary_model and summary_result.model != declared_summary_model:
+            raise ContextForkError("summary response model mismatch")
+        _bind_router_provider(router, summary_result, config.task_id)
+        fallback_origin = getattr(summary_result, "fell_back_from", None)
+        if isinstance(fallback_origin, str):
+            outcome["fell_back_from"] = fallback_origin
+            outcome["model"] = summary_result.model
+        invalid_usage_fields = _invalid_usage_fields(summary_result.usage)
+        if invalid_usage_fields:
+            raise ContextForkError("summary usage contains invalid token counts")
+        summary_total = _usage_total(summary_result.usage)
+        if summary_total is None:
+            raise ContextForkError("summary usage missing usable token counts")
+        if writer is not None:
+            await _emit_usage_event(
+                writer,
+                config,
+                _success_usage_event(
+                    summary_result,
+                    turn,
+                    prompt=sent_summary_prompt,
+                    call_kind="summary",
+                ),
+                epoch=usage_epoch,
+                fork_of=usage_fork_of,
+            )
+        cumulative_usage = _accumulate_usage(cumulative_usage, summary_result.usage)
+        summary_source = (summary_result.provider, summary_result.model)
+        if previous_usage_source != summary_source:
+            previous_prompt_tokens = 0
+        summary_charge, previous_prompt_tokens = _usage_budget_charge(
+            summary_result.usage, previous_prompt_tokens
+        )
+        previous_usage_source = summary_source
+        budget_new_tokens += summary_charge
+        (
+            finalized,
+            forced_finalization,
+            finalization_grace_used,
+            context_continuation,
+            transcript,
+        ) = _arm_finalization(
+            turn,
+            turn_limit=False,
+            base_messages=base_messages,
+            context_continuation=context_continuation,
+            transcript=transcript,
+            config=config,
+            budget_new_tokens=budget_new_tokens,
+            soft_cap=soft_cap,
+            finalized=finalized,
+            forced_finalization=forced_finalization,
+            finalization_grace_used=finalization_grace_used,
+        )
+        if finalized and budget_new_tokens > finalization_cap:
+            raise ContextForkError(
+                _phase_failure(
+                    "token budget exceeded during summary flush", final_synthesis=True
+                )
+            )
+        try:
+            summary_entry = parse_summary_response(summary_result.content, expectation)
+        except SummaryTrunkError as exc:
+            if consecutive_compaction_deferrals >= MAX_CONSECUTIVE_COMPACTION_DEFERRALS:
+                raise
+            compaction_deferred = True
+            consecutive_compaction_deferrals += 1
+            if last_turn_checkpoint is not None:
+                await asyncio.to_thread(
+                    _write_checkpoint_file,
+                    config,
+                    last_turn_checkpoint,
+                    transcript,
+                    cumulative_usage,
+                    [],
+                    compaction_deferred=True,
+                    code_changed=code_changed,
+                )
+            deferred_reason = str(exc).strip() or exc.__class__.__name__
+            if writer is not None:
+                await _emit_compaction_deferred(
+                    writer,
+                    config,
+                    request_id=request_id,
+                    epoch=max(1, prior_epoch),
+                    reason=deferred_reason,
+                )
+            return (
+                False,
+                None,
+                (
+                    base_messages,
+                    context_continuation,
+                    current_epoch_checkpoint,
+                    epoch_count,
+                    compaction_armed,
+                    compaction_deferred,
+                    usage_epoch,
+                    cumulative_usage,
+                    budget_new_tokens,
+                    previous_prompt_tokens,
+                    previous_usage_source,
+                    consecutive_compaction_deferrals,
+                    finalized,
+                    forced_finalization,
+                    finalization_grace_used,
+                    transcript,
+                ),
+            )
+        new_trunk = append_summary_entry(trunk_messages, summary_entry)
+        before_entries = summary_entries(new_trunk)
+        before_tokens = summary_trunk_tokens(new_trunk)
+        if config.cast_policy.rollover_due(len(before_entries), before_tokens):
+            rolled_trunk, _projection, source_entries = rollover_summary_trunk(new_trunk)
+            after_entries = summary_entries(rolled_trunk)
+            after_tokens = summary_trunk_tokens(rolled_trunk)
+            config.cast_policy.validate_rollover(
+                before_segments=len(before_entries),
+                before_tokens=before_tokens,
+                after_segments=len(after_entries),
+                after_tokens=after_tokens,
+            )
+            k0 = after_entries[0]
+            await asyncio.to_thread(
+                _write_cast_rollover_manifest,
+                config,
+                k0,
+                source_entries,
+            )
+            new_trunk = rolled_trunk
+            # K0 starts a new cache lineage. The next provider call must
+            # account its complete prompt instead of subtracting the old
+            # lineage's prompt length.
+            previous_prompt_tokens = 0
+            rollover_reason = "cast_k0_rollover"
+        checkpoint = await asyncio.to_thread(
+            _write_epoch_checkpoint,
+            config,
+            turn=turn,
+            epoch=prior_epoch + 1,
+            provider_messages=copy.deepcopy(new_trunk),
+            continuation_suffix=[],
+            provider=summary_result.provider,
+            model=model,
+            tools_sha256=_sha256_hex(json.dumps(tools, sort_keys=True).encode("utf-8")),
+            provider_compat=provider_compat,
+            provider_boundary=provider_boundaries.get(summary_result.provider),
+            code_changed=code_changed,
+            verified_after_change=verified_after_change,
+            verification_failed=verification_failed,
+            no_progress_actions=no_progress_actions,
+            budget_new_tokens=budget_new_tokens,
+            previous_prompt_tokens=previous_prompt_tokens,
+            cumulative_usage=cumulative_usage,
+            wall_deadline=absolute_wall_deadline,
+        )
+        if checkpoint is None:
+            raise ContextForkError("summary flush has no checkpoint root")
+        checkpoint = _load_epoch_checkpoint(
+            config, checkpoint.checkpoint_ref, expect_task_id=True
+        )
+    except Exception as exc:
+        failure_reason = str(exc).strip() or exc.__class__.__name__
+        if config.redactor is not None:
+            failure_reason = config.redactor.redact_escaped(failure_reason)
+        failure_reason = _cap_utf8(failure_reason, MAX_ENVELOPE_FIELD_CHARS)
+        if writer is not None:
+            await _emit_compaction_failed(
+                writer,
+                config,
+                request_id=request_id,
+                epoch=max(1, prior_epoch),
+                reason=failure_reason,
+            )
+        return (
+            False,
+            failure_reason,
+            (
+                base_messages,
+                context_continuation,
+                current_epoch_checkpoint,
+                epoch_count,
+                compaction_armed,
+                compaction_deferred,
+                usage_epoch,
+                cumulative_usage,
+                budget_new_tokens,
+                previous_prompt_tokens,
+                previous_usage_source,
+                consecutive_compaction_deferrals,
+                finalized,
+                forced_finalization,
+                finalization_grace_used,
+                transcript,
+            ),
+        )
+
+    # Publish only after durable checkpoint creation. Prior summary bytes
+    # are shared verbatim; the raw tail disappears from the active prompt.
+    base_messages = tuple(copy.deepcopy(checkpoint.full_messages))
+    context_continuation = []
+    current_epoch_checkpoint = checkpoint
+    epoch_count = checkpoint.epoch
+    usage_epoch = checkpoint.epoch
+    compaction_armed = True
+    compaction_deferred = False
+    consecutive_compaction_deferrals = 0
+    transcript = _sync_context_transcript(
+        base_messages, context_continuation, transcript
+    )
+    if writer is not None:
+        if local_checkpoint:
+            await _emit_context_epoch_advanced(
+                writer,
+                config,
+                request_id=request_id,
+                checkpoint=checkpoint,
+                folded_from_epoch=prior_epoch,
+                reason=rollover_reason,
+            )
+        else:
+            await _emit_context_checkpoint(
+                writer,
+                config,
+                checkpoint,
+                request_id=request_id,
+            )
+    return (
+        True,
+        None,
+        (
+            base_messages,
+            context_continuation,
+            current_epoch_checkpoint,
+            epoch_count,
+            compaction_armed,
+            compaction_deferred,
+            usage_epoch,
+            cumulative_usage,
+            budget_new_tokens,
+            previous_prompt_tokens,
+            previous_usage_source,
+            consecutive_compaction_deferrals,
+            finalized,
+            forced_finalization,
+            finalization_grace_used,
+            transcript,
+        ),
+    )
+
+
 async def _run_agent_loop(
     *,
     config: AgentConfig,
@@ -4687,423 +5466,6 @@ async def _run_agent_loop(
     provider_boundaries = provider_boundaries or {}
     _install_codex_progress_observer(router, progress)
 
-    def _sync_context_transcript() -> None:
-        nonlocal transcript
-        if base_messages is not None:
-            transcript = copy.deepcopy([*base_messages[1:], *context_continuation])
-
-    def _restore_turn_context(
-        transcript_snapshot: list[dict[str, Any]],
-    ) -> tuple[tuple[dict[str, Any], ...], list[dict[str, Any]], list[dict[str, Any]]]:
-        initial_prompt = _build_agent_prompt(
-            config.task,
-            tools,
-            [],
-            model_identity,
-            parent_envelope=config.parent_envelope,
-        )
-        initial_trunk, _initial_tail = partition_summary_trunk(initial_prompt["messages"])
-        context_continuation = copy.deepcopy(transcript_snapshot)
-        if (
-            len(initial_trunk) > 1
-            and context_continuation
-            and context_continuation[0] == initial_trunk[1]
-        ):
-            context_continuation = context_continuation[1:]
-        return (
-            tuple(copy.deepcopy(initial_trunk)),
-            context_continuation,
-            copy.deepcopy([*initial_trunk[1:], *context_continuation]),
-        )
-
-    async def _maybe_restore_turn_context() -> None:
-        nonlocal base_messages, context_continuation, transcript
-        if (
-            turn_checkpoint_resumed
-            and compaction_deferred
-            and base_messages is None
-            and config.context_reuse
-            and config.checkpoint_root is not None
-        ):
-            base_messages, context_continuation, transcript = await asyncio.to_thread(
-                _restore_turn_context, transcript
-            )
-
-    def _append_context_message(message: dict[str, str]) -> None:
-        nonlocal transcript
-        if base_messages is None:
-            transcript.append(message)
-            if message.get("content") == FINAL_SYNTHESIS_DIRECTIVE:
-                transcript = _summarize_transcript(transcript, config.max_transcript_chars)
-            return
-        context_continuation.append(message)
-        _sync_context_transcript()
-
-    def _finalization_due(turn: int) -> bool:
-        return finalized or budget_new_tokens >= soft_cap or turn >= config.max_turns - 2
-
-    def _arm_finalization(turn: int, *, turn_limit: bool = True) -> None:
-        nonlocal finalized, forced_finalization, finalization_grace_used
-        if (
-            base_messages is not None
-            and config.resume is not None
-            and turn_limit
-            and budget_new_tokens < soft_cap
-            and turn >= config.max_turns - 2
-        ):
-            return
-        if finalized:
-            return
-        if budget_new_tokens < soft_cap and (not turn_limit or turn < config.max_turns - 2):
-            return
-        finalized = True
-        forced_finalization = True
-        finalization_grace_used = False
-        _append_context_message(_final_synthesis_message())
-
-    def _drop_finalization_directive() -> None:
-        nonlocal transcript, context_continuation
-        context_continuation = _strip_finalization_directive(context_continuation)
-        transcript = _strip_finalization_directive(transcript)
-        _sync_context_transcript()
-
-    def _observe_progress(
-        content: str | None = None,
-        action: Mapping[str, Any] | None = None,
-        result_content: str | None = None,
-    ) -> bool:
-        nonlocal no_progress_actions
-        stalled = progress_detector.observe(content, action, result_content)
-        no_progress_actions = progress_detector.no_progress_actions
-        return stalled
-
-    def _no_progress_failure(turn: int) -> dict[str, Any]:
-        return _loop_result(
-            outcome,
-            "failed",
-            f"agent made no progress: {no_progress_actions} consecutive actions "
-            "with no novel content",
-            turn,
-            cumulative_usage,
-            transcript,
-        )
-
-    async def _bound_context_continuation(
-        turn: int, *, force: bool = False
-    ) -> tuple[bool, str | None]:
-        """Flush only the raw tail into one immutable semantic summary entry.
-
-        Existing summary entries remain byte-identical and are never model
-        input to the summarized range. Legacy checkpoint transcript material
-        is treated as raw tail once, then replaced by the first summary entry.
-        """
-        nonlocal base_messages, context_continuation, current_epoch_checkpoint
-        nonlocal epoch_count, compaction_armed, compaction_deferred, usage_epoch, cumulative_usage
-        nonlocal budget_new_tokens, previous_prompt_tokens
-        nonlocal previous_usage_source
-        nonlocal consecutive_compaction_deferrals
-
-        if base_messages is None:
-            return False, None
-        try:
-            trunk_messages, legacy_tail = partition_summary_trunk(base_messages)
-        except SummaryTrunkError as exc:
-            return False, str(exc)
-        raw_tail = [*legacy_tail, *copy.deepcopy(context_continuation)]
-        rolling_gate = (
-            config.rolling_compact and config.context_reuse and config.checkpoint_root is not None
-        )
-        raw_size = _transcript_chars(raw_tail)
-        if not force:
-            if not rolling_gate:
-                bounded = _summarize_transcript(
-                    context_continuation,
-                    config.max_transcript_chars,
-                    max_messages=MAX_CONTEXT_MESSAGES,
-                )
-                if bounded == context_continuation:
-                    return False, None
-                context_continuation = bounded
-                _sync_context_transcript()
-                return True, None
-            if raw_size <= config.rolling_compact_threshold_low:
-                compaction_armed = True
-            if not (
-                compaction_armed
-                and (
-                    raw_size > config.rolling_compact_threshold_high
-                    or len(raw_tail) > MAX_CONTEXT_MESSAGES
-                )
-            ):
-                return False, None
-        elif not config.context_reuse or config.checkpoint_root is None:
-            return False, None
-        if not raw_tail:
-            return False, None
-
-        request_id = (
-            run_request_id
-            if isinstance(run_request_id, str) and run_request_id
-            else make_request_id("run")
-        )
-        prior_epoch = epoch_count
-        local_checkpoint = (
-            current_epoch_checkpoint is not None
-            and current_epoch_checkpoint.task_id == config.task_id
-            and current_epoch_checkpoint.generation == config.generation
-        )
-        rollover_reason: str | None = None
-        try:
-            summary_through_turn = turn
-            existing_entries = summary_entries(trunk_messages)
-            if existing_entries:
-                summary_through_turn = max(
-                    summary_through_turn,
-                    existing_entries[-1].through_turn + 1,
-                )
-            summary_prompt, expectation = build_summary_request(
-                trunk_messages,
-                raw_tail,
-                through_turn=summary_through_turn,
-            )
-            summary_result: CallResult | None = None
-            sent_summary_prompt = copy.deepcopy(summary_prompt)
-            for summary_attempt in range(2):
-                sent_summary_prompt = copy.deepcopy(summary_prompt)
-                try:
-                    summary_caller = getattr(router, "summary_call", None)
-                    if callable(summary_caller):
-                        assert summary_caller is not None
-                        summary_result = await _call_provider(
-                            cast(Callable[..., Any], summary_caller),
-                            progress,
-                            tier,
-                            summary_prompt,
-                            model=model,
-                            budget_usd=budget_usd,
-                            # Summary entries are provider-neutral semantic state;
-                            # unlike the agent transcript, they may be generated
-                            # by a configured sibling when the pinned endpoint is
-                            # unavailable.
-                            allow_model_substitution=True,
-                        )
-                    else:
-                        summary_result = await _call_provider(
-                            router.call,
-                            progress,
-                            tier,
-                            summary_prompt,
-                            model=model,
-                            budget_usd=budget_usd,
-                            allow_model_substitution=True,
-                        )
-                except Exception as exc:
-                    if writer is not None:
-                        await _emit_usage_event(
-                            writer,
-                            config,
-                            _failure_usage_event(
-                                exc,
-                                turn=turn,
-                                model=model,
-                                router=router,
-                                prompt=sent_summary_prompt,
-                                call_kind="summary",
-                            ),
-                            epoch=usage_epoch,
-                            fork_of=usage_fork_of,
-                        )
-                    content_flagged = _is_content_flagged(exc)
-                    if content_flagged and summary_attempt == 0:
-                        summary_prompt = _transform_content_flagged_summary_prompt(
-                            summary_prompt, config.redactor
-                        )
-                        continue
-                    if content_flagged:
-                        raise ContextForkError(
-                            "summary flagged by provider content filter"
-                        ) from exc
-                    detail = exc.__class__.__name__
-                    if isinstance(exc, AllProvidersFailed) and exc.last_error is not None:
-                        inner = exc.last_error
-                        inner_message = str(inner).strip() or "<no message>"
-                        detail = (
-                            f"{detail}: {inner.__class__.__name__}: "
-                            f"{_cap_utf8(inner_message, MAX_ENVELOPE_FIELD_CHARS)}"
-                        )
-                    raise ContextForkError(f"summary provider call failed: {detail}") from exc
-                break
-            if summary_result is None:
-                raise ContextForkError("summary provider call failed")
-            if time.monotonic() >= wall_deadline:
-                raise ContextForkError("wall budget exceeded during summary flush")
-            declared_summary_model = router.declared_model(summary_result.provider)
-            if declared_summary_model and summary_result.model != declared_summary_model:
-                raise ContextForkError("summary response model mismatch")
-            _bind_router_provider(router, summary_result, config.task_id)
-            fallback_origin = getattr(summary_result, "fell_back_from", None)
-            if isinstance(fallback_origin, str):
-                outcome["fell_back_from"] = fallback_origin
-                outcome["model"] = summary_result.model
-            invalid_usage_fields = _invalid_usage_fields(summary_result.usage)
-            if invalid_usage_fields:
-                raise ContextForkError("summary usage contains invalid token counts")
-            summary_total = _usage_total(summary_result.usage)
-            if summary_total is None:
-                raise ContextForkError("summary usage missing usable token counts")
-            if writer is not None:
-                await _emit_usage_event(
-                    writer,
-                    config,
-                    _success_usage_event(
-                        summary_result,
-                        turn,
-                        prompt=sent_summary_prompt,
-                        call_kind="summary",
-                    ),
-                    epoch=usage_epoch,
-                    fork_of=usage_fork_of,
-                )
-            cumulative_usage = _accumulate_usage(cumulative_usage, summary_result.usage)
-            summary_source = (summary_result.provider, summary_result.model)
-            if previous_usage_source != summary_source:
-                previous_prompt_tokens = 0
-            summary_charge, previous_prompt_tokens = _usage_budget_charge(
-                summary_result.usage, previous_prompt_tokens
-            )
-            previous_usage_source = summary_source
-            budget_new_tokens += summary_charge
-            _arm_finalization(turn, turn_limit=False)
-            if finalized and budget_new_tokens > finalization_cap:
-                raise ContextForkError(
-                    _phase_failure(
-                        "token budget exceeded during summary flush", final_synthesis=True
-                    )
-                )
-            try:
-                summary_entry = parse_summary_response(summary_result.content, expectation)
-            except SummaryTrunkError as exc:
-                if consecutive_compaction_deferrals >= MAX_CONSECUTIVE_COMPACTION_DEFERRALS:
-                    raise
-                compaction_deferred = True
-                consecutive_compaction_deferrals += 1
-                if last_turn_checkpoint is not None:
-                    await asyncio.to_thread(
-                        _write_checkpoint_file,
-                        config,
-                        last_turn_checkpoint,
-                        transcript,
-                        cumulative_usage,
-                        [],
-                        compaction_deferred=True,
-                        code_changed=code_changed,
-                    )
-                deferred_reason = str(exc).strip() or exc.__class__.__name__
-                if writer is not None:
-                    await _emit_compaction_deferred(
-                        writer,
-                        config,
-                        request_id=request_id,
-                        epoch=max(1, prior_epoch),
-                        reason=deferred_reason,
-                    )
-                return False, None
-            new_trunk = append_summary_entry(trunk_messages, summary_entry)
-            before_entries = summary_entries(new_trunk)
-            before_tokens = summary_trunk_tokens(new_trunk)
-            if config.cast_policy.rollover_due(len(before_entries), before_tokens):
-                rolled_trunk, _projection, source_entries = rollover_summary_trunk(new_trunk)
-                after_entries = summary_entries(rolled_trunk)
-                after_tokens = summary_trunk_tokens(rolled_trunk)
-                config.cast_policy.validate_rollover(
-                    before_segments=len(before_entries),
-                    before_tokens=before_tokens,
-                    after_segments=len(after_entries),
-                    after_tokens=after_tokens,
-                )
-                k0 = after_entries[0]
-                await asyncio.to_thread(
-                    _write_cast_rollover_manifest,
-                    config,
-                    k0,
-                    source_entries,
-                )
-                new_trunk = rolled_trunk
-                # K0 starts a new cache lineage. The next provider call must
-                # account its complete prompt instead of subtracting the old
-                # lineage's prompt length.
-                previous_prompt_tokens = 0
-                rollover_reason = "cast_k0_rollover"
-            checkpoint = await asyncio.to_thread(
-                _write_epoch_checkpoint,
-                config,
-                turn=turn,
-                epoch=prior_epoch + 1,
-                provider_messages=copy.deepcopy(new_trunk),
-                continuation_suffix=[],
-                provider=summary_result.provider,
-                model=model,
-                tools_sha256=_sha256_hex(json.dumps(tools, sort_keys=True).encode("utf-8")),
-                provider_compat=provider_compat,
-                provider_boundary=provider_boundaries.get(summary_result.provider),
-                code_changed=code_changed,
-                verified_after_change=verified_after_change,
-                verification_failed=verification_failed,
-                no_progress_actions=no_progress_actions,
-                budget_new_tokens=budget_new_tokens,
-                previous_prompt_tokens=previous_prompt_tokens,
-                cumulative_usage=cumulative_usage,
-                wall_deadline=absolute_wall_deadline,
-            )
-            if checkpoint is None:
-                raise ContextForkError("summary flush has no checkpoint root")
-            checkpoint = _load_epoch_checkpoint(
-                config, checkpoint.checkpoint_ref, expect_task_id=True
-            )
-        except Exception as exc:
-            failure_reason = str(exc).strip() or exc.__class__.__name__
-            if config.redactor is not None:
-                failure_reason = config.redactor.redact_escaped(failure_reason)
-            failure_reason = _cap_utf8(failure_reason, MAX_ENVELOPE_FIELD_CHARS)
-            if writer is not None:
-                await _emit_compaction_failed(
-                    writer,
-                    config,
-                    request_id=request_id,
-                    epoch=max(1, prior_epoch),
-                    reason=failure_reason,
-                )
-            return False, failure_reason
-
-        # Publish only after durable checkpoint creation. Prior summary bytes
-        # are shared verbatim; the raw tail disappears from the active prompt.
-        base_messages = tuple(copy.deepcopy(checkpoint.full_messages))
-        context_continuation = []
-        current_epoch_checkpoint = checkpoint
-        epoch_count = checkpoint.epoch
-        usage_epoch = checkpoint.epoch
-        compaction_armed = True
-        compaction_deferred = False
-        consecutive_compaction_deferrals = 0
-        _sync_context_transcript()
-        if writer is not None:
-            if local_checkpoint:
-                await _emit_context_epoch_advanced(
-                    writer,
-                    config,
-                    request_id=request_id,
-                    checkpoint=checkpoint,
-                    folded_from_epoch=prior_epoch,
-                    reason=rollover_reason,
-                )
-            else:
-                await _emit_context_checkpoint(
-                    writer,
-                    config,
-                    checkpoint,
-                    request_id=request_id,
-                )
-        return True, None
 
     resume = config.resume
     try:
@@ -5201,7 +5563,9 @@ async def _run_agent_loop(
         first_turn = resume_checkpoint.turn + 1
         epoch_count = resume_checkpoint.epoch
         usage_epoch = resume_checkpoint.epoch
-        _sync_context_transcript()
+        transcript = _sync_context_transcript(
+            base_messages, context_continuation, transcript
+        )
     elif config.context_fork is not None:
         fork_messages, fork_skip = _resolve_fork_prefix(config, tools, model)
         if fork_messages is not None:
@@ -5218,7 +5582,9 @@ async def _run_agent_loop(
                 epoch_count = fork_checkpoint.epoch
                 usage_epoch = fork_checkpoint.epoch
                 usage_fork_of = fork_checkpoint.checkpoint_ref
-                _sync_context_transcript()
+                transcript = _sync_context_transcript(
+                    base_messages, context_continuation, transcript
+                )
         if fork_skip is not None and writer is not None:
             await send(
                 writer,
@@ -5250,7 +5616,9 @@ async def _run_agent_loop(
             base_messages = tuple(copy.deepcopy(semantic_trunk))
             context_continuation = copy.deepcopy(semantic_tail)
             usage_fork_of = config.summary_trunk_ref
-            _sync_context_transcript()
+            transcript = _sync_context_transcript(
+                base_messages, context_continuation, transcript
+            )
         except (ContextForkError, SummaryTrunkError) as exc:
             if writer is not None:
                 await send(
@@ -5282,7 +5650,9 @@ async def _run_agent_loop(
         initial_trunk, initial_tail = partition_summary_trunk(initial_prompt["messages"])
         base_messages = tuple(copy.deepcopy(initial_trunk))
         context_continuation = copy.deepcopy(initial_tail)
-        _sync_context_transcript()
+        transcript = _sync_context_transcript(
+            base_messages, context_continuation, transcript
+        )
 
     wall_deadline = time.monotonic() + max(0.0, absolute_wall_deadline - time.time())
     try:
@@ -5308,12 +5678,75 @@ async def _run_agent_loop(
                 transcript = _summarize_transcript(transcript, config.max_transcript_chars)
             else:
                 if finalized:
-                    _drop_finalization_directive()
+                    context_continuation, transcript = _drop_finalization_directive(
+                        context_continuation, transcript, base_messages
+                    )
                 # The tuple is immutable and every message is deep-copied at
                 # the prompt boundary. No later turn can rewrite the epoch
                 # prefix in place.
                 if config.context_reuse:
-                    _, compaction_failure = await _bound_context_continuation(turn)
+                    (
+                        _folded,
+                        compaction_failure,
+                        (
+                            base_messages,
+                            context_continuation,
+                            current_epoch_checkpoint,
+                            epoch_count,
+                            compaction_armed,
+                            compaction_deferred,
+                            usage_epoch,
+                            cumulative_usage,
+                            budget_new_tokens,
+                            previous_prompt_tokens,
+                            previous_usage_source,
+                            consecutive_compaction_deferrals,
+                            finalized,
+                            forced_finalization,
+                            finalization_grace_used,
+                            transcript,
+                        ),
+                    ) = await _bound_context_continuation(
+                        turn,
+                        config=config,
+                        router=router,
+                        tier=tier,
+                        model=model,
+                        writer=writer,
+                        progress=progress,
+                        run_request_id=run_request_id,
+                        outcome=outcome,
+                        tools=tools,
+                        budget_usd=budget_usd,
+                        absolute_wall_deadline=absolute_wall_deadline,
+                        wall_deadline=wall_deadline,
+                        base_messages=base_messages,
+                        context_continuation=context_continuation,
+                        current_epoch_checkpoint=current_epoch_checkpoint,
+                        epoch_count=epoch_count,
+                        compaction_armed=compaction_armed,
+                        compaction_deferred=compaction_deferred,
+                        consecutive_compaction_deferrals=consecutive_compaction_deferrals,
+                        usage_epoch=usage_epoch,
+                        usage_fork_of=usage_fork_of,
+                        cumulative_usage=cumulative_usage,
+                        budget_new_tokens=budget_new_tokens,
+                        previous_prompt_tokens=previous_prompt_tokens,
+                        previous_usage_source=previous_usage_source,
+                        no_progress_actions=no_progress_actions,
+                        code_changed=code_changed,
+                        verified_after_change=verified_after_change,
+                        verification_failed=verification_failed,
+                        provider_compat=provider_compat,
+                        provider_boundaries=provider_boundaries,
+                        finalization_cap=finalization_cap,
+                        soft_cap=soft_cap,
+                        finalized=finalized,
+                        forced_finalization=forced_finalization,
+                        finalization_grace_used=finalization_grace_used,
+                        last_turn_checkpoint=last_turn_checkpoint,
+                        transcript=transcript,
+                    )
                     if compaction_failure is not None:
                         return _loop_result(
                             outcome,
@@ -5330,8 +5763,32 @@ async def _run_agent_loop(
                     message.get("content") == FINAL_SYNTHESIS_DIRECTIVE
                     for message in context_continuation
                 ):
-                    _append_context_message(_final_synthesis_message())
-            _arm_finalization(turn, turn_limit=False)
+                    context_continuation, transcript = _append_context_message(
+                        _final_synthesis_message(),
+                        base_messages,
+                        context_continuation,
+                        transcript,
+                        config,
+                    )
+            (
+                finalized,
+                forced_finalization,
+                finalization_grace_used,
+                context_continuation,
+                transcript,
+            ) = _arm_finalization(
+                turn,
+                turn_limit=False,
+                base_messages=base_messages,
+                context_continuation=context_continuation,
+                transcript=transcript,
+                config=config,
+                budget_new_tokens=budget_new_tokens,
+                soft_cap=soft_cap,
+                finalized=finalized,
+                forced_finalization=forced_finalization,
+                finalization_grace_used=finalization_grace_used,
+            )
             if base_messages is None:
                 prompt = _build_agent_prompt(
                     config.task,
@@ -5514,11 +5971,45 @@ async def _run_agent_loop(
                     transcript.extend(invalid_messages)
                 else:
                     context_continuation.extend(invalid_messages)
-                    _sync_context_transcript()
-                await _maybe_restore_turn_context()
-                _arm_finalization(turn)
-                if _observe_progress(response_content) and not _finalization_due(turn):
-                    return _no_progress_failure(turn)
+                    transcript = _sync_context_transcript(
+                        base_messages, context_continuation, transcript
+                    )
+                base_messages, context_continuation, transcript = await _maybe_restore_turn_context(
+                    turn_checkpoint_resumed=turn_checkpoint_resumed,
+                    compaction_deferred=compaction_deferred,
+                    base_messages=base_messages,
+                    context_continuation=context_continuation,
+                    transcript=transcript,
+                    config=config,
+                    tools=tools,
+                    model_identity=model_identity,
+                )
+                (
+                    finalized,
+                    forced_finalization,
+                    finalization_grace_used,
+                    context_continuation,
+                    transcript,
+                ) = _arm_finalization(
+                    turn,
+                    base_messages=base_messages,
+                    context_continuation=context_continuation,
+                    transcript=transcript,
+                    config=config,
+                    budget_new_tokens=budget_new_tokens,
+                    soft_cap=soft_cap,
+                    finalized=finalized,
+                    forced_finalization=forced_finalization,
+                    finalization_grace_used=finalization_grace_used,
+                )
+                stalled = _observe_progress(progress_detector, response_content)
+                no_progress_actions = progress_detector.no_progress_actions
+                if stalled and not _finalization_due(
+                    turn, finalized, budget_new_tokens, soft_cap, config
+                ):
+                    return _no_progress_failure(
+                        outcome, no_progress_actions, turn, cumulative_usage, transcript
+                    )
                 if final_synthesis_call:
                     return _loop_result(
                         outcome,
@@ -5538,7 +6029,13 @@ async def _run_agent_loop(
                 and action["type"] != "finish"
                 and not finalized
             ):
-                _append_context_message(action_message)
+                context_continuation, transcript = _append_context_message(
+                    action_message,
+                    base_messages,
+                    context_continuation,
+                    transcript,
+                    config,
+                )
                 return _loop_result(
                     outcome,
                     "failed",
@@ -5548,10 +6045,22 @@ async def _run_agent_loop(
                     transcript,
                 )
             if final_synthesis_call and action["type"] != "finish":
-                _append_context_message(action_message)
+                context_continuation, transcript = _append_context_message(
+                    action_message,
+                    base_messages,
+                    context_continuation,
+                    transcript,
+                    config,
+                )
                 if turn < config.max_turns and not finalization_grace_used:
                     finalization_grace_used = True
-                    _append_context_message({"role": "user", "content": FINAL_SYNTHESIS_REMINDER})
+                    context_continuation, transcript = _append_context_message(
+                        {"role": "user", "content": FINAL_SYNTHESIS_REMINDER},
+                        base_messages,
+                        context_continuation,
+                        transcript,
+                        config,
+                    )
                     continue
                 if base_messages is not None and config.resume is not None:
                     return _loop_result(
@@ -5568,8 +6077,15 @@ async def _run_agent_loop(
             read_action = (
                 action["type"] == "tool_call" and action.get("name") in _READ_TOOL_NAMES
             )
-            if not read_action and _observe_progress(action=action) and not _finalization_due(turn):
-                return _no_progress_failure(turn)
+            if not read_action:
+                stalled = _observe_progress(progress_detector, action=action)
+                no_progress_actions = progress_detector.no_progress_actions
+                if stalled and not _finalization_due(
+                    turn, finalized, budget_new_tokens, soft_cap, config
+                ):
+                    return _no_progress_failure(
+                        outcome, no_progress_actions, turn, cumulative_usage, transcript
+                    )
             if action["type"] == "plan":
                 if base_messages is None:
                     transcript.append(action_message)
@@ -5582,9 +6098,37 @@ async def _run_agent_loop(
                             {"role": "user", "content": _TRAILING_ACTION_NOTE}
                         )
                     context_continuation.append({"role": "user", "content": "Continue."})
-                    _sync_context_transcript()
-                await _maybe_restore_turn_context()
-                _arm_finalization(turn)
+                    transcript = _sync_context_transcript(
+                        base_messages, context_continuation, transcript
+                    )
+                base_messages, context_continuation, transcript = await _maybe_restore_turn_context(
+                    turn_checkpoint_resumed=turn_checkpoint_resumed,
+                    compaction_deferred=compaction_deferred,
+                    base_messages=base_messages,
+                    context_continuation=context_continuation,
+                    transcript=transcript,
+                    config=config,
+                    tools=tools,
+                    model_identity=model_identity,
+                )
+                (
+                    finalized,
+                    forced_finalization,
+                    finalization_grace_used,
+                    context_continuation,
+                    transcript,
+                ) = _arm_finalization(
+                    turn,
+                    base_messages=base_messages,
+                    context_continuation=context_continuation,
+                    transcript=transcript,
+                    config=config,
+                    budget_new_tokens=budget_new_tokens,
+                    soft_cap=soft_cap,
+                    finalized=finalized,
+                    forced_finalization=forced_finalization,
+                    finalization_grace_used=finalization_grace_used,
+                )
                 progress.tool = "plan"
                 continue
             if action["type"] == "finish":
@@ -5592,8 +6136,19 @@ async def _run_agent_loop(
                     transcript.append(action_message)
                 else:
                     context_continuation.append(action_message)
-                    _sync_context_transcript()
-                await _maybe_restore_turn_context()
+                    transcript = _sync_context_transcript(
+                        base_messages, context_continuation, transcript
+                    )
+                base_messages, context_continuation, transcript = await _maybe_restore_turn_context(
+                    turn_checkpoint_resumed=turn_checkpoint_resumed,
+                    compaction_deferred=compaction_deferred,
+                    base_messages=base_messages,
+                    context_continuation=context_continuation,
+                    transcript=transcript,
+                    config=config,
+                    tools=tools,
+                    model_identity=model_identity,
+                )
                 if (
                     forced_finalization
                     and not code_changed
@@ -5623,7 +6178,9 @@ async def _run_agent_loop(
                         transcript.append({"role": "user", "content": reason})
                     else:
                         context_continuation.append({"role": "user", "content": reason})
-                        _sync_context_transcript()
+                        transcript = _sync_context_transcript(
+                            base_messages, context_continuation, transcript
+                        )
                     if final_synthesis_call:
                         return _loop_result(
                             outcome,
@@ -5637,7 +6194,9 @@ async def _run_agent_loop(
                     continue
 
                 if finalized:
-                    _drop_finalization_directive()
+                    context_continuation, transcript = _drop_finalization_directive(
+                        context_continuation, transcript, base_messages
+                    )
 
                 # The root/parent performs one additional summary call at the
                 # terminal boundary. Forked children return their strict result
@@ -5654,8 +6213,68 @@ async def _run_agent_loop(
                     and base_messages is not None
                     and config.checkpoint_root is not None
                 ):
-                    _folded, compaction_failure = await _bound_context_continuation(
-                        turn, force=True
+                    (
+                        _folded,
+                        compaction_failure,
+                        (
+                            base_messages,
+                            context_continuation,
+                            current_epoch_checkpoint,
+                            epoch_count,
+                            compaction_armed,
+                            compaction_deferred,
+                            usage_epoch,
+                            cumulative_usage,
+                            budget_new_tokens,
+                            previous_prompt_tokens,
+                            previous_usage_source,
+                            consecutive_compaction_deferrals,
+                            finalized,
+                            forced_finalization,
+                            finalization_grace_used,
+                            transcript,
+                        ),
+                    ) = await _bound_context_continuation(
+                        turn,
+                        force=True,
+                        config=config,
+                        router=router,
+                        tier=tier,
+                        model=model,
+                        writer=writer,
+                        progress=progress,
+                        run_request_id=run_request_id,
+                        outcome=outcome,
+                        tools=tools,
+                        budget_usd=budget_usd,
+                        absolute_wall_deadline=absolute_wall_deadline,
+                        wall_deadline=wall_deadline,
+                        base_messages=base_messages,
+                        context_continuation=context_continuation,
+                        current_epoch_checkpoint=current_epoch_checkpoint,
+                        epoch_count=epoch_count,
+                        compaction_armed=compaction_armed,
+                        compaction_deferred=compaction_deferred,
+                        consecutive_compaction_deferrals=consecutive_compaction_deferrals,
+                        usage_epoch=usage_epoch,
+                        usage_fork_of=usage_fork_of,
+                        cumulative_usage=cumulative_usage,
+                        budget_new_tokens=budget_new_tokens,
+                        previous_prompt_tokens=previous_prompt_tokens,
+                        previous_usage_source=previous_usage_source,
+                        no_progress_actions=no_progress_actions,
+                        code_changed=code_changed,
+                        verified_after_change=verified_after_change,
+                        verification_failed=verification_failed,
+                        provider_compat=provider_compat,
+                        provider_boundaries=provider_boundaries,
+                        finalization_cap=finalization_cap,
+                        soft_cap=soft_cap,
+                        finalized=finalized,
+                        forced_finalization=forced_finalization,
+                        finalization_grace_used=finalization_grace_used,
+                        last_turn_checkpoint=last_turn_checkpoint,
+                        transcript=transcript,
                     )
                     if compaction_failure is not None:
                         return _loop_result(
@@ -5771,9 +6390,37 @@ async def _run_agent_loop(
                     transcript.extend(denied_messages)
                 else:
                     context_continuation.extend(denied_messages)
-                    _sync_context_transcript()
-                await _maybe_restore_turn_context()
-                _arm_finalization(turn)
+                    transcript = _sync_context_transcript(
+                        base_messages, context_continuation, transcript
+                    )
+                base_messages, context_continuation, transcript = await _maybe_restore_turn_context(
+                    turn_checkpoint_resumed=turn_checkpoint_resumed,
+                    compaction_deferred=compaction_deferred,
+                    base_messages=base_messages,
+                    context_continuation=context_continuation,
+                    transcript=transcript,
+                    config=config,
+                    tools=tools,
+                    model_identity=model_identity,
+                )
+                (
+                    finalized,
+                    forced_finalization,
+                    finalization_grace_used,
+                    context_continuation,
+                    transcript,
+                ) = _arm_finalization(
+                    turn,
+                    base_messages=base_messages,
+                    context_continuation=context_continuation,
+                    transcript=transcript,
+                    config=config,
+                    budget_new_tokens=budget_new_tokens,
+                    soft_cap=soft_cap,
+                    finalized=finalized,
+                    forced_finalization=forced_finalization,
+                    finalization_grace_used=finalization_grace_used,
+                )
                 progress.tool = name
                 continue
             if stop.is_set():
@@ -5830,13 +6477,48 @@ async def _run_agent_loop(
                 )
                 continuation_suffix.append(state_message)
                 context_continuation.extend(copy.deepcopy(continuation_suffix))
-                _sync_context_transcript()
-            if read_action and _observe_progress(
-                action=action, result_content=result_content
-            ) and not _finalization_due(turn):
-                return _no_progress_failure(turn)
-            await _maybe_restore_turn_context()
-            _arm_finalization(turn)
+                transcript = _sync_context_transcript(
+                    base_messages, context_continuation, transcript
+                )
+            if read_action:
+                stalled = _observe_progress(
+                    progress_detector, action=action, result_content=result_content
+                )
+                no_progress_actions = progress_detector.no_progress_actions
+                if stalled and not _finalization_due(
+                    turn, finalized, budget_new_tokens, soft_cap, config
+                ):
+                    return _no_progress_failure(
+                        outcome, no_progress_actions, turn, cumulative_usage, transcript
+                    )
+            base_messages, context_continuation, transcript = await _maybe_restore_turn_context(
+                turn_checkpoint_resumed=turn_checkpoint_resumed,
+                compaction_deferred=compaction_deferred,
+                base_messages=base_messages,
+                context_continuation=context_continuation,
+                transcript=transcript,
+                config=config,
+                tools=tools,
+                model_identity=model_identity,
+            )
+            (
+                finalized,
+                forced_finalization,
+                finalization_grace_used,
+                context_continuation,
+                transcript,
+            ) = _arm_finalization(
+                turn,
+                base_messages=base_messages,
+                context_continuation=context_continuation,
+                transcript=transcript,
+                config=config,
+                budget_new_tokens=budget_new_tokens,
+                soft_cap=soft_cap,
+                finalized=finalized,
+                forced_finalization=forced_finalization,
+                finalization_grace_used=finalization_grace_used,
+            )
             if writer is not None:
                 await _emit_tool_event(writer, config, name, arguments, turn, tool_result)
                 await _persist_checkpoint(
@@ -5854,8 +6536,68 @@ async def _run_agent_loop(
                 checkpoint: ContextCheckpoint | None = None
                 checkpoint_was_emitted = False
                 if base_messages is not None and config.checkpoint_root is not None:
-                    _folded, compaction_failure = await _bound_context_continuation(
-                        turn, force=True
+                    (
+                        _folded,
+                        compaction_failure,
+                        (
+                            base_messages,
+                            context_continuation,
+                            current_epoch_checkpoint,
+                            epoch_count,
+                            compaction_armed,
+                            compaction_deferred,
+                            usage_epoch,
+                            cumulative_usage,
+                            budget_new_tokens,
+                            previous_prompt_tokens,
+                            previous_usage_source,
+                            consecutive_compaction_deferrals,
+                            finalized,
+                            forced_finalization,
+                            finalization_grace_used,
+                            transcript,
+                        ),
+                    ) = await _bound_context_continuation(
+                        turn,
+                        force=True,
+                        config=config,
+                        router=router,
+                        tier=tier,
+                        model=model,
+                        writer=writer,
+                        progress=progress,
+                        run_request_id=run_request_id,
+                        outcome=outcome,
+                        tools=tools,
+                        budget_usd=budget_usd,
+                        absolute_wall_deadline=absolute_wall_deadline,
+                        wall_deadline=wall_deadline,
+                        base_messages=base_messages,
+                        context_continuation=context_continuation,
+                        current_epoch_checkpoint=current_epoch_checkpoint,
+                        epoch_count=epoch_count,
+                        compaction_armed=compaction_armed,
+                        compaction_deferred=compaction_deferred,
+                        consecutive_compaction_deferrals=consecutive_compaction_deferrals,
+                        usage_epoch=usage_epoch,
+                        usage_fork_of=usage_fork_of,
+                        cumulative_usage=cumulative_usage,
+                        budget_new_tokens=budget_new_tokens,
+                        previous_prompt_tokens=previous_prompt_tokens,
+                        previous_usage_source=previous_usage_source,
+                        no_progress_actions=no_progress_actions,
+                        code_changed=code_changed,
+                        verified_after_change=verified_after_change,
+                        verification_failed=verification_failed,
+                        provider_compat=provider_compat,
+                        provider_boundaries=provider_boundaries,
+                        finalization_cap=finalization_cap,
+                        soft_cap=soft_cap,
+                        finalized=finalized,
+                        forced_finalization=forced_finalization,
+                        finalization_grace_used=finalization_grace_used,
+                        last_turn_checkpoint=last_turn_checkpoint,
+                        transcript=transcript,
                     )
                     if compaction_failure is not None:
                         return _loop_result(
