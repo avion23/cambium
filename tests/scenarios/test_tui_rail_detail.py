@@ -74,3 +74,22 @@ def test_narrow_rail_keeps_summary_only() -> None:
         value.strip().startswith(("phase", "tail", "duration", "status", "•"))
         for _, value in rows
     )
+
+
+def test_context_index_stays_fixed_across_activity_and_tool_changes() -> None:
+    snapshot = _snapshot(_run(tool=None))
+
+    def context_index(activity_line: str) -> int:
+        rows = _rail_rows(snapshot, 32, 32, activity_line=activity_line)
+        return next(index for index, (_, text) in enumerate(rows) if text == " CONTEXT")
+
+    indices = [
+        context_index("… waiting 1s"),
+        context_index("▸ streaming 2s · answer fragment"),
+    ]
+    snapshot.agents[0].tool = "run_shell"
+    indices.append(context_index("▸ streaming 2s · answer fragment"))
+    snapshot.agents[0].tool = None
+    indices.append(context_index("▸ streaming 2s · answer fragment"))
+
+    assert indices == [7, 7, 7, 7]
