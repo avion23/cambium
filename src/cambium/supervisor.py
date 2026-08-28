@@ -2114,6 +2114,44 @@ class _GenOutcome:
     proposals: tuple[dict[str, Any], ...] = ()
 
 
+@dataclass(slots=True)
+class _GenerationState:
+    """Mutable state shared by one generation's explicitly staged phases."""
+
+    task_id: str
+    spec: dict[str, Any]
+    handle: WorkerHandle
+    worktree: Path
+    generation: int
+    loop: asyncio.AbstractEventLoop
+    wall_deadline: float
+    cmd: list[str]
+    env: dict[str, str]
+    init_rid: str
+    init_msg: dict[str, Any]
+    proc: asyncio.subprocess.Process
+    messages: asyncio.Queue[dict[str, Any] | None]
+    heartbeat_timeout: float
+    ready_deadline: float = 0.0
+    stdout_task: asyncio.Task[None] | None = None
+    stderr_task: asyncio.Task[None] | None = None
+    parse_errors: int = 0
+    message_too_long: bool = False
+    stderr_tail: str | None = None
+    phase: Any = "ready"
+    last_heartbeat: float | None = None
+    run_rid: str | None = None
+    envelope: dict[str, Any] | None = None
+    exit_reason: str | None = None
+    correlated: bool = False
+    protocol_reason: str | None = None
+    protocol_failure: str | None = None
+    timeout_phase: str | None = None
+    sandbox_failure_reason: str | None = None
+    reuse_ready: bool = False
+    keep_alive: bool = False
+
+
 class _Runtime:
     """Multi-worker supervisor. One instance per run_plan session.
 
@@ -4971,50 +5009,27 @@ class _Runtime:
         except (TimeoutError, asyncio.CancelledError):
             pass
 
-    async def _drive_generation(
+    async def _report_outbound_message_too_long(self, task_id: str, generation: int) -> None:
+        await self.emit(
+            "protocol",
+            task_id=task_id,
+            generation=generation,
+            error_type="OUTBOUND_MESSAGE_TOO_LONG",
+            note="outbound message exceeds MAX_LINE_BYTES",
+        )
+
+    def _build_generation_init_message(
         self,
         spec: dict[str, Any],
-        handle: WorkerHandle,
-        *,
-        ready_timeout: float,
+        worktree: Path,
+        task_id: str,
+        generation: int,
         heartbeat_interval: float,
         heartbeat_timeout: float,
-        wall_budget: float,
-        wall_deadline: float | None = None,
-        allow_pool: bool = True,
-    ) -> _GenOutcome:
-        task_id = spec["task_id"]
-        worktree = Path(spec["worktree_path"])
-        generation = handle.generation
-        loop = asyncio.get_running_loop()
-        absolute_wall_deadline = (
-            loop.time() + wall_budget if wall_deadline is None else wall_deadline
-        )
-        remaining_wall_budget = absolute_wall_deadline - loop.time()
-        if remaining_wall_budget <= 0:
-            return _GenOutcome(
-                clean=False,
-                fatal=True,
-                reason="wall budget exhausted",
-                timeout_phase="wall",
-            )
-        cmd = self._worker_command(spec)
-        env = self._worker_env(spec, generation)
-        # Proposals are tagged with this generation and returned with its
-        # outcome. They are admitted only by _supervise after the appropriate
-        # parent verdict; a restart can therefore never consume stale input.
-
-        async def _report_outbound_message_too_long() -> None:
-            await self.emit(
-                "protocol",
-                task_id=task_id,
-                generation=generation,
-                error_type="OUTBOUND_MESSAGE_TOO_LONG",
-                note="outbound message exceeds MAX_LINE_BYTES",
-            )
-
+        remaining_wall_budget: float,
+    ) -> tuple[str, dict[str, Any]]:
         init_rid = self._next_rid()
-        init_msg = {
+        init_msg: dict[str, Any] = {
             "type": "init",
             "request_id": init_rid,
             "task_id": task_id,
@@ -5080,8 +5095,51 @@ class _Runtime:
                 "worktree": str(worktree),
                 "branch": spec["branch"],
             }
+        return init_rid, init_msg
+
+    async def _admit_generation(
+        self,
+        spec: dict[str, Any],
+        handle: WorkerHandle,
+        *,
+        ready_timeout: float,
+        heartbeat_interval: float,
+        heartbeat_timeout: float,
+        wall_budget: float,
+        wall_deadline: float | None,
+        allow_pool: bool,
+    ) -> _GenerationState | _GenOutcome:
+        task_id = spec["task_id"]
+        worktree = Path(spec["worktree_path"])
+        generation = handle.generation
+        loop = asyncio.get_running_loop()
+        absolute_wall_deadline = (
+            loop.time() + wall_budget if wall_deadline is None else wall_deadline
+        )
+        remaining_wall_budget = absolute_wall_deadline - loop.time()
+        if remaining_wall_budget <= 0:
+            return _GenOutcome(
+                clean=False,
+                fatal=True,
+                reason="wall budget exhausted",
+                timeout_phase="wall",
+            )
+        cmd = self._worker_command(spec)
+        env = self._worker_env(spec, generation)
+        # Proposals are tagged with this generation and returned with its
+        # outcome. They are admitted only by _supervise after the appropriate
+        # parent verdict; a restart can therefore never consume stale input.
+        init_rid, init_msg = self._build_generation_init_message(
+            spec,
+            worktree,
+            task_id,
+            generation,
+            heartbeat_interval,
+            heartbeat_timeout,
+            remaining_wall_budget,
+        )
         if encode_message(init_msg) is None:
-            await _report_outbound_message_too_long()
+            await self._report_outbound_message_too_long(task_id, generation)
             return _GenOutcome(
                 clean=False,
                 fatal=True,
@@ -5129,860 +5187,1047 @@ class _Runtime:
             return _GenOutcome(clean=False, fatal=True, reason=f"spawn failed: {exc}")
         handle.proc = proc
         handle.state = "SPAWNING"
-
-        messages: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(
-            maxsize=WORKER_STDOUT_QUEUE_MAXSIZE
+        return _GenerationState(
+            task_id=task_id,
+            spec=spec,
+            handle=handle,
+            worktree=worktree,
+            generation=generation,
+            loop=loop,
+            wall_deadline=absolute_wall_deadline,
+            cmd=cmd,
+            env=env,
+            init_rid=init_rid,
+            init_msg=init_msg,
+            proc=proc,
+            messages=asyncio.Queue(maxsize=WORKER_STDOUT_QUEUE_MAXSIZE),
+            heartbeat_timeout=heartbeat_timeout,
         )
-        parse_errors = 0
-        message_too_long = False
 
-        stdout = cast(asyncio.StreamReader, proc.stdout)
-        stderr = cast(asyncio.StreamReader, proc.stderr)
-        stderr_tail: str | None = None
-
-        async def _read_stdout() -> None:
-            nonlocal parse_errors, message_too_long
-            try:
-                async for raw in stdout:
-                    line = raw.decode("utf-8", "replace").rstrip("\n")
-                    if not line.strip():
-                        continue
-                    try:
-                        msg = json.loads(line)
-                    except json.JSONDecodeError as exc:
-                        parse_errors += 1
-                        await self.emit(
-                            "parse_error",
-                            task_id=task_id,
-                            generation=generation,
-                            message=str(exc)[:256],
-                        )
-                        if parse_errors > MAX_PARSE_ERRORS:
-                            try:
-                                os.killpg(proc.pid, signal.SIGKILL)
-                            except (ProcessLookupError, PermissionError, OSError):
-                                pass
-                        continue
-                    if not isinstance(msg, dict):
-                        # A valid JSON line that is not an object cannot be a
-                        # protocol message; count and skip it up to the same
-                        # bound as unparseable lines (agents.md boundary
-                        # invariants: framing never fails supervision on
-                        # non-object JSON).
-                        parse_errors += 1
-                        await self.emit(
-                            "parse_error",
-                            task_id=task_id,
-                            generation=generation,
-                            message="valid JSON line is not an object",
-                        )
-                        if parse_errors > MAX_PARSE_ERRORS:
-                            try:
-                                os.killpg(proc.pid, signal.SIGKILL)
-                            except (ProcessLookupError, PermissionError, OSError):
-                                pass
-                        continue
-                    await messages.put(msg)
-            except (ValueError, asyncio.LimitOverrunError) as exc:
-                message_too_long = True
-                await self.emit(
-                    "protocol",
-                    task_id=task_id,
-                    generation=generation,
-                    note="MessageTooLong",
-                    message=str(exc)[:256],
-                )
-                await _kill_worker(proc)
-            finally:
-                current = asyncio.current_task()
-                if current is None or not current.cancelling():
-                    await messages.put(None)
-
-        async def _read_stderr() -> None:
-            nonlocal stderr_tail
-            async for raw in stderr:
+    async def _read_generation_stdout(
+        self, state: _GenerationState, stdout: asyncio.StreamReader
+    ) -> None:
+        proc = state.proc
+        try:
+            async for raw in stdout:
                 line = raw.decode("utf-8", "replace").rstrip("\n")
-                if line.strip():
-                    if self._redactor is not None:
-                        line = self._redactor.redact_escaped(line)
-                    stderr_tail = line[:512]
-                    await self.emit(
-                        "log",
-                        task_id=task_id,
-                        generation=generation,
-                        stream="stderr",
-                        message=line[:512],
-                    )
-
-        stdout_task = asyncio.create_task(_read_stdout())
-        stderr_task = asyncio.create_task(_read_stderr())
-        wall_deadline = absolute_wall_deadline
-
-        await self.emit("init", task_id=task_id, request_id=init_rid, generation=generation)
-        init_written = await _write_json(
-            proc,
-            init_msg,
-            deadline=_stdin_deadline(wall_deadline),
-        )
-
-        phase = "ready"  # "ready" | "run"
-        ready_deadline = loop.time() + ready_timeout if init_written else loop.time()
-        last_heartbeat: float | None = None
-        run_rid: str | None = None
-        envelope: dict[str, Any] | None = None
-        exit_reason: str | None = None
-        correlated = False
-        protocol_reason: str | None = None
-        protocol_failure: str | None = None
-        timeout_phase: str | None = "stdin" if not init_written else None
-        sandbox_failure_reason: str | None = None
-        # Eval-3 ADOPT: set when the worker reported reuse-ready; the process
-        # is kept alive and returned to the session pool instead of being
-        # waited on and reaped as a terminal worker.
-        reuse_ready = False
-        keep_alive = False
-        # Proposals remain in the runtime buffer until the generation has
-        # reached its terminal process state, then are detached below and
-        # returned with this generation's outcome.
-
-        async def _cancel_and_kill() -> None:
-            cancel_msg = {
-                "type": "cancel",
-                "request_id": self._next_rid(),
-                "reason": timeout_phase or "timeout",
-            }
-            try:
-                if encode_message(cancel_msg) is None:
-                    await _report_outbound_message_too_long()
-                else:
-                    await _write_json(proc, cancel_msg, deadline=_stdin_deadline(wall_deadline))
-            except (
-                OSError,
-                subprocess.SubprocessError,
-                TimeoutError,
-                TypeError,
-                ValueError,
-            ) as exc:
-                print(f"cambium: cancel message error: {exc}", file=sys.stderr)
-            await _kill_worker(proc)
-
-        async def _probe_after_eof() -> bool:
-            """Require one exact pong before treating an EOF survivor as live."""
-            nonlocal protocol_failure, timeout_phase
-            if proc.returncode is not None:
-                return False
-            pong_rid = self._next_rid()
-            pong_deadline = min(wall_deadline, loop.time() + PONG_DEADLINE_S)
-            ping_msg = {
-                "type": "ping",
-                "request_id": pong_rid,
-                "task_id": task_id,
-                "generation": generation,
-            }
-            await self.emit("ping", task_id=task_id, generation=generation, request_id=pong_rid)
-            if encode_message(ping_msg) is None:
-                protocol_failure = OUTBOUND_MESSAGE_TOO_LONG
-                await _report_outbound_message_too_long()
-                await _kill_worker(proc)
-                return False
-            if not await _write_json(
-                proc,
-                ping_msg,
-                deadline=pong_deadline,
-            ):
-                timeout_phase = "pong"
-                await self.emit(
-                    "protocol",
-                    task_id=task_id,
-                    generation=generation,
-                    note="missing correlated pong after EOF",
-                    expected=pong_rid,
-                )
-                return False
-            while loop.time() < pong_deadline:
-                remaining = pong_deadline - loop.time()
+                if not line.strip():
+                    continue
                 try:
-                    response = await asyncio.wait_for(messages.get(), remaining)
-                except TimeoutError:
-                    break
-                if response is None:
-                    break
-                if _protocol_version_mismatch(response):
-                    protocol_failure = "PROTO_VERSION_MISMATCH"
+                    msg = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    state.parse_errors += 1
                     await self.emit(
-                        "protocol",
-                        task_id=task_id,
-                        generation=generation,
-                        error_type=protocol_failure,
-                        expected=PROTO,
-                        got=response.get("proto"),
+                        "parse_error",
+                        task_id=state.task_id,
+                        generation=state.generation,
+                        message=str(exc)[:256],
                     )
-                    return False
-                if response.get("type") != "pong":
-                    await self.emit(
-                        "protocol",
-                        task_id=task_id,
-                        generation=generation,
-                        note="unexpected message during EOF pong probe",
-                        type=response.get("type"),
-                    )
+                    if state.parse_errors > MAX_PARSE_ERRORS:
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except (ProcessLookupError, PermissionError, OSError):
+                            pass
                     continue
-                if response.get("request_id") != pong_rid:
+                if not isinstance(msg, dict):
+                    # A valid JSON line that is not an object cannot be a
+                    # protocol message; count and skip it up to the same
+                    # bound as unparseable lines (agents.md boundary
+                    # invariants: framing never fails supervision on
+                    # non-object JSON).
+                    state.parse_errors += 1
                     await self.emit(
-                        "protocol",
-                        task_id=task_id,
-                        generation=generation,
-                        note="pong request_id mismatch",
-                        expected=pong_rid,
-                        got=response.get("request_id"),
+                        "parse_error",
+                        task_id=state.task_id,
+                        generation=state.generation,
+                        message="valid JSON line is not an object",
                     )
+                    if state.parse_errors > MAX_PARSE_ERRORS:
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except (ProcessLookupError, PermissionError, OSError):
+                            pass
                     continue
-                await self.emit("pong", task_id=task_id, generation=generation, request_id=pong_rid)
-                return True
-            timeout_phase = "pong"
+                await state.messages.put(msg)
+        except (ValueError, asyncio.LimitOverrunError) as exc:
+            state.message_too_long = True
             await self.emit(
                 "protocol",
-                task_id=task_id,
-                generation=generation,
+                task_id=state.task_id,
+                generation=state.generation,
+                note="MessageTooLong",
+                message=str(exc)[:256],
+            )
+            await _kill_worker(proc)
+        finally:
+            current = asyncio.current_task()
+            if current is None or not current.cancelling():
+                await state.messages.put(None)
+
+    async def _read_generation_stderr(
+        self, state: _GenerationState, stderr: asyncio.StreamReader
+    ) -> None:
+        async for raw in stderr:
+            line = raw.decode("utf-8", "replace").rstrip("\n")
+            if line.strip():
+                if self._redactor is not None:
+                    line = self._redactor.redact_escaped(line)
+                state.stderr_tail = line[:512]
+                await self.emit(
+                    "log",
+                    task_id=state.task_id,
+                    generation=state.generation,
+                    stream="stderr",
+                    message=line[:512],
+                )
+
+    async def _start_generation(self, state: _GenerationState, ready_timeout: float) -> None:
+        stdout = cast(asyncio.StreamReader, state.proc.stdout)
+        stderr = cast(asyncio.StreamReader, state.proc.stderr)
+        state.stdout_task = asyncio.create_task(self._read_generation_stdout(state, stdout))
+        state.stderr_task = asyncio.create_task(self._read_generation_stderr(state, stderr))
+        await self.emit(
+            "init",
+            task_id=state.task_id,
+            request_id=state.init_rid,
+            generation=state.generation,
+        )
+        init_written = await _write_json(
+            state.proc,
+            state.init_msg,
+            deadline=_stdin_deadline(state.wall_deadline),
+        )
+        state.phase = "ready"
+        state.ready_deadline = (
+            state.loop.time() + ready_timeout if init_written else state.loop.time()
+        )
+        state.timeout_phase = "stdin" if not init_written else None
+
+    async def _cancel_generation(self, state: _GenerationState) -> None:
+        cancel_msg = {
+            "type": "cancel",
+            "request_id": self._next_rid(),
+            "reason": state.timeout_phase or "timeout",
+        }
+        try:
+            if encode_message(cancel_msg) is None:
+                await self._report_outbound_message_too_long(state.task_id, state.generation)
+            else:
+                await _write_json(
+                    state.proc,
+                    cancel_msg,
+                    deadline=_stdin_deadline(state.wall_deadline),
+                )
+        except (
+            OSError,
+            subprocess.SubprocessError,
+            TimeoutError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            print(f"cambium: cancel message error: {exc}", file=sys.stderr)
+        await _kill_worker(state.proc)
+
+    async def _probe_after_eof(self, state: _GenerationState) -> bool:
+        """Require one exact pong before treating an EOF survivor as live."""
+        if state.proc.returncode is not None:
+            return False
+        pong_rid = self._next_rid()
+        pong_deadline = min(state.wall_deadline, state.loop.time() + PONG_DEADLINE_S)
+        ping_msg = {
+            "type": "ping",
+            "request_id": pong_rid,
+            "task_id": state.task_id,
+            "generation": state.generation,
+        }
+        await self.emit(
+            "ping",
+            task_id=state.task_id,
+            generation=state.generation,
+            request_id=pong_rid,
+        )
+        if encode_message(ping_msg) is None:
+            state.protocol_failure = OUTBOUND_MESSAGE_TOO_LONG
+            await self._report_outbound_message_too_long(state.task_id, state.generation)
+            await _kill_worker(state.proc)
+            return False
+        if not await _write_json(
+            state.proc,
+            ping_msg,
+            deadline=pong_deadline,
+        ):
+            state.timeout_phase = "pong"
+            await self.emit(
+                "protocol",
+                task_id=state.task_id,
+                generation=state.generation,
                 note="missing correlated pong after EOF",
                 expected=pong_rid,
             )
             return False
+        while state.loop.time() < pong_deadline:
+            remaining = pong_deadline - state.loop.time()
+            try:
+                response = await asyncio.wait_for(state.messages.get(), remaining)
+            except TimeoutError:
+                break
+            if response is None:
+                break
+            if _protocol_version_mismatch(response):
+                state.protocol_failure = "PROTO_VERSION_MISMATCH"
+                await self.emit(
+                    "protocol",
+                    task_id=state.task_id,
+                    generation=state.generation,
+                    error_type=state.protocol_failure,
+                    expected=PROTO,
+                    got=response.get("proto"),
+                )
+                return False
+            if response.get("type") != "pong":
+                await self.emit(
+                    "protocol",
+                    task_id=state.task_id,
+                    generation=state.generation,
+                    note="unexpected message during EOF pong probe",
+                    type=response.get("type"),
+                )
+                continue
+            if response.get("request_id") != pong_rid:
+                await self.emit(
+                    "protocol",
+                    task_id=state.task_id,
+                    generation=state.generation,
+                    note="pong request_id mismatch",
+                    expected=pong_rid,
+                    got=response.get("request_id"),
+                )
+                continue
+            await self.emit(
+                "pong",
+                task_id=state.task_id,
+                generation=state.generation,
+                request_id=pong_rid,
+            )
+            return True
+        state.timeout_phase = "pong"
+        await self.emit(
+            "protocol",
+            task_id=state.task_id,
+            generation=state.generation,
+            note="missing correlated pong after EOF",
+            expected=pong_rid,
+        )
+        return False
 
-        try:
-            while True:
-                now = loop.time()
-                if now >= wall_deadline:
-                    timeout_phase = "wall"
-                    await _cancel_and_kill()
-                    break
-                if phase == "ready" and now >= ready_deadline:
-                    if timeout_phase is None:
-                        timeout_phase = "ready"
-                    await _cancel_and_kill()
-                    break
-                if (
-                    phase == "run"
-                    and last_heartbeat is not None
-                    and now - last_heartbeat > heartbeat_timeout
-                ):
-                    timeout_phase = "heartbeat"
-                    await _cancel_and_kill()
-                    break
-                next_deadline = wall_deadline
-                if phase == "ready":
-                    next_deadline = min(next_deadline, ready_deadline)
-                if phase == "run" and last_heartbeat is not None:
-                    next_deadline = min(next_deadline, last_heartbeat + heartbeat_timeout)
-                remaining = next_deadline - loop.time()
+    async def _handle_generation_eof(self, state: _GenerationState) -> None:
+        await self.emit(
+            "log",
+            task_id=state.task_id,
+            generation=state.generation,
+            message="stdout EOF; grace then poll",
+        )
+        await asyncio.sleep(min(EOF_GRACE_S, max(0.0, state.wall_deadline - state.loop.time())))
+        if state.proc.returncode is None:
+            probe_ok = await self._probe_after_eof(state)
+            if probe_ok:
                 try:
-                    msg = await asyncio.wait_for(messages.get(), max(remaining, 0.0))
+                    await asyncio.wait_for(
+                        state.proc.wait(),
+                        min(EOF_GRACE_S, max(0.0, state.wall_deadline - state.loop.time())),
+                    )
                 except TimeoutError:
-                    continue
-                if msg is None:
-                    # EOF alone is never death (arch §5.3): grace, then an
-                    # exact request_id-correlated ping/pong probe.
                     await self.emit(
                         "log",
-                        task_id=task_id,
-                        generation=generation,
-                        message="stdout EOF; grace then poll",
+                        task_id=state.task_id,
+                        generation=state.generation,
+                        message="EOF survivor did not exit after correlated pong",
                     )
-                    await asyncio.sleep(min(EOF_GRACE_S, max(0.0, wall_deadline - loop.time())))
-                    if proc.returncode is None:
-                        probe_ok = await _probe_after_eof()
-                        if probe_ok:
-                            try:
-                                await asyncio.wait_for(
-                                    proc.wait(),
-                                    min(EOF_GRACE_S, max(0.0, wall_deadline - loop.time())),
-                                )
-                            except TimeoutError:
-                                await self.emit(
-                                    "log",
-                                    task_id=task_id,
-                                    generation=generation,
-                                    message="EOF survivor did not exit after correlated pong",
-                                )
-                                await _kill_worker(proc)
-                        else:
-                            await self.emit(
-                                "log",
-                                task_id=task_id,
-                                generation=generation,
-                                message=(
-                                    "EOF survivor has no correlated pong; killing process group"
-                                ),
-                            )
-                            await _kill_worker(proc)
-                    break
-                mtype = msg.get("type")
-                if _protocol_version_mismatch(msg):
-                    protocol_failure = "PROTO_VERSION_MISMATCH"
-                    await self.emit(
-                        "protocol",
-                        task_id=task_id,
-                        generation=generation,
-                        error_type=protocol_failure,
-                        expected=PROTO,
-                        got=msg.get("proto"),
-                    )
-                    await _kill_worker(proc)
-                    break
-                if mtype == "ready":
-                    if msg.get("request_id") != init_rid:
-                        protocol_reason = "ready_request_id_mismatch"
-                        await self.emit(
-                            "protocol",
-                            task_id=task_id,
-                            generation=generation,
-                            request_id=msg.get("request_id"),
-                            code=PROTO_UNKNOWN_REQUEST_ID,
-                            note="ready request_id mismatch",
-                            expected=init_rid,
-                            got=msg.get("request_id"),
-                        )
-                        await _kill_worker(proc)
-                        break
-                    phase = "run"
-                    last_heartbeat = loop.time()
-                    handle.state = "RUNNING"
-                    await self.emit(
-                        "ready",
-                        task_id=task_id,
-                        request_id=msg.get("request_id"),
-                        generation=generation,
-                        pid=msg.get("pid"),
-                        proto=msg.get("proto"),
-                    )
-                    run_rid = self._next_rid()
-                    payload = self._run_payload(
-                        spec, max(0.0, wall_deadline - loop.time()), generation
-                    )
-                    run_msg = {
-                        "type": "run_task",
-                        "request_id": run_rid,
-                        "task_id": task_id,
-                        **payload,
-                    }
-                    if encode_message(run_msg) is None:
-                        protocol_failure = OUTBOUND_MESSAGE_TOO_LONG
-                        await _report_outbound_message_too_long()
-                        await _kill_worker(proc)
-                        break
-                    if not await _write_json(
-                        proc,
-                        run_msg,
-                        deadline=_stdin_deadline(wall_deadline),
-                    ):
-                        timeout_phase = "stdin"
-                        await self.emit("protocol", task_id=task_id, note="run_task write failed")
-                        await _kill_worker(proc)
-                        break
-                    await self.emit(
-                        "run_task", task_id=task_id, request_id=run_rid, generation=generation
-                    )
-                elif mtype in ("result", "result_envelope"):
-                    identity_note = _result_identity_note(msg, task_id, generation)
-                    correlated = run_rid is not None and msg.get("request_id") == run_rid
-                    if not correlated and identity_note is None:
-                        identity_note = "result request_id mismatch"
-                    if identity_note is not None:
-                        await self.emit(
-                            "protocol",
-                            task_id=task_id,
-                            note=identity_note,
-                            expected=run_rid,
-                            got=msg.get("request_id"),
-                        )
-                    if envelope is not None:
-                        # One accepted terminal envelope per run request; a
-                        # stale or duplicate result never triggers lifecycle
-                        # side effects a second time.
-                        await self.emit(
-                            "protocol",
-                            task_id=task_id,
-                            generation=generation,
-                            note="duplicate result envelope ignored",
-                        )
-                    result_payload: dict[str, Any] = {"status": msg.get("status")}
-                    provider_metadata = _redacted_provider_metadata(msg.get("provider_metadata"))
-                    if provider_metadata is not None:
-                        result_payload["provider_metadata"] = provider_metadata
-                    await self.emit(
-                        "result",
-                        task_id=task_id,
-                        request_id=msg.get("request_id"),
-                        generation=generation,
-                        **result_payload,
-                    )
-                    accepted = correlated and identity_note is None and envelope is None
-                    if accepted:
-                        if (
-                            sandbox_failure_reason is not None
-                            and msg.get("status") != "succeeded"
-                        ):
-                            msg = {**msg, "failure_reason": sandbox_failure_reason}
-                        envelope = msg
-                    # Proposals are retained until this generation returns.
-                    # In particular, a correlated worker ``succeeded`` envelope
-                    # is still provisional until _supervise has passed
-                    # integrity and merge; admitting here would orphan children
-                    # when that later verdict fails.
-                elif mtype == "context_checkpoint":
-                    invalid = _invalid_context_checkpoint_fields(msg)
-                    if invalid:
-                        await self.emit(
-                            "protocol",
-                            task_id=task_id,
-                            generation=generation,
-                            note="context_checkpoint rejected: invalid field(s)",
-                            fields=invalid,
-                        )
-                    elif (
-                        msg.get("task_id") != task_id
-                        or type(msg.get("generation")) is not int
-                        or msg.get("generation") != generation
-                    ):
-                        await self.emit(
-                            "protocol",
-                            task_id=task_id,
-                            generation=generation,
-                            note="context_checkpoint rejected: identity mismatch",
-                            expected_task_id=task_id,
-                            expected_generation=generation,
-                        )
-                    else:
-                        self._task_epochs[task_id] = dict(msg)
-                        await self._record_context_checkpoint_conversation(
-                            task_id,
-                            msg["checkpoint_ref"],
-                            msg["epoch"],
-                        )
-                        await self.emit(
-                            "context_checkpoint",
-                            task_id=task_id,
-                            generation=generation,
-                            epoch=msg.get("epoch"),
-                            turn=msg.get("turn"),
-                            checkpoint_ref=msg.get("checkpoint_ref"),
-                            cache_key=msg.get("cache_key"),
-                        )
-                elif mtype == "context_epoch_advanced":
-                    invalid = _invalid_context_epoch_advanced_fields(msg)
-                    if invalid:
-                        await self.emit(
-                            "protocol",
-                            task_id=task_id,
-                            generation=generation,
-                            note="context_epoch_advanced rejected: invalid field(s)",
-                            fields=invalid,
-                        )
-                    elif msg.get("task_id") != task_id or msg.get("generation") != generation:
-                        await self.emit(
-                            "protocol",
-                            task_id=task_id,
-                            generation=generation,
-                            note="context_epoch_advanced rejected: identity mismatch",
-                            expected_task_id=task_id,
-                            expected_generation=generation,
-                        )
-                    else:
-                        active = self._task_epochs.get(task_id)
-                        if (
-                            active is None
-                            or active.get("epoch") != msg["folded_from_epoch"]
-                            or msg["epoch"] != msg["folded_from_epoch"] + 1
-                        ):
-                            await self.emit(
-                                "protocol",
-                                task_id=task_id,
-                                generation=generation,
-                                note="context_epoch_advanced rejected: stale transition",
-                            )
-                            continue
-                        try:
-                            await asyncio.to_thread(
-                                _validate_advanced_epoch_checkpoint,
-                                self._session_dir,
-                                task_id,
-                                generation,
-                                msg,
-                            )
-                        except (OSError, TypeError, ValueError):
-                            await self.emit(
-                                "protocol",
-                                task_id=task_id,
-                                generation=generation,
-                                note="context_epoch_advanced rejected: invalid checkpoint",
-                                fields=["checkpoint_ref"],
-                            )
-                            continue
-                        await self.emit(
-                            "context_epoch_advanced",
-                            task_id=task_id,
-                            generation=generation,
-                            request_id=msg["request_id"],
-                            epoch=msg["epoch"],
-                            turn=msg["turn"],
-                            checkpoint_ref=msg["checkpoint_ref"],
-                            cache_key=msg["cache_key"],
-                            folded_from_epoch=msg["folded_from_epoch"],
-                            reason=msg["reason"],
-                        )
-                        self._task_epochs[task_id] = dict(msg)
-                elif mtype == "compaction_failed":
-                    invalid = _invalid_compaction_failed_fields(msg)
-                    if invalid:
-                        await self.emit(
-                            "protocol",
-                            task_id=task_id,
-                            generation=generation,
-                            note="compaction_failed rejected: invalid field(s)",
-                            fields=invalid,
-                        )
-                    elif msg.get("task_id") != task_id or msg.get("generation") != generation:
-                        await self.emit(
-                            "protocol",
-                            task_id=task_id,
-                            generation=generation,
-                            note="compaction_failed rejected: identity mismatch",
-                            expected_task_id=task_id,
-                            expected_generation=generation,
-                        )
-                    else:
-                        await self.emit(
-                            "compaction_failed",
-                            task_id=task_id,
-                            generation=generation,
-                            request_id=msg["request_id"],
-                            epoch=msg["epoch"],
-                            reason=msg["reason"],
-                        )
-                elif mtype == "provider_boundary_degraded":
-                    invalid = _invalid_provider_boundary_degraded_fields(msg)
-                    if invalid:
-                        await self.emit(
-                            "protocol",
-                            task_id=task_id,
-                            generation=generation,
-                            note="provider_boundary_degraded rejected: invalid field(s)",
-                            fields=invalid,
-                        )
-                    elif msg.get("task_id") != task_id or msg.get("generation") != generation:
-                        await self.emit(
-                            "protocol",
-                            task_id=task_id,
-                            generation=generation,
-                            note="provider_boundary_degraded rejected: identity mismatch",
-                            expected_task_id=task_id,
-                            expected_generation=generation,
-                        )
-                    else:
-                        await self.emit(
-                            "provider_boundary_degraded",
-                            task_id=task_id,
-                            generation=generation,
-                            request_id=msg.get("request_id"),
-                            error_type=msg["error_type"],
-                        )
-                elif mtype == "context_fork_skipped":
-                    fork_skip_reason = msg.get("reason")
-                    await self.emit(
-                        "context_fork_skipped",
-                        task_id=task_id,
-                        generation=generation,
-                        reason=fork_skip_reason,
-                    )
-                elif mtype == "propose_child":
-                    invalid_fields = _invalid_propose_child_fields(msg)
-                    if invalid_fields:
-                        await self.emit(
-                            "protocol",
-                            task_id=task_id,
-                            generation=generation,
-                            note="propose_child rejected: invalid field(s)",
-                            fields=invalid_fields,
-                        )
-                    elif msg.get("parent_task_id") != task_id:
-                        await self.emit(
-                            "protocol",
-                            task_id=task_id,
-                            generation=generation,
-                            note="propose_child parent_task_id mismatch",
-                            parent_task_id=msg.get("parent_task_id"),
-                            child_task_id=msg.get("child_task_id"),
-                        )
-                    else:
-                        # Buffered until the parent's terminal envelope
-                        # arrives; admission then validates the revision
-                        # against the session tree (build_tree over the
-                        # accumulated tasks list).
-                        self._pending_children.setdefault(task_id, []).append((generation, msg))
-                elif mtype == "reuse_ready":
-                    # Eval-3 ADOPT: the worker delivered its terminal result
-                    # and waits for a rebind init; keep the live process for
-                    # the session pool instead of letting it exit.
-                    if envelope is None or not correlated:
-                        protocol_reason = "reuse_ready_without_result"
-                        await self.emit(
-                            "protocol",
-                            task_id=task_id,
-                            generation=generation,
-                            error_type=protocol_reason,
-                            note="reuse_ready before a correlated terminal result",
-                        )
-                        await _kill_worker(proc)
-                        break
-                    reuse_ready = True
-                    keep_alive = True
-                    await self.emit(
-                        "reuse_ready",
-                        task_id=task_id,
-                        generation=generation,
-                        pid=msg.get("pid"),
-                    )
-                    break
-                elif mtype in ("exit", "exit_message"):
-                    exit_reason = msg.get("reason")
-                    handle.exit_reason = exit_reason
-                    await self.emit(
-                        "exit", task_id=task_id, reason=exit_reason, generation=generation
-                    )
-                    break
-                elif mtype == "heartbeat":
-                    last_heartbeat = loop.time()
-                    handle.last_heartbeat = last_heartbeat
-                    forwarded = {
-                        "turn": msg.get("turn"),
-                        "tool": msg.get("tool"),
-                        "status": msg.get("status"),
-                    }
-                    phase = msg.get("phase")
-                    if type(phase) is str and phase in _HEARTBEAT_PHASES:
-                        forwarded["phase"] = phase
-                    tail = msg.get("tail")
-                    if isinstance(tail, str):
-                        forwarded["tail"] = sanitize_terminal_text(tail, single_line=True)[:120]
-                    await self.emit(
-                        "heartbeat",
-                        task_id=task_id,
-                        generation=generation,
-                        **forwarded,
-                    )
-                elif mtype == "checkpoint":
-                    await self.emit(
-                        "checkpoint",
-                        task_id=task_id,
-                        turn=msg.get("turn"),
-                        state_ref=msg.get("state_ref"),
-                        generation=generation,
-                        commits_so_far=msg.get("commits_so_far"),
-                    )
-                elif mtype == "usage_event":
-                    identity_valid = (
-                        msg.get("task_id") == task_id
-                        and type(msg.get("generation")) is int
-                        and msg.get("generation") == generation
-                    )
-                    if not identity_valid:
-                        await self.emit(
-                            "protocol",
-                            task_id=task_id,
-                            generation=generation,
-                            note="usage_event rejected: identity mismatch",
-                            expected_task_id=task_id,
-                            expected_generation=generation,
-                        )
-                    else:
-                        invalid_fields = _invalid_usage_event_fields(msg)
-                        if invalid_fields:
-                            await self.emit(
-                                "protocol",
-                                task_id=task_id,
-                                generation=generation,
-                                note="usage_event rejected: invalid field(s)",
-                                fields=invalid_fields,
-                            )
-                        else:
-                            sandbox_failure_reason = _sandbox_usage_reason(
-                                msg.get("failure_reason")
-                            )
-                            forwarded = {
-                                field: msg[field]
-                                for field in _USAGE_EVENT_FORWARD_FIELDS
-                                if field in msg
-                            }
-                            await self.emit(
-                                "usage_event",
-                                task_id=task_id,
-                                generation=generation,
-                                **forwarded,
-                            )
-                            # Admission balancing (solution C): fold the redacted
-                            # usage event into the session debt ledger so later
-                            # admissions in this session see updated utilization.
-                            if self._debt_store is not None:
-                                self._debt_store.record(msg)
-                elif mtype in ("tool_event", "pong"):
-                    forwarded = {"tool": msg.get("tool"), "cmd": msg.get("cmd")}
-                    if mtype == "tool_event":
-                        invalid_fields = _invalid_tool_event_fields(msg)
-                        if invalid_fields:
-                            await self.emit(
-                                "protocol",
-                                task_id=task_id,
-                                generation=generation,
-                                note="tool_event rejected: invalid field(s)",
-                                fields=invalid_fields,
-                            )
-                        else:
-                            for field in ("batch_index", "batch_size", "ok", "duration_ms", "turn"):
-                                if field in msg:
-                                    forwarded[field] = msg[field]
-                            await self.emit(
-                                "tool_event",
-                                task_id=task_id,
-                                generation=generation,
-                                **forwarded,
-                            )
-                    else:
-                        await self.emit(
-                            "log",
-                            task_id=task_id,
-                            generation=generation,
-                            **forwarded,
-                        )
-                elif mtype == "error":
-                    await self.emit(
-                        "log",
-                        task_id=task_id,
-                        generation=generation,
-                        stream="worker-error",
-                        error_type=msg.get("error_type"),
-                        message=str(msg.get("message", ""))[:512],
-                    )
-                elif mtype == "log":
-                    await self.emit(
-                        "log",
-                        task_id=task_id,
-                        generation=generation,
-                        message=str(msg.get("message", ""))[:512],
-                    )
-                else:
-                    await self.emit(
-                        "protocol",
-                        task_id=task_id,
-                        type=mtype,
-                        note="unhandled message",
-                        generation=generation,
-                    )
-        except asyncio.CancelledError:
-            try:
-                await _kill_worker(proc)
-            except BaseException:
-                pass
-            raise
-        finally:
-            if not keep_alive:
-                try:
-                    await asyncio.wait_for(proc.wait(), WORKER_EXIT_WAIT_S)
-                except BaseException:
-                    try:
-                        await _kill_worker(proc)
-                    except BaseException:
-                        pass
-                    try:
-                        await asyncio.wait_for(proc.wait(), WORKER_EXIT_WAIT_S)
-                    except BaseException:
-                        pass
-            for rt in (stdout_task, stderr_task):
-                if not rt.done():
-                    rt.cancel()
-            try:
-                await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
-            except BaseException:
-                pass
+                    await _kill_worker(state.proc)
+            else:
+                await self.emit(
+                    "log",
+                    task_id=state.task_id,
+                    generation=state.generation,
+                    message="EOF survivor has no correlated pong; killing process group",
+                )
+                await _kill_worker(state.proc)
 
-        generation_proposals = self._take_generation_proposals(task_id, generation)
+    async def _check_generation_deadline(self, state: _GenerationState) -> bool:
+        now = state.loop.time()
+        if now >= state.wall_deadline:
+            state.timeout_phase = "wall"
+            await self._cancel_generation(state)
+            return True
+        if state.phase == "ready" and now >= state.ready_deadline:
+            if state.timeout_phase is None:
+                state.timeout_phase = "ready"
+            await self._cancel_generation(state)
+            return True
+        if (
+            state.phase == "run"
+            and state.last_heartbeat is not None
+            and now - state.last_heartbeat > state.heartbeat_timeout
+        ):
+            state.timeout_phase = "heartbeat"
+            await self._cancel_generation(state)
+            return True
+        return False
+
+    def _generation_next_deadline(self, state: _GenerationState) -> float:
+        next_deadline = state.wall_deadline
+        if state.phase == "ready":
+            next_deadline = min(next_deadline, state.ready_deadline)
+        if state.phase == "run" and state.last_heartbeat is not None:
+            next_deadline = min(next_deadline, state.last_heartbeat + state.heartbeat_timeout)
+        return next_deadline
+
+    async def _handle_ready_message(self, state: _GenerationState, msg: dict[str, Any]) -> bool:
+        if msg.get("request_id") != state.init_rid:
+            state.protocol_reason = "ready_request_id_mismatch"
+            await self.emit(
+                "protocol",
+                task_id=state.task_id,
+                generation=state.generation,
+                request_id=msg.get("request_id"),
+                code=PROTO_UNKNOWN_REQUEST_ID,
+                note="ready request_id mismatch",
+                expected=state.init_rid,
+                got=msg.get("request_id"),
+            )
+            await _kill_worker(state.proc)
+            return True
+        state.phase = "run"
+        state.last_heartbeat = state.loop.time()
+        state.handle.state = "RUNNING"
+        await self.emit(
+            "ready",
+            task_id=state.task_id,
+            request_id=msg.get("request_id"),
+            generation=state.generation,
+            pid=msg.get("pid"),
+            proto=msg.get("proto"),
+        )
+        state.run_rid = self._next_rid()
+        payload = self._run_payload(
+            state.spec,
+            max(0.0, state.wall_deadline - state.loop.time()),
+            state.generation,
+        )
+        run_msg = {
+            "type": "run_task",
+            "request_id": state.run_rid,
+            "task_id": state.task_id,
+            **payload,
+        }
+        if encode_message(run_msg) is None:
+            state.protocol_failure = OUTBOUND_MESSAGE_TOO_LONG
+            await self._report_outbound_message_too_long(state.task_id, state.generation)
+            await _kill_worker(state.proc)
+            return True
+        if not await _write_json(
+            state.proc,
+            run_msg,
+            deadline=_stdin_deadline(state.wall_deadline),
+        ):
+            state.timeout_phase = "stdin"
+            await self.emit("protocol", task_id=state.task_id, note="run_task write failed")
+            await _kill_worker(state.proc)
+            return True
+        await self.emit(
+            "run_task",
+            task_id=state.task_id,
+            request_id=state.run_rid,
+            generation=state.generation,
+        )
+        return False
+
+    async def _handle_result_message(self, state: _GenerationState, msg: dict[str, Any]) -> None:
+        identity_note = _result_identity_note(msg, state.task_id, state.generation)
+        state.correlated = state.run_rid is not None and msg.get("request_id") == state.run_rid
+        if not state.correlated and identity_note is None:
+            identity_note = "result request_id mismatch"
+        if identity_note is not None:
+            await self.emit(
+                "protocol",
+                task_id=state.task_id,
+                note=identity_note,
+                expected=state.run_rid,
+                got=msg.get("request_id"),
+            )
+        if state.envelope is not None:
+            # One accepted terminal envelope per run request; a stale or
+            # duplicate result never triggers lifecycle side effects a second time.
+            await self.emit(
+                "protocol",
+                task_id=state.task_id,
+                generation=state.generation,
+                note="duplicate result envelope ignored",
+            )
+        result_payload: dict[str, Any] = {"status": msg.get("status")}
+        provider_metadata = _redacted_provider_metadata(msg.get("provider_metadata"))
+        if provider_metadata is not None:
+            result_payload["provider_metadata"] = provider_metadata
+        await self.emit(
+            "result",
+            task_id=state.task_id,
+            request_id=msg.get("request_id"),
+            generation=state.generation,
+            **result_payload,
+        )
+        accepted = state.correlated and identity_note is None and state.envelope is None
+        if accepted:
+            if state.sandbox_failure_reason is not None and msg.get("status") != "succeeded":
+                msg = {**msg, "failure_reason": state.sandbox_failure_reason}
+            state.envelope = msg
+        # Proposals are retained until this generation returns. In particular,
+        # a correlated worker ``succeeded`` envelope is still provisional until
+        # _supervise has passed integrity and merge; admitting here would orphan
+        # children when that later verdict fails.
+
+    async def _handle_context_checkpoint_message(
+        self, state: _GenerationState, msg: dict[str, Any]
+    ) -> None:
+        invalid = _invalid_context_checkpoint_fields(msg)
+        if invalid:
+            await self.emit(
+                "protocol",
+                task_id=state.task_id,
+                generation=state.generation,
+                note="context_checkpoint rejected: invalid field(s)",
+                fields=invalid,
+            )
+            return
+        if (
+            msg.get("task_id") != state.task_id
+            or type(msg.get("generation")) is not int
+            or msg.get("generation") != state.generation
+        ):
+            await self.emit(
+                "protocol",
+                task_id=state.task_id,
+                generation=state.generation,
+                note="context_checkpoint rejected: identity mismatch",
+                expected_task_id=state.task_id,
+                expected_generation=state.generation,
+            )
+            return
+        self._task_epochs[state.task_id] = dict(msg)
+        await self._record_context_checkpoint_conversation(
+            state.task_id,
+            msg["checkpoint_ref"],
+            msg["epoch"],
+        )
+        await self.emit(
+            "context_checkpoint",
+            task_id=state.task_id,
+            generation=state.generation,
+            epoch=msg.get("epoch"),
+            turn=msg.get("turn"),
+            checkpoint_ref=msg.get("checkpoint_ref"),
+            cache_key=msg.get("cache_key"),
+        )
+
+    async def _handle_context_epoch_advanced_message(
+        self, state: _GenerationState, msg: dict[str, Any]
+    ) -> None:
+        invalid = _invalid_context_epoch_advanced_fields(msg)
+        if invalid:
+            await self.emit(
+                "protocol",
+                task_id=state.task_id,
+                generation=state.generation,
+                note="context_epoch_advanced rejected: invalid field(s)",
+                fields=invalid,
+            )
+            return
+        if msg.get("task_id") != state.task_id or msg.get("generation") != state.generation:
+            await self.emit(
+                "protocol",
+                task_id=state.task_id,
+                generation=state.generation,
+                note="context_epoch_advanced rejected: identity mismatch",
+                expected_task_id=state.task_id,
+                expected_generation=state.generation,
+            )
+            return
+        active = self._task_epochs.get(state.task_id)
+        if (
+            active is None
+            or active.get("epoch") != msg["folded_from_epoch"]
+            or msg["epoch"] != msg["folded_from_epoch"] + 1
+        ):
+            await self.emit(
+                "protocol",
+                task_id=state.task_id,
+                generation=state.generation,
+                note="context_epoch_advanced rejected: stale transition",
+            )
+            return
+        try:
+            await asyncio.to_thread(
+                _validate_advanced_epoch_checkpoint,
+                self._session_dir,
+                state.task_id,
+                state.generation,
+                msg,
+            )
+        except (OSError, TypeError, ValueError):
+            await self.emit(
+                "protocol",
+                task_id=state.task_id,
+                generation=state.generation,
+                note="context_epoch_advanced rejected: invalid checkpoint",
+                fields=["checkpoint_ref"],
+            )
+            return
+        await self.emit(
+            "context_epoch_advanced",
+            task_id=state.task_id,
+            generation=state.generation,
+            request_id=msg["request_id"],
+            epoch=msg["epoch"],
+            turn=msg["turn"],
+            checkpoint_ref=msg["checkpoint_ref"],
+            cache_key=msg["cache_key"],
+            folded_from_epoch=msg["folded_from_epoch"],
+            reason=msg["reason"],
+        )
+        self._task_epochs[state.task_id] = dict(msg)
+
+    async def _handle_compaction_failed_message(
+        self, state: _GenerationState, msg: dict[str, Any]
+    ) -> None:
+        invalid = _invalid_compaction_failed_fields(msg)
+        if invalid:
+            await self.emit(
+                "protocol",
+                task_id=state.task_id,
+                generation=state.generation,
+                note="compaction_failed rejected: invalid field(s)",
+                fields=invalid,
+            )
+            return
+        if msg.get("task_id") != state.task_id or msg.get("generation") != state.generation:
+            await self.emit(
+                "protocol",
+                task_id=state.task_id,
+                generation=state.generation,
+                note="compaction_failed rejected: identity mismatch",
+                expected_task_id=state.task_id,
+                expected_generation=state.generation,
+            )
+            return
+        await self.emit(
+            "compaction_failed",
+            task_id=state.task_id,
+            generation=state.generation,
+            request_id=msg["request_id"],
+            epoch=msg["epoch"],
+            reason=msg["reason"],
+        )
+
+    async def _handle_provider_boundary_degraded_message(
+        self, state: _GenerationState, msg: dict[str, Any]
+    ) -> None:
+        invalid = _invalid_provider_boundary_degraded_fields(msg)
+        if invalid:
+            await self.emit(
+                "protocol",
+                task_id=state.task_id,
+                generation=state.generation,
+                note="provider_boundary_degraded rejected: invalid field(s)",
+                fields=invalid,
+            )
+            return
+        if msg.get("task_id") != state.task_id or msg.get("generation") != state.generation:
+            await self.emit(
+                "protocol",
+                task_id=state.task_id,
+                generation=state.generation,
+                note="provider_boundary_degraded rejected: identity mismatch",
+                expected_task_id=state.task_id,
+                expected_generation=state.generation,
+            )
+            return
+        await self.emit(
+            "provider_boundary_degraded",
+            task_id=state.task_id,
+            generation=state.generation,
+            request_id=msg.get("request_id"),
+            error_type=msg["error_type"],
+        )
+
+    async def _handle_propose_child_message(
+        self, state: _GenerationState, msg: dict[str, Any]
+    ) -> None:
+        invalid_fields = _invalid_propose_child_fields(msg)
+        if invalid_fields:
+            await self.emit(
+                "protocol",
+                task_id=state.task_id,
+                generation=state.generation,
+                note="propose_child rejected: invalid field(s)",
+                fields=invalid_fields,
+            )
+            return
+        if msg.get("parent_task_id") != state.task_id:
+            await self.emit(
+                "protocol",
+                task_id=state.task_id,
+                generation=state.generation,
+                note="propose_child parent_task_id mismatch",
+                parent_task_id=msg.get("parent_task_id"),
+                child_task_id=msg.get("child_task_id"),
+            )
+            return
+        # Buffered until the parent's terminal envelope arrives; admission then
+        # validates the revision against the session tree (build_tree over the
+        # accumulated tasks list).
+        self._pending_children.setdefault(state.task_id, []).append(
+            (state.generation, msg)
+        )
+
+    async def _handle_reuse_ready_message(
+        self, state: _GenerationState, msg: dict[str, Any]
+    ) -> bool:
+        # Eval-3 ADOPT: the worker delivered its terminal result and waits for a
+        # rebind init; keep the live process for the session pool instead of
+        # letting it exit.
+        if state.envelope is None or not state.correlated:
+            state.protocol_reason = "reuse_ready_without_result"
+            await self.emit(
+                "protocol",
+                task_id=state.task_id,
+                generation=state.generation,
+                error_type=state.protocol_reason,
+                note="reuse_ready before a correlated terminal result",
+            )
+            await _kill_worker(state.proc)
+            return True
+        state.reuse_ready = True
+        state.keep_alive = True
+        await self.emit(
+            "reuse_ready",
+            task_id=state.task_id,
+            generation=state.generation,
+            pid=msg.get("pid"),
+        )
+        return True
+
+    async def _handle_exit_message(self, state: _GenerationState, msg: dict[str, Any]) -> bool:
+        state.exit_reason = msg.get("reason")
+        state.handle.exit_reason = state.exit_reason
+        await self.emit(
+            "exit",
+            task_id=state.task_id,
+            reason=state.exit_reason,
+            generation=state.generation,
+        )
+        return True
+
+    async def _handle_heartbeat_message(
+        self, state: _GenerationState, msg: dict[str, Any]
+    ) -> None:
+        state.last_heartbeat = state.loop.time()
+        state.handle.last_heartbeat = state.last_heartbeat
+        forwarded = {
+            "turn": msg.get("turn"),
+            "tool": msg.get("tool"),
+            "status": msg.get("status"),
+        }
+        phase = msg.get("phase")
+        # Preserve the original protocol phase value, including its interaction
+        # with the ready/run loop phase.
+        state.phase = phase
+        if type(phase) is str and phase in _HEARTBEAT_PHASES:
+            forwarded["phase"] = phase
+        tail = msg.get("tail")
+        if isinstance(tail, str):
+            forwarded["tail"] = sanitize_terminal_text(tail, single_line=True)[:120]
+        await self.emit(
+            "heartbeat",
+            task_id=state.task_id,
+            generation=state.generation,
+            **forwarded,
+        )
+
+    async def _handle_checkpoint_message(
+        self, state: _GenerationState, msg: dict[str, Any]
+    ) -> None:
+        await self.emit(
+            "checkpoint",
+            task_id=state.task_id,
+            turn=msg.get("turn"),
+            state_ref=msg.get("state_ref"),
+            generation=state.generation,
+            commits_so_far=msg.get("commits_so_far"),
+        )
+
+    async def _handle_usage_event_message(
+        self, state: _GenerationState, msg: dict[str, Any]
+    ) -> None:
+        identity_valid = (
+            msg.get("task_id") == state.task_id
+            and type(msg.get("generation")) is int
+            and msg.get("generation") == state.generation
+        )
+        if not identity_valid:
+            await self.emit(
+                "protocol",
+                task_id=state.task_id,
+                generation=state.generation,
+                note="usage_event rejected: identity mismatch",
+                expected_task_id=state.task_id,
+                expected_generation=state.generation,
+            )
+            return
+        invalid_fields = _invalid_usage_event_fields(msg)
+        if invalid_fields:
+            await self.emit(
+                "protocol",
+                task_id=state.task_id,
+                generation=state.generation,
+                note="usage_event rejected: invalid field(s)",
+                fields=invalid_fields,
+            )
+            return
+        state.sandbox_failure_reason = _sandbox_usage_reason(msg.get("failure_reason"))
+        forwarded = {
+            field: msg[field]
+            for field in _USAGE_EVENT_FORWARD_FIELDS
+            if field in msg
+        }
+        await self.emit(
+            "usage_event",
+            task_id=state.task_id,
+            generation=state.generation,
+            **forwarded,
+        )
+        # Admission balancing (solution C): fold the redacted usage event into
+        # the session debt ledger so later admissions in this session see
+        # updated utilization.
+        if self._debt_store is not None:
+            self._debt_store.record(msg)
+
+    async def _handle_tool_or_pong_message(
+        self, state: _GenerationState, msg: dict[str, Any]
+    ) -> None:
+        mtype = msg.get("type")
+        forwarded = {"tool": msg.get("tool"), "cmd": msg.get("cmd")}
+        if mtype == "tool_event":
+            invalid_fields = _invalid_tool_event_fields(msg)
+            if invalid_fields:
+                await self.emit(
+                    "protocol",
+                    task_id=state.task_id,
+                    generation=state.generation,
+                    note="tool_event rejected: invalid field(s)",
+                    fields=invalid_fields,
+                )
+                return
+            for field in ("batch_index", "batch_size", "ok", "duration_ms", "turn"):
+                if field in msg:
+                    forwarded[field] = msg[field]
+            await self.emit(
+                "tool_event",
+                task_id=state.task_id,
+                generation=state.generation,
+                **forwarded,
+            )
+            return
+        await self.emit(
+            "log",
+            task_id=state.task_id,
+            generation=state.generation,
+            **forwarded,
+        )
+
+    async def _handle_error_message(self, state: _GenerationState, msg: dict[str, Any]) -> None:
+        await self.emit(
+            "log",
+            task_id=state.task_id,
+            generation=state.generation,
+            stream="worker-error",
+            error_type=msg.get("error_type"),
+            message=str(msg.get("message", ""))[:512],
+        )
+
+    async def _handle_log_message(self, state: _GenerationState, msg: dict[str, Any]) -> None:
+        await self.emit(
+            "log",
+            task_id=state.task_id,
+            generation=state.generation,
+            message=str(msg.get("message", ""))[:512],
+        )
+
+    async def _handle_generation_protocol_message(
+        self, state: _GenerationState, msg: dict[str, Any]
+    ) -> bool | None:
+        mtype = msg.get("type")
+        if mtype == "ready":
+            return await self._handle_ready_message(state, msg)
+        if mtype in ("result", "result_envelope"):
+            await self._handle_result_message(state, msg)
+            return False
+        if mtype == "context_checkpoint":
+            await self._handle_context_checkpoint_message(state, msg)
+            return False
+        if mtype == "context_epoch_advanced":
+            await self._handle_context_epoch_advanced_message(state, msg)
+            return False
+        if mtype == "compaction_failed":
+            await self._handle_compaction_failed_message(state, msg)
+            return False
+        if mtype == "provider_boundary_degraded":
+            await self._handle_provider_boundary_degraded_message(state, msg)
+            return False
+        return None
+
+    async def _handle_generation_lifecycle_message(
+        self, state: _GenerationState, msg: dict[str, Any]
+    ) -> bool | None:
+        mtype = msg.get("type")
+        if mtype == "context_fork_skipped":
+            await self.emit(
+                "context_fork_skipped",
+                task_id=state.task_id,
+                generation=state.generation,
+                reason=msg.get("reason"),
+            )
+            return False
+        if mtype == "propose_child":
+            await self._handle_propose_child_message(state, msg)
+            return False
+        if mtype == "reuse_ready":
+            return await self._handle_reuse_ready_message(state, msg)
+        if mtype in ("exit", "exit_message"):
+            return await self._handle_exit_message(state, msg)
+        if mtype == "heartbeat":
+            await self._handle_heartbeat_message(state, msg)
+            return False
+        if mtype == "checkpoint":
+            await self._handle_checkpoint_message(state, msg)
+            return False
+        return None
+
+    async def _handle_generation_event_message(
+        self, state: _GenerationState, msg: dict[str, Any]
+    ) -> bool | None:
+        mtype = msg.get("type")
+        if mtype == "usage_event":
+            await self._handle_usage_event_message(state, msg)
+            return False
+        if mtype in ("tool_event", "pong"):
+            await self._handle_tool_or_pong_message(state, msg)
+            return False
+        if mtype == "error":
+            await self._handle_error_message(state, msg)
+            return False
+        if mtype == "log":
+            await self._handle_log_message(state, msg)
+            return False
+        return None
+
+    async def _handle_generation_message(
+        self, state: _GenerationState, msg: dict[str, Any]
+    ) -> bool:
+        mtype = msg.get("type")
+        if _protocol_version_mismatch(msg):
+            state.protocol_failure = "PROTO_VERSION_MISMATCH"
+            await self.emit(
+                "protocol",
+                task_id=state.task_id,
+                generation=state.generation,
+                error_type=state.protocol_failure,
+                expected=PROTO,
+                got=msg.get("proto"),
+            )
+            await _kill_worker(state.proc)
+            return True
+        handled = await self._handle_generation_protocol_message(state, msg)
+        if handled is not None:
+            return handled
+        handled = await self._handle_generation_lifecycle_message(state, msg)
+        if handled is not None:
+            return handled
+        handled = await self._handle_generation_event_message(state, msg)
+        if handled is not None:
+            return handled
+        await self.emit(
+            "protocol",
+            task_id=state.task_id,
+            type=mtype,
+            note="unhandled message",
+            generation=state.generation,
+        )
+        return False
+
+    async def _drive_generation_loop(self, state: _GenerationState) -> None:
+        while True:
+            if await self._check_generation_deadline(state):
+                break
+            next_deadline = self._generation_next_deadline(state)
+            remaining = next_deadline - state.loop.time()
+            try:
+                msg = await asyncio.wait_for(state.messages.get(), max(remaining, 0.0))
+            except TimeoutError:
+                continue
+            if msg is None:
+                await self._handle_generation_eof(state)
+                break
+            if await self._handle_generation_message(state, msg):
+                break
+
+    async def _cleanup_generation(self, state: _GenerationState) -> None:
+        if not state.keep_alive:
+            try:
+                await asyncio.wait_for(state.proc.wait(), WORKER_EXIT_WAIT_S)
+            except BaseException:
+                try:
+                    await _kill_worker(state.proc)
+                except BaseException:
+                    pass
+                try:
+                    await asyncio.wait_for(state.proc.wait(), WORKER_EXIT_WAIT_S)
+                except BaseException:
+                    pass
+        stdout_task = cast(asyncio.Task[None], state.stdout_task)
+        stderr_task = cast(asyncio.Task[None], state.stderr_task)
+        for rt in (stdout_task, stderr_task):
+            if not rt.done():
+                rt.cancel()
+        try:
+            await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+        except BaseException:
+            pass
+
+    async def _finalize_generation(self, state: _GenerationState) -> _GenOutcome:
+        generation_proposals = self._take_generation_proposals(
+            state.task_id, state.generation
+        )
         terminal_verdict = (
-            envelope is not None
-            and correlated
-            and envelope.get("status")
+            state.envelope is not None
+            and state.correlated
+            and state.envelope.get("status")
             in ("succeeded", "failed", "cancelled", "suspended", "unresolvable")
         )
-        if reuse_ready and not message_too_long:
+        if state.reuse_ready and not state.message_too_long:
             # The worker stays alive and owns no task state; the handle no
             # longer owns the process (the pool does). The generation verdict
             # is clean exactly when the terminal envelope is correlated.
-            await self._pool_return(proc, cmd, env)
-            handle.proc = None
+            await self._pool_return(state.proc, state.cmd, state.env)
+            state.handle.proc = None
             return _GenOutcome(
                 clean=terminal_verdict,
                 fatal=False,
                 reason=None,
                 exit_code=None,
                 exit_reason=None,
-                envelope=envelope,
-                correlated=correlated,
+                envelope=state.envelope,
+                correlated=state.correlated,
                 reuse_ready=True,
                 proposals=generation_proposals,
             )
-        exit_code = proc.returncode
-        handle.exit_code = exit_code
-        handle.state = "EXITED"
+        exit_code = state.proc.returncode
+        state.handle.exit_code = exit_code
+        state.handle.state = "EXITED"
         clean = (
-            exit_reason is not None
+            state.exit_reason is not None
             and terminal_verdict
-            and (exit_code == 0 or cast(dict[str, Any], envelope).get("status") != "succeeded")
+            and (
+                exit_code == 0
+                or cast(dict[str, Any], state.envelope).get("status") != "succeeded"
+            )
         )
         reason: str | None
-        if message_too_long:
+        if state.message_too_long:
             clean = False
             reason = "message_too_long"
         elif clean:
             reason = (
                 _worker_failure_reason(
-                    self._redact_envelope(envelope) if envelope is not None else None,
+                    self._redact_envelope(state.envelope) if state.envelope is not None else None,
                     None,
-                    stderr_tail,
+                    state.stderr_tail,
                 )
-                if envelope is not None and envelope.get("status") != "succeeded"
+                if state.envelope is not None and state.envelope.get("status") != "succeeded"
                 else None
             )
-        elif timeout_phase is not None:
-            reason = timeout_phase
-        elif protocol_reason is not None:
-            reason = protocol_reason
+        elif state.timeout_phase is not None:
+            reason = state.timeout_phase
+        elif state.protocol_reason is not None:
+            reason = state.protocol_reason
         elif exit_code != 0:
-            reason = sandbox_failure_reason or (
+            reason = state.sandbox_failure_reason or (
                 f"sandbox_restricted: worker_exit_{exit_code}"
                 if exit_code in (126, 127)
                 else f"worker_exit_{exit_code}"
             )
-        elif exit_reason is None:
+        elif state.exit_reason is None:
             reason = "missing_exit_message"
-        elif envelope is None:
+        elif state.envelope is None:
             reason = "missing_result_envelope"
         else:
             reason = "result_request_id_mismatch"
         if not clean:
             reason = _worker_failure_reason(
-                self._redact_envelope(envelope) if envelope is not None else None,
+                self._redact_envelope(state.envelope) if state.envelope is not None else None,
                 reason,
-                stderr_tail,
+                state.stderr_tail,
             )
         return _GenOutcome(
             clean=clean,
-            fatal=protocol_failure is not None or protocol_reason == "ready_request_id_mismatch",
-            reason=protocol_failure or protocol_reason or reason,
-            timeout_phase=timeout_phase,
+            fatal=state.protocol_failure is not None
+            or state.protocol_reason == "ready_request_id_mismatch",
+            reason=state.protocol_failure or state.protocol_reason or reason,
+            timeout_phase=state.timeout_phase,
             exit_code=exit_code,
-            exit_reason=exit_reason,
-            envelope=envelope,
-            correlated=correlated,
+            exit_reason=state.exit_reason,
+            envelope=state.envelope,
+            correlated=state.correlated,
             proposals=generation_proposals,
         )
+
+    async def _drive_generation(
+        self,
+        spec: dict[str, Any],
+        handle: WorkerHandle,
+        *,
+        ready_timeout: float,
+        heartbeat_interval: float,
+        heartbeat_timeout: float,
+        wall_budget: float,
+        wall_deadline: float | None = None,
+        allow_pool: bool = True,
+    ) -> _GenOutcome:
+        # Keep the generation lifecycle visible: admission, I/O setup, drive,
+        # probe (from the drive loop), cleanup, and finalization.
+        admitted = await self._admit_generation(
+            spec,
+            handle,
+            ready_timeout=ready_timeout,
+            heartbeat_interval=heartbeat_interval,
+            heartbeat_timeout=heartbeat_timeout,
+            wall_budget=wall_budget,
+            wall_deadline=wall_deadline,
+            allow_pool=allow_pool,
+        )
+        if isinstance(admitted, _GenOutcome):
+            return admitted
+        state = admitted
+        await self._start_generation(state, ready_timeout)
+        try:
+            await self._drive_generation_loop(state)
+        except asyncio.CancelledError:
+            try:
+                await _kill_worker(state.proc)
+            except BaseException:
+                pass
+            raise
+        finally:
+            await self._cleanup_generation(state)
+        return await self._finalize_generation(state)
 
     # -- publish eligibility --------------------------------------------------
 
