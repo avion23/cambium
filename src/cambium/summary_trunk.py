@@ -211,7 +211,6 @@ _SUMMARY_FORBIDDEN_MARKERS = (
 )
 
 _SUMMARY_LIST_TRIM_ORDER = (
-    "open_items",
     "relevant_failed_approaches",
     "verification_results",
     "files_and_symbols_changed",
@@ -219,6 +218,7 @@ _SUMMARY_LIST_TRIM_ORDER = (
     "facts_added",
     "decisions_superseded",
     "decisions_added",
+    "open_items",
 )
 _SUMMARY_TEXT_TRIM_ORDER = (
     *SUMMARY_LIST_FIELDS,
@@ -437,6 +437,43 @@ def _shrink_entry_text_field(entry: SummaryEntry, field: str, index: int | None)
     return best
 
 
+def _fallback_entry(entry: SummaryEntry) -> SummaryEntry:
+    """Keep the hypothesis and next action when normal fitting is insufficient."""
+    # The parser has already rejected structural errors and bounded every
+    # model-owned value.  Do not turn a valid but unusually dense finding into
+    # a compaction failure: retain the hypothesis, the first precise next
+    # action, and an explicit account of the discarded summary fields.
+    dropped = [
+        field for field in SUMMARY_LIST_FIELDS if field != "open_items" and getattr(entry, field)
+    ]
+    if len(entry.open_items) > 1:
+        dropped.append("open_items[1:]")
+    if not dropped:
+        dropped.append("oversized summary content")
+    retained = "objective and open_items[0]" if entry.open_items else "objective"
+    note = f"{SUMMARY_TRUNCATION_MARKER} dropped {', '.join(dropped)}; retained {retained}"
+    fallback = replace(
+        entry,
+        outcome=_truncate_text(note, "outcome", max_bytes=SUMMARY_MAX_TEXT_BYTES),
+        decisions_added=(),
+        decisions_superseded=(),
+        facts_added=(),
+        facts_invalidated=(),
+        files_and_symbols_changed=(),
+        verification_results=(),
+        relevant_failed_approaches=(),
+        open_items=entry.open_items[:1],
+    )
+    text_fields: list[tuple[str, int | None]] = [("outcome", None), ("objective", None)]
+    if fallback.open_items:
+        text_fields.append(("open_items", 0))
+    for field, index in text_fields:
+        if _entry_size_bytes(fallback) <= SUMMARY_MAX_ENTRY_BYTES:
+            break
+        fallback = _shrink_entry_text_field(fallback, field, index)
+    return fallback
+
+
 def _fit_entry_size(entry: SummaryEntry) -> SummaryEntry:
     """Trim low-priority list items before shortening core summary text."""
     if _entry_size_bytes(entry) <= SUMMARY_MAX_ENTRY_BYTES:
@@ -463,9 +500,7 @@ def _fit_entry_size(entry: SummaryEntry) -> SummaryEntry:
             if _entry_size_bytes(fitted) <= SUMMARY_MAX_ENTRY_BYTES:
                 return fitted
 
-    if _entry_size_bytes(fitted) > SUMMARY_MAX_ENTRY_BYTES:
-        raise SummaryTrunkError("summary entry exceeds the total byte cap")
-    return fitted
+    return _fallback_entry(entry)
 
 
 def entry_mapping(entry: SummaryEntry) -> dict[str, Any]:
