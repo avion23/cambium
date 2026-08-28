@@ -58,7 +58,6 @@ documentation index: [`docs/README.md`](docs/README.md).
 ## LIMITS
 
 - Some non-scenario suites (bench/cli/lm/routing) are not part of the enforced gate — [`pyproject.toml`](pyproject.toml).
-- Worker-side moderation transform-retry is not yet implemented — [`src/cambium/worker.py`](src/cambium/worker.py).
 - Coding children currently share one coding-agent prompt; `kind` is task-tree metadata, not a prompt selector — [`docs/architecture/subagents.md`](docs/architecture/subagents.md).
 - Nested orchestration needs `CAMBIUM_ALLOW_NESTED_EPHEMERAL=1` — [`src/cambium/oneshot.py`](src/cambium/oneshot.py).
 
