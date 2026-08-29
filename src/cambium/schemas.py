@@ -187,7 +187,12 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
     {
         "name": "run_shell",
-        "description": "Run an argv command when shell permission is enabled.",
+        "description": (
+            "Run an argv command when shell permission is enabled. Execute argv directly "
+            "(without a shell) in the worker's worktree directory. On non-zero exit or "
+            "timeout, captured output is still returned as a failed result; inspect it "
+            "before retrying."
+        ),
         "parameters": _parameters(
             {
                 "cmd": {
@@ -209,7 +214,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "description": (
             "Read multiple UTF-8 text files in one call. Relative paths resolve against cwd; "
             "absolute paths may refer anywhere on the system. Reading files individually is "
-            "not available; batch reads are the only way to read files."
+            "not available; batch reads are the only way to read files. The same read window "
+            "applies to every path in this call; use separate calls for different windows."
         ),
         "parameters": _parameters(
             {
@@ -236,14 +242,12 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "delegate",
         "description": (
-            "Propose one scoped child workload. A child is a normal Cambium worker in an "
-            "isolated git worktree, not a provider-native agent. Put the objective, ownership "
-            "boundary, completion criteria, and verification in spec.task. Provider/model "
-            "selection is supervisor-owned: requirements, model_candidates, and "
-            "authorized_providers constrain it. An exact compatible fork may reuse the "
-            "parent provider cache; otherwise the child starts from immutable semantic "
-            "summaries. Admission occurs only after the parent reaches a permitted terminal "
-            "boundary."
+            "Propose one scoped child workload for work you should not do yourself — a "
+            "separable subproblem with its own files or investigation area. The child is a "
+            "full Cambium worker in an isolated git worktree. IMPORTANT: this call only "
+            "PROPOSES the child; it starts only after your task finishes, and you never see "
+            "its output. Put everything the child needs in spec.task — it inherits only "
+            "immutable summaries, not your conversation."
         ),
         "parameters": _parameters(
             {
@@ -272,7 +276,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                             "minLength": 1,
                             "description": (
                                 "Scoped objective, owned files/symbols or investigation area, "
-                                "definition of done, and required verification."
+                                "definition of done, and required verification. Example: 'In "
+                                "src/parser/, add offset paging to read_lines(); done when "
+                                "tests/test_parser.py::test_paging passes.'"
                             ),
                         },
                         "requirements": {
