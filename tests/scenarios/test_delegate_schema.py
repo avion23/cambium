@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, cast
 
+import pytest
+
 from cambium.schemas import TOOL_SCHEMAS, validate_tool_call
 
 
@@ -71,3 +73,29 @@ def test_delegate_schema_accepts_explicit_provider_constraints() -> None:
     )
 
     assert errors == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    [
+        ("max_turns", 0, ">= 1"),
+        ("max_turns", -1, ">= 1"),
+        ("max_turns", "two", "integer"),
+        ("max_wall_s", 0, ">= 30"),
+        ("max_wall_s", -1, ">= 30"),
+        ("max_wall_s", "slow", "integer"),
+    ],
+)
+def test_delegate_schema_rejects_invalid_budget_values(
+    field: str, value: Any, expected: str
+) -> None:
+    errors = validate_tool_call(
+        _delegate_schema(),
+        {
+            "child_task_id": "child-review",
+            "kind": "investigation",
+            "spec": {"task": "inspect the routing", field: value},
+        },
+    )
+
+    assert errors == [f"validation failed: 'spec.{field}' must be {expected}"]

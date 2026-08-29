@@ -302,6 +302,22 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                             "type": "boolean",
                             "description": "Whether an empty allowlist means deny all.",
                         },
+                        "max_turns": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": (
+                                "Optional child turn budget; supervisor caps it at the "
+                                "parent's remaining turns."
+                            ),
+                        },
+                        "max_wall_s": {
+                            "type": "integer",
+                            "minimum": 30,
+                            "description": (
+                                "Optional child wall budget in seconds; supervisor caps "
+                                "it at the parent's remaining time."
+                            ),
+                        },
                     },
                     "required": ["task"],
                     "additionalProperties": True,
