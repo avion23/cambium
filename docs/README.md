@@ -1,11 +1,25 @@
 # Cambium documentation
 
-Source and tests define current behavior.
+Source and tests define current behavior. Documentation is separated by reader
+need rather than accumulated in one design file.
 
-## Active contracts
+```text
+architecture/   why the system has this shape
+requirements/   normative invariants (kept beside architecture when tightly coupled)
+reference/      exact schemas, values, commands, and source maps
+how-to/         task-oriented examples
+research/       hypotheses, comparisons, and evaluation protocols
+```
+
+## Architecture and requirements
 
 - [`architecture/architecture.md`](architecture/architecture.md) — runtime,
   ownership, publication, and concurrency.
+- [`architecture/context-branches.md`](architecture/context-branches.md) — the
+  paper-like big vision: recursive branches, cache-aligned trunks, provider
+  placement, historical tool recall, and the four distinct structures.
+- [`architecture/context-branch-requirements.md`](architecture/context-branch-requirements.md)
+  — normative MUST/SHOULD invariants and acceptance scenarios.
 - [`architecture/subagents.md`](architecture/subagents.md) — task decomposition,
   child prompts, same-provider cache-affine children, cross-provider semantic
   children, fork-join lifecycle, and artifact integration.
@@ -26,8 +40,23 @@ Source and tests define current behavior.
 - [`architecture/optimization.md`](architecture/optimization.md) — DSPy and
   OpenCode-data gates.
 
-## Supporting notes
+## Reference
 
-The small set of retained engineering standards and provider setup notes is
-indexed in [`research/README.md`](research/README.md). Superseded reviews,
-roadmap snapshots, and run records remain available through Git history.
+- [`reference/context-branches.md`](reference/context-branches.md) — exact
+  `delegate` policy and `branch_history` tool values, formats, and examples.
+
+## How-to
+
+- [`how-to/context-branches.md`](how-to/context-branches.md) — decide whether to
+  continue, fork a cached child, spread a semantic/fresh child, and inspect a
+  returned branch.
+
+## Research and evaluation
+
+- [`research/context-branch-evaluation.md`](research/context-branch-evaluation.md)
+  — paired experiments, metrics, hypotheses, and DSPy promotion gates.
+- [`research/README.md`](research/README.md) — retained research and provider
+  setup notes.
+
+Superseded reviews, roadmap snapshots, and run records remain available through
+Git history rather than being mixed into active contracts.

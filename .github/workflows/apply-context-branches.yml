@@ -1,0 +1,121 @@
+name: apply-context-branches
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - codex/hierarchical-context-branches-20260829
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-verify:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out implementation branch
+        uses: actions/checkout@v4
+        with:
+          ref: codex/hierarchical-context-branches-20260829
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Apply guarded source and documentation patches
+        run: |
+          python .github/apply-context-branches.py
+          python .github/fix-context-branch-gaps.py
+          python .github/apply-context-doc-links.py
+
+      - name: Install locked development environment
+        run: uv sync --locked --extra dev
+
+      - name: Normalize formatting and imports
+        run: |
+          uv run ruff check --fix --select I \
+            src/cambium/branch_history.py \
+            src/cambium/child_policy.py \
+            src/cambium/prompts.py \
+            src/cambium/schemas.py \
+            src/cambium/tools.py \
+            src/cambium/supervisor.py \
+            tests/scenarios/test_branch_history.py \
+            tests/scenarios/test_child_policy.py \
+            tests/scenarios/test_delegate_schema.py \
+            tests/scenarios/test_prompts.py \
+            tests/scenarios/test_supervisor_child_policy.py \
+            tests/scenarios/test_supervisor_delegation_contracts.py
+          uv run ruff format \
+            src/cambium/branch_history.py \
+            src/cambium/child_policy.py \
+            src/cambium/prompts.py \
+            src/cambium/schemas.py \
+            src/cambium/tools.py \
+            src/cambium/supervisor.py \
+            tests/scenarios/test_branch_history.py \
+            tests/scenarios/test_child_policy.py \
+            tests/scenarios/test_delegate_schema.py \
+            tests/scenarios/test_prompts.py \
+            tests/scenarios/test_supervisor_child_policy.py \
+            tests/scenarios/test_supervisor_delegation_contracts.py
+
+      - name: Static verification
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+          uv run python -m compileall -q src tests
+          git diff --check
+
+      - name: Focused context-branch tests
+        run: >-
+          uv run pytest -q -o addopts=''
+          tests/scenarios/test_branch_history.py
+          tests/scenarios/test_child_policy.py
+          tests/scenarios/test_delegate_schema.py
+          tests/scenarios/test_prompts.py
+          tests/scenarios/test_supervisor_child_policy.py
+          tests/scenarios/test_supervisor_delegation_contracts.py
+          tests/scenarios/test_tools.py
+          tests/scenarios/test_context_epochs.py
+
+      - name: Fast suite
+        run: uv run pytest -q
+
+      - name: Slow suite
+        run: uv run pytest -q -m slow
+
+      - name: Remove staging machinery and obsolete temporary runners
+        run: |
+          rm -f \
+            .github/context-branch.trigger \
+            .github/apply-context-branches.py \
+            .github/fix-context-branch-gaps.py \
+            .github/apply-context-doc-links.py \
+            .github/apply-latest-fixes.py \
+            .github/fix-trigger \
+            .github/pr-sync-trigger \
+            .github/trigger-latest-runner \
+            .github/workflows/apply-context-branches.yml \
+            .github/workflows/apply-latest-regression-fixes.yml \
+            .github/workflows/run-latest-fixes.yml
+
+      - name: Commit verified implementation
+        run: |
+          git config user.name 'cambium-context-bot'
+          git config user.email 'cambium-context-bot@users.noreply.github.com'
+          git add -A
+          git diff --cached --check
+          git commit -m 'context: add recursive branches and historical recall'
+          git push origin HEAD:codex/hierarchical-context-branches-20260829
