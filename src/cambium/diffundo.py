@@ -161,6 +161,7 @@ _URL_CREDENTIALS_RE = re.compile(
 _REDACTED = "[REDACTED]"
 MAX_PROVIDER_RESPONSE_BYTES = 4 * 1024 * 1024
 DEFAULT_SUMMARY_CALL_BUDGET_S = 120.0
+MAX_CONSECUTIVE_ALL_PROVIDER_FAILURES = 3
 _REASONING_EFFORT_MULTIPLIERS = {"max": 2.0}
 _CLOUDFLARE_1010_RE = re.compile(
     r"(?=.*\b1010\b)(?=.*(?:cloudflare|cf[- ]error|"
@@ -832,12 +833,15 @@ class AllProvidersFailed(DiffundoError):
         self,
         providers_tried: Sequence[str],
         last_error: BaseException | None,
+        reason: str | None = None,
     ) -> None:
         super().__init__(
-            f"all providers failed: tried {list(providers_tried)}; last error: {last_error!r}"
+            reason
+            or f"all providers failed: tried {list(providers_tried)}; last error: {last_error!r}"
         )
         self.providers_tried = tuple(providers_tried)
         self.last_error = last_error
+        self.reason = reason
 
 
 class ProviderError(DiffundoError):
@@ -2024,6 +2028,8 @@ class Diffundo:
         self._pinned_provider = self._primary_provider
         self._fallback_origin: str | None = None
         self._active_tier: ProviderTier | None = None
+        self._all_provider_failure_lock = threading.Lock()
+        self._consecutive_all_provider_failures = 0
         # Endpoint-death evidence is stronger than ordinary cooldown state for
         # routing order. Keep it local to this router/process: a fresh Diffundo
         # instance is the explicit recovery/probe boundary.
@@ -2111,6 +2117,16 @@ class Diffundo:
             allow_model_substitution=allow_model_substitution,
             requirements=requirements,
         )
+        if self._all_provider_failure_limit_reached():
+            raise AllProvidersFailed(
+                (),
+                None,
+                reason=(
+                    "all providers failed for "
+                    f"{MAX_CONSECUTIVE_ALL_PROVIDER_FAILURES} consecutive calls; "
+                    "provider failure circuit is open"
+                ),
+            )
         deadline = time.monotonic() + float(effective_call_budget_s)
         tried: list[str] = []
         last_error: BaseException | None = None
@@ -2134,7 +2150,7 @@ class Diffundo:
             fallback_origin = terminal_origin or fallback_origin
             fallback_triggered = fallback_triggered or terminal_origin is not None
             if not candidates:
-                raise AllProvidersFailed(tried, last_error)
+                raise self._all_providers_failed(tried, last_error)
             probe_rejected = False
             pending = list(candidates)
             while pending:
@@ -2196,6 +2212,7 @@ class Diffundo:
                     if exc.budget_exhausted and not fallback_triggered:
                         raise AllProvidersFailed(tried, last_error) from exc
                     continue
+                self._record_provider_success()
                 if budget_usd is not None and result.estimated_cost_usd > budget_usd:
                     raise CostBudgetExceeded(result.provider, result.estimated_cost_usd, budget_usd)
                 self._primary_provider = provider.name
@@ -2207,7 +2224,7 @@ class Diffundo:
                 return result
             if probe_rejected and not tried:
                 continue
-            raise AllProvidersFailed(tried, last_error)
+            raise self._all_providers_failed(tried, last_error)
 
     async def summary_call(
         self,
@@ -2236,6 +2253,34 @@ class Diffundo:
             requirements=requirements,
             call_budget_s=self._summary_call_budget_s,
         )
+
+    def _all_provider_failure_limit_reached(self) -> bool:
+        with self._all_provider_failure_lock:
+            return self._consecutive_all_provider_failures >= (
+                MAX_CONSECUTIVE_ALL_PROVIDER_FAILURES
+            )
+
+    def _all_providers_failed(
+        self,
+        providers_tried: Sequence[str],
+        last_error: BaseException | None,
+    ) -> AllProvidersFailed:
+        """Record an exhausted provider call without counting empty selection."""
+        reason: str | None = None
+        if providers_tried:
+            with self._all_provider_failure_lock:
+                self._consecutive_all_provider_failures += 1
+                count = self._consecutive_all_provider_failures
+            if count >= MAX_CONSECUTIVE_ALL_PROVIDER_FAILURES:
+                reason = (
+                    "all providers failed for "
+                    f"{count} consecutive calls; provider failure circuit is open"
+                )
+        return AllProvidersFailed(providers_tried, last_error, reason=reason)
+
+    def _record_provider_success(self) -> None:
+        with self._all_provider_failure_lock:
+            self._consecutive_all_provider_failures = 0
 
     def health(self, name: str) -> HealthState:
         """Current circuit-breaker health state for a provider."""

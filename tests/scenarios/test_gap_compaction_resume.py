@@ -194,6 +194,65 @@ def test_valid_summary_response_does_not_defer(tmp_path: Path) -> None:
     assert any(message["type"] == "context_epoch_advanced" for message in writer.messages())
 
 
+def test_compaction_deferral_count_survives_generation_boundary(tmp_path: Path) -> None:
+    worktree = _worktree(tmp_path / "repo")
+    checkpoint_root = tmp_path / "checkpoints"
+    first_config = _config(worktree, checkpoint_root, max_turns=10)
+    first_router = _SummaryRouter(malformed_summaries=1)
+    first_router.responses = [
+        '{"type":"tool_call","name":"run_shell","arguments":{"cmd":["true"]}}',
+        "not-an-action",
+    ]
+    first_writer = _Writer()
+
+    first = asyncio.run(_drive(first_config, worktree, first_router, first_writer))
+
+    assert first["status"] == "failed"
+    checkpoint_path = checkpoint_root / first_config.task_id / "turn-001.json"
+    checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    assert checkpoint["compaction_deferred"] is True
+    assert checkpoint["consecutive_compaction_deferrals"] == 1
+
+    write_generation(worktree, 2)
+    resumed_config = _config(
+        worktree,
+        checkpoint_root,
+        generation=2,
+        max_turns=10,
+        resume={
+            "checkpoint_ref": f"{first_config.task_id}/turn-001.json",
+            "epoch": 1,
+            "child_results": [],
+            "child_results_truncated": False,
+            "workspace_changed": False,
+        },
+    )
+    resumed_router = _SummaryRouter(malformed_summaries=2)
+    resumed_router.responses = [
+        '{"type":"plan","steps":["continue"]}',
+        '{"type":"plan","steps":["continue again"]}',
+    ]
+    resumed_writer = _Writer()
+
+    resumed = asyncio.run(_drive(resumed_config, worktree, resumed_router, resumed_writer))
+
+    assert resumed["status"] == "failed"
+    assert resumed["failure_reason"] == (
+        "compaction_failed: summary response must be exactly one JSON object"
+    )
+    assert len(
+        [
+            message
+            for message in resumed_writer.messages()
+            if message["type"] == "compaction_deferred"
+        ]
+    ) == 1
+    assert len(
+        [message for message in resumed_writer.messages() if message["type"] == "compaction_failed"]
+    ) == 1
+    assert resumed_router.summary_calls == 2
+
+
 def _write_restart_worker(path: Path, wire_log: Path, prompt_log: Path, init_log: Path) -> None:
     source_root = Path(__file__).resolve().parents[2] / "src"
     path.write_text(
