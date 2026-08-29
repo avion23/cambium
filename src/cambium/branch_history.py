@@ -202,7 +202,10 @@ def _branches(events: Sequence[_Event]) -> list[_Branch]:
             if not isinstance(status, str):
                 status = "failed" if event.kind == "task_failed" else event.kind
             get(task_id).status = status
-    return sorted(branches.values(), key=lambda branch: (branch.parent_task_id or "", branch.task_id))
+    return sorted(
+        branches.values(),
+        key=lambda branch: (branch.parent_task_id or "", branch.task_id),
+    )
 
 
 def _bounded(text: str, limit: int = MAX_HISTORY_OUTPUT_BYTES) -> str:

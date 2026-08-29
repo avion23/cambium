@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from cambium.child_policy import ContextMode, Placement, parse_child_policy
+from cambium.child_policy import parse_child_policy
 from cambium.supervisor import _Runtime
 from cambium.worker import _provider_task_tools_hash
 

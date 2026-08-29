@@ -1,5 +1,5 @@
+# ruff: noqa: E501  # long lines are byte-exact patch anchors, must not wrap
 from pathlib import Path
-
 
 ROOT = Path(__file__).resolve().parents[1]
 
