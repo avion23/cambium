@@ -422,8 +422,10 @@ def _checkpoint_record(
     verified = meta.get("verified_after_change") if isinstance(meta, Mapping) else None
     if type(verified) is not bool:
         verified = None
-    if code_changed is None and verified is None and not (
-        raw.get("schema") == 1 and isinstance(raw.get("transcript"), list)
+    if (
+        code_changed is None
+        and verified is None
+        and not (raw.get("schema") == 1 and isinstance(raw.get("transcript"), list))
     ):
         raise ValueError("checkpoint has no durable state")
     record: dict[str, Any] = {

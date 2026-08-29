@@ -168,7 +168,11 @@ def test_retry_loop_uses_production_tool_event_command(tmp_path: Path) -> None:
             ]
             + [
                 _event(
-                    "result", {"status": "succeeded", "terminal_action": {"objective_met": True}}
+                    "result",
+                    {
+                        "status": "succeeded",
+                        "terminal_action": {"type": "finish", "objective_met": True},
+                    },
                 )
             ],
         )
@@ -191,7 +195,13 @@ def test_finish_without_verification_reads_durable_checkpoint_state(tmp_path: Pa
                 {"tool": "write_file", "cmd": _write_cmd("a.py"), "ok": True, "turn": 1},
             ),
             _event("checkpoint", {}),
-            _event("result", {"status": "succeeded", "terminal_action": {"objective_met": True}}),
+            _event(
+                "result",
+                {
+                    "status": "succeeded",
+                    "terminal_action": {"type": "finish", "objective_met": True},
+                },
+            ),
         ],
     )
     checkpoint = _ordinary_checkpoint(session, "task/turn-001.json", code_changed=True)
@@ -227,7 +237,13 @@ def test_latest_epoch_checkpoint_can_prove_verification(tmp_path: Path) -> None:
                 },
             ),
             _event("context_checkpoint", {"checkpoint_ref": "task/epoch-001-ref.json"}),
-            _event("result", {"status": "succeeded", "terminal_action": {"objective_met": True}}),
+            _event(
+                "result",
+                {
+                    "status": "succeeded",
+                    "terminal_action": {"type": "finish", "objective_met": True},
+                },
+            ),
         ],
     )
     _epoch_checkpoint(
@@ -250,7 +266,11 @@ def test_objective_met_override_uses_durable_terminal_action(tmp_path: Path) -> 
             tmp_path,
             [
                 _event(
-                    "result", {"status": "succeeded", "terminal_action": {"objective_met": False}}
+                    "result",
+                    {
+                        "status": "succeeded",
+                        "terminal_action": {"type": "finish", "objective_met": False},
+                    },
                 )
             ],
         )
@@ -298,7 +318,11 @@ def test_successful_read_only_task_is_clean_with_warning(tmp_path: Path) -> None
             ]
             + [
                 _event(
-                    "result", {"status": "succeeded", "terminal_action": {"objective_met": True}}
+                    "result",
+                    {
+                        "status": "succeeded",
+                        "terminal_action": {"type": "finish", "objective_met": True},
+                    },
                 )
             ],
         )
@@ -319,7 +343,11 @@ def test_one_read_does_not_trigger_churn(tmp_path: Path) -> None:
                     {"tool": "read_batch", "cmd": _read_cmd("one.py"), "ok": True, "turn": 1},
                 ),
                 _event(
-                    "result", {"status": "succeeded", "terminal_action": {"objective_met": True}}
+                    "result",
+                    {
+                        "status": "succeeded",
+                        "terminal_action": {"type": "finish", "objective_met": True},
+                    },
                 ),
             ],
         )
@@ -340,7 +368,13 @@ def test_interactive_requests_do_not_share_retry_runs(tmp_path: Path) -> None:
                 "tool_event",
                 {"tool": "git_op", "cmd": "git_op status", "ok": True, "turn": 2},
             ),
-            _event("result", {"status": "succeeded", "terminal_action": {"objective_met": True}}),
+            _event(
+                "result",
+                {
+                    "status": "succeeded",
+                    "terminal_action": {"type": "finish", "objective_met": True},
+                },
+            ),
         ]
         for turn in (1, 2)
     }
@@ -371,7 +405,10 @@ def test_interactive_evidence_has_source_order(tmp_path: Path) -> None:
                     ),
                     _event(
                         "result",
-                        {"status": "succeeded", "terminal_action": {"objective_met": True}},
+                        {
+                            "status": "succeeded",
+                            "terminal_action": {"type": "finish", "objective_met": True},
+                        },
                     ),
                 ],
                 2: [
@@ -398,7 +435,11 @@ def test_compaction_deferred_is_not_a_failure(tmp_path: Path) -> None:
             [
                 _event("compaction_deferred", {"epoch": 1, "reason": "retry later"}),
                 _event(
-                    "result", {"status": "succeeded", "terminal_action": {"objective_met": True}}
+                    "result",
+                    {
+                        "status": "succeeded",
+                        "terminal_action": {"type": "finish", "objective_met": True},
+                    },
                 ),
             ],
         )
@@ -436,7 +477,10 @@ def test_finish_verification_does_not_cross_task_boundaries(tmp_path: Path) -> N
                 _event("result", {"status": "failed"}, task_id="task-a"),
                 _event(
                     "result",
-                    {"status": "succeeded", "terminal_action": {"objective_met": True}},
+                    {
+                        "status": "succeeded",
+                        "terminal_action": {"type": "finish", "objective_met": True},
+                    },
                     task_id="task-b",
                 ),
             ],
@@ -471,7 +515,13 @@ def test_state_ref_escape_is_incomplete_without_reading_outside(tmp_path: Path) 
         tmp_path,
         [
             _event("checkpoint", {"turn": 1, "state_ref": str(outside)}),
-            _event("result", {"status": "succeeded", "terminal_action": {"objective_met": True}}),
+            _event(
+                "result",
+                {
+                    "status": "succeeded",
+                    "terminal_action": {"type": "finish", "objective_met": True},
+                },
+            ),
         ],
     )
 
@@ -487,7 +537,15 @@ def test_direct_root_store_layout_is_supported(tmp_path: Path) -> None:
     report = _report(
         _session(
             tmp_path,
-            [_event("result", {"status": "succeeded", "terminal_action": {"objective_met": True}})],
+            [
+                _event(
+                    "result",
+                    {
+                        "status": "succeeded",
+                        "terminal_action": {"type": "finish", "objective_met": True},
+                    },
+                )
+            ],
             direct_root=True,
         )
     )
@@ -512,7 +570,15 @@ def test_clean_session_has_no_detectors(tmp_path: Path) -> None:
     report = _report(
         _session(
             tmp_path,
-            [_event("result", {"status": "succeeded", "terminal_action": {"objective_met": True}})],
+            [
+                _event(
+                    "result",
+                    {
+                        "status": "succeeded",
+                        "terminal_action": {"type": "finish", "objective_met": True},
+                    },
+                )
+            ],
         )
     )
 
