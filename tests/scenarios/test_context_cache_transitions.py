@@ -279,8 +279,9 @@ def test_summary_flush_keeps_head_and_appends_entry_at_head_length(
         pre_flush[: len(immutable_head)]
     )
     assert _summary_indices(post_flush) == [len(immutable_head)]
-    assert len(post_flush) == len(immutable_head) + 1
+    assert len(post_flush) == len(immutable_head) + 2
     assert post_flush[-1]["role"] == "user"
+    assert post_flush[-1]["content"].startswith("<cambium-loop-state>budget=")
     assert not any(
         "<cambium-rolling-context>" in str(message.get("content", "")) for message in post_flush
     )
@@ -292,7 +293,7 @@ def test_summary_flush_keeps_head_and_appends_entry_at_head_length(
     folded = worker._load_epoch_checkpoint(
         config, advanced[0]["checkpoint_ref"], expect_task_id=True
     )
-    assert folded.full_messages == post_flush
+    assert folded.full_messages == post_flush[:-1]
     entries = summary_entries(folded.provider_messages)
     assert len(entries) == 1
     assert entries[0].sequence == 1
@@ -373,8 +374,14 @@ def test_summary_flush_appends_second_entry_after_raw_tail_crosses_threshold(
     ) == _messages_bytes(first_folded.provider_messages)
     assert first_folded.continuation_suffix == []
     assert second_folded.continuation_suffix == []
-    assert action_prompts[0]["messages"] == first_folded.full_messages
-    assert action_prompts[1]["messages"] == second_folded.full_messages
+    assert action_prompts[0]["messages"][:-1] == first_folded.full_messages
+    assert action_prompts[1]["messages"][:-1] == second_folded.full_messages
+    assert action_prompts[0]["messages"][-1]["content"].startswith(
+        "<cambium-loop-state>budget="
+    )
+    assert action_prompts[1]["messages"][-1]["content"].startswith(
+        "<cambium-loop-state>budget="
+    )
     assert summary_prompts[1]["messages"][: len(first_folded.full_messages)] == (
         first_folded.full_messages
     )
@@ -385,7 +392,7 @@ def test_summary_flush_appends_second_entry_after_raw_tail_crosses_threshold(
     assert [entry.sequence for entry in second_entries] == [1, 2]
     assert second_entries[0] == first_entries[0]
     assert first_entries[0].source_message_count == 2
-    assert second_entries[1].source_message_count == 3
+    assert second_entries[1].source_message_count == 2
     assert first_entries[0].through_turn == checkpoint.turn + 1
     assert second_entries[1].through_turn == checkpoint.turn + 2
     assert first_entries[0].source_sha256 != second_entries[1].source_sha256

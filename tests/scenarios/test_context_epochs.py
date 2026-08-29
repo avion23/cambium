@@ -1067,7 +1067,7 @@ def test_rolling_compact_internal_opt_out_keeps_existing_epoch_path(
     router = _ScriptedRouter(['{"type":"plan","steps":["continue"]}'])
     asyncio.run(_drive_loop(config, worktree, router, writer, run_request_id="run-legacy"))
 
-    assert router.prompts[0]["messages"] == [
+    assert router.prompts[0]["messages"][:-1] == [
         *checkpoint.full_messages,
         {
             "role": "user",
@@ -1122,7 +1122,7 @@ def test_fork_reuses_epoch_prefix(tmp_path: Path) -> None:
     first = router.prompts[0]["messages"]
     assert first[0] == checkpoint.system_message
     assert first[: len(checkpoint.full_messages)] == checkpoint.full_messages
-    assert first[1:] == [
+    assert first[1:-1] == [
         *checkpoint.transcript,
         {
             "role": "user",
