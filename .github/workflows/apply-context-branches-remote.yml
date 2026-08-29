@@ -4,12 +4,17 @@ on:
   workflow_run:
     workflows: [ci]
     types: [completed]
+  issues:
+    types: [opened]
 
 permissions:
   contents: write
 
 jobs:
   apply-and-verify:
+    if: >-
+      github.event_name == 'workflow_run' ||
+      github.event.issue.title == 'run recursive context branch verifier'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
