@@ -978,6 +978,10 @@ def test_openrouter_free(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.acceptance
+@pytest.mark.skipif(
+    os.environ.get("CAMBIUM_LIVE") != "1",
+    reason="OpenCode Zen acceptance requires CAMBIUM_LIVE=1",
+)
 def test_opencode_zen(monkeypatch: pytest.MonkeyPatch) -> None:
     context = _api_provider_context(OPENCODE_ZEN_CONFIG_ENV, OPENCODE_ZEN_PROVIDER_ENV)
     if "opencode" not in context.provider.name.casefold():
