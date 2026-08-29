@@ -28,6 +28,7 @@ from .interactive import (
 from .monitor import AnsiDashboard, render_agent_lines
 from .observability import ObservabilityState, SessionSnapshot
 from .store import StoreError, read_events_file
+from .terminal import sanitize_terminal_text
 from .tui_screen import ActivityState, Cockpit, Transcript, render_quota_rows
 
 try:
@@ -242,7 +243,7 @@ def _strip_bracketed_paste_markers(value: str) -> str:
 def _unframe_bracketed_paste(value: str, source: TextIO) -> str:
     """Remove terminal paste framing while retaining newlines in the payload."""
     if not _is_tty(source):
-        return value.rstrip("\r\n")
+        return sanitize_terminal_text(value).rstrip("\r\n")
 
     accumulated = value
     while True:
@@ -257,13 +258,19 @@ def _unframe_bracketed_paste(value: str, source: TextIO) -> str:
         )
         if end >= 0 and not pending:
             suffix = accumulated[end + len(_BRACKETED_PASTE_END) :].rstrip("\r\n")
-            return _strip_bracketed_paste_markers(accumulated[:end] + suffix)
+            return sanitize_terminal_text(
+                _strip_bracketed_paste_markers(accumulated[:end] + suffix)
+            )
         if start < 0 and not pending:
-            return _strip_bracketed_paste_markers(accumulated).rstrip("\r\n")
+            return sanitize_terminal_text(
+                _strip_bracketed_paste_markers(accumulated)
+            ).rstrip("\r\n")
 
         line = source.readline()
         if line == "":
-            return _strip_bracketed_paste_markers(accumulated).rstrip("\r\n")
+            return sanitize_terminal_text(
+                _strip_bracketed_paste_markers(accumulated)
+            ).rstrip("\r\n")
         accumulated += pending + line
 
 

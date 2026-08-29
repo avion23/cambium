@@ -921,10 +921,10 @@ class Transcript:
     @staticmethod
     def _event_clock(record: Mapping[str, Any]) -> float | None:
         monotonic_ms = record.get("monotonic_ms")
-        if type(monotonic_ms) in (int, float) and math.isfinite(float(monotonic_ms)):
+        if isinstance(monotonic_ms, int | float) and math.isfinite(monotonic_ms):
             return max(0.0, float(monotonic_ms) / 1000.0)
         timestamp = record.get("ts")
-        if type(timestamp) in (int, float) and math.isfinite(float(timestamp)):
+        if isinstance(timestamp, int | float) and math.isfinite(timestamp):
             return max(0.0, float(timestamp))
         return None
 
@@ -5125,13 +5125,12 @@ class Cockpit:
         self._input_active = False
         self._last_restored_input_text = None
         if self.enabled:
-            if commit:
-                if self._fixed_frame:
-                    self.stream.write(f"\r{_CLEAR_LINE}")
-                    if not self._small_frame and self._last_request is not None:
-                        self._redraw_bottom(self._last_request, self._last_status_rows)
-                else:
-                    self.stream.write("\n")
+            if self._fixed_frame:
+                self.stream.write(f"\r{_CLEAR_LINE}")
+                if commit and not self._small_frame and self._last_request is not None:
+                    self._redraw_bottom(self._last_request, self._last_status_rows)
+            elif commit:
+                self.stream.write("\n")
             self.stream.flush()
 
 
