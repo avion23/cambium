@@ -183,6 +183,8 @@ PROTO = 1
 HEARTBEAT_INTERVAL_S = 1.0
 PHASE_HEARTBEAT_INTERVAL_S = 1.0
 PHASE_TAIL_MAX_CHARS = 120
+TOOL_OUTPUT_DELTA_INTERVAL_S = 0.1
+_HEARTBEAT_DRAIN_TIMEOUT_S = 0.25
 INIT_TIMEOUT_S = 30.0
 IDLE_TIMEOUT_S = 300.0
 MAX_SUMMARY_CHARS = 2_000
@@ -825,8 +827,11 @@ def _env_float(name: str, default: float) -> float:
 
 
 async def send(writer: asyncio.StreamWriter, msg: dict[str, Any]) -> None:
+    # Write synchronously; never await drain inline. drain() backpressure
+    # must not slow (or fail) the tool path or the heartbeat cadence — the
+    # transport flushes buffered bytes as the pipe becomes writable, and the
+    # heartbeat loop performs the only capped, guarded drain.
     write_message(writer, msg)
-    await writer.drain()
 
 
 def git(*args: str, cwd: str | Path | None = None) -> tuple[int, str, str]:
@@ -3079,11 +3084,7 @@ class _ProgressDetector:
             result_hash = _progress_content_hash(result_content)
             repeated_read = result_hash in self._recent_content_hashes
             self._recent_content_hashes.append(result_hash)
-        novel = (
-            bool(signature)
-            and signature not in self._recent_signatures
-            and not repeated_read
-        )
+        novel = bool(signature) and signature not in self._recent_signatures and not repeated_read
         self.no_progress_actions = 0 if novel else self.no_progress_actions + 1
         self._recent_signatures.append(signature)
         return (
@@ -3118,8 +3119,7 @@ class _ProgressDetector:
             else:
                 signature = _progress_signature(None, action=action)
                 pending_read_result = (
-                    action.get("type") == "tool_call"
-                    and action.get("name") in _READ_TOOL_NAMES
+                    action.get("type") == "tool_call" and action.get("name") in _READ_TOOL_NAMES
                 )
             if signature:
                 self._recent_signatures.append(signature)
@@ -3139,9 +3139,7 @@ def _context_state_message(
 ) -> dict[str, str]:
     """Render one deterministic loop-status line as user-role tail data."""
     budget_remaining_pct = (
-        max(0, 100 - min(100, budget_new_tokens * 100 // max_tokens))
-        if max_tokens > 0
-        else 0
+        max(0, 100 - min(100, budget_new_tokens * 100 // max_tokens)) if max_tokens > 0 else 0
     )
     return {
         "role": "user",
@@ -3187,6 +3185,71 @@ async def _emit_tool_event(
             "duration_ms": int(tool_result.duration_ms),
         },
     )
+
+
+def _emit_tool_output_delta(
+    writer: asyncio.StreamWriter,
+    config: AgentConfig,
+    name: str,
+    turn: int,
+    stream_name: str,
+    delta: str,
+) -> None:
+    """Forward one already-bounded process-output tail to the supervisor."""
+    write_message(
+        writer,
+        {
+            "type": "tool_output_delta",
+            "task_id": config.task_id,
+            "generation": config.generation,
+            "tool": name,
+            "turn": turn,
+            "stream": stream_name,
+            "delta": delta,
+            "monotonic_ms": _monotonic_ms(),
+        },
+    )
+
+
+def _tool_progress_callback(
+    writer: asyncio.StreamWriter,
+    config: AgentConfig,
+    name: str,
+    turn: int,
+) -> Callable[[str, str], Any]:
+    """Throttle process tails to at most ten wire updates per second.
+
+    Delivery must never block or fail the tool: the callback is synchronous
+    and only writes to the transport buffer (no ``drain``). Tails arriving
+    inside the throttle window go into a bounded pending slot per stream
+    (drop-oldest); the agent loop flushes that pending tail before the
+    tool's completion event, so the newest content is always the last
+    emitted delta and history never shows a cross-tool mixture.
+    """
+    last_emit = float("-inf")
+    pending: dict[str, str] = {}
+
+    def _progress(stream_name: str, delta: str) -> None:
+        nonlocal last_emit
+        now = time.monotonic()
+        if now - last_emit < TOOL_OUTPUT_DELTA_INTERVAL_S:
+            pending[stream_name] = delta
+            return
+        last_emit = now
+        stale = pending.pop(stream_name, None)
+        if stale is not None:
+            # The held tail is older than this delta: emit it first so the
+            # last emitted delta is always the newest content.
+            _emit_tool_output_delta(writer, config, name, turn, stream_name, stale)
+        _emit_tool_output_delta(writer, config, name, turn, stream_name, delta)
+
+    async def flush() -> None:
+        for stream_name in list(pending):
+            delta = pending.pop(stream_name)
+            _emit_tool_output_delta(writer, config, name, turn, stream_name, delta)
+
+    _progress.flush = flush  # type: ignore[attr-defined]
+    return _progress
 
 
 def _canonical_message_list_bytes(messages: Sequence[Mapping[str, Any]]) -> int:
@@ -4814,8 +4877,7 @@ def _no_progress_failure(
     return _loop_result(
         outcome,
         "failed",
-        f"agent made no progress: {no_progress_actions} consecutive actions "
-        "with no novel content",
+        f"agent made no progress: {no_progress_actions} consecutive actions with no novel content",
         turn,
         cumulative_usage,
         transcript,
@@ -4955,9 +5017,7 @@ async def _bound_context_continuation(
                     ),
                 )
             context_continuation = bounded
-            transcript = _sync_context_transcript(
-                base_messages, context_continuation, transcript
-            )
+            transcript = _sync_context_transcript(base_messages, context_continuation, transcript)
             return (
                 True,
                 None,
@@ -5137,9 +5197,7 @@ async def _bound_context_continuation(
                     )
                     continue
                 if content_flagged:
-                    raise ContextForkError(
-                        "summary flagged by provider content filter"
-                    ) from exc
+                    raise ContextForkError("summary flagged by provider content filter") from exc
                 detail = exc.__class__.__name__
                 if isinstance(exc, AllProvidersFailed) and exc.last_error is not None:
                     inner = exc.last_error
@@ -5211,9 +5269,7 @@ async def _bound_context_continuation(
         )
         if finalized and budget_new_tokens > finalization_cap:
             raise ContextForkError(
-                _phase_failure(
-                    "token budget exceeded during summary flush", final_synthesis=True
-                )
+                _phase_failure("token budget exceeded during summary flush", final_synthesis=True)
             )
         try:
             summary_entry = parse_summary_response(summary_result.content, expectation)
@@ -5313,9 +5369,7 @@ async def _bound_context_continuation(
         )
         if checkpoint is None:
             raise ContextForkError("summary flush has no checkpoint root")
-        checkpoint = _load_epoch_checkpoint(
-            config, checkpoint.checkpoint_ref, expect_task_id=True
-        )
+        checkpoint = _load_epoch_checkpoint(config, checkpoint.checkpoint_ref, expect_task_id=True)
     except Exception as exc:
         failure_reason = str(exc).strip() or exc.__class__.__name__
         if config.redactor is not None:
@@ -5362,9 +5416,7 @@ async def _bound_context_continuation(
     compaction_armed = True
     compaction_deferred = False
     consecutive_compaction_deferrals = 0
-    transcript = _sync_context_transcript(
-        base_messages, context_continuation, transcript
-    )
+    transcript = _sync_context_transcript(base_messages, context_continuation, transcript)
     if writer is not None:
         if local_checkpoint:
             await _emit_context_epoch_advanced(
@@ -5492,7 +5544,6 @@ async def _run_agent_loop(
     provider_boundaries = provider_boundaries or {}
     _install_codex_progress_observer(router, progress)
 
-
     resume = config.resume
     try:
         resume_kind = (
@@ -5528,9 +5579,7 @@ async def _run_agent_loop(
             for child_result in resume["child_results"]:
                 transcript.append({"role": "user", "content": _child_result_lines(child_result)})
             compaction_deferred = turn_checkpoint["compaction_deferred"]
-            consecutive_compaction_deferrals = turn_checkpoint[
-                "consecutive_compaction_deferrals"
-            ]
+            consecutive_compaction_deferrals = turn_checkpoint["consecutive_compaction_deferrals"]
             outcome["commits_so_far"] = turn_checkpoint["commits_so_far"]
         except ContextForkError as exc:
             return _loop_result(
@@ -5592,9 +5641,7 @@ async def _run_agent_loop(
         first_turn = resume_checkpoint.turn + 1
         epoch_count = resume_checkpoint.epoch
         usage_epoch = resume_checkpoint.epoch
-        transcript = _sync_context_transcript(
-            base_messages, context_continuation, transcript
-        )
+        transcript = _sync_context_transcript(base_messages, context_continuation, transcript)
     elif config.context_fork is not None:
         fork_messages, fork_skip = _resolve_fork_prefix(config, tools, model)
         if fork_messages is not None:
@@ -5645,9 +5692,7 @@ async def _run_agent_loop(
             base_messages = tuple(copy.deepcopy(semantic_trunk))
             context_continuation = copy.deepcopy(semantic_tail)
             usage_fork_of = config.summary_trunk_ref
-            transcript = _sync_context_transcript(
-                base_messages, context_continuation, transcript
-            )
+            transcript = _sync_context_transcript(base_messages, context_continuation, transcript)
         except (ContextForkError, SummaryTrunkError) as exc:
             if writer is not None:
                 await send(
@@ -5679,9 +5724,7 @@ async def _run_agent_loop(
         initial_trunk, initial_tail = partition_summary_trunk(initial_prompt["messages"])
         base_messages = tuple(copy.deepcopy(initial_trunk))
         context_continuation = copy.deepcopy(initial_tail)
-        transcript = _sync_context_transcript(
-            base_messages, context_continuation, transcript
-        )
+        transcript = _sync_context_transcript(base_messages, context_continuation, transcript)
 
     wall_deadline = time.monotonic() + max(0.0, absolute_wall_deadline - time.time())
     try:
@@ -6127,9 +6170,7 @@ async def _run_agent_loop(
                         transcript,
                     )
                 break
-            read_action = (
-                action["type"] == "tool_call" and action.get("name") in _READ_TOOL_NAMES
-            )
+            read_action = action["type"] == "tool_call" and action.get("name") in _READ_TOOL_NAMES
             if not read_action:
                 stalled = _observe_progress(progress_detector, action=action)
                 no_progress_actions = progress_detector.no_progress_actions
@@ -6489,6 +6530,11 @@ async def _run_agent_loop(
                     outcome, "cancelled", None, turn - 1, cumulative_usage, transcript
                 )
             progress.tool = name
+            progress_sink = (
+                _tool_progress_callback(writer, config, name, turn)
+                if writer is not None and name in {"run_shell", "git_op"}
+                else None
+            )
             with ToolContext(
                 worktree,
                 lint=lint_diag,
@@ -6496,8 +6542,20 @@ async def _run_agent_loop(
                     shell=config.shell_permission,
                     network=config.network_permission,
                 ),
+                progress=progress_sink,
             ) as ctx:
-                tool_result = await run_tool(name, arguments, ctx)
+                try:
+                    tool_result = await run_tool(name, arguments, ctx)
+                finally:
+                    # The next heartbeat belongs to the provider turn, not
+                    # the completed tool. Do not carry its name into that
+                    # operation's live window.
+                    progress.tool = None
+                    if progress_sink is not None:
+                        # Deliver any pending (throttled) tail before the
+                        # tool's completion event so the newest process
+                        # output is the last emitted delta.
+                        await progress_sink.flush()
             if name == "delegate" and tool_result.ok and writer is not None:
                 await _emit_delegated_child(writer, config, arguments, request_id=run_request_id)
             if tool_result.ok:
@@ -7175,6 +7233,7 @@ async def _heartbeat_loop(
     published_tail: str | None = None
     published_revision = 0
     last_phase_emit = float("-inf")
+    drain_ok = True
     while not stop.is_set():
         now = time.monotonic()
         heartbeat_due = now >= next_heartbeat
@@ -7212,10 +7271,16 @@ async def _heartbeat_loop(
             heartbeat["phase"] = published_phase
             if published_tail:
                 heartbeat["tail"] = published_tail
-        await send(
-            writer,
-            heartbeat,
-        )
+        write_message(writer, heartbeat)
+        try:
+            if drain_ok:
+                # The only guarded drain: a backpressured transport pauses
+                # the heartbeat at most once for this bound, then the loop
+                # keeps writing without waiting. Never inside a tool's
+                # timeout path.
+                await asyncio.wait_for(writer.drain(), _HEARTBEAT_DRAIN_TIMEOUT_S)
+        except (TimeoutError, OSError, ConnectionError):
+            drain_ok = False
         if heartbeat_due:
             next_heartbeat = time.monotonic() + interval_s
         if stop.is_set():

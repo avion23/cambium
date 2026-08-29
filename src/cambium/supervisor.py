@@ -676,6 +676,8 @@ def _terminal_action_for_event(value: Any) -> dict[str, Any] | None:
 
 _TOOL_EVENT_INT_FIELDS = ("batch_index", "batch_size", "turn")
 _TOOL_EVENT_DURATION_FIELDS = ("duration_ms",)
+_TOOL_OUTPUT_DELTA_MAX_BYTES = 2048
+_TOOL_OUTPUT_STREAMS = frozenset({"stdout", "stderr"})
 _USAGE_EVENT_FORWARD_FIELDS = frozenset(
     {
         "turn",
@@ -723,6 +725,40 @@ def _invalid_tool_event_fields(msg: dict[str, Any]) -> list[str]:
         ):
             invalid.append(field)
     return invalid
+
+
+def _invalid_tool_output_delta_fields(msg: dict[str, Any]) -> list[str]:
+    """Validate the bounded, non-terminal process-output wire message."""
+    allowed = {
+        "type",
+        "task_id",
+        "generation",
+        "tool",
+        "turn",
+        "stream",
+        "delta",
+        "monotonic_ms",
+    }
+    invalid = sorted(set(msg) - allowed)
+    for field in ("turn", "monotonic_ms"):
+        value = msg.get(field)
+        if field in msg and not (
+            type(value) is int and value >= 0
+        ):
+            invalid.append(field)
+    tool = msg.get("tool")
+    if not isinstance(tool, str) or not tool:
+        invalid.append("tool")
+    if msg.get("stream") not in _TOOL_OUTPUT_STREAMS:
+        invalid.append("stream")
+    delta = msg.get("delta")
+    if (
+        not isinstance(delta, str)
+        or not delta
+        or len(delta.encode("utf-8", errors="replace")) > _TOOL_OUTPUT_DELTA_MAX_BYTES
+    ):
+        invalid.append("delta")
+    return sorted(set(invalid))
 
 
 def _invalid_usage_event_fields(msg: dict[str, Any]) -> list[str]:
@@ -6059,6 +6095,34 @@ class _Runtime:
         self, state: _GenerationState, msg: dict[str, Any]
     ) -> None:
         mtype = msg.get("type")
+        if mtype == "tool_output_delta":
+            invalid_fields = _invalid_tool_output_delta_fields(msg)
+            if invalid_fields:
+                await self.emit(
+                    "protocol",
+                    task_id=state.task_id,
+                    generation=state.generation,
+                    note="tool_output_delta rejected: invalid field(s)",
+                    fields=invalid_fields,
+                )
+                return
+            event_turn = msg.get("turn")
+            if type(event_turn) is int and event_turn >= 0:
+                state.turn = max(state.turn, event_turn)
+            delta = sanitize_terminal_text(msg["delta"])
+            if not delta:
+                return
+            await self.emit(
+                "tool_output_delta",
+                task_id=state.task_id,
+                generation=state.generation,
+                tool=msg["tool"],
+                turn=event_turn,
+                stream=msg["stream"],
+                delta=_cap_utf8(delta, _TOOL_OUTPUT_DELTA_MAX_BYTES),
+                monotonic_ms=msg.get("monotonic_ms"),
+            )
+            return
         forwarded = {"tool": msg.get("tool"), "cmd": msg.get("cmd")}
         if mtype == "tool_event":
             invalid_fields = _invalid_tool_event_fields(msg)
@@ -6166,7 +6230,7 @@ class _Runtime:
         if mtype == "usage_event":
             await self._handle_usage_event_message(state, msg)
             return False
-        if mtype in ("tool_event", "pong"):
+        if mtype in ("tool_event", "tool_output_delta", "pong"):
             await self._handle_tool_or_pong_message(state, msg)
             return False
         if mtype == "error":

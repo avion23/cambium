@@ -21,6 +21,7 @@ from cambium.tui_screen import (
     _bounded_markdown_lines,
     _compact_rail_rows,
     _display_width,
+    _live_window_lines,
     _rail_depth,
     _rail_rows,
     _side_sections,
@@ -304,7 +305,7 @@ def test_activity_rail_ticks_redraw_in_place_at_duration_width_change(monkeypatc
 
     assert "┌ Cambium · conversation" not in delta
     assert "duration 10s" in delta
-    assert "thinking 10s" in delta
+    assert "starting 10s" in delta
 
 
 def test_replaying_events_after_snapshot_is_idempotent() -> None:
@@ -1157,9 +1158,9 @@ def test_cockpit_replaces_failed_to_idle_status_in_place() -> None:
         cockpit.hide_cursor()
         cockpit.flush()
 
-    assert len(cockpit._last_status_rows) == 3
+    assert len(cockpit._last_status_rows) == 5
     assert cockpit._last_status_rows[-2].startswith(" ⠋ idle")
-    assert stream.getvalue().count("┌ Cambium · conversation") == 2
+    assert stream.getvalue().count("┌ Cambium · conversation") == 1
 
 
 def test_cockpit_forces_completed_frame_while_input_read_is_pending() -> None:
@@ -1199,19 +1200,27 @@ def test_cockpit_forces_completed_frame_while_input_read_is_pending() -> None:
         flushes_before_completion = stream.flush_count
 
         transcript.finish_stream("completed response")
+        # While the input line is still active the completion is coalesced,
+        # never painted.
         cockpit.draw(
             final_snapshot,
             transcript,
             session_description="session",
             branch_line="branch",
             cumulative_line="usage: calls=1 tokens=20000",
-            force=True,
         )
+        mid = stream.getvalue()
+        assert "completed response" not in mid
+
+        # Release the input FIRST, then flush: the pending completion frame
+        # must be delivered in place without repainting a second frame.
+        cockpit.hide_cursor()
+        cockpit.flush()
 
         after = stream.getvalue()
         assert "completed response" in after
-        assert after.count("┌ Cambium · conversation") == 2
-        assert "conversation · done" in after
+        assert after.count("┌ Cambium · conversation") == 1
+        assert "conversation · done" not in after
         assert "20k tok" in after
         assert after != before
         assert stream.flush_count > flushes_before_completion
@@ -1245,6 +1254,330 @@ def test_cockpit_updates_fixed_status_pane_in_place() -> None:
     assert "last run_shell 1s" in delta
     assert "last run_shell 2s" in second_delta
     assert "┌ Cambium · conversation" not in delta
+
+
+def test_live_window_updates_two_fixed_rows_without_reflow() -> None:
+    class _Tty(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    stream = _Tty()
+    transcript = Transcript()
+    cockpit = Cockpit(stream)
+    with cockpit:
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+            activity_line="⠋ WAITING · thinking… 0s",
+            turn_active=True,
+        )
+        first = stream.getvalue()
+        cockpit.move_to_input()
+        for second, tail in ((1, "first"), (2, "second")):
+            transcript.observe_event(
+                {
+                    "kind": "heartbeat",
+                    "task_id": "interactive-main",
+                    "monotonic_ms": second * 1_000,
+                    "payload": {"phase": "streaming", "tail": tail, "turn": 2},
+                }
+            )
+            cockpit.draw(
+                _snapshot(),
+                transcript,
+                session_description="session",
+                branch_line="branch",
+                cumulative_line="usage: calls=0",
+                activity_line=f"▸ streaming {second}s · {tail}",
+                turn_active=True,
+            )
+
+        delta = stream.getvalue()[len(first) :]
+
+    assert len(_live_window_lines(transcript, 80, activity_line="▸ streaming 2s")) == 2
+    assert "second" in delta
+    assert "┌ Cambium · conversation" not in delta
+    assert "\n" not in delta
+
+
+def test_live_window_replaces_the_same_rows_with_a_bounded_result() -> None:
+    class _Tty(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    stream = _Tty()
+    transcript = Transcript()
+    cockpit = Cockpit(stream)
+    with cockpit:
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+            activity_line="⠋ WAITING · thinking… 0s",
+            turn_active=True,
+        )
+        first = stream.getvalue()
+        cockpit.move_to_input()
+        transcript.observe_event(
+            {
+                "kind": "heartbeat",
+                "task_id": "interactive-main",
+                "monotonic_ms": 1_000,
+                "payload": {"phase": "streaming", "tail": "partial", "turn": 2},
+            }
+        )
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+            activity_line="▸ streaming 1s · partial",
+            turn_active=True,
+        )
+        middle = stream.getvalue()
+        transcript.finish_stream("final\nline")
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=1",
+            activity_line="✓ DONE",
+            turn_active=True,
+            force=True,
+        )
+        delta = stream.getvalue()[len(middle) :]
+
+    assert "final line" in delta
+    assert "┌ Cambium · conversation" not in delta
+    assert "\n" not in delta
+    assert len(cockpit._last_status_rows) == 5
+    assert len(cockpit._last_status_rows[1:3]) == 2
+    assert all(_display_width(row) <= 118 for row in cockpit._last_status_rows[1:3])
+    assert stream.getvalue().count("┌ Cambium · conversation") == 1
+    assert first != middle
+
+
+def test_live_rows_sanitize_multiline_ansi_and_wide_output() -> None:
+    transcript = Transcript()
+    transcript.observe_event(
+        {
+            "kind": "heartbeat",
+            "payload": {"phase": "streaming", "tail": "line one\n\x1b[31m" + "界" * 200},
+        }
+    )
+
+    rows = _live_window_lines(transcript, 32)
+    assert len(rows) == 2
+    assert all("\n" not in row and "\x1b" not in row for row in rows)
+    assert all(_display_width(row) <= 32 for row in rows)
+    assert "line one" in rows[1]
+
+
+def test_current_tool_counters_reset_at_the_next_turn() -> None:
+    transcript = Transcript()
+    transcript.observe_event(
+        {"kind": "tool_event", "payload": {"tool": "run_shell", "ok": False}}
+    )
+    transcript.observe_event(
+        {"kind": "tool_event", "payload": {"tool": "read_batch", "ok": True}}
+    )
+
+    assert transcript.tool_count == 2
+    assert transcript.current_tool_count == 2
+    assert transcript.current_tool_error_count == 1
+
+    transcript.user("next turn")
+    assert transcript.tool_count == 2
+    assert transcript.current_tool_count == 0
+    assert transcript.current_tool_error_count == 0
+
+
+def test_local_waiting_activity_renders_honest_starting_state() -> None:
+    rows = _live_window_lines(
+        Transcript(),
+        80,
+        activity_line="⠇ WAITING · thinking… 12s",
+    )
+
+    # No runtime event has arrived: the window may only claim the local
+    # clock. It must not fabricate a provider call, turn, or call counter.
+    joined = " ".join(rows)
+    assert all("waiting" not in row.casefold() for row in rows)
+    assert "starting" in rows[0]
+    assert "12s" in rows[0]
+    assert "provider call" not in joined
+    assert "turn=" not in joined
+    assert "call=" not in joined
+    assert "no runtime events yet" in rows[1]
+
+
+def test_small_terminal_live_events_rewrite_two_rows_without_newlines(monkeypatch) -> None:
+    class _Tty(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    monkeypatch.setattr(
+        tui_screen.shutil,
+        "get_terminal_size",
+        lambda _fallback: os.terminal_size((70, 11)),
+    )
+    stream = _Tty()
+    transcript = Transcript()
+    cockpit = Cockpit(stream)
+    with cockpit:
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+            activity_line="⠋ WAITING · thinking… 0s",
+            turn_active=True,
+        )
+        first = stream.getvalue()
+        cockpit.move_to_input()
+        # At least three repeated live updates: each rewrites the same rows
+        # in place with stable cursor coordinates and never a newline.
+        for index in range(1, 5):
+            tail = f"chunk-{index}"
+            transcript.observe_event(
+                {
+                    "kind": "tool_output_delta",
+                    "task_id": "interactive-main",
+                    "payload": {
+                        "tool": "run_shell",
+                        "stream": "stdout",
+                        "delta": tail,
+                    },
+                }
+            )
+            cockpit.draw(
+                _snapshot(),
+                transcript,
+                session_description="session",
+                branch_line="branch",
+                cumulative_line="usage: calls=0",
+                activity_line="▸ streaming",
+                turn_active=True,
+            )
+            delta = stream.getvalue()[len(first) :]
+            first = stream.getvalue()
+            assert tail in delta
+            assert "┌ Cambium" not in delta
+            assert "\n" not in delta
+            assert "\x1b[s\x1b[2A" in delta
+            assert "\x1b[1A" in delta
+
+
+def test_live_tool_tail_and_duration_clear_at_provider_boundary() -> None:
+    transcript = Transcript()
+    transcript.observe_event(
+        {
+            "kind": "heartbeat",
+            "payload": {
+                "phase": "streaming",
+                "tool": "run_shell",
+                "tail": "stale command output",
+            },
+        }
+    )
+    transcript.observe_event(
+        {
+            "kind": "tool_event",
+            "payload": {"tool": "run_shell", "ok": True, "duration_ms": 1250},
+        }
+    )
+    transcript.observe_event(
+        {"kind": "heartbeat", "payload": {"phase": "waiting", "status": "working"}}
+    )
+
+    rows = _live_window_lines(transcript, 100)
+    assert all(
+        value not in " ".join(rows)
+        for value in ("stale command output", "run_shell", "1250ms")
+    )
+    assert "provider call" in " ".join(rows)
+
+
+def test_live_provider_tail_clears_when_heartbeat_phase_changes() -> None:
+    transcript = Transcript()
+    transcript.observe_event(
+        {"kind": "heartbeat", "payload": {"phase": "streaming", "tail": "old provider tail"}}
+    )
+    transcript.observe_event(
+        {"kind": "heartbeat", "payload": {"phase": "waiting", "status": "working"}}
+    )
+
+    rows = _live_window_lines(transcript, 100)
+    assert "old provider tail" not in " ".join(rows)
+    assert "provider call" in " ".join(rows)
+
+
+def test_heartbeat_tool_none_clears_the_tool_in_every_view() -> None:
+    # The worker clears progress.tool before the completion event, so a
+    # heartbeat carrying tool=None must clear the rail tool AND the live
+    # transcript view instead of keeping the previous tool stuck.
+    events = [
+        {
+            "seq": 1,
+            "kind": "heartbeat",
+            "task_id": "root",
+            "payload": {"tool": "run_shell", "phase": "streaming", "tail": "cmd out"},
+        },
+        {
+            "seq": 2,
+            "kind": "heartbeat",
+            "task_id": "root",
+            "payload": {"tool": None, "phase": "waiting", "status": "working"},
+        },
+    ]
+    snapshot = snapshot_from_events(events)
+    assert snapshot.agents[0].tool is None
+
+    transcript = Transcript()
+    transcript.observe_event(events[0])
+    assert "run_shell" in " ".join(_live_window_lines(transcript, 100))
+    transcript.observe_event(events[1])
+    rows = _live_window_lines(transcript, 100)
+    assert all("run_shell" not in row for row in rows)
+
+    # The rail detail rows read the same snapshot tool field.
+    detail = [value for _, value in _rail_rows(snapshot, 32, 32)]
+    assert all("run_shell" not in value for value in detail)
+
+
+def test_tool_output_stream_rotates_per_tool_without_committing_a_mixture() -> None:
+    transcript = Transcript()
+    transcript.observe_event(
+        {
+            "kind": "tool_output_delta",
+            "payload": {"tool": "run_shell", "stream": "stdout", "delta": "OLD-A"},
+        }
+    )
+    transcript.observe_event(
+        {
+            "kind": "tool_output_delta",
+            "payload": {"tool": "git_op", "stream": "stdout", "delta": "NEW-B"},
+        }
+    )
+
+    # The active stream belongs to the newest tool only.
+    assert transcript.streaming_role == "tool"
+    assert transcript.streaming_text == "NEW-B"
+
+    transcript.finish_stream("done")
+    texts = [entry.text for entry in transcript.entries]
+    assert any("OLD-A" in text for text in texts)
+    assert any("NEW-B" in text for text in texts)
+    assert all(not ("OLD-A" in text and "NEW-B" in text) for text in texts)
+    assert any(text == "done" for text in texts)
 
 
 def test_short_terminal_falls_back_to_stream_rows() -> None:

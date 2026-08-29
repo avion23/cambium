@@ -483,6 +483,7 @@ class ObservabilityState:
                 "run_task",
                 "heartbeat",
                 "tool_event",
+                "tool_output_delta",
                 "checkpoint",
                 "usage_event",
                 "context_checkpoint",
@@ -524,9 +525,15 @@ class ObservabilityState:
                 agent.provider = provider
             if model is not None:
                 agent.model = model
-            tool = _string(payload.get("tool"))
-            if tool is not None:
-                agent.tool = tool
+            if "tool" in payload and payload.get("tool") is None:
+                # A heartbeat with tool=None is an explicit "no tool running"
+                # signal (the worker clears the field after each tool); keep
+                # the operator rail from showing a completed tool forever.
+                agent.tool = None
+            else:
+                tool = _string(payload.get("tool"))
+                if tool is not None:
+                    agent.tool = tool
 
             if kind == "usage_event":
                 (

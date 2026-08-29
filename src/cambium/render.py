@@ -434,6 +434,14 @@ def _format_tool_event(payload: Mapping[str, Any], stream: Any = None) -> str:
     return f"{_text(payload, 'tool') or '?'} {cmd} {status} {duration_text}"
 
 
+def _format_tool_output_delta(payload: Mapping[str, Any]) -> str:
+    return _join(
+        _text(payload, "tool"),
+        _text(payload, "stream"),
+        _text(payload, "delta"),
+    )
+
+
 def _format_context_checkpoint(payload: Mapping[str, Any]) -> str:
     return _join(
         _pair(payload, "epoch"),
@@ -501,6 +509,7 @@ _EventFormatter = Callable[..., str]
 
 _EVENT_FORMATTERS: dict[str, _EventFormatter] = {
     "tool_event": _format_tool_event,
+    "tool_output_delta": _format_tool_output_delta,
     "context_checkpoint": _format_context_checkpoint,
     "context_epoch_advanced": _format_context_epoch_advanced,
     "checkpoint": _format_checkpoint,

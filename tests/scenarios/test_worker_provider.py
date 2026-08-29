@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import io
 import json
 import os
 import shlex
@@ -29,6 +30,7 @@ from cambium import worker
 from cambium.fencing import write_generation
 from cambium.ipc import MAX_LINE_BYTES, read_message
 from cambium.supervisor import read_events, run_plan, run_session
+from cambium.tui_screen import Cockpit, Transcript
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKER = "cambium.worker"
@@ -1655,6 +1657,118 @@ def test_worker_ipc_observability_tool_event_checkpoint_heartbeat(tmp_path) -> N
 
         heartbeats = [m for m in messages if m["type"] == "heartbeat"]
         assert any(hb.get("turn", 0) >= 1 for hb in heartbeats)
-        assert any(hb.get("tool") == "read_batch" for hb in heartbeats)
+        # Tool identity is cleared before the next provider phase, so a
+        # heartbeat cannot mislabel provider work as read_batch.
+        assert any(hb.get("tool") is None for hb in heartbeats)
+    finally:
+        server.close()
+
+
+@pytest.mark.slow
+def test_run_shell_output_deltas_reach_supervisor_and_tui_rows(tmp_path, monkeypatch) -> None:
+    """Real subprocess chunks travel worker -> supervisor -> live rows."""
+    _reset_server()
+    server = _FakeOpenAIServer()
+    try:
+        project = tmp_path / "project"
+        project.mkdir()
+        config_path = _provider_config(project / "providers.json", server.base_url)
+        _set_provider_env(monkeypatch, config_path)
+        command = [
+            sys.executable,
+            "-u",
+            "-c",
+            "import time; [print(f'delta-{i}', flush=True) or time.sleep(.02) "
+            "for i in range(20)]",
+        ]
+        _enqueue(
+            json.dumps(
+                {
+                    "type": "tool_call",
+                    "name": "run_shell",
+                    "arguments": {"cmd": command},
+                }
+            )
+        )
+        _enqueue(
+            '{"type":"finish","summary":"observed command output",'
+            '"objective_met":true}'
+        )
+
+        session_dir = tmp_path / "session"
+        repo = session_dir / "repo"
+        base = _make_repo(repo)
+        task = _task(session_dir, repo, base, config_path)
+        task["fanout_config"] = {
+            **task["fanout_config"],
+            "call_budget_s": 10.0,
+        }
+        task["permissions"] = {"shell": True, "network": False}
+
+        transcript = Transcript()
+
+        class _Tty(io.StringIO):
+            def isatty(self) -> bool:
+                return True
+
+        stream = _Tty()
+        cockpit = Cockpit(stream)
+        with cockpit:
+            cockpit.draw(
+                None,
+                transcript,
+                session_description="session",
+                branch_line="branch",
+                cumulative_line="usage: calls=0",
+                activity_line="⠋ WAITING · thinking… 0s",
+                turn_active=True,
+            )
+            first_frame = stream.getvalue()
+            cockpit.move_to_input()
+
+            def observe(event: dict[str, Any]) -> None:
+                transcript.observe_event(event)
+                terminal = event["kind"] == "result"
+                cockpit.draw(
+                    None,
+                    transcript,
+                    session_description="session",
+                    branch_line="branch",
+                    cumulative_line="usage: calls=0",
+                    activity_line="✓ DONE" if terminal else "▸ streaming",
+                    turn_active=not terminal,
+                    force=terminal,
+                )
+
+            result = asyncio.run(
+                run_plan(
+                    session_dir,
+                    {"tasks": [task]},
+                    on_event=observe,
+                    routing_state_path=str(tmp_path / "routing-state.json"),
+                )
+            )
+            output = stream.getvalue()
+
+        events = read_events(session_dir)
+        deltas = [event for event in events if event["kind"] == "tool_output_delta"]
+        assert result.exit_code == 0
+        assert 2 <= len(deltas) < 20
+        assert all(event["payload"]["tool"] == "run_shell" for event in deltas)
+        assert all(event["payload"]["stream"] == "stdout" for event in deltas)
+        assert all(
+            len(event["payload"]["delta"].encode("utf-8")) <= 2048 for event in deltas
+        )
+        timestamps = [event["payload"]["monotonic_ms"] for event in deltas]
+        assert all(
+            later - earlier >= 80
+            for earlier, later in zip(timestamps, timestamps[1:], strict=False)
+        )
+        joined_deltas = "".join(event["payload"]["delta"] for event in deltas)
+        assert "delta-0" in joined_deltas
+        assert "delta-" in joined_deltas
+        assert output.count("┌ Cambium · conversation") == 1
+        assert output.find("delta-") > len(first_frame)
+        assert "succeeded" in output
     finally:
         server.close()

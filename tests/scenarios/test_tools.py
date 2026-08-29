@@ -399,6 +399,31 @@ def test_run_shell_is_list_form(tmp_path: Path) -> None:
     assert result.output == "shell-ok\n"
 
 
+@pytest.mark.slow  # real long-running subprocess output is observed before exit
+def test_run_shell_reports_bounded_output_progress(tmp_path: Path) -> None:
+    progress: list[tuple[str, str]] = []
+    command = [
+        sys.executable,
+        "-u",
+        "-c",
+        "import sys,time; print('first', flush=True); time.sleep(.15); "
+        "print('second', flush=True); time.sleep(.15); print('third', flush=True)",
+    ]
+
+    result = _run(
+        "run_shell",
+        {"cmd": command},
+        ToolContext(tmp_path, progress=lambda stream, delta: progress.append((stream, delta))),
+    )
+
+    assert result.ok
+    assert result.output == "first\nsecond\nthird\n"
+    assert len(progress) >= 2
+    joined = "".join(delta for _stream, delta in progress)
+    assert all(word in joined for word in ("first", "second", "third"))
+    assert all(len(delta.encode()) <= tools._PROCESS_PROGRESS_MAX_BYTES for _, delta in progress)
+
+
 @pytest.mark.slow  # python interpreter spawn; asserts subprocess execution
 def test_run_shell_output_is_capped(tmp_path: Path) -> None:
     command = [sys.executable, "-c", "print('x' * 100000)"]
