@@ -155,12 +155,13 @@ from cambium.ipc import (
     write_message,
 )
 from cambium.lint_diag import LintDiag
+from cambium.prompts import CODING_AGENT
+from cambium.prompts import SUMMARY_PROTOCOL_LINES as _SUMMARY_PROTOCOL_LINES
 from cambium.provider_config import AuthMode, load_providers
 from cambium.redact import Redactor, build_session_redactor
 from cambium.schemas import FINISH_ACTION_SCHEMA, TOOL_SCHEMAS, validate_tool_call
 from cambium.summary_trunk import (
     SUMMARY_CONTROL_OPEN,
-    SUMMARY_PROTOCOL_LINES,
     SummaryEntry,
     SummaryTrunkError,
     append_summary_entry,
@@ -175,6 +176,8 @@ from cambium.summary_trunk import (
 )
 from cambium.terminal import sanitize_terminal_text
 from cambium.tools import ToolContext, ToolPermissionPolicy, ToolResult, run_tool
+
+SUMMARY_PROTOCOL_LINES = _SUMMARY_PROTOCOL_LINES
 
 PROTO = 1
 HEARTBEAT_INTERVAL_S = 1.0
@@ -258,7 +261,7 @@ FINAL_SYNTHESIS_DIRECTIVE = (
     "Forced finalization: produce the final answer NOW with no further tool use. "
     'Return exactly one terminal finish action: {"type":"finish","summary":"...",'
     '"objective_met":<true|false>} where objective_met is true only when the task '
-    "objective was met, including a complete review that found no defect, summarizing the "
+    "objective was met; a complete review that found no defect counts as met. Summarize the "
     "work completed so far."
 )
 FINAL_SYNTHESIS_REMINDER = "Finalization active: return finish now."
@@ -2877,50 +2880,15 @@ def _build_agent_prompt(
     model_identity: str = "",
     parent_envelope: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    system_lines = [
-        "You are Cambium's autonomous coding agent.",
-        "You act inside a disposable git worktree and must complete the task.",
-        "File-tool paths may be absolute anywhere on the system; relative paths "
-        "resolve against cwd.",
-        "Format final answers in Markdown (short headings, bullets, tables where useful); "
-        "the operator TUI renders Markdown.",
-    ]
+    system_lines = CODING_AGENT.splitlines()
     if model_identity:
-        system_lines.append(
+        system_lines.insert(
+            -1,
             f"You are running as the configured model {model_identity}. When "
             "asked what model or provider you are, answer truthfully from this "
-            "identity and never guess."
+            "identity and never guess.",
         )
-    system_lines.extend(SUMMARY_PROTOCOL_LINES)
-    system_lines.extend(
-        [
-            "In normal mode, return exactly one JSON object; it must be one action:",
-            '  plan:      {"type": "plan", "steps": ["...", "..."]}',
-            '  tool_call: {"type": "tool_call", "name": <tool name>, "arguments": {...}}',
-            '  finish:    {"type": "finish", "summary": <non-empty summary>, '
-            '"objective_met": <boolean>}',
-            'An optional "thought" field may be added to the same object to record your '
-            "reasoning; the action fields above must remain exact.",
-            "Your FIRST action must be a short plan: list the concrete steps before any tool_call.",
-            "Approach:",
-            "- Reading uses only the batch read tool (read_batch); individual file "
-            "reads are unavailable, so read all needed files in one batch call.",
-            "- Read the relevant files before editing; verify each change before moving on.",
-            "- If a tool call fails, diagnose the error and retry with a corrected call.",
-            "- When the task changes code, run the relevant tests via run_shell; only emit "
-            "finish after the change is verified and the tests pass. If tests fail, iterate.",
-            "- Emit finish only when the task is complete and verified.",
-            "Examples:",
-            '  {"type": "plan", "steps": ["read src/a.py and src/b.py", "edit src/a.py", '
-            '"run tests"]}',
-            '  {"type": "tool_call", "name": "read_batch", '
-            '"arguments": {"paths": ["src/a.py", "src/b.py"]}}',
-            '  {"type": "finish", "summary": "implemented and verified the change", '
-            '"objective_met": true}',
-            "Available tools:",
-            json.dumps(tools, sort_keys=True),
-        ]
-    )
+    system_lines.append(json.dumps(tools, sort_keys=True))
     messages = [
         {"role": "system", "content": "\n".join(system_lines)},
         _task_message(task),
