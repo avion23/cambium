@@ -14,3 +14,8 @@ class ShouldDecomposeModuleDSPy(DSPyModuleBase):
     output_type = DecomposeOutput
     decision_type = Decision
     signature_name = "ShouldDecomposeSignature"
+    signature_docstring = (
+        "Decide decomposition when at least two signals show multiple requirement clauses, "
+        "a long description, parallel or per-item work, multiple files, itemized lists, or "
+        "verb-led workstreams."
+    )
