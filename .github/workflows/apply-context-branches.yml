@@ -36,6 +36,7 @@ jobs:
       - name: Apply guarded source and documentation patches
         run: |
           python .github/apply-context-branches.py
+          python .github/fix-context-branch-gaps.py
           python .github/apply-context-doc-links.py
 
       - name: Install locked development environment
@@ -98,7 +99,9 @@ jobs:
       - name: Remove staging machinery and obsolete temporary runners
         run: |
           rm -f \
+            .github/context-branch.trigger \
             .github/apply-context-branches.py \
+            .github/fix-context-branch-gaps.py \
             .github/apply-context-doc-links.py \
             .github/apply-latest-fixes.py \
             .github/fix-trigger \
