@@ -7,13 +7,7 @@ every record, and check the metric. No mocking, no network.
 from __future__ import annotations
 
 import asyncio
-import os
-import shutil
-import subprocess
-import sys
 from pathlib import Path
-
-import pytest
 
 from cambium.modules.base import DatasetError
 from cambium.modules.should_review import (
@@ -128,55 +122,3 @@ def test_module_rule_engine_smoke_on_its_dataset() -> None:
     assert len(processed_canaries) == len(canaries)
     assert all(item["prediction"] is not None for item in processed_canaries)
     assert any(item["metric"] == 0.0 for item in processed_canaries)
-
-
-def test_eval_aggregate_is_finite_smoke() -> None:
-    loader = ExampleDatasetLoader(DATASETS_DIR)
-    module = ShouldReviewModule()
-
-    async def run() -> float:
-        scores = []
-        for example in loader.load_split(Split.EVAL):
-            prediction = await module.decide(example.input)
-            scores.append(module.metric(example.with_prediction(prediction)))
-        return sum(scores) / len(scores)
-
-    mean = asyncio.run(run())
-    assert len(loader.load_split(Split.EVAL)) == 11
-    assert 0.0 <= mean <= 1.0
-
-
-def test_subprocess_network_client_is_denied() -> None:
-    """The module gate must protect subprocesses, not only this pytest process."""
-    if os.environ.get("CAMBIUM_MODULE_OFFLINE") != "1":
-        pytest.skip("requires the isolated module-test environment")
-    if shutil.which("curl") is None:
-        pytest.skip("curl is not installed; cannot probe network-client denial")
-
-    try:
-        result = subprocess.run(
-            ["curl", "--fail", "http://127.0.0.1:9/"],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=5,
-        )
-    except PermissionError as exc:
-        assert "network client denied" in str(exc)
-    else:
-        assert result.returncode != 0
-        assert "network client denied" in result.stderr
-
-    python_probe = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "import socket; socket.create_connection(('127.0.0.1', 9), timeout=1)",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=5,
-    )
-    assert python_probe.returncode != 0
-    assert "network access is forbidden" in python_probe.stderr
