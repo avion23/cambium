@@ -34,8 +34,10 @@ def test_semantic_and_fresh_children_can_prefer_spread() -> None:
         {"context_mode": "fresh", "placement": "spread"}
     )
 
-    assert semantic == (ContextMode.SEMANTIC, Placement.SPREAD)
-    assert fresh == (ContextMode.FRESH, Placement.SPREAD)
+    assert semantic.context_mode is ContextMode.SEMANTIC
+    assert semantic.placement is Placement.SPREAD
+    assert fresh.context_mode is ContextMode.FRESH
+    assert fresh.placement is Placement.SPREAD
 
 
 def test_trunk_cannot_claim_another_provider() -> None:
