@@ -46,7 +46,7 @@
     "canaries": 6
   },
   "tests": {
-    "count": 61,
+    "count": 59,
     "wall_seconds": {
       "p50": 0.000959,
       "p90": 0.005426,
@@ -108,12 +108,10 @@
       "src/cambium/modules/should_review/tests/test_review_module.py::test_dataset_is_loadable_and_schema_valid": 0.024491,
       "src/cambium/modules/should_review/tests/test_review_module.py::test_decompose_mirror_must_agree_with_review": 0.00045,
       "src/cambium/modules/should_review/tests/test_review_module.py::test_engine_tolerates_leading_separators": 0.000141,
-      "src/cambium/modules/should_review/tests/test_review_module.py::test_eval_aggregate_is_finite_smoke": 0.00552,
       "src/cambium/modules/should_review/tests/test_review_module.py::test_loader_maps_wire_boolean_to_decision": 0.000548,
       "src/cambium/modules/should_review/tests/test_review_module.py::test_malformed_record_is_rejected": 0.0005,
       "src/cambium/modules/should_review/tests/test_review_module.py::test_missing_expected_reason_is_rejected": 0.003437,
-      "src/cambium/modules/should_review/tests/test_review_module.py::test_module_rule_engine_smoke_on_its_dataset": 0.017334,
-      "src/cambium/modules/should_review/tests/test_review_module.py::test_subprocess_network_client_is_denied": 0.0002
+      "src/cambium/modules/should_review/tests/test_review_module.py::test_module_rule_engine_smoke_on_its_dataset": 0.017334
     }
   },
   "drift_thresholds": {
