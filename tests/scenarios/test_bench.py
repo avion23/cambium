@@ -1277,11 +1277,12 @@ def test_quality_repo_builder_creates_main_branch_and_fixture(tmp_path) -> None:
     assert (repo / "tests" / "test_calculator.py").is_file()
 
     branch = subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "--verify", "refs/heads/main"],
+        ["git", "-C", str(repo), "symbolic-ref", "--short", "HEAD"],
         capture_output=True,
         text=True,
     )
     assert branch.returncode == 0, branch.stderr
+    assert branch.stdout.strip() == "main"
 
     calculator = (repo / "calculator.py").read_text()
     assert "TODO" in calculator

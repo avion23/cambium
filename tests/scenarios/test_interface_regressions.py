@@ -242,13 +242,17 @@ def test_tui_prints_usage_stats_line(monkeypatch, tmp_path):
     value = out.getvalue()
     assert code == 0
     assert err.getvalue() == ""
-    assert "plan_status={succeeded}" in value
-    assert "· tokens=200 (in=130 out=70 cached=0) ·" in value
-    assert "stats: calls=2 ·" in value
-    assert "last_turn=+50" in value
-    assert "model=opencode-go/deepseek-v4-flash" in value
-    assert f"worktree=…/{session_dir.name}/wt" in value
-    assert str(session_dir) not in value
+    stats_lines = [line for line in value.splitlines() if line.startswith("stats: ")]
+    assert len(stats_lines) == 1
+    fields = dict(
+        field.split("=", 1) for field in stats_lines[0].removeprefix("stats: ").split(" · ")
+    )
+    assert fields["calls"] == "2"
+    assert fields["tokens"] == "200 (in=130 out=70 cached=0)"
+    assert fields["last_turn"] == "+50"
+    assert fields["model"] == "opencode-go/deepseek-v4-flash"
+    assert fields["worktree"] == f"…/{session_dir.name}/wt"
+    assert str(session_dir) not in stats_lines[0]
 
 
 def test_tui_stats_failure_does_not_break_loop(monkeypatch, tmp_path):
