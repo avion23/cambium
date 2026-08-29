@@ -1068,6 +1068,7 @@ class DSPyModuleBase:
     output_type: ClassVar[type]
     decision_type: ClassVar[type[Enum]]
     signature_name: ClassVar[str]
+    signature_docstring: ClassVar[str]
 
     def __init__(self, lm) -> None:
         import dspy  # type: ignore[import-untyped]
@@ -1086,6 +1087,7 @@ class DSPyModuleBase:
             (dspy.Signature,),
             {
                 "__module__": cls.__module__,
+                "__doc__": self.signature_docstring,
                 "__annotations__": {
                     "task": str,
                     "context": str,
@@ -1094,8 +1096,8 @@ class DSPyModuleBase:
                 },
                 "task": dspy.InputField(),
                 "context": dspy.InputField(),
-                "decision": dspy.OutputField(),
-                "reason": dspy.OutputField(),
+                "decision": dspy.OutputField(desc="exactly one of the allowed values"),
+                "reason": dspy.OutputField(desc="one short sentence naming the evidence"),
             },
         )
         self._predict = dspy.Predict(signature)

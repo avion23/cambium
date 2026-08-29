@@ -147,9 +147,11 @@ callers, loader, dataset, and metric remain stable.
 
 ### 5.2 Signature and replacement
 
-`N/A — no DSPy seam in v2.` A future classifier may implement
-`async decide` with signature `task, context -> review, reason`; replacement
-modules use the same interface and read `dspy.Prediction` attributes directly.
+`ShouldReviewSignature` is the shipped optimization seam, used only by
+`cambium optimize` and conformance tests; the rule engine decides in the
+default run path. A classifier may implement `async decide` with signature
+`task, context -> review, reason`; replacement modules use the same interface
+and read `dspy.Prediction` attributes directly.
 Configure a `CambiumLM` through `dspy.configure(lm=...)`; do not construct
 `dspy.LM` directly or mutate `dspy.settings.context`.
 

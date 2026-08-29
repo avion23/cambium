@@ -14,3 +14,7 @@ class ShouldReviewModuleDSPy(DSPyModuleBase):
     output_type = ReviewOutput
     decision_type = Decision
     signature_name = "ShouldReviewSignature"
+    signature_docstring = (
+        "Decide review when the worker result shows refusal markers, leftover TODOs, "
+        "high-stakes domains, or missing verification."
+    )
