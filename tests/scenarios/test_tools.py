@@ -19,6 +19,7 @@ from cambium.tools import (
     MAX_OUTPUT_BYTES,
     MAX_READ_BYTES,
     MAX_READ_LINES,
+    READ_BATCH_MAX_BYTES_PER_FILE,
     SHELL_OUTPUT_HEAD_BYTES,
     SHELL_OUTPUT_TAIL_BYTES,
     ToolContext,
@@ -40,12 +41,12 @@ def test_read_batch_happy_path_and_cap(tmp_path: Path) -> None:
     assert result.error is None
     assert isinstance(result.duration_ms, int)
 
-    (tmp_path / "large.txt").write_bytes(b"x" * (MAX_READ_BYTES + 1))
+    (tmp_path / "large.txt").write_bytes(b"x" * (READ_BATCH_MAX_BYTES_PER_FILE + 1))
     capped = _run("read_batch", {"paths": ["large.txt"]}, ToolContext(tmp_path))
 
     assert capped.ok
     assert "--- large.txt ---" in capped.output
-    assert "[output truncated]" in capped.output
+    assert "[file truncated]" in capped.output
     assert len(capped.output.encode()) <= MAX_OUTPUT_BYTES
 
 
