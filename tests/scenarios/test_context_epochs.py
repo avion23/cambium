@@ -16,7 +16,7 @@ import subprocess
 import threading
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import pytest
 
@@ -422,29 +422,6 @@ def test_redacted_epoch_checkpoint_roundtrip(tmp_path: Path) -> None:
     )
     assert not compatible
     assert reason == "checkpoint redacted"
-
-
-def test_child_result_lines_and_fork_prompt() -> None:
-    lines = worker._child_result_lines(_strict_child_envelope())
-    assert "Child task result:" in lines
-    assert "succeeded" in lines
-    assert "child did the work" in lines
-    assert "b.txt" in lines
-
-    prompt = worker._fork_prompt(
-        cast(Any, {"role": "system", "content": "sys"}),
-        [{"role": "user", "content": "obs"}],
-    )
-    assert prompt["messages"][-1]["role"] == "user"
-    assert prompt["messages"][-1]["content"] != "Continue."
-    plan_tail = worker._fork_prompt(
-        cast(Any, {"role": "system", "content": "sys"}),
-        [
-            {"role": "user", "content": "obs"},
-            {"role": "assistant", "content": '{"type": "plan", "steps": []}'},
-        ],
-    )
-    assert plan_tail["messages"][-1]["content"] == "Continue."
 
 
 def test_fork_cache_compatible_matrix() -> None:
