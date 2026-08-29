@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import random
 import sqlite3
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -324,11 +325,118 @@ def session_usage_breakdown(session_dir: str | Path) -> UsageBreakdown | None:
     return usage_breakdown_from_events(events)
 
 
+def _paired_values(results_a: Sequence[bool], results_b: Sequence[bool]) -> list[int]:
+    if not results_a or len(results_a) != len(results_b):
+        raise ValueError("paired results must be non-empty and have equal lengths")
+    if not all(type(value) is bool for value in (*results_a, *results_b)):
+        raise TypeError("paired results must contain booleans")
+    return [int(b) - int(a) for a, b in zip(results_a, results_b, strict=True)]
+
+
+def _percentile(values: Sequence[float], quantile: float) -> float:
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * quantile
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
+
+
+def _bootstrap(
+    differences: Sequence[int], iterations: int, confidence: float, seed: int
+) -> tuple[float, float, float]:
+    if isinstance(iterations, bool) or not isinstance(iterations, int) or iterations < 1:
+        raise ValueError("iterations must be a positive integer")
+    if not math.isfinite(confidence) or not 0 < confidence < 1:
+        raise ValueError("confidence must be between zero and one")
+    rng = random.Random(seed)
+    samples: list[float] = []
+    opposite = 0
+    observed = sum(differences)
+    for _ in range(iterations):
+        sample = sum(differences[rng.randrange(len(differences))] for _ in differences)
+        samples.append(sample / len(differences))
+        if observed < 0:
+            opposite += sample >= 0
+        elif observed > 0:
+            opposite += sample <= 0
+    tail = (1.0 - confidence) / 2.0
+    p_value = 1.0 if observed == 0 else (opposite + 1) / (iterations + 1)
+    return _percentile(samples, tail), _percentile(samples, 1.0 - tail), p_value
+
+
+def paired_bootstrap(
+    results_a: Sequence[bool],
+    results_b: Sequence[bool],
+    *,
+    iterations: int = 10_000,
+    confidence: float = 0.95,
+    seed: int = 0,
+) -> tuple[float, float]:
+    """Return a percentile bootstrap CI for the paired pass-rate delta B - A."""
+    low, high, _p_value = _bootstrap(
+        _paired_values(results_a, results_b), iterations, confidence, seed
+    )
+    return low, high
+
+
+def mcnemar_pvalue(results_a: Sequence[bool], results_b: Sequence[bool]) -> float:
+    """Return McNemar's exact two-sided p-value for paired binary results."""
+    differences = _paired_values(results_a, results_b)
+    a_only = differences.count(-1)
+    b_only = differences.count(1)
+    discordant = a_only + b_only
+    if not discordant:
+        return 1.0
+    tail = sum(math.comb(discordant, index) for index in range(min(a_only, b_only) + 1))
+    return min(1.0, 2.0 * tail / (2**discordant))
+
+
+def paired_significance(
+    results_a: Sequence[bool],
+    results_b: Sequence[bool],
+    *,
+    iterations: int = 10_000,
+    confidence: float = 0.95,
+    alpha: float = 0.05,
+    seed: int = 0,
+) -> dict[str, Any]:
+    """Summarize paired pass/fail significance with CI and exact McNemar.
+
+    ``p_value`` is the one-sided bootstrap tail, useful for a regression gate;
+    ``mcnemar_p_value`` remains the exact two-sided diagnostic.
+    """
+    differences = _paired_values(results_a, results_b)
+    if not math.isfinite(alpha) or not 0 < alpha < 1:
+        raise ValueError("alpha must be between zero and one")
+    ci_low, ci_high, bootstrap_p = _bootstrap(differences, iterations, confidence, seed)
+    mcnemar_p = mcnemar_pvalue(results_a, results_b)
+    delta = sum(differences) / len(differences)
+    return {
+        "n": len(differences),
+        "pass_rate_a": sum(results_a) / len(results_a),
+        "pass_rate_b": sum(results_b) / len(results_b),
+        "delta_b_minus_a": delta,
+        "ci": {"low": ci_low, "high": ci_high, "confidence": confidence},
+        "p_value": bootstrap_p,
+        "mcnemar_p_value": mcnemar_p,
+        "a_only": differences.count(-1),
+        "b_only": differences.count(1),
+        "iterations": iterations,
+        "alpha": alpha,
+        "verdict": "significant" if bootstrap_p < alpha else "not significant",
+    }
+
+
 __all__ = [
     "UsageBreakdown",
     "UsageStats",
     "session_usage_breakdown",
     "session_usage_stats",
+    "mcnemar_pvalue",
+    "paired_bootstrap",
+    "paired_significance",
     "usage_breakdown_from_events",
     "usage_stats_from_events",
 ]
