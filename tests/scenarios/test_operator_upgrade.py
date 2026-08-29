@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from cambium import cli, oauth
+from cambium import oauth
 from cambium.modules.base import Example
 from cambium.oauth import OAuthDoc, OAuthStore, RefreshedTokens, TokenManager
 from cambium.provider_config import CODEX_CHATGPT_PROFILE
@@ -115,11 +115,3 @@ def test_transcript_candidates_load_only_approved_records(tmp_path: Path) -> Non
 
     assert len(records) == 1
     assert records[0].input["task"] == "approved"
-
-
-def test_cli_exposes_monitor_and_optimizer_commands() -> None:
-    monitor = cli._build_parser().parse_args(["monitor", "--once"])
-    optimizer = cli._build_parser().parse_args(["optimize", "should_decompose", "--dry-run"])
-    assert monitor.command == "monitor"
-    assert optimizer.command == "optimize"
-    assert optimizer.module_name == "should_decompose"

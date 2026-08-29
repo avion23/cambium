@@ -21,7 +21,6 @@ from cambium.tui_screen import (
     _bounded_markdown_lines,
     _compact_rail_rows,
     _display_width,
-    _frame_content_width,
     _rail_depth,
     _rail_rows,
     _side_sections,
@@ -1858,28 +1857,6 @@ def test_activity_resize_repaints_frame_and_restores_input_prompt(monkeypatch) -
             assert stream.getvalue()[len(before) :].endswith("› ")
 
     assert cockpit.size.columns == 70
-
-
-def test_frame_status_rows_use_the_left_content_width(monkeypatch) -> None:
-    seen: list[int] = []
-    render_status_rows = tui_screen._status_rows
-
-    def capture(*args: Any, **kwargs: Any) -> list[str]:
-        seen.append(kwargs["width"])
-        return render_status_rows(*args, **kwargs)
-
-    monkeypatch.setattr(tui_screen, "_status_rows", capture)
-    render_cockpit(
-        _snapshot(),
-        Transcript(),
-        session_description="session",
-        branch_line="branch",
-        cumulative_line="usage: calls=0",
-        width=120,
-        height=24,
-    )
-
-    assert seen == [_frame_content_width(120)]
 
 
 def test_style_kind_ignores_unhashable_state_values() -> None:

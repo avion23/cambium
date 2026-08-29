@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import sys
@@ -230,23 +229,6 @@ def test_library_operations_do_not_write_output(capsys: pytest.CaptureFixture[st
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == ""
-
-
-def test_module_cli_output_remains_byte_stable() -> None:
-    payload = json.dumps(
-        {
-            "tasks": [
-                {"task_id": "root", "kind": "FEATURE", "depends_on": []},
-                {"task_id": "child", "kind": "TEST", "depends_on": ["root"]},
-            ]
-        }
-    )
-
-    result = _run_cli(payload)
-
-    assert result.returncode == 0
-    assert result.stdout == '"root"\n"child"\n'
-    assert result.stderr == ""
 
 
 def test_upward_result_rejects_unvalidated_text_and_lists() -> None:

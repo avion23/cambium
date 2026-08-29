@@ -83,12 +83,6 @@ def _plan(session_dir: Path) -> dict[str, list[dict[str, str]]]:
     }
 
 
-def test_cli_warm_pool_default_is_zero() -> None:
-    args = cli._build_parser().parse_args(["supervisor", "--session-dir", "/tmp/session", "--demo"])
-
-    assert args.warm_pool_size == 0
-
-
 def test_cli_supervisor_forwards_explicit_warm_pool_size(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -99,7 +99,6 @@ def test_filtered_incumbent_reselects_and_new_incumbent_does_not_bounce() -> Non
 def test_rotation_is_deterministic_spreads_and_preserves_priority_runs() -> None:
     items = [Item("a"), Item("b"), Item("c"), Item("x", 1), Item("y", 1)]
     assert _names(_order(items, offset=1)) == ["b", "c", "a", "y", "x"]
-    assert _names(_order(items, offset=1)) == _names(_order(items, offset=1))
     assert {_names(_order(items, offset=i))[0] for i in range(3)} == {"a", "b", "c"}
 
 

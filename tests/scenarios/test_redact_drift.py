@@ -213,7 +213,6 @@ def test_oauth_account_fingerprint_is_stable_distinct_and_bounded() -> None:
     for value in values:
         expected = hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
         assert _oauth_account_fingerprint(value) == expected
-        assert _oauth_account_fingerprint(value) == expected
 
     similar = (
         "account-0001",
