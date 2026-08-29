@@ -6,7 +6,9 @@ from typing import Any
 
 import pytest
 
+from cambium.child_policy import ContextMode, Placement, parse_child_policy
 from cambium.supervisor import _Runtime
+from cambium.worker import _provider_task_tools_hash
 
 
 def _epoch() -> dict[str, Any]:
@@ -16,7 +18,16 @@ def _epoch() -> dict[str, Any]:
         "cache_key": {
             "provider": "provider-a",
             "model": "model-a",
+            "protocol": "http",
+            "reasoning_effort": "high",
             "redacted": False,
+            "system_sha256": "aaa",
+            "tools_sha256": _provider_task_tools_hash(),
+            "prefix_sha256": "ccc",
+            "suffix_sha256": "ddd",
+            "full_sha256": "eee",
+            "prefix_bytes": 100,
+            "provider_boundary": {"provider": "provider-a", "model": "model-a", "epoch": 2},
         },
     }
 
@@ -33,53 +44,79 @@ def _runtime(tmp_path: Path) -> tuple[_Runtime, list[dict[str, Any]]]:
     return runtime, events
 
 
-def test_semantic_spread_reuses_summaries_and_removes_parent_pin(tmp_path: Path) -> None:
+def test_semantic_child_pins_summary_trunk_and_drops_provider(tmp_path: Path) -> None:
     runtime, events = _runtime(tmp_path)
-    child = {
+
+    child_spec: dict[str, Any] = {
         "context_mode": "semantic",
         "placement": "spread",
-        "assigned_provider": "provider-a",
-        "fanout_config": {"model": "model-a"},
-        "model_candidates": ["model-a", "model-b"],
-        "authorized_providers": ["provider-a", "provider-b"],
-    }
-
-    runtime._validate_child_context_policy(child, "parent")
-    asyncio.run(runtime._pin_fork_child(child, "parent", "child", "investigation"))
-
-    assert child["summary_trunk_ref"] == _epoch()["checkpoint_ref"]
-    assert "context_fork" not in child
-    assert "assigned_provider" not in child
-    assert "model" not in child["fanout_config"]
-    assert child["spread_from_provider"] == "provider-a"
-    assert events[-1]["context_mode"] == "semantic"
-    assert events[-1]["placement"] == "spread"
-    assert events[-1]["semantic_reuse"] is True
-
-
-def test_fresh_inherit_keeps_provider_but_no_parent_context(tmp_path: Path) -> None:
-    runtime, events = _runtime(tmp_path)
-    child = {
-        "context_mode": "fresh",
-        "placement": "inherit",
         "fanout_config": {},
         "authorized_providers": ["provider-a", "provider-b"],
     }
 
-    runtime._validate_child_context_policy(child, "parent")
-    asyncio.run(runtime._pin_fork_child(child, "parent", "child", "investigation"))
+    asyncio.run(runtime._pin_fork_child(child_spec, "parent", "child", "investigation"))
 
-    assert child["assigned_provider"] == "provider-a"
-    assert child["fanout_config"]["model"] == "model-a"
-    assert "context_fork" not in child
-    assert "summary_trunk_ref" not in child
-    assert events[-1]["context_mode"] == "fresh"
-    assert events[-1]["semantic_reuse"] is False
+    # Semantic (incompatible by construction) sets summary_trunk_ref
+    # and drops assigned_provider so the child picks a fresh provider.
+    assert child_spec.get("summary_trunk_ref") == _epoch()["checkpoint_ref"]
+    assert "assigned_provider" not in child_spec
+    assert "context_fork" not in child_spec
+
+    # The context_fork event carries the semantic_reuse flag.
+    fork_events = [e for e in events if e["kind"] == "context_fork"]
+    assert len(fork_events) == 1
+    assert fork_events[0]["semantic_reuse"] is True
+    assert fork_events[0]["compatible"] is False
 
 
-def test_semantic_mode_requires_a_parent_checkpoint(tmp_path: Path) -> None:
+def test_exact_compatible_child_inherits_provider_and_model(tmp_path: Path) -> None:
+    """A child with compatible provider/model/protocol gets an exact fork."""
+    runtime, events = _runtime(tmp_path)
+
+    child_spec: dict[str, Any] = {
+        "context_mode": "trunk",
+        "placement": "inherit",
+        "fanout_config": {
+            "model": "model-a",
+            "protocol": "http",
+            "reasoning_effort": "high",
+        },
+        "authorized_providers": ["provider-a", "provider-b"],
+    }
+
+    asyncio.run(runtime._pin_fork_child(child_spec, "parent", "child", "investigation"))
+
+    # Compatible fork: provider and model are pinned.
+    assert child_spec.get("assigned_provider") == "provider-a"
+    assert child_spec.get("fanout_config", {}).get("model") == "model-a"
+    assert "context_fork" in child_spec
+
+    # No summary_trunk_ref for exact forks.
+    assert "summary_trunk_ref" not in child_spec
+
+    fork_events = [e for e in events if e["kind"] == "context_fork"]
+    assert len(fork_events) == 1
+    assert fork_events[0]["semantic_reuse"] is False
+    assert fork_events[0]["compatible"] is True
+
+
+def test_missing_parent_epoch_skips_pin_without_error(tmp_path: Path) -> None:
+    """_pin_fork_child returns silently when no parent epoch exists."""
     runtime = _Runtime(tmp_path, None)
-    child = {"context_mode": "semantic", "placement": "spread"}
+    child_spec: dict[str, Any] = {
+        "context_mode": "semantic",
+        "placement": "spread",
+    }
 
-    with pytest.raises(ValueError, match="requires a parent checkpoint"):
-        runtime._validate_child_context_policy(child, "missing")
+    # No epoch for task "missing" — method returns, no error.
+    asyncio.run(runtime._pin_fork_child(child_spec, "missing", "child", "investigation"))
+
+    assert child_spec == {"context_mode": "semantic", "placement": "spread"}
+
+
+def test_parse_child_policy_rejects_trunk_spread_combination() -> None:
+    """trunk+spread is contradictory and must be rejected."""
+    with pytest.raises(ValueError, match="trunk requires placement=inherit"):
+        parse_child_policy({"context_mode": "trunk", "placement": "spread"})
+    parse_child_policy({"context_mode": "trunk", "placement": "inherit"})
+    parse_child_policy({"context_mode": "semantic", "placement": "spread"})
