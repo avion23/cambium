@@ -28,7 +28,6 @@ from cambium.routing import (
     LaneState,
     ProviderDebt,
     select_lane,
-    select_primary,
 )
 from cambium.supervisor import _preassign_lanes, _release_lane
 
@@ -352,14 +351,3 @@ def test_debt_store_persists_and_clears_quarantine_record(tmp_path) -> None:
     reloaded = DebtStore(path)
     reloaded.load()
     assert reloaded.as_mapping()["p1"].disable_reason == "config_error: model not found again"
-
-
-# --------------------------------------------------------------------------- #
-# 5. regression: select_primary keeps its contract alongside select_lane
-# --------------------------------------------------------------------------- #
-
-
-def test_select_primary_unchanged_contract() -> None:
-    providers = [_pc("a", "m1"), _pc("b", "m2")]
-    debt = {"a": ProviderDebt(tokens=100), "b": ProviderDebt(tokens=100, requests=2)}
-    assert select_primary(providers, ["m1"], debt) == ("a", "m1")

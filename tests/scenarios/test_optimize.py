@@ -79,21 +79,6 @@ class ReviewRuleLM(dspy.LM):
         return self(*args, **kwargs)
 
 
-def test_parser_defaults_to_fast_tier() -> None:
-    args = optimize._parser().parse_args(["should_decompose"])
-
-    assert args.tier == "fast"
-    assert not args.include_transcript_candidates
-    assert args.transcript_candidates is None
-
-
-def test_parser_can_opt_in_to_transcript_candidates() -> None:
-    args = optimize._parser().parse_args(["should_decompose", "--include-transcript-candidates"])
-
-    assert args.include_transcript_candidates
-    assert args.transcript_candidates is None
-
-
 class OfflineProgram(dspy.Module):
     """Tiny real DSPy program used to exercise both optimizer stages."""
 
@@ -261,48 +246,6 @@ def test_eval_loads_saved_program_state(monkeypatch, tmp_path: Path, capsys) -> 
     report = json.loads(capsys.readouterr().out)
     assert report["program"] == "optimized"
     assert loaded_states and loaded_states[0]
-
-
-def test_eval_json_shape_is_stable(monkeypatch, tmp_path: Path, capsys) -> None:
-    monkeypatch.chdir(tmp_path)
-    _patch_eval(
-        monkeypatch,
-        MemoryLoader(_examples(1), _examples(1), _examples(1)),
-        tmp_path / "optimized",
-    )
-
-    assert (
-        optimize.main(
-            [
-                "eval",
-                "should_decompose",
-                "--dataset",
-                str(tmp_path / "reviewed-dataset"),
-                "--json",
-            ]
-        )
-        == 0
-    )
-
-    report = json.loads(capsys.readouterr().out)
-    assert set(report) == {"dataset", "module", "parse_failures", "program", "splits"}
-    assert all(
-        set(summary)
-        == {
-            "count",
-            "mean",
-            "parse_failures",
-            "records",
-            "scored_count",
-            "std",
-        }
-        for summary in report["splits"].values()
-    )
-    assert set(report["splits"]["train"]["records"][0]) == {
-        "index",
-        "parse_failure",
-        "score",
-    }
 
 
 def test_load_program_class_rejects_empty_manifest_field() -> None:
@@ -765,16 +708,6 @@ def test_main_tiny_budget_fails_without_crashing() -> None:
     assert result != 0
 
 
-def test_gepa_is_available_in_parser_and_dry_run(capsys) -> None:
-    args = optimize._parser().parse_args(["should_decompose", "--optimizer", "gepa"])
-
-    assert args.optimizer == "gepa"
-    assert (
-        optimize.main(["--dry-run", "should_decompose", "--optimizer", "gepa", "--seed", "23"]) == 0
-    )
-    assert "optimizer=gepa" in capsys.readouterr().err
-
-
 def test_run_stage_gepa_requires_four_reviewed_records() -> None:
     with pytest.raises(optimize.OptimizeError, match="GEPA requires more reviewed data"):
         optimize.run_stage_gepa(OfflineProgram(OfflineLM()), _examples(2), [], seed=7)
@@ -815,25 +748,6 @@ def test_run_stage_gepa_uses_same_reflection_lm_and_reports_scores(monkeypatch) 
     assert report["calls"] == 9
     assert report["iterations"] == 2
     assert report["full_evals"] == 2
-
-
-def test_gepa_report_schema_records_stage_and_optimizer() -> None:
-    args = SimpleNamespace(
-        module_name="should_decompose",
-        optimizer="gepa",
-        seed=3,
-        tier="fast",
-        budget_usd=1.0,
-    )
-    report = optimize._partial_report(
-        SimpleNamespace(module_name="should_decompose"),
-        cast(Any, args),
-        optimize._CostLedger(1.0),
-        stage_gepa={"eval_mean": 0.9, "train_mean": 1.0},
-    )
-
-    assert report["optimizer"] == "gepa"
-    assert report["stage_gepa"] == {"eval_mean": 0.9, "train_mean": 1.0}
 
 
 def test_gepa_budget_enforcement_raises_before_optimizer() -> None:

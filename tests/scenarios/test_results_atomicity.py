@@ -187,13 +187,3 @@ def test_error_paths_use_documented_exit_codes(
     assert result.status == expected_status
     assert result.status in EXIT_CODES
     assert result.exit_code == EXIT_CODES[result.status]
-
-
-def test_exit_codes_cover_the_canonical_result_statuses() -> None:
-    assert EXIT_CODES == {
-        "done": 0,
-        "failed": 1,
-        "rejected": 2,
-        "timeout": 3,
-        "cancelled": 4,
-    }

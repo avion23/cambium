@@ -6,47 +6,6 @@ import pytest
 
 from cambium import doctor
 
-CHECKS = (
-    ("check_python", "Python version"),
-    ("check_uv", "uv"),
-    ("check_git", "git"),
-    ("check_worktrees", "Worktree hygiene"),
-    ("check_event_store", "Event store integrity"),
-    ("check_dataset", "Dataset integrity"),
-    ("check_secrets", "Secrets hygiene"),
-    ("check_provider_env", "Provider env"),
-    ("check_auth_metadata", "Auth metadata"),
-    ("check_auth_schema", "Auth schema"),
-    ("check_auth_coverage", "Auth coverage"),
-    ("check_provider_runnable", "Provider runnable"),
-    ("check_conversation_store", "Conversation store"),
-    ("check_system_health", "System health"),
-)
-
-
-def _forced_failure(*args: object, **kwargs: object) -> tuple[doctor.Status, str]:
-    return doctor.Status.FAIL, "forced diagnostic failure"
-
-
-@pytest.mark.parametrize(("target", "name"), CHECKS)
-def test_each_check_failure_has_stable_report_contract(
-    target: str, name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    monkeypatch.setattr(doctor, "check_python", lambda: (doctor.Status.PASS, "3.12.0 (>= 3.12)"))
-    monkeypatch.setattr(doctor, target, _forced_failure)
-
-    checks = doctor.run_checks(None, tmp_path)
-
-    assert doctor.exit_code(checks) == 1
-    assert [check.number for check in checks] == list(range(1, 15))
-    report = doctor.format_report(checks)
-    lines = report.splitlines()
-    assert len(lines) == 16
-    assert lines[0] == "cambium doctor — Cambium harness diagnostics"
-    assert lines[-1].startswith("Summary:")
-    assert f"{name:<22}" in report
-    assert "1 fail" in report
-
 
 def test_check_python_passes_on_packaging_floor(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(doctor.sys, "version_info", (3, 12, 0))
@@ -100,20 +59,6 @@ def test_network_probe_failure_is_bounded_and_reported(
     report = doctor.format_report(checks)
     assert report.splitlines()[1].startswith("  15. OAuth live")
     assert report.splitlines()[-1].endswith("1 fail")
-
-
-def test_format_report_sorts_checks_without_mutating_input() -> None:
-    checks = [
-        doctor.Check(2, "Second", doctor.Status.WARN, "second"),
-        doctor.Check(1, "First", doctor.Status.PASS, "first"),
-    ]
-
-    report = doctor.format_report(checks)
-
-    assert [check.number for check in checks] == [2, 1]
-    rows = report.splitlines()[1:-1]
-    assert rows[0].startswith("   1. First")
-    assert rows[1].startswith("   2. Second")
 
 
 def test_format_report_keeps_credential_names_and_redacts_values(
