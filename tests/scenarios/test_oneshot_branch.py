@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -115,6 +116,37 @@ def test_default_branch_is_stable_and_explicit_branch_is_preserved(tmp_path: Pat
         session_dir,
     )
     assert explicit["tasks"][0]["branch"] == "release/topic"
+
+
+def test_non_main_checked_out_branch_is_used_as_one_shot_base(
+    monkeypatch, tmp_path: Path
+) -> None:
+    repo = _repo(tmp_path / "repo")
+    subprocess.run(["git", "-C", str(repo), "branch", "-m", "feature"], check=True)
+    captured: dict[str, Any] = {}
+
+    async def fake_run_plan(session_dir, plan, on_event=None, **kwargs):
+        captured.update(session_dir=session_dir, plan=plan, on_event=on_event, kwargs=kwargs)
+        return PlanResult((TaskResult(task_id="oneshot", status="succeeded", exit_code=0),))
+
+    monkeypatch.setattr(oneshot.supervisor, "run_plan", fake_run_plan)
+    config = oneshot.OneShotConfig(
+        prompt="inspect the repository",
+        repo=repo,
+        target_file="file.txt",
+        marker="// marker",
+    )
+
+    result = asyncio.run(oneshot.run_oneshot(config))
+
+    expected_base = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert result.exit_code == 0
+    assert captured["plan"]["tasks"][0]["base_commit"] == expected_base
 
 
 # --------------------------------------------------------------------------- #

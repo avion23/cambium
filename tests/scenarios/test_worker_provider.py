@@ -560,6 +560,12 @@ def test_worker_agent_loop_read_edit_finish_one_fenced_commit(tmp_path, monkeypa
 
         result_events = [e for e in events if e["kind"] == "result"]
         assert len(result_events) == 1
+        assert result_events[0]["payload"]["terminal_action"] == {
+            "type": "finish",
+            "objective_met": True,
+            "summary_present": True,
+            "summary": "read target.txt and appended a provider marker",
+        }
         metadata = result_events[0]["payload"]["provider_metadata"]
         assert metadata == {
             "provider": "loopback-provider",
