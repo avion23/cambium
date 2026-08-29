@@ -16,24 +16,46 @@ def _delegate_schema() -> dict[str, Any]:
 
 def test_delegate_schema_describes_the_proposal_boundary() -> None:
     schema = _delegate_schema()
-    description = schema["description"]
+    description = schema["description"].lower()
 
-    assert "work you should not do yourself" in description
-    assert "separable subproblem with its own files or investigation area" in description
-    assert "full Cambium worker" in description
-    assert "isolated git worktree" in description
-    assert "IMPORTANT: this call only PROPOSES the child" in description
-    assert "it starts only after your task finishes, and you never see its output" in description
-    assert "it inherits only immutable summaries, not your conversation" in description
-    assert "An exact compatible fork" not in description
+    for term in (
+        "separable subproblem",
+        "own files or investigation area",
+        "propose",
+        "supervisor-owned",
+        "task boundary",
+        "context reuse",
+        "suspend",
+        "bounded",
+        "child-result envelope",
+        "full conversation",
+    ):
+        assert term in description
+    assert "starts only after" not in description
+    assert "never see its output" not in description
 
     task_description = schema["parameters"]["properties"]["spec"]["properties"]["task"][
         "description"
-    ]
-    assert (
-        "Example: 'In src/parser/, add offset paging to read_lines(); done when "
-        "tests/test_parser.py::test_paging passes.'"
-    ) in task_description
+    ].lower()
+    for term in (
+        "objective",
+        "owned files/symbols",
+        "done criteria",
+        "verification",
+        "example:",
+        "src/parser/",
+        "read_lines",
+        "test_paging",
+    ):
+        assert term in task_description
+
+    for field in ("max_turns", "max_wall_s"):
+        budget_description = schema["parameters"]["properties"]["spec"]["properties"][field][
+            "description"
+        ].lower()
+        assert "optional" in budget_description
+        assert "supervisor" in budget_description
+        assert "parent" in budget_description
 
 
 def test_delegate_schema_requires_a_scoped_workload() -> None:
