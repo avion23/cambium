@@ -183,6 +183,7 @@ PROTO = 1
 HEARTBEAT_INTERVAL_S = 1.0
 PHASE_HEARTBEAT_INTERVAL_S = 1.0
 PHASE_TAIL_MAX_CHARS = 120
+TOOL_OUTPUT_DELTA_INTERVAL_S = 0.1
 INIT_TIMEOUT_S = 30.0
 IDLE_TIMEOUT_S = 300.0
 MAX_SUMMARY_CHARS = 2_000
@@ -3187,6 +3188,50 @@ async def _emit_tool_event(
             "duration_ms": int(tool_result.duration_ms),
         },
     )
+
+
+async def _emit_tool_output_delta(
+    writer: asyncio.StreamWriter,
+    config: AgentConfig,
+    name: str,
+    turn: int,
+    stream_name: str,
+    delta: str,
+) -> None:
+    """Forward one already-bounded process-output tail to the supervisor."""
+    await send(
+        writer,
+        {
+            "type": "tool_output_delta",
+            "task_id": config.task_id,
+            "generation": config.generation,
+            "tool": name,
+            "turn": turn,
+            "stream": stream_name,
+            "delta": delta,
+            "monotonic_ms": _monotonic_ms(),
+        },
+    )
+
+
+def _tool_progress_callback(
+    writer: asyncio.StreamWriter,
+    config: AgentConfig,
+    name: str,
+    turn: int,
+) -> Callable[[str, str], Any]:
+    """Throttle process tails to at most ten wire updates per second."""
+    last_emit = float("-inf")
+
+    async def _progress(stream_name: str, delta: str) -> None:
+        nonlocal last_emit
+        now = time.monotonic()
+        if now - last_emit < TOOL_OUTPUT_DELTA_INTERVAL_S:
+            return
+        last_emit = now
+        await _emit_tool_output_delta(writer, config, name, turn, stream_name, delta)
+
+    return _progress
 
 
 def _canonical_message_list_bytes(messages: Sequence[Mapping[str, Any]]) -> int:
@@ -6490,8 +6535,19 @@ async def _run_agent_loop(
                     shell=config.shell_permission,
                     network=config.network_permission,
                 ),
+                progress=(
+                    _tool_progress_callback(writer, config, name, turn)
+                    if writer is not None and name in {"run_shell", "git_op"}
+                    else None
+                ),
             ) as ctx:
-                tool_result = await run_tool(name, arguments, ctx)
+                try:
+                    tool_result = await run_tool(name, arguments, ctx)
+                finally:
+                    # The next heartbeat belongs to the provider turn, not
+                    # the completed tool. Do not carry its name into that
+                    # operation's live window.
+                    progress.tool = None
             if name == "delegate" and tool_result.ok and writer is not None:
                 await _emit_delegated_child(writer, config, arguments, request_id=run_request_id)
             if tool_result.ok:

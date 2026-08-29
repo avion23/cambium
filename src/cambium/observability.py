@@ -483,6 +483,7 @@ class ObservabilityState:
                 "run_task",
                 "heartbeat",
                 "tool_event",
+                "tool_output_delta",
                 "checkpoint",
                 "usage_event",
                 "context_checkpoint",

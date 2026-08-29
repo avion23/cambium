@@ -282,6 +282,7 @@ _LIVE_EVENT_KINDS = frozenset(
         "task_failed",
         "timeout",
         "tool_event",
+        "tool_output_delta",
         "turn_failed",
         "usage_event",
         "worker_failed",
@@ -841,6 +842,7 @@ class Transcript:
         self._turn_tool_count = 0
         self._last_tool_name = None
         self._last_tool_duration_ms = None
+        self._clear_stream()
         self._clear_live_window()
         self.add("user", text)
 
@@ -973,8 +975,10 @@ class Transcript:
         self,
         task_id: str | None,
         event_clock: float | None,
+        *,
+        force: bool = False,
     ) -> None:
-        if task_id == self._live_task_id:
+        if not force and task_id == self._live_task_id:
             return
         self._live_task_id = task_id
         self._live_kind = ""
@@ -993,6 +997,11 @@ class Transcript:
         self._live_provider_call_open = False
         self._live_final = False
 
+    @staticmethod
+    def _event_tool(data: Mapping[str, Any]) -> str | None:
+        value = data.get("tool") or data.get("tool_name")
+        return _single_line(value) if isinstance(value, str) and value.strip() else None
+
     def _observe_live_event(
         self,
         record: Mapping[str, Any],
@@ -1007,6 +1016,17 @@ class Transcript:
             self._start_live_operation(task_id, event_clock)
         if self._live_final and kind != "result":
             return
+        incoming_tool = self._event_tool(data)
+        if incoming_tool is not None and incoming_tool != self._live_tool:
+            self._start_live_operation(task_id, event_clock, force=True)
+        elif (
+            kind == "heartbeat"
+            and incoming_tool is None
+            and self._live_tool is not None
+        ):
+            # A heartbeat with no tool is the next provider phase. Clear the
+            # completed tool's tail/duration instead of displaying it as live.
+            self._start_live_operation(task_id, event_clock, force=True)
         if self._live_started_at is None:
             self._live_started_at = event_clock
         if event_clock is not None and self._live_started_at is not None:
@@ -1030,9 +1050,8 @@ class Transcript:
             if isinstance(heartbeat_status, str) and heartbeat_status:
                 self._live_status = _single_line(heartbeat_status)
 
-        tool = data.get("tool") or data.get("tool_name")
-        if isinstance(tool, str) and tool.strip():
-            self._live_tool = _single_line(tool)
+        if incoming_tool is not None:
+            self._live_tool = incoming_tool
         command = data.get("cmd") or data.get("command")
         if isinstance(command, str) and command.strip():
             self._live_command = _single_line(command)
@@ -1042,7 +1061,7 @@ class Transcript:
 
         if kind == "heartbeat":
             phase = _single_line(data.get("phase")).casefold().replace("_", "-")
-            if phase == "waiting" and not self._live_provider_call_open:
+            if phase == "waiting" and incoming_tool is None and not self._live_provider_call_open:
                 self._live_calls += 1
                 self._live_provider_call_open = True
         elif kind == "usage_event":
@@ -1093,6 +1112,11 @@ class Transcript:
         if self._live_final and self._live_status == status:
             return
         self._live_kind = self._live_kind or "result"
+        self._live_tool = None
+        self._live_command = ""
+        self._live_duration_ms = None
+        self._live_text = ""
+        self._live_bytes = 0
         self._live_status = status
         self._live_role = "error" if status == "error" else "assistant"
         self._live_final = True
@@ -1636,11 +1660,6 @@ class ActivityState:
 
     def _observe_heartbeat(self, data: Mapping[str, Any], event_now: float) -> bool:
         phase = data.get("phase")
-        if not isinstance(phase, str):
-            return False
-        phase = phase.casefold().replace("_", "-")
-        if phase not in _ACTIVITY_PHASE_GLYPHS:
-            return False
         tool = data.get("tool")
         if isinstance(tool, str) and tool.strip():
             tool_name = _sanitize(tool).strip() or "tool"
@@ -1648,6 +1667,19 @@ class ActivityState:
                 self._heartbeat_tool = (tool_name, event_now)
         else:
             self._heartbeat_tool = None
+        if not isinstance(phase, str):
+            self._heartbeat_phase = None
+            self._heartbeat_tail = ""
+            self._state = "RUNNING" if self._heartbeat_tool is not None else "WAITING"
+            self._responding = False
+            return True
+        phase = phase.casefold().replace("_", "-")
+        if phase not in _ACTIVITY_PHASE_GLYPHS:
+            self._heartbeat_phase = None
+            self._heartbeat_tail = ""
+            self._state = "RUNNING" if self._heartbeat_tool is not None else "WAITING"
+            self._responding = False
+            return True
         self._heartbeat_phase = phase
         self._heartbeat_tail = _activity_tail(data.get("tail")) if phase != "waiting" else ""
         self._state = "STREAMING" if phase == "streaming" else "WAITING"
@@ -1712,6 +1744,12 @@ class ActivityState:
             self._responding = True
             self._state = "STREAMING"
             self._observe_stream_rate(data, update[1], event_now)
+        elif update is not None and update[0] == "tool" and update[1]:
+            tool_name = self._tool_name(data)
+            if not any(name == tool_name for name, _started in self._tools.values()):
+                self._start_tool(data, event_now)
+            self._state = "RUNNING"
+            self._responding = False
         elif kind in _FIRST_TOKEN_KINDS:
             self._state = "STREAMING"
 
@@ -2449,7 +2487,7 @@ def _terminal_activity_status(activity_line: str) -> str | None:
     upper = clean.upper()
     if "✗" in clean or "ERROR" in upper or "FAILED" in upper:
         return "error"
-    if "CANCEL" in upper or "IDLE" in upper:
+    if "CANCEL" in upper:
         return "cancelled"
     if "✓" in clean or any(word in upper for word in ("DONE", "SUCCEEDED", "COMPLETE")):
         return "succeeded"
@@ -2480,7 +2518,7 @@ def _live_window_lines(
 
     activity = _activity_parts(activity_line)
     terminal_status = _terminal_activity_status(activity_line)
-    if terminal_status is not None:
+    if terminal_status is not None and (transcript._live_kind or transcript.live_final):
         glyph = (
             "✗"
             if terminal_status == "error"
@@ -2511,24 +2549,28 @@ def _live_window_lines(
         running = _running_tool(activity_line)
         operation = running[0] if running is not None else "provider call"
         return [
-            _status_row([f"{spinner} {phase} {elapsed} · {operation}"], width),
-            _status_row(["provider call in progress · turn=? · call=0 · bytes=0"], width),
+            _status_row(
+                [f"{spinner} starting · thinking {elapsed} · operation event pending"],
+                width,
+            ),
+            _status_row([f"{operation} not established"], width),
         ]
 
     operation = transcript._live_tool or "provider call"
     phase = transcript._live_phase.casefold().replace("_", "-")
     if phase not in _ACTIVITY_PHASE_GLYPHS:
         phase = (
-            "thinking"
-            if transcript._live_tool
-            else "streaming"
-            if transcript._live_text
+            "streaming"
+            if transcript._live_kind in _TOOL_STREAM_KINDS
+            or transcript._live_text
             else "thinking"
         )
     spinner = _ACTIVITY_PHASE_GLYPHS[phase]
     elapsed = _fmt_secs(transcript._live_age_s)
     if activity is not None:
         spinner, phase, elapsed = activity
+    if phase not in _ACTIVITY_PHASE_GLYPHS:
+        phase = "thinking"
     if phase == "waiting":
         spinner, phase = _ACTIVITY_PHASE_GLYPHS["thinking"], "thinking"
     if transcript.live_final:
@@ -2562,6 +2604,8 @@ def _live_window_lines(
             details.append(
                 f"{_format_duration(transcript._live_duration_ms)} ✓ {transcript._live_tool}"
             )
+        elif transcript._live_kind == "tool_event" and transcript._live_status == "ok":
+            details.append(f"✓ {transcript._live_tool or 'tool'}")
         if transcript._live_text and phase != "waiting":
             details.append(
                 f"{_ROLE_LABELS.get(transcript._live_role, 'LIVE')} ▸ "
@@ -2584,9 +2628,10 @@ def _transcript_lines(
     capacity: int,
     *,
     color: bool = False,
+    include_stream: bool = True,
 ) -> list[tuple[str, str]]:
     capacity = max(1, capacity)
-    active = _stream_lines(transcript, width, capacity, color=color)
+    active = _stream_lines(transcript, width, capacity, color=color) if include_stream else []
     remaining = max(0, capacity - len(active))
     rendered: list[tuple[str, str]] = []
     if remaining:
@@ -3420,6 +3465,7 @@ def _primary_rows(
     width: int,
     *,
     color: bool = False,
+    include_stream: bool = True,
 ) -> list[tuple[str, str]]:
     """Return safe, labelled transcript rows for the append-only view."""
     width = max(8, width)
@@ -3427,7 +3473,13 @@ def _primary_rows(
     # many wrapped rows.  Leave enough capacity to render the complete local
     # view so the Cockpit can append only the suffix it has not emitted yet.
     capacity = max(64, len(transcript.entries) * 16 + 64)
-    rows = _transcript_lines(transcript, width, capacity, color=color)
+    rows = _transcript_lines(
+        transcript,
+        width,
+        capacity,
+        color=color,
+        include_stream=include_stream,
+    )
     rendered: list[tuple[str, str]] = []
     for role, text in rows:
         rendered.append((role, _clip(_safe_rendered(text), width)))
@@ -3931,7 +3983,13 @@ def _cockpit_frame_lines(
     conversation = (
         list(primary_rows[-conversation_capacity:])
         if primary_rows is not None
-        else _transcript_lines(transcript, left_inner, conversation_capacity, color=color)
+        else _transcript_lines(
+            transcript,
+            left_inner,
+            conversation_capacity,
+            color=color,
+            include_stream=True,
+        )
     )
     if not rail_width:
         lines = [
@@ -4040,7 +4098,12 @@ def render_primary(
     width = max(8, width)
     lines = [
         _paint(text, _ROLE_COLORS.get(role, ""), color)
-        for role, text in _primary_rows(transcript, width, color=color)
+        for role, text in _primary_rows(
+            transcript,
+            width,
+            color=color,
+            include_stream=False,
+        )
     ]
     status_rows = _status_rows(
         snapshot,
@@ -4145,6 +4208,9 @@ class Cockpit:
         self._last_rail_rows: tuple[tuple[str, str], ...] = ()
         self._last_request: tuple[Any, Transcript, str, str, str, str, str] | None = None
         self._fixed_frame = False
+        self._small_frame = False
+        self._small_conversation_capacity = 0
+        self._small_total_rows = 0
         self._frame_size: os.terminal_size | None = None
         self._frame_show_detail: bool | None = None
         self._activity_line = ""
@@ -4189,8 +4255,12 @@ class Cockpit:
             if self._input_active:
                 self.hide_cursor(commit=True)
             else:
-                self.stream.write("\x1b[1B\r\n")
+                if self._small_frame:
+                    self.stream.write("\r\n")
+                else:
+                    self.stream.write("\x1b[1B\r\n")
                 self._fixed_frame = False
+                self._small_frame = False
                 self.stream.flush()
         if self._entered:
             self._entered = False
@@ -4236,9 +4306,20 @@ class Cockpit:
             live_event_changed = request[1].live_revision != self._last_live_revision
             activity_changed = request[-1] != self._activity_line
             if live_event_changed or activity_changed:
+                now = time.monotonic()
+                immediate_event = request[1]._live_kind in (
+                    _ASSISTANT_STREAM_KINDS | _TOOL_STREAM_KINDS | {"heartbeat"}
+                )
+                if (
+                    live_event_changed
+                    and not immediate_event
+                    and now - self._last_live_draw_at < _LIVE_DRAW_INTERVAL
+                ):
+                    self._pending_draw = request
+                    return
                 self._pending_draw = None
                 self._draw_live_now(request, live_only=True)
-                self._last_live_draw_at = time.monotonic()
+                self._last_live_draw_at = now
                 return
         if self._input_active and not force:
             pending_before = self._pending_draw
@@ -4249,9 +4330,15 @@ class Cockpit:
                 getattr(request[1], "live_revision", -1) != self._last_live_revision
             )
             if live_event_changed and self._fixed_frame:
-                self._draw_live_now(request, live_only=True)
-                if pending_before is None:
-                    self._last_live_draw_at = time.monotonic()
+                now = time.monotonic()
+                immediate_event = request[1]._live_kind in (
+                    _ASSISTANT_STREAM_KINDS | _TOOL_STREAM_KINDS | {"heartbeat"}
+                )
+                if immediate_event or now - self._last_live_draw_at >= _LIVE_DRAW_INTERVAL:
+                    self._pending_draw = None
+                    self._draw_live_now(request, live_only=True)
+                    if pending_before is None:
+                        self._last_live_draw_at = now
                 return
             if not live_event_changed and not request[1]._live_kind:
                 self._pending_draw = None
@@ -4303,6 +4390,127 @@ class Cockpit:
             return
         self.stream.write(f"\r{_CLEAR_LINE}{self._input_prompt_label} {text}")
 
+    def _small_live_rows(
+        self,
+        transcript: Transcript,
+        width: int,
+        activity_line: str,
+    ) -> tuple[str, str]:
+        rows = _live_window_lines(transcript, width, activity_line=activity_line)
+        return rows[0], rows[1]
+
+    def _small_frame_lines(
+        self,
+        transcript: Transcript,
+        width: int,
+        activity_line: str,
+        input_label: str,
+    ) -> tuple[tuple[tuple[str, str], ...], tuple[str, ...]]:
+        has_input = self._last_size.lines >= 3
+        conversation_capacity = max(0, self._last_size.lines - 2 - int(has_input))
+        conversation_rows = tuple(
+            _primary_rows(
+                transcript,
+                width,
+                color=self.color,
+                include_stream=False,
+            )[-conversation_capacity:]
+        ) if conversation_capacity else ()
+        live_rows = self._small_live_rows(transcript, width, activity_line)
+        lines_list = [
+            *(
+                _paint(text, _ROLE_COLORS.get(role, ""), self.color)
+                for role, text in conversation_rows
+            ),
+            *(_paint(text, _DIM_CYAN, self.color) for text in live_rows),
+        ]
+        if has_input:
+            lines_list.append(_paint(_clip(f"{input_label} ", width), _BLUE, self.color))
+        lines = tuple(lines_list)
+        return conversation_rows, lines
+
+    def _redraw_small_lines(self, lines: tuple[str, ...]) -> None:
+        if not self._small_frame or len(lines) != self._small_total_rows:
+            return
+        self.stream.write("\x1b[s")
+        for index, line in enumerate(lines):
+            distance = self._small_total_rows - 1 - index
+            move = f"\x1b[{distance}A" if distance else ""
+            self.stream.write(f"{move}\r{_CLEAR_LINE}{line}\x1b[u")
+        self.stream.flush()
+
+    def _redraw_small_live(self, live_rows: tuple[str, str]) -> None:
+        if not self._small_frame:
+            return
+        conversation_capacity = self._small_conversation_capacity
+        self.stream.write("\x1b[s")
+        for offset, row in enumerate(live_rows):
+            index = conversation_capacity + offset
+            distance = self._small_total_rows - 1 - index
+            move = f"\x1b[{distance}A" if distance else ""
+            rendered = _paint(row, _DIM_CYAN, self.color)
+            self.stream.write(f"{move}\r{_CLEAR_LINE}{rendered}\x1b[u")
+        self.stream.flush()
+
+    def _draw_small_now(
+        self,
+        request: tuple[Any, Transcript, str, str, str, str, str],
+        *,
+        preserve_input: bool = False,
+    ) -> None:
+        del preserve_input
+        (
+            snapshot,
+            transcript,
+            session_description,
+            branch_line,
+            cumulative_line,
+            input_label,
+            activity_line,
+        ) = request
+        width = max(1, self._last_size.columns)
+        conversation_rows, lines = self._small_frame_lines(
+            transcript,
+            width,
+            activity_line,
+            input_label,
+        )
+        if self._small_frame and self._small_total_rows == len(lines):
+            self._redraw_small_lines(lines)
+        else:
+            if self._fixed_frame and not self._small_frame:
+                self.stream.write(f"\r{_CLEAR_LINE}")
+            self.stream.write("\n".join(lines))
+            self.stream.flush()
+        status_rows = tuple(
+            _status_rows(
+                snapshot,
+                transcript,
+                session_description=session_description,
+                branch_line=branch_line,
+                cumulative_line=cumulative_line,
+                width=width,
+                activity_line=activity_line,
+                show_detail=self._show_detail,
+                include_live=True,
+            )
+        )
+        self._fixed_frame = True
+        self._small_frame = True
+        self._frame_size = self._last_size
+        self._frame_show_detail = self._show_detail
+        self._small_conversation_capacity = len(conversation_rows)
+        self._small_total_rows = len(lines)
+        self._last_request = request
+        self._activity_line = activity_line
+        self._last_primary_rows = conversation_rows
+        self._last_conversation_rows = conversation_rows
+        self._last_frame_conversation_rows = conversation_rows
+        self._last_status_rows = status_rows
+        self._last_live_status_rows = (status_rows[1], status_rows[2])
+        self._last_live_revision = transcript.live_revision
+        self._last_rail_rows = ()
+
     def _redraw_live_status(
         self,
         request: tuple[Any, Transcript, str, str, str, str, str],
@@ -4314,6 +4522,9 @@ class Cockpit:
             return
         live_rows = tuple(status_rows[1:3])
         if len(live_rows) != _LIVE_WINDOW_ROWS:
+            return
+        if self._small_frame:
+            self._redraw_small_live((live_rows[0], live_rows[1]))
             return
         height = self._last_size.lines
         conversation_capacity = max(1, height - _frame_overhead(self._show_detail))
@@ -4348,7 +4559,7 @@ class Cockpit:
         indices: tuple[int, ...],
     ) -> None:
         """Rewrite changed non-live status rows in place."""
-        if not self._fixed_frame or not indices:
+        if not self._fixed_frame or self._small_frame or not indices:
             return
         height = self._last_size.lines
         conversation_capacity = max(1, height - _frame_overhead(self._show_detail))
@@ -4385,7 +4596,7 @@ class Cockpit:
         terminal_status = _terminal_activity_status(activity_line)
         if terminal_status is not None:
             transcript._set_live_status(terminal_status)
-        if not self._fixed_frame or self._last_size.lines < _FIXED_MIN_HEIGHT:
+        if not self._fixed_frame:
             self._draw_now(request, force=True)
             return
         content_width = _frame_content_width(self._last_size.columns)
@@ -4455,14 +4666,12 @@ class Cockpit:
             if live_only or (
                 force
                 and self._fixed_frame
-                and bool(request[-1])
                 and (
-                    request[1].live_revision != self._last_live_revision
+                    request[1].live_final
+                    or request[1].live_revision != self._last_live_revision
                     or _terminal_activity_status(request[-1]) is not None
                 )
             ):
-                if force:
-                    self._pending_draw = request
                 self._draw_live_event_now(request)
             else:
                 self._draw_now(
@@ -4497,15 +4706,18 @@ class Cockpit:
         self._last_request = request
         self._activity_line = activity_line
         if self._last_size.lines < _FIXED_MIN_HEIGHT:
-            if self._fixed_frame:
-                self.stream.write("\x1b[1B\r\n")
-                self._fixed_frame = False
-                preserve_input = False
-            self._draw_stream_now(request, preserve_input=preserve_input)
+            self._draw_small_now(request, preserve_input=preserve_input)
             return
 
         content_width = _frame_content_width(self._last_size.columns)
-        conversation_rows = tuple(_primary_rows(transcript, content_width, color=self.color))
+        conversation_rows = tuple(
+            _primary_rows(
+                transcript,
+                content_width,
+                color=self.color,
+                include_stream=False,
+            )
+        )
         conversation_capacity = max(1, self._last_size.lines - _frame_overhead(self._show_detail))
         rail_width = _rail_width(self._last_size.columns)
         rail_rows = (
@@ -4752,7 +4964,10 @@ class Cockpit:
             return
         request = self._pending_draw
         self._pending_draw = None
-        self._paint_now(request)
+        if self._fixed_frame and (request[-1] or request[1].live_final):
+            self._draw_live_now(request, live_only=True)
+        else:
+            self._paint_now(request)
 
     def draw_activity(self, activity_line: str) -> None:
         """Update only the fixed status pane while readline owns the input."""
@@ -4800,6 +5015,8 @@ class Cockpit:
         self._native_input = native
         label_text = _clip(_sanitize(label).replace(chr(10), " "), 8)
         self._input_prompt_label = label_text
+        if self._small_frame and self._small_total_rows < 3:
+            return
         if self._fixed_frame:
             self.stream.write(f"\r{_CLEAR_LINE}{label_text} ")
         else:
@@ -4812,7 +5029,7 @@ class Cockpit:
             if commit:
                 if self._fixed_frame:
                     self.stream.write(f"\r{_CLEAR_LINE}")
-                    if self._last_request is not None:
+                    if not self._small_frame and self._last_request is not None:
                         self._redraw_bottom(self._last_request, self._last_status_rows)
                 else:
                     self.stream.write("\n")

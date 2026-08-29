@@ -26,6 +26,7 @@ from typing import Any, cast
 from .auth import scrub_environment
 from .lint_diag import LintDiag
 from .schemas import TOOL_SCHEMAS, validate_tool_call
+from .terminal import sanitize_terminal_text
 from .tasktree import TaskKind
 
 MAX_READ_BYTES = 100 * 1024
@@ -45,6 +46,7 @@ _ALLOWED_TASK_KINDS = frozenset(member.value for member in TaskKind)
 _ALLOWED_TASK_KINDS_TEXT = ", ".join(member.value for member in TaskKind)
 
 ToolEventSink = Callable[[dict[str, Any]], Awaitable[None] | None]
+ToolProgressSink = Callable[[str, str], Awaitable[None] | None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +63,7 @@ class ToolContext:
     lint: LintDiag | None = None
     init: Mapping[str, Any] | None = None
     emit: ToolEventSink | None = None
+    progress: ToolProgressSink | None = None
     policy: ToolPermissionPolicy | None = None
 
     def __post_init__(self) -> None:
@@ -346,6 +349,42 @@ def _process_output(stdout: Any, stderr: Any) -> str:
 _PROCESS_CAPTURE_BYTES = MAX_OUTPUT_BYTES + 1
 _PROCESS_READ_CHUNK_BYTES = 8192
 _PROCESS_DRAIN_TIMEOUT_S = 0.5
+_PROCESS_PROGRESS_MAX_BYTES = 2048
+_PROCESS_PROGRESS_MAX_LINES = 2
+
+
+def _bounded_process_delta(raw: bytes) -> str:
+    """Return only a small, terminal-safe tail of one process read."""
+    text = sanitize_terminal_text(raw.decode("utf-8", errors="replace"))
+    lines = text.splitlines()
+    if len(lines) > _PROCESS_PROGRESS_MAX_LINES:
+        text = "\n".join(lines[-_PROCESS_PROGRESS_MAX_LINES:])
+    encoded = text.encode("utf-8")
+    if len(encoded) > _PROCESS_PROGRESS_MAX_BYTES:
+        text = encoded[-_PROCESS_PROGRESS_MAX_BYTES :].decode("utf-8", errors="ignore")
+    return text
+
+
+async def _notify_progress(
+    progress: ToolProgressSink | None,
+    stream_name: str,
+    raw: bytes,
+) -> None:
+    if progress is None:
+        return
+    delta = _bounded_process_delta(raw)
+    if not delta:
+        return
+    try:
+        result = progress(stream_name, delta)
+        if isawaitable(result):
+            await result
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        # Progress is advisory. A broken observer must not change the command
+        # result or stop us draining the child process.
+        return
 
 
 def _spill_directory(ctx: ToolContext) -> Path:
@@ -472,42 +511,67 @@ def _shell_output(stdout: Any, stderr: Any, ctx: ToolContext) -> str:
 async def _run_shell_process(
     command: list[str], cwd: Path, timeout_s: int, ctx: ToolContext
 ) -> subprocess.CompletedProcess[str]:
-    # File-backed capture keeps an unbounded command from consuming worker
-    # memory while still allowing the handler to preserve the complete output.
+    # Keep the complete result file-backed while reading pipes incrementally so
+    # long-running commands can report bounded progress before they exit.
     with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
         process = await asyncio.create_subprocess_exec(
             *command,
             cwd=cwd,
             env=scrub_environment(),
-            stdout=stdout,
-            stderr=stderr,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
+            limit=_PROCESS_CAPTURE_BYTES,
         )
+        stdout_task = asyncio.create_task(
+            _capture_process_stream(process.stdout, stdout, "stdout", ctx.progress)
+        )
+        stderr_task = asyncio.create_task(
+            _capture_process_stream(process.stderr, stderr, "stderr", ctx.progress)
+        )
+        wait_task = asyncio.create_task(process.wait())
+        completion = asyncio.gather(wait_task, stdout_task, stderr_task)
         try:
-            await asyncio.wait_for(process.wait(), timeout_s)
+            await asyncio.wait_for(asyncio.shield(completion), timeout_s)
         except (TimeoutError, asyncio.CancelledError) as exc:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            try:
-                await asyncio.wait_for(process.wait(), _PROCESS_DRAIN_TIMEOUT_S)
-            except TimeoutError:
-                try:
-                    process.kill()
-                except ProcessLookupError:
-                    pass
-                await process.wait()
+            await _bounded_process_drain(completion)
+            stdout.flush()
+            stderr.flush()
             output = _shell_output(stdout, stderr, ctx)
             if isinstance(exc, asyncio.CancelledError):
                 raise
             raise subprocess.TimeoutExpired(command, timeout_s, output=output) from exc
 
+        stdout.flush()
+        stderr.flush()
         output = _shell_output(stdout, stderr, ctx)
         return subprocess.CompletedProcess(command, process.returncode, output, "")
 
 
-async def _read_process_stream(stream: Any, chunks: list[bytes]) -> None:
+async def _capture_process_stream(
+    stream: Any,
+    target: Any,
+    stream_name: str,
+    progress: ToolProgressSink | None,
+) -> None:
+    while True:
+        chunk = await stream.read(_PROCESS_READ_CHUNK_BYTES)
+        if not chunk:
+            return
+        target.write(chunk)
+        await _notify_progress(progress, stream_name, chunk)
+
+
+async def _read_process_stream(
+    stream: Any,
+    chunks: list[bytes],
+    stream_name: str | None = None,
+    progress: ToolProgressSink | None = None,
+) -> None:
     captured = 0
     while True:
         chunk = await stream.read(_PROCESS_READ_CHUNK_BYTES)
@@ -517,6 +581,8 @@ async def _read_process_stream(stream: Any, chunks: list[bytes]) -> None:
             kept = chunk[: _PROCESS_CAPTURE_BYTES - captured]
             chunks.append(kept)
             captured += len(kept)
+        if stream_name is not None:
+            await _notify_progress(progress, stream_name, chunk)
 
 
 async def _bounded_process_drain(completion: asyncio.Future[Any]) -> None:
@@ -528,7 +594,10 @@ async def _bounded_process_drain(completion: asyncio.Future[Any]) -> None:
 
 
 async def _run_process(
-    command: list[str], cwd: Path, timeout_s: int
+    command: list[str],
+    cwd: Path,
+    timeout_s: int,
+    progress: ToolProgressSink | None = None,
 ) -> subprocess.CompletedProcess[str]:
     process = await asyncio.create_subprocess_exec(
         *command,
@@ -541,8 +610,12 @@ async def _run_process(
     )
     stdout_chunks: list[bytes] = []
     stderr_chunks: list[bytes] = []
-    stdout_task = asyncio.create_task(_read_process_stream(process.stdout, stdout_chunks))
-    stderr_task = asyncio.create_task(_read_process_stream(process.stderr, stderr_chunks))
+    stdout_task = asyncio.create_task(
+        _read_process_stream(process.stdout, stdout_chunks, "stdout", progress)
+    )
+    stderr_task = asyncio.create_task(
+        _read_process_stream(process.stderr, stderr_chunks, "stderr", progress)
+    )
     wait_task = asyncio.create_task(process.wait())
     completion = asyncio.gather(wait_task, stdout_task, stderr_task)
     try:
@@ -596,7 +669,7 @@ async def _git_op(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
     command = ["git", op, *argument_tokens]
 
     try:
-        result = await _run_process(command, Path(ctx.cwd), GIT_TIMEOUT_S)
+        result = await _run_process(command, Path(ctx.cwd), GIT_TIMEOUT_S, ctx.progress)
     except subprocess.TimeoutExpired as exc:
         output = _truncate_text(
             _process_output(exc.stdout, exc.stderr), MAX_OUTPUT_BYTES, OUTPUT_TRUNCATION_MARKER
