@@ -38,7 +38,7 @@ vocabulary.
 | `merge_staging_pruned` | `merge.py`; flushed by `supervisor.py` | Records removal of one stale staging/quarantine artifact. |
 | `merge_staging_quarantined` | `merge.py`; flushed by `supervisor.py` | Records dirty staging moved into the bounded quarantine. |
 | `merge_staging_cleanup_failed` | `merge.py`; fallback in `supervisor.py` | Records staging cleanup failure that prevents silent artifact loss. |
-| `result` | `supervisor.py` (worker envelope in `worker.py`) | Records the correlated terminal worker verdict and redacted provider metadata. |
+| `result` | `supervisor.py` (worker envelope in `worker.py`) | Records the correlated terminal worker verdict, bounded `terminal_action` (`type`, `objective_met`, and summary presence), and redacted provider metadata. |
 | `exit` | `supervisor.py` (worker `exit_message` in `worker.py`) | Records the worker generation's terminal exit reason. |
 | `worker_failed` | `supervisor.py` | Records task/generation failure after protocol, integrity, recovery, or restart exhaustion. |
 | `timeout` | `supervisor.py` | Records a wall, ready, heartbeat, pong, or stdin deadline timeout and its phase. |

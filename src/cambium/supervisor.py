@@ -566,6 +566,26 @@ def _result_identity_note(msg: Mapping[str, Any], task_id: str, generation: int)
     return None
 
 
+def _terminal_action_for_event(value: Any) -> dict[str, Any] | None:
+    """Project a worker terminal action into a small, bounded event payload."""
+    if not isinstance(value, Mapping):
+        return None
+    if value.get("type") != "finish" or type(value.get("objective_met")) is not bool:
+        return None
+    summary = value.get("summary")
+    if not isinstance(summary, str):
+        summary = ""
+    summary_present = value.get("summary_present")
+    if type(summary_present) is not bool:
+        summary_present = bool(summary)
+    return {
+        "type": "finish",
+        "objective_met": value["objective_met"],
+        "summary_present": summary_present,
+        "summary": _cap_utf8(summary, MAX_ENVELOPE_FIELD_CHARS),
+    }
+
+
 _TOOL_EVENT_INT_FIELDS = ("batch_index", "batch_size", "turn")
 _TOOL_EVENT_DURATION_FIELDS = ("duration_ms",)
 _USAGE_EVENT_FORWARD_FIELDS = frozenset(
@@ -5568,6 +5588,9 @@ class _Runtime:
         provider_metadata = _redacted_provider_metadata(msg.get("provider_metadata"))
         if provider_metadata is not None:
             result_payload["provider_metadata"] = provider_metadata
+        terminal_action = _terminal_action_for_event(msg.get("terminal_action"))
+        if terminal_action is not None:
+            result_payload["terminal_action"] = terminal_action
         await self.emit(
             "result",
             task_id=state.task_id,

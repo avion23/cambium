@@ -4335,6 +4335,9 @@ def _loop_failure_outcome(loop_outcome: dict[str, Any]) -> dict[str, Any]:
     if outcome["status"] == TaskStatus.SUSPENDED.value:
         outcome["epoch"] = loop_outcome.get("epoch")
         outcome["checkpoint_ref"] = loop_outcome.get("checkpoint_ref")
+    terminal_action = loop_outcome.get("terminal_action")
+    if isinstance(terminal_action, dict):
+        outcome["terminal_action"] = dict(terminal_action)
     return outcome
 
 
@@ -4432,9 +4435,10 @@ def _do_work_marker(run: dict[str, Any], stop: threading.Event) -> dict[str, Any
             return git(*args, cwd=cwd)
 
         _require_generation(worktree, generation)
-        rc, _out, err = guarded_git("rev-parse", "main", cwd=scratch)
+        base_ref = run.get("base_commit") or "HEAD"
+        rc, _out, err = guarded_git("rev-parse", str(base_ref), cwd=scratch)
         if rc != 0:
-            outcome["failure_reason"] = f"no main branch in scratch repo: {err}"
+            outcome["failure_reason"] = f"cannot resolve base commit in scratch repo: {err}"
             return outcome
         base_commit = _out
 
@@ -4567,6 +4571,19 @@ def _loop_result(
         "turn": max(0, int(turn)),
         "usage": dict(cumulative_usage),
         "transcript": transcript,
+    }
+
+
+def _terminal_action_record(action: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the bounded terminal action metadata sent to the supervisor."""
+    summary = action.get("summary")
+    if not isinstance(summary, str):
+        summary = ""
+    return {
+        "type": "finish",
+        "objective_met": action.get("objective_met") is True,
+        "summary_present": bool(summary),
+        "summary": _cap_utf8(summary, MAX_SUMMARY_CHARS),
     }
 
 
@@ -6331,6 +6348,7 @@ async def _run_agent_loop(
                     **outcome,
                     "status": "succeeded",
                     "summary": action["summary"],
+                    "terminal_action": _terminal_action_record(action),
                     "turn": turn,
                     "usage": cumulative_usage,
                     "provider": terminal_provider,
@@ -6875,6 +6893,9 @@ def _finalize_worktree(
     provider_metadata = _cumulative_provider_metadata(loop_outcome)
     if provider_metadata is not None:
         outcome["provider_metadata"] = provider_metadata
+    terminal_action = loop_outcome.get("terminal_action")
+    if isinstance(terminal_action, dict):
+        outcome["terminal_action"] = dict(terminal_action)
 
     def _write_terminal_epoch() -> ContextCheckpoint | None:
         terminal_epoch = loop_outcome.get("_terminal_epoch")
@@ -7301,6 +7322,9 @@ async def _emit_result_envelope(writer: asyncio.StreamWriter, outcome: dict[str,
     provider_metadata = outcome.get("provider_metadata")
     if isinstance(provider_metadata, dict):
         envelope["provider_metadata"] = provider_metadata
+    terminal_action = outcome.get("terminal_action")
+    if isinstance(terminal_action, Mapping):
+        envelope["terminal_action"] = _terminal_action_record(terminal_action)
     await send(writer, envelope)
 
 
