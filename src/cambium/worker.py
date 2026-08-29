@@ -3228,30 +3228,27 @@ def _tool_progress_callback(
     """
     last_emit = float("-inf")
     pending: dict[str, str] = {}
-    dropped = 0
 
     def _progress(stream_name: str, delta: str) -> None:
-        nonlocal last_emit, dropped
+        nonlocal last_emit
         now = time.monotonic()
         if now - last_emit < TOOL_OUTPUT_DELTA_INTERVAL_S:
-            if stream_name in pending:
-                dropped += 1
             pending[stream_name] = delta
             return
         last_emit = now
+        stale = pending.pop(stream_name, None)
+        if stale is not None:
+            # The held tail is older than this delta: emit it first so the
+            # last emitted delta is always the newest content.
+            _emit_tool_output_delta(writer, config, name, turn, stream_name, stale)
         _emit_tool_output_delta(writer, config, name, turn, stream_name, delta)
 
-    async def flush() -> int:
-        nonlocal dropped
+    async def flush() -> None:
         for stream_name in list(pending):
             delta = pending.pop(stream_name)
             _emit_tool_output_delta(writer, config, name, turn, stream_name, delta)
-        flushed_dropped = dropped
-        dropped = 0
-        return flushed_dropped
 
     _progress.flush = flush  # type: ignore[attr-defined]
-    _progress.dropped = lambda: dropped  # type: ignore[attr-defined]
     return _progress
 
 
