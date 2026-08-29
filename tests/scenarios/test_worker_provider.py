@@ -1007,25 +1007,69 @@ def test_worker_context_reuse_fork_resume_is_byte_exact(tmp_path, monkeypatch) -
         assert authorizations == [f"Bearer {PROVIDER_SECRET}"] * 4
         child_messages = requests[2]["messages"]
         resumed_messages = requests[3]["messages"]
-        assert child_messages[:prefix_length] == checkpoint_prefix
-        assert resumed_messages[:prefix_length] == checkpoint_prefix
-        assert summary_requests[1]["messages"][:prefix_length] == checkpoint_prefix
-        assert len(child_messages) == prefix_length + 1
-        assert len(resumed_messages) == prefix_length + 1
+        prefix_requests = (
+            child_messages,
+            resumed_messages,
+            summary_requests[1]["messages"],
+        )
+        checkpoint_prefix_bytes = json.dumps(
+            checkpoint_prefix, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+        assert all(
+            json.dumps(
+                request_messages[:prefix_length],
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+            == checkpoint_prefix_bytes
+            for request_messages in prefix_requests
+        )
+
+        def loop_state_indices(messages: list[dict[str, Any]]) -> list[int]:
+            return [
+                index
+                for index, message in enumerate(messages)
+                if isinstance(message.get("content"), str)
+                and message["content"].startswith("<cambium-loop-state>")
+            ]
+
+        assert not loop_state_indices(checkpoint_prefix)
+        assert all(not loop_state_indices(request["messages"]) for request in summary_requests)
+
+        for messages, expected_turn, expected_budget in (
+            (child_messages, 1, 0),
+            (resumed_messages, 3, 35),
+        ):
+            assert loop_state_indices(messages) == [prefix_length + 1]
+            state_message = messages[prefix_length + 1]
+            assert set(state_message) == {"role", "content"}
+            assert state_message["role"] == "user"
+            state_content = state_message["content"]
+            assert isinstance(state_content, str)
+            assert state_content.startswith("<cambium-loop-state>")
+            assert state_content.endswith("</cambium-loop-state>")
+            state_fields = state_content.removeprefix(
+                "<cambium-loop-state>"
+            ).removesuffix("</cambium-loop-state>").split()
+            assert dict(field.split("=", 1) for field in state_fields) == {
+                "budget": "100%",
+                "turn": str(expected_turn),
+                "epoch": "1",
+                "code_changed": "false",
+                "verified_after_change": "false",
+                "verification_failed": "false",
+                "no_progress": "0",
+                "budget_new_tokens": str(expected_budget),
+                "previous_prompt_tokens": "0",
+            }
+
         assert set(child_messages[prefix_length]) == {"role", "content"}
         assert child_messages[prefix_length]["role"] == "user"
         assert child_messages[prefix_length]["content"].startswith("Child task: ")
         assert set(resumed_messages[prefix_length]) == {"role", "content"}
         assert resumed_messages[prefix_length]["role"] == "user"
         assert resumed_messages[prefix_length]["content"].startswith("Child task result:\n")
-
-        child_prefix_bytes = json.dumps(
-            {"messages": child_messages[:prefix_length], "model": requests[2]["model"]}
-        ).encode("utf-8")
-        resumed_prefix_bytes = json.dumps(
-            {"messages": resumed_messages[:prefix_length], "model": requests[3]["model"]}
-        ).encode("utf-8")
-        assert child_prefix_bytes == resumed_prefix_bytes
 
         assert set(checkpoint_snapshots) == {"at_checkpoint", "after_child", "after_resume"}
         checkpoint_bytes = checkpoint_path.read_bytes()
