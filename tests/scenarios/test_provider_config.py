@@ -145,6 +145,24 @@ def test_enabled_defaults_to_true_when_omitted(tmp_path: Path) -> None:
     assert providers[0].enabled is True
 
 
+@pytest.mark.parametrize(
+    ("declared", "expected"),
+    [(None, False), (False, False), (True, True)],
+)
+def test_native_tool_capability_is_opt_in(
+    tmp_path: Path, declared: bool | None, expected: bool
+) -> None:
+    entry = _provider()
+    if declared is None:
+        entry.pop("supports_native_tools", None)
+    else:
+        entry["supports_native_tools"] = declared
+
+    providers = load_providers(_write(tmp_path / "providers.json", [entry]))
+
+    assert providers[0].supports_native_tools is expected
+
+
 def test_explicit_source_overrides_environment_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

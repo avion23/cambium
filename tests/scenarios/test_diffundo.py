@@ -117,6 +117,70 @@ def test_prompt_prefix_token_estimate_uses_utf8_bytes() -> None:
     assert prompt_prefix_estimate_tokens(PROMPT) is None
 
 
+def test_routing_request_does_not_infer_native_tools_from_prompt() -> None:
+    router = Diffundo(())
+    request = router._routing_request(
+        {**PROMPT, "tools": [{"name": "read_file"}]},
+        None,
+        allow_model_substitution=False,
+        requirements=None,
+    )
+
+    assert request.needs_native_tools is False
+
+
+@pytest.mark.parametrize("supports_native_tools", [False, True])
+def test_selected_provider_controls_native_wire_tools(
+    supports_native_tools: bool,
+) -> None:
+    server = FakeServer([(200, _ok_payload("done"), 0.0)])
+    prompt = {
+        "messages": [
+            {"role": "system", "content": "Return one JSON action."},
+            {"role": "user", "content": "read README"},
+        ],
+        "tools": [
+            {
+                "name": "read_file",
+                "description": "Read one file",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ],
+        "tool_choice": "auto",
+    }
+    router = Diffundo(
+        (
+            _config(
+                "p_tools",
+                server,
+                "K_TOOLS",
+                supports_native_tools=supports_native_tools,
+            ),
+        )
+    )
+    try:
+        asyncio.run(router.call(ProviderTier.FAST, prompt))
+        body = server.calls[0]
+        assert body["messages"] == prompt["messages"]
+        if supports_native_tools:
+            assert body["tools"] == [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "description": "Read one file",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ]
+            assert body["tool_choice"] == "auto"
+        else:
+            assert "tools" not in body
+            assert "tool_choice" not in body
+    finally:
+        server.close()
+
+
 # --------------------------------------------------------------------------- #
 # 1. cascade fallback
 # --------------------------------------------------------------------------- #
