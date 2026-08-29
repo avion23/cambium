@@ -762,6 +762,7 @@ class Transcript:
         self._stream_text = ""
         self._stream_message_id: str | None = None
         self._stream_truncated = False
+        self._stream_tool_key: str | None = None
         self._turn_serial = 0
         self._turn_by_task: dict[str, int] = {}
         self._failure_context: dict[tuple[str, int | None, int], list[str]] = {}
@@ -999,8 +1000,17 @@ class Transcript:
 
     @staticmethod
     def _event_tool(data: Mapping[str, Any]) -> str | None:
-        value = data.get("tool") or data.get("tool_name")
-        return _single_line(value) if isinstance(value, str) and value.strip() else None
+        # ``tool=None`` is a deliberate wire signal (a heartbeat that reports
+        # the next provider phase, not a completed tool) and must clear the
+        # previous tool instead of being ignored like an absent key.
+        if "tool" not in data and "tool_name" not in data:
+            return None
+        value = data.get("tool")
+        if value is None:
+            value = data.get("tool_name")
+        if value is None:
+            return ""
+        return _single_line(value) if isinstance(value, str) and value.strip() else ""
 
     def _observe_live_event(
         self,
@@ -1018,13 +1028,9 @@ class Transcript:
         if self._live_final and kind != "result":
             return
         incoming_tool = self._event_tool(data)
-        if (
-            turn is not None
-            and self._live_turn is not None
-            and turn != self._live_turn
+        if (turn is not None and self._live_turn is not None and turn != self._live_turn) or (
+            kind == "tool_output_delta" and self._live_kind == "tool_event"
         ):
-            self._start_live_operation(task_id, event_clock, force=True)
-        elif kind == "tool_output_delta" and self._live_kind == "tool_event":
             self._start_live_operation(task_id, event_clock, force=True)
         elif (
             kind in _FAILURE_EVENT_KINDS | {"error", "fatal_error", "timeout"}
@@ -1075,7 +1081,9 @@ class Transcript:
             if isinstance(heartbeat_status, str) and heartbeat_status:
                 self._live_status = _single_line(heartbeat_status)
 
-        if incoming_tool is not None:
+        if incoming_tool is None:
+            self._live_tool = None
+        elif incoming_tool:
             self._live_tool = incoming_tool
         command = data.get("cmd") or data.get("command")
         if isinstance(command, str) and command.strip():
@@ -1155,6 +1163,7 @@ class Transcript:
         self._stream_text = ""
         self._stream_message_id = None
         self._stream_truncated = False
+        self._stream_tool_key = None
 
     def _commit_stream(self) -> None:
         if self._stream_role is not None and self._stream_text:
@@ -1175,6 +1184,7 @@ class Transcript:
         *,
         append: bool,
         message_id: str | None,
+        tool_key: str | None = None,
     ) -> None:
         if self._stream_role != role or (
             message_id is not None
@@ -1182,8 +1192,14 @@ class Transcript:
             and message_id != self._stream_message_id
         ):
             self._commit_stream()
+        elif tool_key is not None and tool_key != self._stream_tool_key:
+            # Tool output streams are per-tool: a second tool's first delta
+            # commits the previous tool's tail so history can never hold a
+            # cross-tool mixture ("OLD-ANEW-B").
+            self._commit_stream()
         self._stream_role = role
         self._stream_message_id = message_id
+        self._stream_tool_key = tool_key
 
         current = self._stream_text
         if not current:
@@ -1395,11 +1411,21 @@ class Transcript:
         update = _stream_update(record)
         if update is not None:
             role, text, append, message_id = update
+            tool_key: str | None = None
+            if role == "tool":
+                # One stream identity per tool operation: deltas from tool A
+                # never append to tool B's row, and a completion event closes
+                # the running tool's stream before the next tool opens one.
+                if kind == "tool_event":
+                    tool_key = f"end:{data.get('tool')}"
+                else:
+                    tool_key = f"run:{self._event_tool(data) or ''}"
             self._update_stream(
                 role,
                 text,
                 append=append,
                 message_id=message_id,
+                tool_key=tool_key,
             )
         self._observe_live_event(record, kind, data)
 
@@ -2571,17 +2597,14 @@ def _live_window_lines(
     if not transcript._live_kind:
         if activity is None:
             return [_status_row([], width), _status_row([], width)]
-        spinner, phase, elapsed = activity
-        if phase == "waiting":
-            spinner, phase = _ACTIVITY_PHASE_GLYPHS["thinking"], "thinking"
+        spinner, _phase, elapsed = activity
         running = _running_tool(activity_line)
-        operation = running[0] if running is not None else "provider call"
+        operation = f" · {running[0]}" if running is not None else ""
+        # No runtime event has arrived yet: claim only the local clock. The
+        # provider, turn, and call counts are unknown until a real event lands.
         return [
-            _status_row(
-                [f"{spinner} starting · thinking {elapsed} · operation event pending"],
-                width,
-            ),
-            _status_row([f"{operation} not established"], width),
+            _status_row([f"{spinner} starting {elapsed}{operation}"], width),
+            _status_row(["no runtime events yet"], width),
         ]
 
     operation = transcript._live_tool or "provider call"

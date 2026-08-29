@@ -1900,3 +1900,151 @@ def test_clean_noop_envelope_reports_requires_commit_false(tmp_path: Path) -> No
     assert envelope["status"] == "succeeded"
     assert envelope["commits"] == []
     assert envelope["requires_commit"] is False
+
+
+# ---------------------------------------------------------------------------
+# Tool progress delivery: a backpressured consumer never blocks or fails
+# the tool, and the newest tail is always the last emitted delta
+# ---------------------------------------------------------------------------
+
+
+class _BackpressuredWriter(_FakeWriter):
+    """A writer whose transport never accepts bytes: drain() blocks forever."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._blocked = asyncio.Event()
+
+    async def drain(self) -> None:
+        await self._blocked.wait()
+
+
+def test_tool_progress_callback_delivers_pending_tail_before_completion() -> None:
+    writer = _BackpressuredWriter()
+    config = SimpleNamespace(task_id="t", generation=1)
+    sink = worker._tool_progress_callback(
+        cast(asyncio.StreamWriter, writer),
+        config,  # type: ignore[arg-type]
+        "run_shell",
+        1,
+    )
+
+    sink("stdout", "first")
+    sink("stdout", "FINAL ERROR")  # inside the 100ms throttle window
+
+    deltas = [m for m in writer.messages() if m["type"] == "tool_output_delta"]
+    assert [m["delta"] for m in deltas] == ["first"]
+
+    asyncio.run(sink.flush())  # the loop's flush before the completion event
+
+    deltas = [m for m in writer.messages() if m["type"] == "tool_output_delta"]
+    assert [m["delta"] for m in deltas] == ["first", "FINAL ERROR"]
+
+
+def test_run_shell_delivery_survives_backpressure_and_reports_final_tail(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    worktree = _make_worktree(repo)
+    config = _agent_config(worktree)
+    command = [
+        sys.executable,
+        "-u",
+        "-c",
+        "import sys,time; print('first', flush=True); time.sleep(0.02); "
+        "print('FINAL ERROR', flush=True)",
+    ]
+    router = _ScriptedRouter(
+        [
+            json.dumps(
+                {"type": "tool_call", "name": "run_shell", "arguments": {"cmd": command}}
+            ),
+            '{"type":"finish","summary":"done","objective_met":true}',
+        ]
+    )
+    writer = _BackpressuredWriter()
+
+    async def _run() -> dict[str, Any]:
+        # A drain() that never completes must not stall the loop: the tool's
+        # inline delivery path never awaits the writer.
+        return await asyncio.wait_for(
+            worker._run_agent_loop(
+                config=config,
+                router=router,  # type: ignore[arg-type]
+                tier=ProviderTier.FAST,
+                model="loopback-model",
+                worktree=worktree,
+                writer=writer,  # type: ignore[arg-type]
+                stop=threading.Event(),
+                progress=worker.AgentProgress(),
+            ),
+            timeout=30.0,
+        )
+
+    outcome = asyncio.run(_run())
+
+    assert outcome["status"] == "succeeded"
+    deltas = [m for m in writer.messages() if m["type"] == "tool_output_delta"]
+    assert deltas
+    assert "first" in deltas[0]["delta"]
+    # "first" + "FINAL ERROR" arrived well inside the throttle window: the
+    # final emission still contains FINAL ERROR as the last delta.
+    assert "FINAL ERROR" in deltas[-1]["delta"]
+    tool_events = [m for m in writer.messages() if m["type"] == "tool_event"]
+    assert tool_events
+    assert tool_events[0]["tool"] == "run_shell"
+    assert tool_events[0]["ok"] is True
+
+
+def test_run_shell_still_times_out_with_backpressured_writer(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = _make_worktree(repo)
+    config = _agent_config(worktree)
+    command = [sys.executable, "-c", "import time; time.sleep(5)"]
+    router = _ScriptedRouter(
+        [
+            json.dumps(
+                {
+                    "type": "tool_call",
+                    "name": "run_shell",
+                    "arguments": {"cmd": command, "timeout_s": 1},
+                }
+            ),
+            '{"type":"finish","summary":"done","objective_met":true}',
+        ]
+    )
+    writer = _BackpressuredWriter()
+
+    async def _run() -> dict[str, Any]:
+        return await asyncio.wait_for(
+            worker._run_agent_loop(
+                config=config,
+                router=router,  # type: ignore[arg-type]
+                tier=ProviderTier.FAST,
+                model="loopback-model",
+                worktree=worktree,
+                writer=writer,  # type: ignore[arg-type]
+                stop=threading.Event(),
+                progress=worker.AgentProgress(),
+            ),
+            timeout=30.0,
+        )
+
+    started = time.monotonic()
+    outcome = asyncio.run(_run())
+    elapsed = time.monotonic() - started
+
+    # The 1s tool timeout fired on schedule despite the blocked transport,
+    # and the loop continued to the scripted finish.
+    assert outcome["status"] == "succeeded"
+    assert elapsed < 4.5
+    tool_events = [m for m in writer.messages() if m["type"] == "tool_event"]
+    assert tool_events
+    assert tool_events[0]["tool"] == "run_shell"
+    assert tool_events[0]["ok"] is False
+    observations = [
+        message["content"]
+        for message in outcome["transcript"]
+        if "timed out after 1s" in str(message.get("content", ""))
+    ]
+    assert observations

@@ -305,7 +305,7 @@ def test_activity_rail_ticks_redraw_in_place_at_duration_width_change(monkeypatc
 
     assert "┌ Cambium · conversation" not in delta
     assert "duration 10s" in delta
-    assert "thinking 10s" in delta
+    assert "starting 10s" in delta
 
 
 def test_replaying_events_after_snapshot_is_idempotent() -> None:
@@ -1200,22 +1200,21 @@ def test_cockpit_forces_completed_frame_while_input_read_is_pending() -> None:
         flushes_before_completion = stream.flush_count
 
         transcript.finish_stream("completed response")
+        # While the input line is still active the completion is coalesced,
+        # never painted.
         cockpit.draw(
             final_snapshot,
             transcript,
             session_description="session",
             branch_line="branch",
             cumulative_line="usage: calls=1 tokens=20000",
-            force=True,
         )
-        cockpit.draw(
-            final_snapshot,
-            transcript,
-            session_description="session",
-            branch_line="branch",
-            cumulative_line="usage: calls=1 tokens=20000",
-            activity_line="✓ DONE",
-        )
+        mid = stream.getvalue()
+        assert "completed response" not in mid
+
+        # Release the input FIRST, then flush: the pending completion frame
+        # must be delivered in place without repainting a second frame.
+        cockpit.hide_cursor()
         cockpit.flush()
 
         after = stream.getvalue()
@@ -1400,17 +1399,23 @@ def test_current_tool_counters_reset_at_the_next_turn() -> None:
     assert transcript.current_tool_error_count == 0
 
 
-def test_provider_call_heartbeat_is_not_rendered_as_waiting() -> None:
+def test_local_waiting_activity_renders_honest_starting_state() -> None:
     rows = _live_window_lines(
         Transcript(),
         80,
         activity_line="⠇ WAITING · thinking… 12s",
     )
 
+    # No runtime event has arrived: the window may only claim the local
+    # clock. It must not fabricate a provider call, turn, or call counter.
+    joined = " ".join(rows)
     assert all("waiting" not in row.casefold() for row in rows)
     assert "starting" in rows[0]
-    assert "operation event pending" in rows[0]
-    assert "provider call not established" in rows[1]
+    assert "12s" in rows[0]
+    assert "provider call" not in joined
+    assert "turn=" not in joined
+    assert "call=" not in joined
+    assert "no runtime events yet" in rows[1]
 
 
 def test_small_terminal_live_events_rewrite_two_rows_without_newlines(monkeypatch) -> None:
@@ -1438,46 +1443,37 @@ def test_small_terminal_live_events_rewrite_two_rows_without_newlines(monkeypatc
         )
         first = stream.getvalue()
         cockpit.move_to_input()
-        transcript.observe_event(
-            {
-                "kind": "tool_output_delta",
-                "task_id": "interactive-main",
-                "payload": {
-                    "tool": "run_shell",
-                    "stream": "stdout",
-                    "delta": "first chunk",
-                },
-            }
-        )
-        cockpit.draw(
-            _snapshot(),
-            transcript,
-            session_description="session",
-            branch_line="branch",
-            cumulative_line="usage: calls=0",
-            activity_line="▸ streaming",
-            turn_active=True,
-        )
-        live_delta = stream.getvalue()[len(first) :]
-        transcript.finish_stream("final status")
-        cockpit.draw(
-            _snapshot(),
-            transcript,
-            session_description="session",
-            branch_line="branch",
-            cumulative_line="usage: calls=1",
-            activity_line="✓ DONE",
-            turn_active=True,
-            force=True,
-        )
-        final_delta = stream.getvalue()[len(first) + len(live_delta) :]
-
-    assert "first chunk" in live_delta
-    assert "final status" in final_delta
-    assert "┌ Cambium" not in live_delta + final_delta
-    assert "\n" not in live_delta + final_delta
-    assert "\x1b[2A" in live_delta + final_delta
-    assert "\x1b[1A" in live_delta + final_delta
+        # At least three repeated live updates: each rewrites the same rows
+        # in place with stable cursor coordinates and never a newline.
+        for index in range(1, 5):
+            tail = f"chunk-{index}"
+            transcript.observe_event(
+                {
+                    "kind": "tool_output_delta",
+                    "task_id": "interactive-main",
+                    "payload": {
+                        "tool": "run_shell",
+                        "stream": "stdout",
+                        "delta": tail,
+                    },
+                }
+            )
+            cockpit.draw(
+                _snapshot(),
+                transcript,
+                session_description="session",
+                branch_line="branch",
+                cumulative_line="usage: calls=0",
+                activity_line="▸ streaming",
+                turn_active=True,
+            )
+            delta = stream.getvalue()[len(first) :]
+            first = stream.getvalue()
+            assert tail in delta
+            assert "┌ Cambium" not in delta
+            assert "\n" not in delta
+            assert "\x1b[s\x1b[2A" in delta
+            assert "\x1b[1A" in delta
 
 
 def test_live_tool_tail_and_duration_clear_at_provider_boundary() -> None:
@@ -1522,6 +1518,66 @@ def test_live_provider_tail_clears_when_heartbeat_phase_changes() -> None:
     rows = _live_window_lines(transcript, 100)
     assert "old provider tail" not in " ".join(rows)
     assert "provider call" in " ".join(rows)
+
+
+def test_heartbeat_tool_none_clears_the_tool_in_every_view() -> None:
+    # The worker clears progress.tool before the completion event, so a
+    # heartbeat carrying tool=None must clear the rail tool AND the live
+    # transcript view instead of keeping the previous tool stuck.
+    events = [
+        {
+            "seq": 1,
+            "kind": "heartbeat",
+            "task_id": "root",
+            "payload": {"tool": "run_shell", "phase": "streaming", "tail": "cmd out"},
+        },
+        {
+            "seq": 2,
+            "kind": "heartbeat",
+            "task_id": "root",
+            "payload": {"tool": None, "phase": "waiting", "status": "working"},
+        },
+    ]
+    snapshot = snapshot_from_events(events)
+    assert snapshot.agents[0].tool is None
+
+    transcript = Transcript()
+    transcript.observe_event(events[0])
+    assert "run_shell" in " ".join(_live_window_lines(transcript, 100))
+    transcript.observe_event(events[1])
+    rows = _live_window_lines(transcript, 100)
+    assert all("run_shell" not in row for row in rows)
+
+    # The rail detail rows read the same snapshot tool field.
+    detail = [value for _, value in _rail_rows(snapshot, 32, 32)]
+    assert all("run_shell" not in value for value in detail)
+
+
+def test_tool_output_stream_rotates_per_tool_without_committing_a_mixture() -> None:
+    transcript = Transcript()
+    transcript.observe_event(
+        {
+            "kind": "tool_output_delta",
+            "payload": {"tool": "run_shell", "stream": "stdout", "delta": "OLD-A"},
+        }
+    )
+    transcript.observe_event(
+        {
+            "kind": "tool_output_delta",
+            "payload": {"tool": "git_op", "stream": "stdout", "delta": "NEW-B"},
+        }
+    )
+
+    # The active stream belongs to the newest tool only.
+    assert transcript.streaming_role == "tool"
+    assert transcript.streaming_text == "NEW-B"
+
+    transcript.finish_stream("done")
+    texts = [entry.text for entry in transcript.entries]
+    assert any("OLD-A" in text for text in texts)
+    assert any("NEW-B" in text for text in texts)
+    assert all(not ("OLD-A" in text and "NEW-B" in text) for text in texts)
+    assert any(text == "done" for text in texts)
 
 
 def test_short_terminal_falls_back_to_stream_rows() -> None:

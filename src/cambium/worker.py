@@ -184,6 +184,7 @@ HEARTBEAT_INTERVAL_S = 1.0
 PHASE_HEARTBEAT_INTERVAL_S = 1.0
 PHASE_TAIL_MAX_CHARS = 120
 TOOL_OUTPUT_DELTA_INTERVAL_S = 0.1
+_HEARTBEAT_DRAIN_TIMEOUT_S = 0.25
 INIT_TIMEOUT_S = 30.0
 IDLE_TIMEOUT_S = 300.0
 MAX_SUMMARY_CHARS = 2_000
@@ -826,8 +827,11 @@ def _env_float(name: str, default: float) -> float:
 
 
 async def send(writer: asyncio.StreamWriter, msg: dict[str, Any]) -> None:
+    # Write synchronously; never await drain inline. drain() backpressure
+    # must not slow (or fail) the tool path or the heartbeat cadence — the
+    # transport flushes buffered bytes as the pipe becomes writable, and the
+    # heartbeat loop performs the only capped, guarded drain.
     write_message(writer, msg)
-    await writer.drain()
 
 
 def git(*args: str, cwd: str | Path | None = None) -> tuple[int, str, str]:
@@ -3199,7 +3203,7 @@ async def _emit_tool_output_delta(
     delta: str,
 ) -> None:
     """Forward one already-bounded process-output tail to the supervisor."""
-    await send(
+    write_message(
         writer,
         {
             "type": "tool_output_delta",
@@ -3220,17 +3224,41 @@ def _tool_progress_callback(
     name: str,
     turn: int,
 ) -> Callable[[str, str], Any]:
-    """Throttle process tails to at most ten wire updates per second."""
-    last_emit = float("-inf")
+    """Throttle process tails to at most ten wire updates per second.
 
-    async def _progress(stream_name: str, delta: str) -> None:
-        nonlocal last_emit
+    Delivery must never block or fail the tool: the callback is synchronous
+    and only writes to the transport buffer (no ``drain``). Tails arriving
+    inside the throttle window go into a bounded pending slot per stream
+    (drop-oldest); the agent loop flushes that pending tail before the
+    tool's completion event, so the newest content is always the last
+    emitted delta and history never shows a cross-tool mixture.
+    """
+    last_emit = float("-inf")
+    pending: dict[str, str] = {}
+    dropped = 0
+
+    def _progress(stream_name: str, delta: str) -> None:
+        nonlocal last_emit, dropped
         now = time.monotonic()
         if now - last_emit < TOOL_OUTPUT_DELTA_INTERVAL_S:
+            if stream_name in pending:
+                dropped += 1
+            pending[stream_name] = delta
             return
         last_emit = now
-        await _emit_tool_output_delta(writer, config, name, turn, stream_name, delta)
+        _emit_tool_output_delta(writer, config, name, turn, stream_name, delta)
 
+    async def flush() -> int:
+        nonlocal dropped
+        for stream_name in list(pending):
+            delta = pending.pop(stream_name)
+            _emit_tool_output_delta(writer, config, name, turn, stream_name, delta)
+        flushed_dropped = dropped
+        dropped = 0
+        return flushed_dropped
+
+    _progress.flush = flush  # type: ignore[attr-defined]
+    _progress.dropped = lambda: dropped  # type: ignore[attr-defined]
     return _progress
 
 
@@ -6528,6 +6556,11 @@ async def _run_agent_loop(
                     outcome, "cancelled", None, turn - 1, cumulative_usage, transcript
                 )
             progress.tool = name
+            progress_sink = (
+                _tool_progress_callback(writer, config, name, turn)
+                if writer is not None and name in {"run_shell", "git_op"}
+                else None
+            )
             with ToolContext(
                 worktree,
                 lint=lint_diag,
@@ -6535,11 +6568,7 @@ async def _run_agent_loop(
                     shell=config.shell_permission,
                     network=config.network_permission,
                 ),
-                progress=(
-                    _tool_progress_callback(writer, config, name, turn)
-                    if writer is not None and name in {"run_shell", "git_op"}
-                    else None
-                ),
+                progress=progress_sink,
             ) as ctx:
                 try:
                     tool_result = await run_tool(name, arguments, ctx)
@@ -6548,6 +6577,11 @@ async def _run_agent_loop(
                     # the completed tool. Do not carry its name into that
                     # operation's live window.
                     progress.tool = None
+                    if progress_sink is not None:
+                        # Deliver any pending (throttled) tail before the
+                        # tool's completion event so the newest process
+                        # output is the last emitted delta.
+                        await progress_sink.flush()
             if name == "delegate" and tool_result.ok and writer is not None:
                 await _emit_delegated_child(writer, config, arguments, request_id=run_request_id)
             if tool_result.ok:
@@ -7225,6 +7259,7 @@ async def _heartbeat_loop(
     published_tail: str | None = None
     published_revision = 0
     last_phase_emit = float("-inf")
+    drain_ok = True
     while not stop.is_set():
         now = time.monotonic()
         heartbeat_due = now >= next_heartbeat
@@ -7262,10 +7297,16 @@ async def _heartbeat_loop(
             heartbeat["phase"] = published_phase
             if published_tail:
                 heartbeat["tail"] = published_tail
-        await send(
-            writer,
-            heartbeat,
-        )
+        write_message(writer, heartbeat)
+        try:
+            if drain_ok:
+                # The only guarded drain: a backpressured transport pauses
+                # the heartbeat at most once for this bound, then the loop
+                # keeps writing without waiting. Never inside a tool's
+                # timeout path.
+                await asyncio.wait_for(writer.drain(), _HEARTBEAT_DRAIN_TIMEOUT_S)
+        except (TimeoutError, OSError, ConnectionError):
+            drain_ok = False
         if heartbeat_due:
             next_heartbeat = time.monotonic() + interval_s
         if stop.is_set():
