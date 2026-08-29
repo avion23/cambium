@@ -3128,23 +3128,26 @@ def _context_state_message(
     budget_new_tokens: int,
     previous_prompt_tokens: int,
     turn: int,
+    context_epoch: int = 0,
+    max_tokens: int = 1,
 ) -> dict[str, str]:
-    """Render bounded loop state as delimited user-role continuation data."""
-    state = {
-        "code_changed": code_changed,
-        "verified_after_change": verified_after_change,
-        "verification_failed": verification_failed,
-        "no_progress_actions": no_progress_actions,
-        "budget_new_tokens": budget_new_tokens,
-        "previous_prompt_tokens": previous_prompt_tokens,
-        "turn": turn,
-    }
+    """Render one deterministic loop-status line as user-role tail data."""
+    budget_remaining_pct = (
+        max(0, 100 - min(100, budget_new_tokens * 100 // max_tokens))
+        if max_tokens > 0
+        else 0
+    )
     return {
         "role": "user",
         "content": (
-            "<cambium-loop-state>\n"
-            + json.dumps(state, sort_keys=True, separators=(",", ":"))
-            + "\n</cambium-loop-state>"
+            "<cambium-loop-state>"
+            f"budget={budget_remaining_pct}% turn={turn} epoch={context_epoch} "
+            f"code_changed={str(code_changed).lower()} "
+            f"verified_after_change={str(verified_after_change).lower()} "
+            f"verification_failed={str(verification_failed).lower()} "
+            f"no_progress={no_progress_actions} budget_new_tokens={budget_new_tokens} "
+            f"previous_prompt_tokens={previous_prompt_tokens}"
+            "</cambium-loop-state>"
         ),
     }
 
@@ -5774,6 +5777,17 @@ async def _run_agent_loop(
                 forced_finalization=forced_finalization,
                 finalization_grace_used=finalization_grace_used,
             )
+            state_message = _context_state_message(
+                code_changed=code_changed,
+                verified_after_change=verified_after_change,
+                verification_failed=verification_failed,
+                no_progress_actions=no_progress_actions,
+                budget_new_tokens=budget_new_tokens,
+                previous_prompt_tokens=previous_prompt_tokens,
+                turn=turn,
+                context_epoch=epoch_count,
+                max_tokens=config.max_tokens,
+            )
             if base_messages is None:
                 prompt = _build_agent_prompt(
                     config.task,
@@ -5784,6 +5798,7 @@ async def _run_agent_loop(
                 )
             else:
                 prompt = _fork_prompt(base_messages, context_continuation, tools)
+            prompt["messages"].append(state_message)
             final_synthesis_call = finalized
             # Keep the object handed to the router immutable for checkpointing.
             # A provider adapter is allowed to normalize its local request, but
@@ -6452,16 +6467,6 @@ async def _run_agent_loop(
                 if trailing:
                     continuation_suffix.append({"role": "user", "content": _TRAILING_ACTION_NOTE})
                 continuation_suffix.append(observation)
-                state_message = _context_state_message(
-                    code_changed=code_changed,
-                    verified_after_change=verified_after_change,
-                    verification_failed=verification_failed,
-                    no_progress_actions=no_progress_actions,
-                    budget_new_tokens=budget_new_tokens,
-                    previous_prompt_tokens=previous_prompt_tokens,
-                    turn=turn,
-                )
-                continuation_suffix.append(state_message)
                 context_continuation.extend(copy.deepcopy(continuation_suffix))
                 transcript = _sync_context_transcript(
                     base_messages, context_continuation, transcript
@@ -6615,6 +6620,8 @@ async def _run_agent_loop(
                                 budget_new_tokens=budget_new_tokens,
                                 previous_prompt_tokens=previous_prompt_tokens,
                                 turn=turn,
+                                context_epoch=epoch_count,
+                                max_tokens=config.max_tokens,
                             ),
                         ]
                     checkpoint = await asyncio.to_thread(

@@ -614,6 +614,50 @@ def test_build_agent_prompt_head_is_byte_stable_across_transcript_growth() -> No
     assert prompt_prefix_bytes(grown) == prompt_prefix_bytes(fresh)
 
 
+def test_agent_status_bar_is_last_context_tail_message(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = _make_worktree(repo)
+    config = _agent_config(
+        worktree,
+        context_reuse=True,
+        checkpoint_root=tmp_path / "checkpoints",
+        max_tokens=100,
+    )
+    router = _SummaryFlushRouter(
+        responses=[
+            '{"type":"plan","steps":["continue"]}',
+            '{"type":"finish","summary":"done","objective_met":true}',
+        ]
+    )
+
+    outcome = asyncio.run(_drive_loop(config, worktree, router))  # type: ignore[arg-type]
+
+    assert outcome["status"] == "succeeded"
+    action_prompts = [
+        prompt
+        for prompt in router.prompts
+        if not str(prompt["messages"][-1].get("content", "")).startswith(
+            "<cambium-summary-control>"
+        )
+    ]
+    assert len(action_prompts) == 2
+    first_messages = action_prompts[0]["messages"]
+    second_messages = action_prompts[1]["messages"]
+    assert first_messages[:2] == second_messages[:2]
+    assert first_messages[-1]["role"] == "user"
+    assert first_messages[-1]["content"] == (
+        "<cambium-loop-state>budget=100% turn=1 epoch=0 code_changed=false "
+        "verified_after_change=false verification_failed=false no_progress=0 "
+        "budget_new_tokens=0 previous_prompt_tokens=0"
+        "</cambium-loop-state>"
+    )
+    assert "budget=90%" in second_messages[-1]["content"]
+    assert "turn=2" in second_messages[-1]["content"]
+    assert "epoch=0" in second_messages[-1]["content"]
+    assert "code_changed=false" in second_messages[-1]["content"]
+    assert "verified_after_change=false" in second_messages[-1]["content"]
+
+
 def test_usage_budget_charge_uses_uncached_baseline_and_safe_fallback() -> None:
     cached = {
         "prompt_tokens": 100,
@@ -1172,6 +1216,10 @@ def test_agent_loop_bounds_transcript_before_every_provider_call(tmp_path: Path)
         if transcript and transcript[0].get("content", "").startswith("<cambium-task>"):
             transcript = transcript[1:]
         if transcript and transcript[-1].get("content") in {"Begin.", "Continue."}:
+            transcript = transcript[:-1]
+        if transcript and str(transcript[-1].get("content", "")).startswith(
+            "<cambium-loop-state>"
+        ):
             transcript = transcript[:-1]
         assert worker._transcript_chars(transcript) <= budget
 
