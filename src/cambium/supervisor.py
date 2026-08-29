@@ -224,6 +224,94 @@ def _invalid_propose_child_fields(msg: dict[str, Any]) -> list[str]:
     return invalid
 
 
+def _validate_child_budget_fields(spec: Mapping[str, Any]) -> None:
+    """Validate optional model-requested child budget fields at admission."""
+    max_turns = spec.get("max_turns")
+    if "max_turns" in spec and (type(max_turns) is not int or max_turns < 1):
+        raise ValueError("child max_turns must be an integer >= 1")
+    max_wall_s = spec.get("max_wall_s")
+    if "max_wall_s" in spec and (type(max_wall_s) is not int or max_wall_s < 30):
+        raise ValueError("child max_wall_s must be an integer >= 30")
+
+
+def _parent_budget_limits(
+    parent_spec: Mapping[str, Any], proposal: Mapping[str, Any]
+) -> dict[str, int]:
+    """Return the parent's remaining turn and wall budgets for one proposal."""
+    configured_turns = parent_spec.get("max_turns", DEFAULT_MAX_TURNS)
+    if type(configured_turns) is not int or configured_turns < 1:
+        configured_turns = DEFAULT_MAX_TURNS
+    configured_wall = _cfg_float(
+        dict(parent_spec), "max_wall_s", "CAMBIUM_WALL_BUDGET_S", DEFAULT_WALL_BUDGET_S
+    )
+    limits = {
+        "max_turns": configured_turns,
+        "max_wall_s": max(0, math.floor(configured_wall)),
+    }
+    snapshot = proposal.get("_parent_budget")
+    if isinstance(snapshot, dict):
+        for field in limits:
+            value = snapshot.get(field)
+            if type(value) is int and value >= 0:
+                limits[field] = value
+    return limits
+
+
+def _prepare_child_budget(
+    parent_spec: Mapping[str, Any], proposal: dict[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Clamp requested child budgets and return the admission decision."""
+    raw_spec = proposal.get("spec")
+    if not isinstance(raw_spec, dict):
+        return proposal, None
+    _validate_child_budget_fields(raw_spec)
+    requested = {
+        field: raw_spec[field] for field in ("max_turns", "max_wall_s") if field in raw_spec
+    }
+    prepared = {**proposal, "_parent_budget": None}
+    if not requested:
+        prepared.pop("_parent_budget", None)
+        return prepared, None
+
+    limits = _parent_budget_limits(parent_spec, proposal)
+    admitted: dict[str, int] = {}
+    clamped: list[str] = []
+    for field, value in requested.items():
+        limit = limits[field]
+        if limit < 1:
+            raise ValueError(f"child {field} has no remaining parent budget")
+        effective = min(value, limit)
+        if effective != value:
+            clamped.append(field)
+        admitted[field] = effective
+    prepared["spec"] = {**raw_spec, **admitted}
+    prepared.pop("_parent_budget", None)
+    return prepared, {
+        "requested": requested,
+        "admitted": admitted,
+        "parent_remaining": {field: limits[field] for field in requested},
+        "clamped": clamped,
+    }
+
+
+def _proposal_parent_budget(state: Any) -> dict[str, int]:
+    """Snapshot a generation's remaining budget before buffering its proposal."""
+    configured_turns = state.spec.get("max_turns", DEFAULT_MAX_TURNS)
+    if type(configured_turns) is not int or configured_turns < 1:
+        configured_turns = DEFAULT_MAX_TURNS
+    current_turn = state.turn
+    if type(current_turn) is not int or current_turn < 0:
+        current_turn = 0
+    if current_turn == 0 and isinstance(state.envelope, dict):
+        result_turn = state.envelope.get("turn")
+        if type(result_turn) is int and result_turn >= 0:
+            current_turn = result_turn
+    return {
+        "max_turns": max(0, configured_turns - current_turn),
+        "max_wall_s": max(0, math.floor(state.wall_deadline - state.loop.time())),
+    }
+
+
 _CONTEXT_CHECKPOINT_FIELDS = frozenset(
     {
         "type",
@@ -2160,6 +2248,7 @@ class _GenerationState:
     stderr_tail: str | None = None
     phase: Any = "ready"
     last_heartbeat: float | None = None
+    turn: int = 0
     run_rid: str | None = None
     envelope: dict[str, Any] | None = None
     exit_reason: str | None = None
@@ -3306,6 +3395,30 @@ class _Runtime:
         parent_task_id = parent_spec["task_id"]
         child_task_id = proposal["child_task_id"]
         kind = proposal["kind"]
+        original_proposal = proposal
+        try:
+            proposal, budget_decision = _prepare_child_budget(parent_spec, proposal)
+        except ValueError as exc:
+            await self.emit(
+                "child_rejected",
+                task_id=parent_task_id,
+                request_id=request_id,
+                parent_task_id=parent_task_id,
+                child_task_id=child_task_id,
+                child_kind=kind,
+                reason=exc.__class__.__name__,
+                message=str(exc)[:512],
+            )
+            await self._record_revision_conversation(
+                outcome="rejected",
+                parent_task_id=parent_task_id,
+                child_task_id=child_task_id,
+                child_kind=kind,
+                request_id=request_id,
+                reason=exc.__class__.__name__,
+                proposal=original_proposal,
+            )
+            return []
         candidate = {
             "task_id": child_task_id,
             "kind": kind,
@@ -3431,19 +3544,21 @@ class _Runtime:
                 child_task_id=child_task_id,
                 child_kind=kind,
                 request_id=request_id,
-                proposal=proposal,
+                proposal=original_proposal,
             )
             # This is the durable-before-spawn barrier.  A child is not an
             # admitted runtime object until this critical event succeeds.
-            await self.emit(
-                "child_admitted",
-                task_id=parent_task_id,
-                request_id=request_id,
-                parent_task_id=parent_task_id,
-                child_task_id=child_task_id,
-                child_kind=kind,
-                branch=child_spec.get("branch"),
-            )
+            admitted_payload: dict[str, Any] = {
+                "task_id": parent_task_id,
+                "request_id": request_id,
+                "parent_task_id": parent_task_id,
+                "child_task_id": child_task_id,
+                "child_kind": kind,
+                "branch": child_spec.get("branch"),
+            }
+            if budget_decision is not None:
+                admitted_payload["budget"] = budget_decision
+            await self.emit("child_admitted", **admitted_payload)
         except BaseException as admission_error:
             self._rollback_child_admission(parent_task_id, child_task_id, child_spec)
             try:
@@ -5563,6 +5678,9 @@ class _Runtime:
         return False
 
     async def _handle_result_message(self, state: _GenerationState, msg: dict[str, Any]) -> None:
+        result_turn = msg.get("turn")
+        if type(result_turn) is int and result_turn >= 0:
+            state.turn = max(state.turn, result_turn)
         identity_note = _result_identity_note(msg, state.task_id, state.generation)
         state.correlated = state.run_rid is not None and msg.get("request_id") == state.run_rid
         if not state.correlated and identity_note is None:
@@ -5807,6 +5925,7 @@ class _Runtime:
         # Buffered until the parent's terminal envelope arrives; admission then
         # validates the revision against the session tree (build_tree over the
         # accumulated tasks list).
+        msg = {**msg, "_parent_budget": _proposal_parent_budget(state)}
         self._pending_children.setdefault(state.task_id, []).append(
             (state.generation, msg)
         )
@@ -5852,6 +5971,9 @@ class _Runtime:
     async def _handle_heartbeat_message(
         self, state: _GenerationState, msg: dict[str, Any]
     ) -> None:
+        heartbeat_turn = msg.get("turn")
+        if type(heartbeat_turn) is int and heartbeat_turn >= 0:
+            state.turn = max(state.turn, heartbeat_turn)
         state.last_heartbeat = state.loop.time()
         state.handle.last_heartbeat = state.last_heartbeat
         forwarded = {
@@ -5949,6 +6071,9 @@ class _Runtime:
                     fields=invalid_fields,
                 )
                 return
+            event_turn = msg.get("turn")
+            if type(event_turn) is int and event_turn >= 0:
+                state.turn = max(state.turn, event_turn)
             for field in ("batch_index", "batch_size", "ok", "duration_ms", "turn"):
                 if field in msg:
                     forwarded[field] = msg[field]
