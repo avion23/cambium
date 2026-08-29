@@ -21,6 +21,7 @@ from cambium.tui_screen import (
     _bounded_markdown_lines,
     _compact_rail_rows,
     _display_width,
+    _live_window_lines,
     _rail_depth,
     _rail_rows,
     _side_sections,
@@ -1157,7 +1158,7 @@ def test_cockpit_replaces_failed_to_idle_status_in_place() -> None:
         cockpit.hide_cursor()
         cockpit.flush()
 
-    assert len(cockpit._last_status_rows) == 3
+    assert len(cockpit._last_status_rows) == 5
     assert cockpit._last_status_rows[-2].startswith(" ⠋ idle")
     assert stream.getvalue().count("┌ Cambium · conversation") == 2
 
@@ -1245,6 +1246,160 @@ def test_cockpit_updates_fixed_status_pane_in_place() -> None:
     assert "last run_shell 1s" in delta
     assert "last run_shell 2s" in second_delta
     assert "┌ Cambium · conversation" not in delta
+
+
+def test_live_window_updates_two_fixed_rows_without_reflow() -> None:
+    class _Tty(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    stream = _Tty()
+    transcript = Transcript()
+    cockpit = Cockpit(stream)
+    with cockpit:
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+            activity_line="⠋ WAITING · thinking… 0s",
+            turn_active=True,
+        )
+        first = stream.getvalue()
+        cockpit.move_to_input()
+        for second, tail in ((1, "first"), (2, "second")):
+            transcript.observe_event(
+                {
+                    "kind": "heartbeat",
+                    "task_id": "interactive-main",
+                    "monotonic_ms": second * 1_000,
+                    "payload": {"phase": "streaming", "tail": tail, "turn": 2},
+                }
+            )
+            cockpit.draw(
+                _snapshot(),
+                transcript,
+                session_description="session",
+                branch_line="branch",
+                cumulative_line="usage: calls=0",
+                activity_line=f"▸ streaming {second}s · {tail}",
+                turn_active=True,
+            )
+
+        delta = stream.getvalue()[len(first) :]
+
+    assert len(_live_window_lines(transcript, 80, activity_line="▸ streaming 2s")) == 2
+    assert "second" in delta
+    assert "┌ Cambium · conversation" not in delta
+    assert "\n" not in delta
+
+
+def test_live_window_replaces_the_same_rows_with_a_bounded_result() -> None:
+    class _Tty(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    stream = _Tty()
+    transcript = Transcript()
+    cockpit = Cockpit(stream)
+    with cockpit:
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+            activity_line="⠋ WAITING · thinking… 0s",
+            turn_active=True,
+        )
+        first = stream.getvalue()
+        cockpit.move_to_input()
+        transcript.observe_event(
+            {
+                "kind": "heartbeat",
+                "task_id": "interactive-main",
+                "monotonic_ms": 1_000,
+                "payload": {"phase": "streaming", "tail": "partial", "turn": 2},
+            }
+        )
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+            activity_line="▸ streaming 1s · partial",
+            turn_active=True,
+        )
+        middle = stream.getvalue()
+        transcript.finish_stream("final\nline")
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=1",
+            activity_line="✓ DONE",
+            turn_active=True,
+            force=True,
+        )
+        delta = stream.getvalue()[len(middle) :]
+
+    assert "final line" in delta
+    assert "┌ Cambium · conversation" not in delta
+    assert "\n" not in delta
+    assert len(cockpit._last_status_rows) == 5
+    assert len(cockpit._last_status_rows[1:3]) == 2
+    assert all(_display_width(row) <= 118 for row in cockpit._last_status_rows[1:3])
+    assert stream.getvalue().count("┌ Cambium · conversation") == 1
+    assert first != middle
+
+
+def test_live_rows_sanitize_multiline_ansi_and_wide_output() -> None:
+    transcript = Transcript()
+    transcript.observe_event(
+        {
+            "kind": "heartbeat",
+            "payload": {"phase": "streaming", "tail": "line one\n\x1b[31m" + "界" * 200},
+        }
+    )
+
+    rows = _live_window_lines(transcript, 32)
+    assert len(rows) == 2
+    assert all("\n" not in row and "\x1b" not in row for row in rows)
+    assert all(_display_width(row) <= 32 for row in rows)
+    assert "line one" in rows[1]
+
+
+def test_current_tool_counters_reset_at_the_next_turn() -> None:
+    transcript = Transcript()
+    transcript.observe_event(
+        {"kind": "tool_event", "payload": {"tool": "run_shell", "ok": False}}
+    )
+    transcript.observe_event(
+        {"kind": "tool_event", "payload": {"tool": "read_batch", "ok": True}}
+    )
+
+    assert transcript.tool_count == 2
+    assert transcript.current_tool_count == 2
+    assert transcript.current_tool_error_count == 1
+
+    transcript.user("next turn")
+    assert transcript.tool_count == 2
+    assert transcript.current_tool_count == 0
+    assert transcript.current_tool_error_count == 0
+
+
+def test_provider_call_heartbeat_is_not_rendered_as_waiting() -> None:
+    rows = _live_window_lines(
+        Transcript(),
+        80,
+        activity_line="⠇ WAITING · thinking… 12s",
+    )
+
+    assert all("waiting" not in row.casefold() for row in rows)
+    assert "provider call" in rows[0] + rows[1]
 
 
 def test_short_terminal_falls_back_to_stream_rows() -> None:

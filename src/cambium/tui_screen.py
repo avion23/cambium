@@ -586,32 +586,11 @@ def _format_duration(duration_ms: int | float | None) -> str:
     return f"{int(milliseconds / 1_000)}s"
 
 
-def _tool_evidence(entry: TranscriptEntry) -> str:
-    """Return compact command/output evidence retained in a tool entry."""
-    fields: dict[str, str] = {}
-    for line in entry.text.splitlines():
-        key, separator, value = line.partition(": ")
-        if separator and key in {"cmd", "command", "output", "stdout", "stderr", "error"}:
-            clean = _single_line(value)
-            if clean:
-                fields.setdefault(key, clean)
-    status = "ok" if entry.tool_ok is True else "failed" if entry.tool_ok is False else "done"
-    parts = [f"status={status}"]
-    for key in ("cmd", "command", "output", "stdout", "stderr", "error"):
-        value = fields.get(key)
-        if value:
-            parts.append(f"{key}={_clip(value, 48)}")
-            if key in {"output", "stdout", "stderr", "error"}:
-                break
-    return " · ".join(parts)
-
-
 def _tool_line(
     entry: TranscriptEntry,
     *,
     count: int = 1,
     last_duration_ms: int | float | None = None,
-    evidence_entry: TranscriptEntry | None = None,
 ) -> str:
     glyph = "✓" if entry.tool_ok else "✗" if entry.tool_ok is not None else "•"
     name = entry.tool_name or "?"
@@ -622,12 +601,13 @@ def _tool_line(
         prefix = f"{duration:>7} " if duration else ""
         line = f"{prefix}{glyph} {name} ×{count}"
     else:
-        duration = _format_duration(entry.duration_ms) if _usage_float(entry.duration_ms) > 0 else ""
+        duration = (
+            _format_duration(entry.duration_ms)
+            if _usage_float(entry.duration_ms) > 0
+            else ""
+        )
         prefix = f"{duration:>7} " if duration else ""
         line = f"{prefix}{glyph} {name}"
-    evidence = _tool_evidence(evidence_entry or entry)
-    if evidence and (evidence_entry is not None or entry.text.count("\n") > 0):
-        line += f" · {evidence}"
     return line
 
 
@@ -807,11 +787,9 @@ class Transcript:
         self._live_duration_ms: int | float | None = None
         self._live_turn: int | None = None
         self._live_calls = 0
-        self._live_tool_calls = 0
         self._live_bytes = 0
         self._live_age_s = 0.0
         self._live_started_at: float | None = None
-        self._live_last_at: float | None = None
         self._live_provider_call_open = False
         self._live_final = False
 
@@ -935,11 +913,9 @@ class Transcript:
         self._live_duration_ms = None
         self._live_turn = None
         self._live_calls = 0
-        self._live_tool_calls = 0
         self._live_bytes = 0
         self._live_age_s = 0.0
         self._live_started_at = None
-        self._live_last_at = None
         self._live_provider_call_open = False
         self._live_final = False
 
@@ -969,7 +945,9 @@ class Transcript:
                 total = usage.get("total_tokens")
                 output = usage.get("output_tokens", usage.get("completion_tokens"))
                 if type(total) is int or type(output) is int:
-                    return f"tokens={total if type(total) is int else '?'} out={output if type(output) is int else '?'}"
+                    total_text = total if type(total) is int else "?"
+                    output_text = output if type(output) is int else "?"
+                    return f"tokens={total_text} out={output_text}"
             provider = data.get("provider") or data.get("assigned_provider")
             return f"provider={provider}" if isinstance(provider, str) else ""
         if kind == "result":
@@ -1009,11 +987,9 @@ class Transcript:
         self._live_duration_ms = None
         self._live_turn = None
         self._live_calls = 0
-        self._live_tool_calls = 0
         self._live_bytes = 0
         self._live_age_s = 0.0
         self._live_started_at = event_clock
-        self._live_last_at = event_clock
         self._live_provider_call_open = False
         self._live_final = False
 
@@ -1029,9 +1005,10 @@ class Transcript:
         task_id = _task_id(record, data)
         if task_id is not None or self._live_task_id is None:
             self._start_live_operation(task_id, event_clock)
+        if self._live_final and kind != "result":
+            return
         if self._live_started_at is None:
             self._live_started_at = event_clock
-        self._live_last_at = event_clock
         if event_clock is not None and self._live_started_at is not None:
             self._live_age_s = max(0.0, event_clock - self._live_started_at)
 
@@ -1062,17 +1039,12 @@ class Transcript:
         duration = _duration_ms(data.get("duration_ms"))
         if duration is not None:
             self._live_duration_ms = duration
-        if kind == "tool_event":
-            self._live_tool_calls += 1
-            self._live_tool = _single_line(data.get("tool")) or self._live_tool
 
         if kind == "heartbeat":
             phase = _single_line(data.get("phase")).casefold().replace("_", "-")
             if phase == "waiting" and not self._live_provider_call_open:
                 self._live_calls += 1
                 self._live_provider_call_open = True
-            elif phase in {"thinking", "streaming"}:
-                self._live_provider_call_open = False
         elif kind == "usage_event":
             if not self._live_provider_call_open:
                 self._live_calls += 1
@@ -1099,7 +1071,7 @@ class Transcript:
             active_bytes = data.get("active_context_bytes")
             if type(active_bytes) is int and active_bytes >= 0:
                 self._live_bytes = max(self._live_bytes, active_bytes)
-        self._live_final = kind == "result"
+        self._live_final = self._live_final or kind == "result"
         self._live_revision += 1
 
     def _set_live_result(self, text: str | None) -> None:
@@ -1113,6 +1085,16 @@ class Transcript:
             self._live_status = "failed"
         elif self._live_status.casefold() not in {"succeeded", "failed", "cancelled", "error"}:
             self._live_status = "succeeded"
+        self._live_final = True
+        self._live_revision += 1
+
+    def _set_live_status(self, status: str) -> None:
+        """Close the fixed live window when the activity state is terminal."""
+        if self._live_final and self._live_status == status:
+            return
+        self._live_kind = self._live_kind or "result"
+        self._live_status = status
+        self._live_role = "error" if status == "error" else "assistant"
         self._live_final = True
         self._live_revision += 1
 
@@ -1741,7 +1723,7 @@ class ActivityState:
             self._frame = (self._frame + 1) % len(_SPINNER_FRAMES)
         current = time.monotonic() if now is None else now
         turn_elapsed = max(0.0, current - self._turn_started_at)
-        if self._heartbeat_phase is not None:
+        if self._heartbeat_phase is not None and self._heartbeat_tool is None:
             line = f"{_ACTIVITY_PHASE_GLYPHS[self._heartbeat_phase]} {self._heartbeat_phase} "
             line += _fmt_secs(turn_elapsed)
             if self._heartbeat_tail:
@@ -2328,15 +2310,9 @@ def _tool_compact_lines(
     *,
     count: int = 1,
     last_duration_ms: int | float | None = None,
-    evidence_entry: TranscriptEntry | None = None,
 ) -> list[tuple[str, str]]:
     width = max(1, width)
-    line = _tool_line(
-        entry,
-        count=count,
-        last_duration_ms=last_duration_ms,
-        evidence_entry=evidence_entry,
-    )
+    line = _tool_line(entry, count=count, last_duration_ms=last_duration_ms)
     return [("dim", _clip("  " + line, width))]
 
 
@@ -2392,7 +2368,6 @@ def _transcript_blocks(
                 width,
                 count=end - index,
                 last_duration_ms=last.duration_ms,
-                evidence_entry=last,
             )
         )
         index = end
@@ -2459,9 +2434,37 @@ def _activity_parts(activity_line: str) -> tuple[str, str, str] | None:
         phase = "thinking"
     else:
         return None
-    match = re.search(r"\b(?:running\s+\S+\s+|(?:thinking|streaming|waiting|turn)\s*…?\s*)(\d+(?:\.\d+)?)s", clean, re.IGNORECASE)
+    match = re.search(
+        r"\b(?:running\s+\S+\s+|(?:thinking|streaming|waiting|turn)\s*…?\s*)"
+        r"(\d+(?:\.\d+)?)s",
+        clean,
+        re.IGNORECASE,
+    )
     elapsed = _fmt_secs(_usage_float(match.group(1))) if match is not None else "0s"
     return spinner, phase, elapsed
+
+
+def _terminal_activity_status(activity_line: str) -> str | None:
+    clean = _single_line(activity_line)
+    upper = clean.upper()
+    if "✗" in clean or "ERROR" in upper or "FAILED" in upper:
+        return "error"
+    if "CANCEL" in upper or "IDLE" in upper:
+        return "cancelled"
+    if "✓" in clean or any(word in upper for word in ("DONE", "SUCCEEDED", "COMPLETE")):
+        return "succeeded"
+    return None
+
+
+def _latest_live_text(transcript: Transcript) -> str:
+    if transcript._live_text:
+        return transcript._live_text
+    for entry in reversed(transcript.entries):
+        if entry.role in {"assistant", "error", "system"}:
+            text = _single_line(entry.text)
+            if text:
+                return text
+    return "status recorded"
 
 
 def _live_window_lines(
@@ -2476,6 +2479,29 @@ def _live_window_lines(
         return [_status_row([], width), _status_row([], width)]
 
     activity = _activity_parts(activity_line)
+    terminal_status = _terminal_activity_status(activity_line)
+    if terminal_status is not None:
+        glyph = (
+            "✗"
+            if terminal_status == "error"
+            else "•"
+            if terminal_status == "cancelled"
+            else "✓"
+        )
+        elapsed = _fmt_secs(transcript._live_age_s)
+        if activity is not None:
+            elapsed = activity[2]
+        status = terminal_status
+        row_one = (
+            f"{glyph} result status={status} · age={elapsed} · "
+            f"turn={transcript._live_turn if transcript._live_turn is not None else '?'} · "
+            f"call={transcript._live_calls}"
+        )
+        label = _ROLE_LABELS.get(transcript._live_role, "RESULT")
+        return [
+            _status_row([row_one], width),
+            _status_row([f"{label} ▸ {_latest_live_text(transcript)}"], width),
+        ]
     if not transcript._live_kind:
         if activity is None:
             return [_status_row([], width), _status_row([], width)]
@@ -2492,7 +2518,13 @@ def _live_window_lines(
     operation = transcript._live_tool or "provider call"
     phase = transcript._live_phase.casefold().replace("_", "-")
     if phase not in _ACTIVITY_PHASE_GLYPHS:
-        phase = "streaming" if transcript._live_text else "thinking"
+        phase = (
+            "thinking"
+            if transcript._live_tool
+            else "streaming"
+            if transcript._live_text
+            else "thinking"
+        )
     spinner = _ACTIVITY_PHASE_GLYPHS[phase]
     elapsed = _fmt_secs(transcript._live_age_s)
     if activity is not None:
@@ -2500,9 +2532,17 @@ def _live_window_lines(
     if phase == "waiting":
         spinner, phase = _ACTIVITY_PHASE_GLYPHS["thinking"], "thinking"
     if transcript.live_final:
+        glyph = (
+            "✗"
+            if transcript._live_status in {"failed", "error"}
+            else "•"
+            if transcript._live_status == "cancelled"
+            else "✓"
+        )
         row_one = (
-            f"✓ result status={transcript._live_status or 'done'} · "
-            f"age={elapsed} · turn={transcript._live_turn if transcript._live_turn is not None else '?'} · "
+            f"{glyph} result status={transcript._live_status or 'done'} · "
+            f"age={elapsed} · "
+            f"turn={transcript._live_turn if transcript._live_turn is not None else '?'} · "
             f"call={transcript._live_calls}"
         )
         result_text = transcript._live_text or "status recorded"
@@ -2523,7 +2563,10 @@ def _live_window_lines(
                 f"{_format_duration(transcript._live_duration_ms)} ✓ {transcript._live_tool}"
             )
         if transcript._live_text and phase != "waiting":
-            details.append(f"{_ROLE_LABELS.get(transcript._live_role, 'LIVE')} ▸ {transcript._live_text}")
+            details.append(
+                f"{_ROLE_LABELS.get(transcript._live_role, 'LIVE')} ▸ "
+                f"{transcript._live_text}"
+            )
         else:
             if transcript._live_command:
                 details.append(f"cmd={transcript._live_command}")
@@ -3424,7 +3467,16 @@ _STATUS_KEYS = frozenset(
 
 def _snapshot_is_active(snapshot: Any) -> bool:
     session_status = _side_clean(getattr(snapshot, "session_status", "")).strip().casefold()
-    if session_status in {"done", "ended", "succeeded", "complete", "completed", "failed", "error", "cancelled"}:
+    if session_status in {
+        "done",
+        "ended",
+        "succeeded",
+        "complete",
+        "completed",
+        "failed",
+        "error",
+        "cancelled",
+    }:
         return False
     return bool(
         getattr(snapshot, "active_agents", 0)
@@ -3489,14 +3541,16 @@ def _status_fields(
 
     if _snapshot_is_active(snapshot):
         lane = _current_lane(snapshot)
-        fields["tokens"] = _human_count(
-            _usage_int(
-                getattr(lane, "total_tokens", getattr(snapshot, "total_tokens", 0))
+        if "tokens" not in fields:
+            fields["tokens"] = _human_count(
+                _usage_int(
+                    getattr(lane, "total_tokens", getattr(snapshot, "total_tokens", 0))
+                )
             )
-        )
-        fields["calls"] = str(
-            _usage_int(getattr(lane, "calls", getattr(snapshot, "calls", 0)))
-        )
+        if "calls" not in fields:
+            fields["calls"] = str(
+                _usage_int(getattr(lane, "calls", getattr(snapshot, "calls", 0)))
+            )
 
     context = getattr(snapshot, "context", None)
     if context is not None:
@@ -3806,7 +3860,7 @@ def _status_rows(
                     cumulative_line=cumulative_line,
                     width=width,
                     transcript=transcript,
-                    activity_line="",
+                    activity_line=activity_line if not include_live else "",
                 )
             ],
             width,
@@ -3988,20 +4042,21 @@ def render_primary(
         _paint(text, _ROLE_COLORS.get(role, ""), color)
         for role, text in _primary_rows(transcript, width, color=color)
     ]
-    lines.extend(
-        _paint(text, _DIM_CYAN, color)
-        for text in _status_rows(
-            snapshot,
-            transcript,
-            session_description=session_description,
-            branch_line=branch_line,
-            cumulative_line=cumulative_line,
-            width=width,
-            activity_line=activity_line,
-            show_detail=show_detail,
-            include_live=True,
-        )
+    status_rows = _status_rows(
+        snapshot,
+        transcript,
+        session_description=session_description,
+        branch_line=branch_line,
+        cumulative_line=cumulative_line,
+        width=width,
+        activity_line=activity_line,
+        show_detail=show_detail,
+        include_live=True,
     )
+    # Keep the legacy stream renderer's tool/status suffix intact; the two
+    # live rows still stay in the same bottom block, ahead of that suffix.
+    status_rows = [*status_rows[1:3], status_rows[0], *status_rows[3:]]
+    lines.extend(_paint(text, _DIM_CYAN, color) for text in status_rows)
     return lines
 
 
@@ -4177,6 +4232,14 @@ class Cockpit:
         if self._draw_in_flight:
             self._pending_draw = request
             return
+        if self._fixed_frame and live_turn and not force and not self._input_active:
+            live_event_changed = request[1].live_revision != self._last_live_revision
+            activity_changed = request[-1] != self._activity_line
+            if live_event_changed or activity_changed:
+                self._pending_draw = None
+                self._draw_live_now(request, live_only=True)
+                self._last_live_draw_at = time.monotonic()
+                return
         if self._input_active and not force:
             pending_before = self._pending_draw
             self._pending_draw = request
@@ -4255,6 +4318,13 @@ class Cockpit:
         height = self._last_size.lines
         conversation_capacity = max(1, height - _frame_overhead(self._show_detail))
         rail_width = _rail_width(self._last_size.columns)
+        changed = tuple(
+            offset
+            for offset, row in enumerate(live_rows)
+            if row != self._last_live_status_rows[offset]
+        )
+        if not changed:
+            return
         rendered = tuple(
             _split_frame_row(
                 row,
@@ -4266,7 +4336,8 @@ class Cockpit:
             for row in live_rows
         )
         self.stream.write("\x1b[s")
-        for offset, line in enumerate(rendered):
+        for offset in changed:
+            line = rendered[offset]
             distance = height - 3 - (conversation_capacity + 2 + offset)
             self.stream.write(f"\x1b[{distance}A\r{_CLEAR_LINE}{line}\x1b[u")
         self.stream.flush()
@@ -4286,7 +4357,7 @@ class Cockpit:
         for index in indices:
             if index >= len(status_rows):
                 continue
-            distance = height - 3 - (conversation_capacity + 2 + index)
+            distance = height - 2 - (conversation_capacity + 2 + index)
             line = _split_frame_row(
                 status_rows[index],
                 self._last_size.columns,
@@ -4302,12 +4373,21 @@ class Cockpit:
         request: tuple[Any, Transcript, str, str, str, str, str],
     ) -> None:
         """Paint a real event into the fixed status window, never history."""
+        (
+            snapshot,
+            transcript,
+            session_description,
+            branch_line,
+            cumulative_line,
+            _,
+            activity_line,
+        ) = request
+        terminal_status = _terminal_activity_status(activity_line)
+        if terminal_status is not None:
+            transcript._set_live_status(terminal_status)
         if not self._fixed_frame or self._last_size.lines < _FIXED_MIN_HEIGHT:
             self._draw_now(request, force=True)
             return
-        snapshot, transcript, session_description, branch_line, cumulative_line, _, activity_line = (
-            request
-        )
         content_width = _frame_content_width(self._last_size.columns)
         conversation_capacity = max(1, self._last_size.lines - _frame_overhead(self._show_detail))
         rail_width = _rail_width(self._last_size.columns)
@@ -4341,7 +4421,6 @@ class Cockpit:
             index
             for index, row in enumerate(status_rows)
             if index not in {1, 2}
-            and index != 0
             and (index >= len(self._last_status_rows) or row != self._last_status_rows[index])
         )
         self._redraw_status_indices(status_rows, changed)
@@ -4358,6 +4437,8 @@ class Cockpit:
             branch_line=branch_line,
             cumulative_line=cumulative_line,
         )
+        if self._last_conversation_rows:
+            self._last_primary_rows = _primary_request_rows(self._last_conversation_rows, rail_rows)
         self._last_rail_rows = rail_rows
         self._last_live_revision = transcript.live_revision
 
@@ -4375,7 +4456,10 @@ class Cockpit:
                 force
                 and self._fixed_frame
                 and bool(request[-1])
-                and request[1].live_revision != self._last_live_revision
+                and (
+                    request[1].live_revision != self._last_live_revision
+                    or _terminal_activity_status(request[-1]) is not None
+                )
             ):
                 if force:
                     self._pending_draw = request
@@ -4702,13 +4786,10 @@ class Cockpit:
             )
         )
         self._redraw_live_status(request, status_rows)
+        if not self._last_status_rows or status_rows[0] != self._last_status_rows[0]:
+            self._redraw_status_indices(status_rows, (0,))
         self._last_request = request
-        if len(self._last_status_rows) == len(status_rows):
-            current = list(self._last_status_rows)
-            current[1:3] = status_rows[1:3]
-            self._last_status_rows = tuple(current)
-        else:
-            self._last_status_rows = status_rows
+        self._last_status_rows = status_rows
         self._last_live_status_rows = (status_rows[1], status_rows[2])
         self._activity_only_update = True
 
