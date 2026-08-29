@@ -121,6 +121,8 @@ The admission semaphore bounds live worker processes; parallel dispatch is
 unlimited by default, while `--max-workers N` opts into an explicit cap.
 (`max_concurrent_tasks=0` disables the semaphore.) (src/cambium/supervisor.py:2154-2157,4384-4410,8176-8194)
 
+Continuous integration is the enforced validation path for pushes to `main` and pull requests: after installing the `dev` extra with `python -m pip install -e ".[dev]"`, it runs `ruff check`, `python -m pytest -m "not slow" -q`, and then `python -m pytest -m slow -q` as a separate step; acceptance-marked checks are credential-gated but not hermetic because local provider configuration/auth can make them issue live calls, while CI supplies no credentials.
+
 **Can it start 50 subagents?** Yes: 50 flat top-level plan entries are
 configurable and all `N` entries are scheduled concurrently by default; no
 source-level count cap is present. Passing `--max-workers N` caps simultaneous
