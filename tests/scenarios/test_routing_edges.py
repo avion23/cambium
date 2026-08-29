@@ -10,7 +10,10 @@ from cambium.routing import (
     LaneState,
     ProviderAssignment,
     ProviderDebt,
+    RoutingRequest,
+    provider_satisfies_request,
     resolve_assignment,
+    score_providers,
     select_lane,
     validate_requirements,
 )
@@ -94,6 +97,17 @@ def test_resolve_assignment_reports_all_matching_lanes_exhausted() -> None:
             {},
             {"a": LaneState(in_flight=1, rpm_allowance=1.0)},
         )
+
+
+def test_native_tool_capability_does_not_exclude_a_provider() -> None:
+    provider = _provider("a", "m1")
+    request = RoutingRequest(model="m1", needs_native_tools=True)
+
+    assert provider.supports_native_tools is False
+    assert provider_satisfies_request(provider, request)
+    assert score_providers([provider], ["m1"], {}, requirements={"needs_native_tools": True}) == [
+        ("a", "m1", 0.0)
+    ]
 
 
 def test_resolve_assignment_breaks_equal_cost_ties_by_config_order() -> None:

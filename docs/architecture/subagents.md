@@ -162,7 +162,6 @@ admission with fields such as:
   "requirements": {
     "quality": "strong",
     "min_context_window": 100000,
-    "needs_native_tools": true,
     "allow_paid": true
   },
   "model_candidates": ["gpt-5.6", "claude-opus"],
@@ -177,6 +176,13 @@ An exact compatible child inherits the parent provider/model lease and a
 with semantic history. If neither form is legal, the child starts fresh or is
 rejected.
 
+The provider JSON field `supports_native_tools` is an opt-in transport
+capability; when absent it is `false`. A declared `true` provider receives
+typed function/tool wire fields, while a declared `false` or absent provider
+receives the identical messages without those fields and uses the universal
+textual-JSON action protocol. Native capability never filters the cascade: all
+enabled providers remain eligible, and `needs_native_tools` is retained only
+as a backward-compatible task field rather than a hard admission filter.
 Provider “native tools” means that the provider transports typed function/tool
 calls. It does not mean the provider owns subagent orchestration.
 

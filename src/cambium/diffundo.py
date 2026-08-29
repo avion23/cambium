@@ -709,7 +709,10 @@ class ProviderConfig:
     # hint during quality ordering.
     tokens_per_s: float | None = None
     interactive_wall_budget_s: float | None = None
-    supports_native_tools: bool = True
+    # Native function-call wire support is an explicit provider capability;
+    # absent config/direct construction stays on the universal textual JSON
+    # action protocol.
+    supports_native_tools: bool = False
     supports_python_tool: bool = True
     allow_model_substitution: bool = False
     # This marker lets routing distinguish an explicitly separated capacity
@@ -1704,12 +1707,13 @@ def _codex_request_body(provider: ProviderConfig, prompt: dict[str, Any]) -> dic
         body["input"] = [
             _codex_input_item(message) for message in messages if isinstance(message, Mapping)
         ]
-    tools = _codex_tools(prompt.get("tools"))
-    if tools:
-        body["tools"] = tools
-    tool_choice = prompt.get("tool_choice")
-    if tool_choice is not None:
-        body["tool_choice"] = tool_choice
+    if provider.supports_native_tools:
+        tools = _codex_tools(prompt.get("tools"))
+        if tools:
+            body["tools"] = tools
+        tool_choice = prompt.get("tool_choice")
+        if tool_choice is not None:
+            body["tool_choice"] = tool_choice
     if provider.reasoning_effort:
         body["reasoning"] = {"effort": provider.reasoning_effort}
     return body
@@ -2363,19 +2367,19 @@ class Diffundo:
 
         The pure request predicates live in :mod:`cambium.routing`; importing
         them lazily avoids a module cycle because routing names ProviderTier.
-        Tool-bearing prompts require native tool support unless the task
-        explicitly opts out, while task requirements supply the remaining
-        context, billing, and quality boundaries.
+        Native tools are an optional provider transport mode, not a hard task
+        requirement: tool-bearing prompts use the universal textual JSON
+        action protocol when the selected provider does not declare native
+        support. Task requirements supply the remaining admission boundaries.
         """
         from .routing import RoutingRequest, validate_requirements
 
         raw = dict(requirements) if requirements is not None else dict(self._requirements)
         validated = validate_requirements(raw)
-        has_native_tools = isinstance(prompt.get("tools"), list) and bool(prompt["tools"])
         return RoutingRequest(
             model=model or "",
             required_context_tokens=validated.get("min_context_window", 0),
-            needs_native_tools=validated.get("needs_native_tools", has_native_tools),
+            needs_native_tools=validated.get("needs_native_tools", False),
             needs_python_tool=validated.get("needs_python_tool", False),
             allow_model_substitution=allow_model_substitution,
             allow_paid=validated.get("allow_paid", True),
@@ -3039,7 +3043,7 @@ class Diffundo:
             )
         url = f"{provider.base_url.rstrip('/')}/chat/completions"
         body = {**prompt, "model": provider.model}
-        if isinstance(body.get("tools"), list):
+        if provider.supports_native_tools and isinstance(body.get("tools"), list):
             # Internal tool schemas carry {name, description, parameters}; the
             # chat-completions wire format requires the function wrapper. The
             # codex responses path has its own converter (_codex_tools); this
@@ -3061,6 +3065,11 @@ class Diffundo:
                     }
                 )
             body["tools"] = wire_tools
+        elif not provider.supports_native_tools:
+            # The textual JSON action protocol is provider-neutral. Keep the
+            # messages byte-identical while omitting native-only wire fields.
+            body.pop("tools", None)
+            body.pop("tool_choice", None)
         data = json.dumps(body).encode("utf-8")
         headers = {
             "Content-Type": "application/json",

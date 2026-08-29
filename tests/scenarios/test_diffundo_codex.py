@@ -340,7 +340,7 @@ def test_codex_body_serialization_is_byte_identical_across_calls() -> None:
     """D8c: the same prompt serializes to the same request bytes every call —
     fixed field order, no per-call timestamps or ids — so the body head cannot
     churn a provider's exact-prefix cache key."""
-    config = _codex_config(None)
+    config = _codex_config(None, supports_native_tools=True)
     first = _codex_request_body(config, TOOL_PROMPT)
     second = _codex_request_body(config, TOOL_PROMPT)
     assert json.dumps(first) == json.dumps(second)
@@ -355,6 +355,22 @@ def test_codex_body_serialization_is_byte_identical_across_calls() -> None:
         "tool_choice",
         "reasoning",
     ]
+
+
+def test_codex_non_native_mode_keeps_messages_and_omits_tool_wire_fields() -> None:
+    config = _codex_config(None)
+
+    body = _codex_request_body(config, TOOL_PROMPT)
+
+    assert body["input"] == [
+        {
+            "role": "developer",
+            "content": [{"type": "input_text", "text": "You are a coding assistant."}],
+        },
+        {"role": "user", "content": [{"type": "input_text", "text": "read README"}]},
+    ]
+    assert "tools" not in body
+    assert "tool_choice" not in body
 
 
 def test_codex_body_leading_developer_item_is_byte_stable_as_transcript_grows() -> None:

@@ -174,7 +174,9 @@ _DEFAULTS: dict[str, object] = {
     "throughput_hint_tps": 0.0,
     "tokens_per_s": None,
     "interactive_wall_budget_s": None,
-    "supports_native_tools": True,
+    # Native function-call wire support is opt-in. An omitted declaration is
+    # deliberately conservative: the textual JSON action protocol is universal.
+    "supports_native_tools": False,
     "supports_python_tool": True,
     "allow_model_substitution": False,
     "cache_capability": None,

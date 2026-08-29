@@ -102,7 +102,9 @@ class RoutingRequest:
 
     model: str
     required_context_tokens: int = 0
-    needs_native_tools: bool = True
+    # Kept for task/config compatibility. Native tools are an optional
+    # per-provider transport mode, not an admission requirement.
+    needs_native_tools: bool = False
     needs_python_tool: bool = False
     allow_model_substitution: bool = False
     allow_paid: bool = True
@@ -999,7 +1001,8 @@ def provider_satisfies_request(provider: Any, request: RoutingRequest) -> bool:
 
     Health, token buckets, and tier membership are intentionally outside this
     pure predicate.  They are live state and remain in Diffundo's candidate
-    loop.  A lease is never permission to bypass context, tools, or billing.
+    loop.  A lease is never permission to bypass context, Python tools, or
+    billing; native tools are an optional per-provider wire mode.
     """
     if not getattr(provider, "enabled", True):
         return False
@@ -1019,8 +1022,6 @@ def provider_satisfies_request(provider: Any, request: RoutingRequest) -> bool:
         return False
     if not context_window_satisfies(provider, request.required_context_tokens):
         return False
-    if request.needs_native_tools and not getattr(provider, "supports_native_tools", False):
-        return False
     if request.needs_python_tool and not getattr(provider, "supports_python_tool", False):
         return False
     billing = getattr(provider, "billing_mode", "metered")
@@ -1037,11 +1038,12 @@ def validate_requirements(requirements: Mapping[str, Any] | None) -> dict[str, A
     """Validate a task's capability/quality requirements, fail-closed.
 
     ``quality`` must be ``"high"`` or ``"normal"``; ``min_context_window``
-    must be a positive int.  Tool and billing flags, when declared, must be
-    booleans. Unknown keys raise ``ValueError`` — a task that declares a
-    requirement the selector does not understand fails closed instead of
-    silently downgrading the task. Returns a plain dict copy (``{}`` for
-    ``None``/absent).
+    must be a positive int.  Python-tool and billing flags, when declared, must
+    be booleans. ``needs_native_tools`` remains accepted for compatibility but
+    does not make native wire support a hard requirement. Unknown keys raise
+    ``ValueError`` — a task that declares a requirement the selector does not
+    understand fails closed instead of silently downgrading the task. Returns
+    a plain dict copy (``{}`` for ``None``/absent).
     """
     if requirements is None:
         return {}
@@ -1092,10 +1094,11 @@ def score_providers(
     :attr:`~cambium.diffundo.ProviderConfig.context_window`) and at least as
     large as the requirement — a provider that declares no capacity can never
     satisfy the boundary, so the task is never bound to a provider that
-    cannot fit its context. Declared tool and billing flags are hard filters as
-    well. Unknown requirement keys raise ``ValueError``, so a cheaper/underused
-    provider that fails the task's constraints is never substituted (and no
-    eligible provider raises, fail-closed).
+    cannot fit its context. Python-tool and billing flags are hard filters;
+    native tools remain an optional per-provider wire mode. Unknown requirement
+    keys raise ``ValueError``, so a cheaper/underused provider that fails the
+    task's constraints is never substituted (and no eligible provider raises,
+    fail-closed).
 
     Eligible providers use :func:`cambium.selection.order_candidates`, whose
     lexicographic quality key is success confidence, latency-SLO compliance,
