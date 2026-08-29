@@ -67,7 +67,7 @@ plan mode: a parent proposes typed child revisions (`propose_child`), the
 supervisor validates and durably admits them before dispatch, and the
 transactional join enforces `post_join_parent_HEAD == accepted_integration_HEAD`.
 
-**Worker** (`worker.py`, `tools.py`, `schemas.py`, `ipc.py`) — one process per
+**Worker** (`worker.py`, `prompts.py`, `tools.py`, `schemas.py`, `ipc.py`) — one process per
 task, in its own Git worktree and process group, speaking bounded NDJSON over
 stdio. With a `fanout_config` it runs the agent loop: each turn calls Diffundo
 and requires exactly one strict JSON action — `plan`, `tool_call`, or `finish` —
@@ -75,7 +75,8 @@ dispatched against a six-tool roster: `delegate`, `read_batch`, `write_file`,
 `edit_file`, `git_op`, `run_shell`. The loop bounds turns, tokens, wall time,
 and transcript size; finalization creates at most one fenced commit (zero for a
 clean no-change finish) gated by the task's `requires_commit` flag, and returns
-a redacted result envelope.
+a redacted result envelope. `prompts.py` contains the versioned static prompt
+text: `PROMPTS_VERSION`, `CODING_AGENT`, and `SUMMARY_PROTOCOL_LINES`.
 
 **Store** (`store.py`, `results.py`) — `EventStore` at `.cambium/events.db` is
 the durable boundary: a bounded writer queue, critical-kind admission that
@@ -117,6 +118,7 @@ None of it is on the task-execution path.
 
 ```text
 src/cambium/        package: supervisor, worker, diffundo, store, tui, ...
+  prompts.py         versioned static prompt text (`PROMPTS_VERSION`, `CODING_AGENT`, `SUMMARY_PROTOCOL_LINES`)
   modules/          optimizable modules (example, should_review)
 tests/              unit + scenario tests (the behavioral spec)
 docs/architecture/  the focused subsystem contracts (see below)
