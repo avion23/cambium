@@ -4,13 +4,18 @@ on:
   push:
     branches:
       - codex/fix-latest-regressions-20260829
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: write
 
 jobs:
   fix:
-    if: github.event.head_commit.message == 'chore: trigger latest regression runner'
+    if: >-
+      github.event_name == 'pull_request' ||
+      github.event.head_commit.message == 'chore: trigger latest regression runner'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
