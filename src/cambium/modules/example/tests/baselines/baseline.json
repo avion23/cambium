@@ -51,7 +51,7 @@
     "canaries": 10
   },
   "tests": {
-    "count": 54,
+    "count": 53,
     "wall_seconds": {
       "p50": 0.000519,
       "p90": 0.004243,
@@ -110,8 +110,7 @@
       "src/cambium/modules/example/tests/test_example_module.py::test_loader_maps_wire_boolean_to_decision": 0.000375,
       "src/cambium/modules/example/tests/test_example_module.py::test_malformed_record_is_rejected": 0.000363,
       "src/cambium/modules/example/tests/test_example_module.py::test_missing_expected_reason_is_rejected": 0.000402,
-      "src/cambium/modules/example/tests/test_example_module.py::test_module_scores_perfect_on_its_dataset": 0.00109,
-      "src/cambium/modules/example/tests/test_example_module.py::test_subprocess_network_client_is_denied": 0.000185
+      "src/cambium/modules/example/tests/test_example_module.py::test_module_scores_perfect_on_its_dataset": 0.00109
     }
   },
   "drift_thresholds": {
