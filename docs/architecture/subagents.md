@@ -276,7 +276,7 @@ Do not delegate when:
 ## 10. Source map
 
 - Tool schema and preflight validation: `src/cambium/schemas.py`
-- Worker prompt and delegate suspension: `src/cambium/worker.py`
+- Worker prompt: `src/cambium/prompts.py`; delegate suspension: `src/cambium/worker.py`.
 - Admission, provider pinning, join, and publication: `src/cambium/supervisor.py`
 - Task-tree bounds: `src/cambium/tasktree.py`
 - Provider feasibility and debt: `src/cambium/routing.py`
