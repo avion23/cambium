@@ -270,11 +270,8 @@ def preflight(
         raise ValueError(f"one-shot repository is not a directory: {target_repo}")
     if not (target_repo / ".git").exists():
         raise ValueError(f"one-shot repository is not a git repository: {target_repo}")
-    current_branch = _git_stdout(target_repo, "symbolic-ref", "--quiet", "--short", "HEAD")
-    if current_branch is None or _git_stdout(
-        target_repo, "rev-parse", "--verify", f"refs/heads/{current_branch}"
-    ) is None:
-        raise ValueError(f"one-shot repository has no checked-out branch: {target_repo}")
+    if _git_stdout(target_repo, "rev-parse", "--verify", "refs/heads/main") is None:
+        raise ValueError(f"one-shot repository has no refs/heads/main: {target_repo}")
 
     if session_dir is None:
         return
@@ -846,7 +843,9 @@ def build_plan(
         spec["provider_config_path"] = str(Path(config.provider_config_path).resolve())
     base_commit = config.base_commit
     if base_commit is None:
-        base_commit = _git_stdout(target_repo, "rev-parse", "--verify", "HEAD^{commit}")
+        base_commit = _git_stdout(
+            target_repo, "rev-parse", "--verify", "refs/heads/main^{commit}"
+        )
     if base_commit is not None:
         spec["base_commit"] = base_commit
     if config.target_file is not None:

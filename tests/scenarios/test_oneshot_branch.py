@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import subprocess
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -118,35 +117,52 @@ def test_default_branch_is_stable_and_explicit_branch_is_preserved(tmp_path: Pat
     assert explicit["tasks"][0]["branch"] == "release/topic"
 
 
-def test_non_main_checked_out_branch_is_used_as_one_shot_base(
-    monkeypatch, tmp_path: Path
+def test_checked_out_feature_branch_still_uses_main_as_one_shot_base(
+    tmp_path: Path,
 ) -> None:
     repo = _repo(tmp_path / "repo")
-    subprocess.run(["git", "-C", str(repo), "branch", "-m", "feature"], check=True)
-    captured: dict[str, Any] = {}
-
-    async def fake_run_plan(session_dir, plan, on_event=None, **kwargs):
-        captured.update(session_dir=session_dir, plan=plan, on_event=on_event, kwargs=kwargs)
-        return PlanResult((TaskResult(task_id="oneshot", status="succeeded", exit_code=0),))
-
-    monkeypatch.setattr(oneshot.supervisor, "run_plan", fake_run_plan)
-    config = oneshot.OneShotConfig(
-        prompt="inspect the repository",
-        repo=repo,
-        target_file="file.txt",
-        marker="// marker",
-    )
-
-    result = asyncio.run(oneshot.run_oneshot(config))
-
-    expected_base = subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+    main_base = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "refs/heads/main^{commit}"],
         check=True,
         capture_output=True,
         text=True,
     ).stdout.strip()
-    assert result.exit_code == 0
-    assert captured["plan"]["tasks"][0]["base_commit"] == expected_base
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", "-c", "feature"],
+        check=True,
+        capture_output=True,
+    )
+    (repo / "feature.txt").write_text("feature\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "feature.txt"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "feature"],
+        check=True,
+        capture_output=True,
+    )
+
+    plan = oneshot.build_plan(
+        oneshot.OneShotConfig(prompt="inspect the repository", repo=repo),
+        repo,
+        tmp_path / "session",
+    )
+
+    assert plan["tasks"][0]["base_commit"] == main_base
+
+
+def test_repository_without_main_is_rejected(tmp_path: Path) -> None:
+    repo = _repo(tmp_path / "repo")
+    subprocess.run(
+        ["git", "-C", str(repo), "branch", "-m", "feature"],
+        check=True,
+        capture_output=True,
+    )
+
+    with pytest.raises(ValueError, match="no refs/heads/main"):
+        oneshot.preflight(oneshot.OneShotConfig(prompt="inspect the repository", repo=repo))
 
 
 # --------------------------------------------------------------------------- #

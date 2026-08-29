@@ -242,13 +242,15 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "delegate",
         "description": (
-            "Propose one child for a separable subproblem with its own files or investigation "
-            "area. The child runs as a Cambium worker in an isolated git worktree; admission "
-            "is supervisor-owned and constrained by the task boundary. When context reuse is "
-            "enabled (the default), a successful delegate call suspends the parent at a "
-            "boundary while the child runs, then resumes it with a bounded child-result "
-            "envelope. Never expect the child's full conversation. Put the objective, owned "
-            "files/symbols, done criteria, and verification in spec.task."
+            "Propose one scoped child workload for work you should not do yourself — a "
+            "separable subproblem with its own files or investigation area. The child is a "
+            "full Cambium worker in an isolated git worktree. IMPORTANT: this call only "
+            "PROPOSES the child. With context reuse, a successful proposal suspends this "
+            "task; the supervisor may later resume it with a bounded child-result envelope. "
+            "Without context reuse, child admission waits for this task's terminal boundary. "
+            "Make spec.task self-contained. An exact compatible child may receive the "
+            "immutable checkpoint prefix; otherwise it receives semantic summaries. It never "
+            "receives sibling context or hidden reasoning."
         ),
         "parameters": _parameters(
             {

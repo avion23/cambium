@@ -6202,15 +6202,21 @@ async def _run_agent_loop(
                     tools=tools,
                     model_identity=model_identity,
                 )
-                if (
-                    forced_finalization
-                    and not code_changed
-                    and not action.get("objective_met", False)
-                ):
+                if not action["objective_met"]:
+                    incomplete = {
+                        **outcome,
+                        "summary": action["summary"],
+                        "terminal_action": _terminal_action_record(action),
+                    }
+                    reason = (
+                        "forced finalization: investigation incomplete, no changes made"
+                        if forced_finalization and not code_changed
+                        else "finish declared objective_met=false"
+                    )
                     return _loop_result(
-                        outcome,
+                        incomplete,
                         "failed",
-                        "forced finalization: investigation incomplete, no changes made",
+                        reason,
                         turn,
                         cumulative_usage,
                         transcript,

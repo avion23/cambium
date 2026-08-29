@@ -5,6 +5,8 @@ def replace_once(path: str, old: str, new: str) -> None:
     target = Path(path)
     text = target.read_text(encoding="utf-8")
     count = text.count(old)
+    if count == 0 and new in text:
+        return
     if count != 1:
         raise SystemExit(f"{path}: expected one match, found {count}")
     target.write_text(text.replace(old, new), encoding="utf-8")

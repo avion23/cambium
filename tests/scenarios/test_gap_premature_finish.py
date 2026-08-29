@@ -86,6 +86,30 @@ def test_non_forced_finish_without_code_change_is_unchanged(tmp_path: Path) -> N
     assert outcome["summary"] == "completed investigation"
 
 
+def test_non_forced_finish_with_objective_false_is_failed(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = _make_worktree(repo)
+    config = _agent_config(worktree, max_tokens=100)
+    router = _ScriptedRouter(
+        [
+            '{"type":"finish","summary":"task remains incomplete",'
+            '"objective_met":false}',
+        ]
+    )
+
+    outcome = asyncio.run(_drive_loop(config, worktree, router))
+
+    assert outcome["status"] == "failed"
+    assert outcome["failure_reason"] == "finish declared objective_met=false"
+    assert outcome["summary"] == "task remains incomplete"
+    assert outcome["terminal_action"] == {
+        "type": "finish",
+        "objective_met": False,
+        "summary_present": True,
+        "summary": "task remains incomplete",
+    }
+
+
 def test_forced_finish_without_code_change_but_objective_met_succeeds_review(
     tmp_path: Path,
 ) -> None:

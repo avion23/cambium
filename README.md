@@ -7,7 +7,7 @@ and resume from durable checkpoints.
 
 ## Quickstart
 
-Requires Python 3.12+ and a Git repository with a checked-out branch.
+Requires Python 3.12+ and a Git repository with `refs/heads/main`.
 
 ```bash
 python -m venv .venv && . .venv/bin/activate && python -m pip install -e .
