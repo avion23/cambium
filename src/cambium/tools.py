@@ -37,9 +37,15 @@ SHELL_OUTPUT_TAIL_BYTES = 4 * 1024
 LINT_FEEDBACK_MAX_BYTES = 960
 GIT_TIMEOUT_S = 30
 BATCH_READ_MAX_CONCURRENCY = 4
+READ_BATCH_MAX_FILES = 16
+READ_BATCH_MAX_BYTES_PER_FILE = 32 * 1024
 READ_TRUNCATION_MARKER = "\n... [file truncated]"
 OUTPUT_TRUNCATION_MARKER = "\n... [output truncated]"
 LINT_FEEDBACK_TRUNCATION_MARKER = "\n... [lint diagnostics truncated]"
+OWN_SESSION_READ_ERROR = (
+    "read refused: path is inside the worker's own active session; stay focused on the "
+    "assigned task instead of inspecting session artifacts, logs, or spill files"
+)
 _SPILL_COUNTER = count(1)
 _ALLOWED_TASK_KINDS = frozenset(member.value for member in TaskKind)
 _ALLOWED_TASK_KINDS_TEXT = ", ".join(member.value for member in TaskKind)
@@ -136,6 +142,43 @@ def _display_path(ctx: ToolContext, path: Path) -> str:
     return relative.as_posix() or "."
 
 
+def _inside(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _assigned_worktree_file(path: Path, worktree: Path) -> bool:
+    try:
+        relative = path.relative_to(worktree)
+    except ValueError:
+        return False
+    return not relative.parts or relative.parts[0] not in {".git", ".cambium"}
+
+
+def _reject_active_session_read(
+    ctx: ToolContext, requested_path: Path, resolved_path: Path
+) -> None:
+    session_id = os.environ.get("CAMBIUM_SESSION_ID")
+    if not session_id:
+        return
+    session_dir = Path(session_id).expanduser().resolve()
+    requested_absolute = requested_path.absolute()
+    in_session = _inside(requested_absolute, session_dir) or _inside(resolved_path, session_dir)
+    worktree = Path(ctx.cwd).resolve()
+    assigned_worktree = (
+        worktree != session_dir
+        and _inside(worktree, session_dir)
+        and (worktree / ".git").exists()
+        and _assigned_worktree_file(requested_absolute, worktree)
+        and _assigned_worktree_file(resolved_path, worktree)
+    )
+    if in_session and not assigned_worktree:
+        raise _ToolFailure(f"{OWN_SESSION_READ_ERROR}: {resolved_path}")
+
+
 def _read_text(path: Path) -> str:
     try:
         mode = path.stat().st_mode
@@ -198,24 +241,37 @@ def _read_file_sync(
         if offset is not None or limit is not None:
             start_line = offset if offset is not None else 1
             max_lines = limit if limit is not None else MAX_READ_LINES
-            selected: list[str] = []
-            total_lines = 0
-            with path.open("r", encoding="utf-8", newline="") as handle:
-                for line_number, line in enumerate(handle, start=1):
-                    total_lines = line_number
-                    if start_line <= line_number < start_line + max_lines:
-                        selected.append(line)
+            with path.open("rb") as handle:
+                raw = handle.read(READ_BATCH_MAX_BYTES_PER_FILE + 1)
+            if len(raw) > READ_BATCH_MAX_BYTES_PER_FILE:
+                excerpt = raw[:READ_BATCH_MAX_BYTES_PER_FILE].decode("utf-8", errors="ignore")
+                lines = excerpt.splitlines(keepends=True)
+                total_lines = len(lines)
+                end_line = min(start_line + max_lines - 1, total_lines)
+                output = (
+                    f"showing lines {start_line}-{end_line} of at least {total_lines}\n"
+                    + "".join(lines[start_line - 1 : start_line - 1 + max_lines])
+                    + READ_TRUNCATION_MARKER
+                )
+                return _Outcome(
+                    ok=True,
+                    output=_truncate_text(
+                        output, READ_BATCH_MAX_BYTES_PER_FILE, READ_TRUNCATION_MARKER
+                    ),
+                )
+            lines = _decode_utf8(raw, display_path).splitlines(keepends=True)
+            total_lines = len(lines)
             end_line = min(start_line + max_lines - 1, total_lines)
             return _Outcome(
                 ok=True,
                 output=(
                     f"showing lines {start_line}-{end_line} of {total_lines}\n"
-                    + "".join(selected)
+                    + "".join(lines[start_line - 1 : start_line - 1 + max_lines])
                 ),
             )
 
         with path.open("rb") as handle:
-            raw = handle.read(MAX_READ_BYTES + 1)
+            raw = handle.read(READ_BATCH_MAX_BYTES_PER_FILE + 1)
     except FileNotFoundError as exc:
         raise _ToolFailure(f"file not found: {display_path}") from exc
     except IsADirectoryError as exc:
@@ -225,16 +281,18 @@ def _read_file_sync(
     except OSError as exc:
         raise _ToolFailure(f"could not read {display_path}: {exc}") from exc
 
-    if len(raw) > MAX_READ_BYTES:
-        output = _truncate_bytes(raw, MAX_READ_BYTES, READ_TRUNCATION_MARKER)
+    if len(raw) > READ_BATCH_MAX_BYTES_PER_FILE:
+        output = _truncate_bytes(raw, READ_BATCH_MAX_BYTES_PER_FILE, READ_TRUNCATION_MARKER)
     else:
         output = _decode_utf8(raw, display_path)
     return _Outcome(ok=True, output=output)
 
 
 async def _read_file(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
-    path = (Path(ctx.cwd) / Path(args["path"]).expanduser()).resolve()
+    requested_path = Path(ctx.cwd) / Path(args["path"]).expanduser()
+    path = requested_path.resolve()
     display_path = _display_path(ctx, path)
+    _reject_active_session_read(ctx, requested_path, path)
     offset = args.get("offset")
     limit = args.get("limit")
     if offset is not None or limit is not None:
@@ -640,7 +698,8 @@ async def _run_shell(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
 
 
 async def _read_batch(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
-    paths = args["paths"]
+    requested_paths = args["paths"]
+    paths = requested_paths[:READ_BATCH_MAX_FILES]
     if not paths:
         raise _ToolFailure("read_batch requires at least one path")
     semaphore = asyncio.Semaphore(BATCH_READ_MAX_CONCURRENCY)
@@ -655,6 +714,11 @@ async def _read_batch(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
 
     results = await asyncio.gather(*(_bounded_read(path) for path in paths))
     parts: list[str] = []
+    omitted = len(requested_paths) - len(paths)
+    if omitted:
+        parts.append(
+            f"[read_batch capped at {READ_BATCH_MAX_FILES} files; {omitted} file(s) omitted]"
+        )
     ok = True
     for path, result in zip(paths, results, strict=True):
         body = result.output if result.ok else (result.error or "read failed")
@@ -737,6 +801,15 @@ def _batch_failure_results(batch_size: int, reason: str) -> tuple[ToolResult, ..
     return tuple(ToolResult(ok=False, error=reason) for _ in range(batch_size))
 
 
+def _read_batch_limit_errors(batch_size: int) -> tuple[str, ...]:
+    if batch_size <= READ_BATCH_MAX_FILES:
+        return ()
+    return (
+        "read_batch batch rejected atomically: "
+        f"maximum {READ_BATCH_MAX_FILES} files per batch",
+    )
+
+
 async def _emit_read_batch_event(
     ctx: ToolContext, batch_index: int, batch_size: int, result: ToolResult
 ) -> None:
@@ -786,7 +859,7 @@ async def run_read_batch(
         and "read_batch" in offered_tools
     )
 
-    preflight_errors: list[str] = []
+    preflight_errors: list[str] = list(_read_batch_limit_errors(batch_size))
     if not read_offered:
         preflight_errors.append("read_batch is not offered in init.tools")
     for batch_index, call in enumerate(batch):
@@ -896,6 +969,9 @@ __all__ = [
     "MAX_OUTPUT_BYTES",
     "MAX_READ_BYTES",
     "MAX_READ_LINES",
+    "OWN_SESSION_READ_ERROR",
+    "READ_BATCH_MAX_BYTES_PER_FILE",
+    "READ_BATCH_MAX_FILES",
     "SHELL_OUTPUT_HEAD_BYTES",
     "SHELL_OUTPUT_MAX_BYTES",
     "SHELL_OUTPUT_TAIL_BYTES",
