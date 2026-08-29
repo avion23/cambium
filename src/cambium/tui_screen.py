@@ -596,16 +596,12 @@ def _tool_line(
     glyph = "✓" if entry.tool_ok else "✗" if entry.tool_ok is not None else "•"
     name = entry.tool_name or "?"
     if count > 1:
-        duration = (
-            _format_duration(last_duration_ms) if _usage_float(last_duration_ms) > 0 else ""
-        )
+        duration = _format_duration(last_duration_ms) if _usage_float(last_duration_ms) > 0 else ""
         prefix = f"{duration:>7} " if duration else ""
         line = f"{prefix}{glyph} {name} ×{count}"
     else:
         duration = (
-            _format_duration(entry.duration_ms)
-            if _usage_float(entry.duration_ms) > 0
-            else ""
+            _format_duration(entry.duration_ms) if _usage_float(entry.duration_ms) > 0 else ""
         )
         prefix = f"{duration:>7} " if duration else ""
         line = f"{prefix}{glyph} {name}"
@@ -1042,11 +1038,11 @@ class Transcript:
             and self._live_tool is not None
         ):
             self._start_live_operation(task_id, event_clock, force=True)
-        if incoming_tool is not None and incoming_tool != self._live_tool:
+        if incoming_tool and incoming_tool != self._live_tool:
             self._start_live_operation(task_id, event_clock, force=True)
         elif (
             kind == "heartbeat"
-            and incoming_tool is None
+            and not incoming_tool
             and (
                 self._live_tool is not None
                 or (
@@ -1081,10 +1077,14 @@ class Transcript:
             if isinstance(heartbeat_status, str) and heartbeat_status:
                 self._live_status = _single_line(heartbeat_status)
 
-        if incoming_tool is None:
-            self._live_tool = None
-        elif incoming_tool:
+        if incoming_tool:
             self._live_tool = incoming_tool
+        elif incoming_tool is not None:
+            # Explicit ``tool: null`` on the wire clears the completed tool
+            # without resetting the rest of the live operation; an event with
+            # no tool key at all carries no tool information and leaves the
+            # current tool display alone.
+            self._live_tool = None
         command = data.get("cmd") or data.get("command")
         if isinstance(command, str) and command.strip():
             self._live_command = _single_line(command)
@@ -1094,7 +1094,7 @@ class Transcript:
 
         if kind == "heartbeat":
             phase = _single_line(data.get("phase")).casefold().replace("_", "-")
-            if phase == "waiting" and incoming_tool is None and not self._live_provider_call_open:
+            if phase == "waiting" and not incoming_tool and not self._live_provider_call_open:
                 self._live_calls += 1
                 self._live_provider_call_open = True
         elif kind == "usage_event":
@@ -2470,9 +2470,7 @@ def _transcript_block_kind(block: list[tuple[str, str]]) -> str:
     if not block:
         return ""
     role, text = block[0]
-    if role in {"tool", "dim"} or text.lstrip().startswith(
-        ("✓ ", "✗ ", "• ", _TOOL_ERROR_PREFIX)
-    ):
+    if role in {"tool", "dim"} or text.lstrip().startswith(("✓ ", "✗ ", "• ", _TOOL_ERROR_PREFIX)):
         return "tool"
     return role
 
@@ -2574,11 +2572,7 @@ def _live_window_lines(
     terminal_status = _terminal_activity_status(activity_line)
     if terminal_status is not None and (transcript._live_kind or transcript.live_final):
         glyph = (
-            "✗"
-            if terminal_status == "error"
-            else "•"
-            if terminal_status == "cancelled"
-            else "✓"
+            "✗" if terminal_status == "error" else "•" if terminal_status == "cancelled" else "✓"
         )
         elapsed = _fmt_secs(transcript._live_age_s)
         if activity is not None:
@@ -2612,8 +2606,7 @@ def _live_window_lines(
     if phase not in _ACTIVITY_PHASE_GLYPHS:
         phase = (
             "streaming"
-            if transcript._live_kind in _TOOL_STREAM_KINDS
-            or transcript._live_text
+            if transcript._live_kind in _TOOL_STREAM_KINDS or transcript._live_text
             else "thinking"
         )
     spinner = _ACTIVITY_PHASE_GLYPHS[phase]
@@ -2659,8 +2652,7 @@ def _live_window_lines(
             details.append(f"✓ {transcript._live_tool or 'tool'}")
         if transcript._live_text and phase != "waiting":
             details.append(
-                f"{_ROLE_LABELS.get(transcript._live_role, 'LIVE')} ▸ "
-                f"{transcript._live_text}"
+                f"{_ROLE_LABELS.get(transcript._live_role, 'LIVE')} ▸ {transcript._live_text}"
             )
         else:
             if transcript._live_command:
@@ -3646,14 +3638,10 @@ def _status_fields(
         lane = _current_lane(snapshot)
         if "tokens" not in fields:
             fields["tokens"] = _human_count(
-                _usage_int(
-                    getattr(lane, "total_tokens", getattr(snapshot, "total_tokens", 0))
-                )
+                _usage_int(getattr(lane, "total_tokens", getattr(snapshot, "total_tokens", 0)))
             )
         if "calls" not in fields:
-            fields["calls"] = str(
-                _usage_int(getattr(lane, "calls", getattr(snapshot, "calls", 0)))
-            )
+            fields["calls"] = str(_usage_int(getattr(lane, "calls", getattr(snapshot, "calls", 0))))
 
     context = getattr(snapshot, "context", None)
     if context is not None:
@@ -3852,9 +3840,7 @@ def _detail_status_line(snapshot: Any, cumulative_line: str, width: int) -> str:
 
     def field(key: str, snapshot_key: str) -> int:
         if _snapshot_is_active(snapshot):
-            return _usage_int(
-                getattr(lane, snapshot_key, getattr(snapshot, snapshot_key, 0))
-            )
+            return _usage_int(getattr(lane, snapshot_key, getattr(snapshot, snapshot_key, 0)))
         return _usage_int(
             _usage_field(cumulative_line, key),
             _usage_int(getattr(snapshot, snapshot_key, 0)),
@@ -3879,8 +3865,7 @@ def _detail_status_line(snapshot: Any, cumulative_line: str, width: int) -> str:
     cost_field = _usage_field(cumulative_line, "cost")
     cost = (
         cost_field
-        if cost_field in {"free", "subscription"}
-        and not _snapshot_is_active(snapshot)
+        if cost_field in {"free", "subscription"} and not _snapshot_is_active(snapshot)
         else _format_cost(
             _usage_float(
                 getattr(lane, "estimated_cost_usd", getattr(snapshot, "estimated_cost_usd", 0.0))
@@ -4495,14 +4480,18 @@ class Cockpit:
     ) -> tuple[tuple[tuple[str, str], ...], tuple[str, ...]]:
         has_input = self._last_size.lines >= 3
         conversation_capacity = max(0, self._last_size.lines - 2 - int(has_input))
-        conversation_rows = tuple(
-            _primary_rows(
-                transcript,
-                width,
-                color=self.color,
-                include_stream=False,
-            )[-conversation_capacity:]
-        ) if conversation_capacity else ()
+        conversation_rows = (
+            tuple(
+                _primary_rows(
+                    transcript,
+                    width,
+                    color=self.color,
+                    include_stream=False,
+                )[-conversation_capacity:]
+            )
+            if conversation_capacity
+            else ()
+        )
         live_rows = self._small_live_rows(transcript, width, activity_line)
         lines_list = [
             *(
@@ -4894,9 +4883,8 @@ class Cockpit:
             # Conversation changes are committed as a fresh normal-buffer
             # frame. Heartbeat activity only changes the fixed rail cells;
             # repaint those in place so elapsed seconds cannot move the frame.
-            activity_changed = (
-                activity_only_update
-                or (previous_request is not None and activity_line != previous_request[-1])
+            activity_changed = activity_only_update or (
+                previous_request is not None and activity_line != previous_request[-1]
             )
             if conversation_rows == self._last_conversation_rows and activity_changed:
                 self._redraw_rail(self._last_frame_conversation_rows, rail_rows)

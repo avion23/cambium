@@ -3084,11 +3084,7 @@ class _ProgressDetector:
             result_hash = _progress_content_hash(result_content)
             repeated_read = result_hash in self._recent_content_hashes
             self._recent_content_hashes.append(result_hash)
-        novel = (
-            bool(signature)
-            and signature not in self._recent_signatures
-            and not repeated_read
-        )
+        novel = bool(signature) and signature not in self._recent_signatures and not repeated_read
         self.no_progress_actions = 0 if novel else self.no_progress_actions + 1
         self._recent_signatures.append(signature)
         return (
@@ -3123,8 +3119,7 @@ class _ProgressDetector:
             else:
                 signature = _progress_signature(None, action=action)
                 pending_read_result = (
-                    action.get("type") == "tool_call"
-                    and action.get("name") in _READ_TOOL_NAMES
+                    action.get("type") == "tool_call" and action.get("name") in _READ_TOOL_NAMES
                 )
             if signature:
                 self._recent_signatures.append(signature)
@@ -3144,9 +3139,7 @@ def _context_state_message(
 ) -> dict[str, str]:
     """Render one deterministic loop-status line as user-role tail data."""
     budget_remaining_pct = (
-        max(0, 100 - min(100, budget_new_tokens * 100 // max_tokens))
-        if max_tokens > 0
-        else 0
+        max(0, 100 - min(100, budget_new_tokens * 100 // max_tokens)) if max_tokens > 0 else 0
     )
     return {
         "role": "user",
@@ -3194,7 +3187,7 @@ async def _emit_tool_event(
     )
 
 
-async def _emit_tool_output_delta(
+def _emit_tool_output_delta(
     writer: asyncio.StreamWriter,
     config: AgentConfig,
     name: str,
@@ -4887,8 +4880,7 @@ def _no_progress_failure(
     return _loop_result(
         outcome,
         "failed",
-        f"agent made no progress: {no_progress_actions} consecutive actions "
-        "with no novel content",
+        f"agent made no progress: {no_progress_actions} consecutive actions with no novel content",
         turn,
         cumulative_usage,
         transcript,
@@ -5028,9 +5020,7 @@ async def _bound_context_continuation(
                     ),
                 )
             context_continuation = bounded
-            transcript = _sync_context_transcript(
-                base_messages, context_continuation, transcript
-            )
+            transcript = _sync_context_transcript(base_messages, context_continuation, transcript)
             return (
                 True,
                 None,
@@ -5210,9 +5200,7 @@ async def _bound_context_continuation(
                     )
                     continue
                 if content_flagged:
-                    raise ContextForkError(
-                        "summary flagged by provider content filter"
-                    ) from exc
+                    raise ContextForkError("summary flagged by provider content filter") from exc
                 detail = exc.__class__.__name__
                 if isinstance(exc, AllProvidersFailed) and exc.last_error is not None:
                     inner = exc.last_error
@@ -5284,9 +5272,7 @@ async def _bound_context_continuation(
         )
         if finalized and budget_new_tokens > finalization_cap:
             raise ContextForkError(
-                _phase_failure(
-                    "token budget exceeded during summary flush", final_synthesis=True
-                )
+                _phase_failure("token budget exceeded during summary flush", final_synthesis=True)
             )
         try:
             summary_entry = parse_summary_response(summary_result.content, expectation)
@@ -5386,9 +5372,7 @@ async def _bound_context_continuation(
         )
         if checkpoint is None:
             raise ContextForkError("summary flush has no checkpoint root")
-        checkpoint = _load_epoch_checkpoint(
-            config, checkpoint.checkpoint_ref, expect_task_id=True
-        )
+        checkpoint = _load_epoch_checkpoint(config, checkpoint.checkpoint_ref, expect_task_id=True)
     except Exception as exc:
         failure_reason = str(exc).strip() or exc.__class__.__name__
         if config.redactor is not None:
@@ -5435,9 +5419,7 @@ async def _bound_context_continuation(
     compaction_armed = True
     compaction_deferred = False
     consecutive_compaction_deferrals = 0
-    transcript = _sync_context_transcript(
-        base_messages, context_continuation, transcript
-    )
+    transcript = _sync_context_transcript(base_messages, context_continuation, transcript)
     if writer is not None:
         if local_checkpoint:
             await _emit_context_epoch_advanced(
@@ -5565,7 +5547,6 @@ async def _run_agent_loop(
     provider_boundaries = provider_boundaries or {}
     _install_codex_progress_observer(router, progress)
 
-
     resume = config.resume
     try:
         resume_kind = (
@@ -5601,9 +5582,7 @@ async def _run_agent_loop(
             for child_result in resume["child_results"]:
                 transcript.append({"role": "user", "content": _child_result_lines(child_result)})
             compaction_deferred = turn_checkpoint["compaction_deferred"]
-            consecutive_compaction_deferrals = turn_checkpoint[
-                "consecutive_compaction_deferrals"
-            ]
+            consecutive_compaction_deferrals = turn_checkpoint["consecutive_compaction_deferrals"]
             outcome["commits_so_far"] = turn_checkpoint["commits_so_far"]
         except ContextForkError as exc:
             return _loop_result(
@@ -5665,9 +5644,7 @@ async def _run_agent_loop(
         first_turn = resume_checkpoint.turn + 1
         epoch_count = resume_checkpoint.epoch
         usage_epoch = resume_checkpoint.epoch
-        transcript = _sync_context_transcript(
-            base_messages, context_continuation, transcript
-        )
+        transcript = _sync_context_transcript(base_messages, context_continuation, transcript)
     elif config.context_fork is not None:
         fork_messages, fork_skip = _resolve_fork_prefix(config, tools, model)
         if fork_messages is not None:
@@ -5718,9 +5695,7 @@ async def _run_agent_loop(
             base_messages = tuple(copy.deepcopy(semantic_trunk))
             context_continuation = copy.deepcopy(semantic_tail)
             usage_fork_of = config.summary_trunk_ref
-            transcript = _sync_context_transcript(
-                base_messages, context_continuation, transcript
-            )
+            transcript = _sync_context_transcript(base_messages, context_continuation, transcript)
         except (ContextForkError, SummaryTrunkError) as exc:
             if writer is not None:
                 await send(
@@ -5752,9 +5727,7 @@ async def _run_agent_loop(
         initial_trunk, initial_tail = partition_summary_trunk(initial_prompt["messages"])
         base_messages = tuple(copy.deepcopy(initial_trunk))
         context_continuation = copy.deepcopy(initial_tail)
-        transcript = _sync_context_transcript(
-            base_messages, context_continuation, transcript
-        )
+        transcript = _sync_context_transcript(base_messages, context_continuation, transcript)
 
     wall_deadline = time.monotonic() + max(0.0, absolute_wall_deadline - time.time())
     try:
@@ -6200,9 +6173,7 @@ async def _run_agent_loop(
                         transcript,
                     )
                 break
-            read_action = (
-                action["type"] == "tool_call" and action.get("name") in _READ_TOOL_NAMES
-            )
+            read_action = action["type"] == "tool_call" and action.get("name") in _READ_TOOL_NAMES
             if not read_action:
                 stalled = _observe_progress(progress_detector, action=action)
                 no_progress_actions = progress_detector.no_progress_actions
