@@ -1160,7 +1160,7 @@ def test_cockpit_replaces_failed_to_idle_status_in_place() -> None:
 
     assert len(cockpit._last_status_rows) == 5
     assert cockpit._last_status_rows[-2].startswith(" ⠋ idle")
-    assert stream.getvalue().count("┌ Cambium · conversation") == 2
+    assert stream.getvalue().count("┌ Cambium · conversation") == 1
 
 
 def test_cockpit_forces_completed_frame_while_input_read_is_pending() -> None:
@@ -1208,11 +1208,20 @@ def test_cockpit_forces_completed_frame_while_input_read_is_pending() -> None:
             cumulative_line="usage: calls=1 tokens=20000",
             force=True,
         )
+        cockpit.draw(
+            final_snapshot,
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=1 tokens=20000",
+            activity_line="✓ DONE",
+        )
+        cockpit.flush()
 
         after = stream.getvalue()
         assert "completed response" in after
-        assert after.count("┌ Cambium · conversation") == 2
-        assert "conversation · done" in after
+        assert after.count("┌ Cambium · conversation") == 1
+        assert "conversation · done" not in after
         assert "20k tok" in after
         assert after != before
         assert stream.flush_count > flushes_before_completion
@@ -1399,7 +1408,120 @@ def test_provider_call_heartbeat_is_not_rendered_as_waiting() -> None:
     )
 
     assert all("waiting" not in row.casefold() for row in rows)
-    assert "provider call" in rows[0] + rows[1]
+    assert "starting" in rows[0]
+    assert "operation event pending" in rows[0]
+    assert "provider call not established" in rows[1]
+
+
+def test_small_terminal_live_events_rewrite_two_rows_without_newlines(monkeypatch) -> None:
+    class _Tty(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    monkeypatch.setattr(
+        tui_screen.shutil,
+        "get_terminal_size",
+        lambda _fallback: os.terminal_size((70, 11)),
+    )
+    stream = _Tty()
+    transcript = Transcript()
+    cockpit = Cockpit(stream)
+    with cockpit:
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+            activity_line="⠋ WAITING · thinking… 0s",
+            turn_active=True,
+        )
+        first = stream.getvalue()
+        cockpit.move_to_input()
+        transcript.observe_event(
+            {
+                "kind": "tool_output_delta",
+                "task_id": "interactive-main",
+                "payload": {
+                    "tool": "run_shell",
+                    "stream": "stdout",
+                    "delta": "first chunk",
+                },
+            }
+        )
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+            activity_line="▸ streaming",
+            turn_active=True,
+        )
+        live_delta = stream.getvalue()[len(first) :]
+        transcript.finish_stream("final status")
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=1",
+            activity_line="✓ DONE",
+            turn_active=True,
+            force=True,
+        )
+        final_delta = stream.getvalue()[len(first) + len(live_delta) :]
+
+    assert "first chunk" in live_delta
+    assert "final status" in final_delta
+    assert "┌ Cambium" not in live_delta + final_delta
+    assert "\n" not in live_delta + final_delta
+    assert "\x1b[2A" in live_delta + final_delta
+    assert "\x1b[1A" in live_delta + final_delta
+
+
+def test_live_tool_tail_and_duration_clear_at_provider_boundary() -> None:
+    transcript = Transcript()
+    transcript.observe_event(
+        {
+            "kind": "heartbeat",
+            "payload": {
+                "phase": "streaming",
+                "tool": "run_shell",
+                "tail": "stale command output",
+            },
+        }
+    )
+    transcript.observe_event(
+        {
+            "kind": "tool_event",
+            "payload": {"tool": "run_shell", "ok": True, "duration_ms": 1250},
+        }
+    )
+    transcript.observe_event(
+        {"kind": "heartbeat", "payload": {"phase": "waiting", "status": "working"}}
+    )
+
+    rows = _live_window_lines(transcript, 100)
+    assert all(
+        value not in " ".join(rows)
+        for value in ("stale command output", "run_shell", "1250ms")
+    )
+    assert "provider call" in " ".join(rows)
+
+
+def test_live_provider_tail_clears_when_heartbeat_phase_changes() -> None:
+    transcript = Transcript()
+    transcript.observe_event(
+        {"kind": "heartbeat", "payload": {"phase": "streaming", "tail": "old provider tail"}}
+    )
+    transcript.observe_event(
+        {"kind": "heartbeat", "payload": {"phase": "waiting", "status": "working"}}
+    )
+
+    rows = _live_window_lines(transcript, 100)
+    assert "old provider tail" not in " ".join(rows)
+    assert "provider call" in " ".join(rows)
 
 
 def test_short_terminal_falls_back_to_stream_rows() -> None:

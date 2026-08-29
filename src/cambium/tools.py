@@ -26,8 +26,8 @@ from typing import Any, cast
 from .auth import scrub_environment
 from .lint_diag import LintDiag
 from .schemas import TOOL_SCHEMAS, validate_tool_call
-from .terminal import sanitize_terminal_text
 from .tasktree import TaskKind
+from .terminal import sanitize_terminal_text
 
 MAX_READ_BYTES = 100 * 1024
 MAX_READ_LINES = 2_000

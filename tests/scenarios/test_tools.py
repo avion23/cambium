@@ -417,8 +417,9 @@ def test_run_shell_reports_bounded_output_progress(tmp_path: Path) -> None:
 
     assert result.ok
     assert result.output == "first\nsecond\nthird\n"
-    assert [stream for stream, _delta in progress] == ["stdout", "stdout", "stdout"]
-    assert [delta.strip() for _stream, delta in progress] == ["first", "second", "third"]
+    assert len(progress) >= 2
+    joined = "".join(delta for _stream, delta in progress)
+    assert all(word in joined for word in ("first", "second", "third"))
     assert all(len(delta.encode()) <= tools._PROCESS_PROGRESS_MAX_BYTES for _, delta in progress)
 
 

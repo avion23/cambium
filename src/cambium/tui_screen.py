@@ -1012,27 +1012,52 @@ class Transcript:
             return
         event_clock = self._event_clock(record)
         task_id = _task_id(record, data)
+        turn = _event_turn(data)
         if task_id is not None or self._live_task_id is None:
             self._start_live_operation(task_id, event_clock)
         if self._live_final and kind != "result":
             return
         incoming_tool = self._event_tool(data)
+        if (
+            turn is not None
+            and self._live_turn is not None
+            and turn != self._live_turn
+        ):
+            self._start_live_operation(task_id, event_clock, force=True)
+        elif kind == "tool_output_delta" and self._live_kind == "tool_event":
+            self._start_live_operation(task_id, event_clock, force=True)
+        elif (
+            kind in _FAILURE_EVENT_KINDS | {"error", "fatal_error", "timeout"}
+            and self._live_tool is not None
+        ):
+            self._start_live_operation(task_id, event_clock, force=True)
+        elif (
+            kind not in {"heartbeat", "tool_event", "tool_output_delta"}
+            and self._live_tool is not None
+        ):
+            self._start_live_operation(task_id, event_clock, force=True)
         if incoming_tool is not None and incoming_tool != self._live_tool:
             self._start_live_operation(task_id, event_clock, force=True)
         elif (
             kind == "heartbeat"
             and incoming_tool is None
-            and self._live_tool is not None
+            and (
+                self._live_tool is not None
+                or (
+                    self._live_kind == "heartbeat"
+                    and _single_line(data.get("phase")) != self._live_phase
+                )
+                or self._live_kind not in {"", "heartbeat"}
+            )
         ):
             # A heartbeat with no tool is the next provider phase. Clear the
-            # completed tool's tail/duration instead of displaying it as live.
+            # completed operation's tail/duration instead of displaying it as live.
             self._start_live_operation(task_id, event_clock, force=True)
         if self._live_started_at is None:
             self._live_started_at = event_clock
         if event_clock is not None and self._live_started_at is not None:
             self._live_age_s = max(0.0, event_clock - self._live_started_at)
 
-        turn = _event_turn(data)
         if turn is not None:
             self._live_turn = turn
         self._live_kind = kind
@@ -1095,6 +1120,9 @@ class Transcript:
 
     def _set_live_result(self, text: str | None) -> None:
         clean = _single_line(text) if isinstance(text, str) else ""
+        self._live_tool = None
+        self._live_command = ""
+        self._live_duration_ms = None
         if clean:
             self._live_text = clean[-_LIVE_TEXT_LIMIT:]
             self._live_bytes = _utf8_size(self._live_text)
@@ -4192,6 +4220,8 @@ class Cockpit:
         self._input_active = False
         self._native_input = False
         self._input_prompt_label = "›"
+        self._last_restored_input_text: str | None = None
+        self._last_restored_input_label = "›"
         self._pending_draw: tuple[Any, Transcript, str, str, str, str, str] | None = None
         self._turn_active = False
         self._last_live_draw_at = 0.0
@@ -4213,6 +4243,7 @@ class Cockpit:
         self._small_total_rows = 0
         self._frame_size: os.terminal_size | None = None
         self._frame_show_detail: bool | None = None
+        self._final_hold_conversation_rows: tuple[tuple[str, str], ...] | None = None
         self._activity_line = ""
         self._activity_only_update = False
         self._show_detail = True
@@ -4299,6 +4330,31 @@ class Cockpit:
         )
         live_turn = turn_active or bool(activity_line)
         self._turn_active = live_turn and not force
+        if self._final_hold_conversation_rows is not None:
+            if not request[1].live_final:
+                self._final_hold_conversation_rows = None
+            elif (
+                not force
+                and self._frame_size == self._last_size
+                and self._frame_show_detail == self._show_detail
+            ):
+                width = (
+                    self._last_size.columns
+                    if self._small_frame
+                    else _frame_content_width(self._last_size.columns)
+                )
+                current_rows = tuple(
+                    _primary_rows(
+                        request[1],
+                        width,
+                        color=self.color,
+                        include_stream=False,
+                    )
+                )
+                if current_rows == self._final_hold_conversation_rows:
+                    self._draw_live_now(request, live_only=True)
+                    return
+                self._final_hold_conversation_rows = None
         if self._draw_in_flight:
             self._pending_draw = request
             return
@@ -4385,10 +4441,18 @@ class Cockpit:
             return ""
         return _sanitize(value).replace("\r", " ").replace("\n", " ").replace("\t", " ")
 
-    def _restore_input_line(self, text: str) -> None:
+    def _restore_input_line(self, text: str, *, force: bool = False) -> None:
         if not self._input_active:
             return
+        if (
+            not force
+            and self._last_restored_input_text == text
+            and self._last_restored_input_label == self._input_prompt_label
+        ):
+            return
         self.stream.write(f"\r{_CLEAR_LINE}{self._input_prompt_label} {text}")
+        self._last_restored_input_text = text
+        self._last_restored_input_label = self._input_prompt_label
 
     def _small_live_rows(
         self,
@@ -4652,6 +4716,7 @@ class Cockpit:
             self._last_primary_rows = _primary_request_rows(self._last_conversation_rows, rail_rows)
         self._last_rail_rows = rail_rows
         self._last_live_revision = transcript.live_revision
+        self._hold_final_conversation(request)
 
     def _draw_live_now(
         self,
@@ -4661,17 +4726,18 @@ class Cockpit:
         live_only: bool = False,
     ) -> None:
         input_text = self._input_line_text()
+        live_only_render = live_only or (
+            force
+            and self._fixed_frame
+            and (
+                request[1].live_final
+                or request[1].live_revision != self._last_live_revision
+                or _terminal_activity_status(request[-1]) is not None
+            )
+        )
         self._draw_in_flight = True
         try:
-            if live_only or (
-                force
-                and self._fixed_frame
-                and (
-                    request[1].live_final
-                    or request[1].live_revision != self._last_live_revision
-                    or _terminal_activity_status(request[-1]) is not None
-                )
-            ):
+            if live_only_render:
                 self._draw_live_event_now(request)
             else:
                 self._draw_now(
@@ -4681,7 +4747,7 @@ class Cockpit:
                 )
         finally:
             self._draw_in_flight = False
-        self._restore_input_line(input_text)
+        self._restore_input_line(input_text, force=not live_only_render)
         self.stream.flush()
 
     def _draw_now(
@@ -4825,6 +4891,25 @@ class Cockpit:
         self._last_live_status_rows = (status_rows[1], status_rows[2])
         self._last_live_revision = transcript.live_revision
         self._last_rail_rows = rail_rows
+
+    def _hold_final_conversation(
+        self, request: tuple[Any, Transcript, str, str, str, str, str]
+    ) -> None:
+        if not request[1].live_final:
+            return
+        width = (
+            self._last_size.columns
+            if self._small_frame
+            else _frame_content_width(self._last_size.columns)
+        )
+        self._final_hold_conversation_rows = tuple(
+            _primary_rows(
+                request[1],
+                width,
+                color=self.color,
+                include_stream=False,
+            )
+        )
 
     def _draw_stream_now(
         self,
@@ -5015,6 +5100,8 @@ class Cockpit:
         self._native_input = native
         label_text = _clip(_sanitize(label).replace(chr(10), " "), 8)
         self._input_prompt_label = label_text
+        self._last_restored_input_text = None
+        self._last_restored_input_label = label_text
         if self._small_frame and self._small_total_rows < 3:
             return
         if self._fixed_frame:
@@ -5025,6 +5112,7 @@ class Cockpit:
 
     def hide_cursor(self, *, commit: bool = False) -> None:
         self._input_active = False
+        self._last_restored_input_text = None
         if self.enabled:
             if commit:
                 if self._fixed_frame:
