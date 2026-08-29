@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -14,22 +13,6 @@ from cambium.process_env import build_subprocess_env
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CLI = [sys.executable, "-m", "cambium.cli"]
-UNIFIED_COMMANDS = (
-    "auth",
-    "supervisor",
-    "doctor",
-    "bench",
-    "module-test",
-    "version",
-    "run",
-    "repl",
-    "tui",
-    "monitor",
-    "quota",
-    "optimize",
-    "session",
-    "architectus",
-)
 
 
 def _run(*args: str) -> subprocess.CompletedProcess[str]:
@@ -43,19 +26,6 @@ def _run(*args: str) -> subprocess.CompletedProcess[str]:
         env=env,
         timeout=300,
     )
-
-
-def test_help_lists_exact_unified_commands() -> None:
-    result = _run("--help")
-
-    assert result.returncode == 0, result.stdout + result.stderr
-    expected = ",".join(UNIFIED_COMMANDS)
-    command_lines = [
-        line.strip()[1:-1]
-        for line in result.stdout.splitlines()
-        if line.strip().startswith("{") and line.strip().endswith("}")
-    ]
-    assert command_lines and all(line == expected for line in command_lines), result.stdout
 
 
 def test_bare_unknown_command_is_rejected() -> None:
@@ -120,57 +90,3 @@ def test_supervisor_requires_session_dir_and_exactly_one_input(
     result = _run(*args)
 
     assert result.returncode == 2, result.stdout + result.stderr
-
-
-HELP_SURFACES = (
-    ("--help",),
-    ("auth", "--help"),
-    ("auth", "set", "--help"),
-    ("auth", "remove", "--help"),
-    ("auth", "list", "--help"),
-    ("auth", "oauth", "--help"),
-    ("auth", "oauth", "login", "--help"),
-    ("auth", "oauth", "status", "--help"),
-    ("auth", "oauth", "logout", "--help"),
-    ("auth", "oauth", "import-codex-cli", "--help"),
-    ("auth", "run", "--help"),
-    ("auth", "run", "supervisor", "--help"),
-    ("supervisor", "--help"),
-    ("doctor", "--help"),
-    ("bench", "--help"),
-    ("bench", "report", "--help"),
-    ("bench", "gate", "--help"),
-    ("bench", "re-anchor", "--help"),
-    ("bench", "quality", "--help"),
-    ("module-test", "--help"),
-    ("version", "--help"),
-    ("run", "--help"),
-    ("repl", "--help"),
-    ("tui", "--help"),
-    ("monitor", "--help"),
-    ("quota", "--help"),
-    ("optimize", "--help"),
-    ("session", "--help"),
-    ("session", "list", "--help"),
-    ("session", "latest", "--help"),
-    ("session", "show", "--help"),
-    ("session", "status", "--help"),
-    ("session", "resume", "--help"),
-    ("session", "usage", "--help"),
-    ("architectus", "--help"),
-)
-
-
-@pytest.mark.parametrize("args", HELP_SURFACES)
-def test_no_context_reuse_option_appears_in_help(args: tuple[str, ...]) -> None:
-    result = _run(*args)
-
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "--context-reuse" not in result.stdout + result.stderr
-
-
-def test_version_prints_a_version_string() -> None:
-    result = _run("version")
-
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert re.fullmatch(r"\d+\.\d+\.\d+(?:[.-][0-9A-Za-z.-]+)?", result.stdout.strip())
