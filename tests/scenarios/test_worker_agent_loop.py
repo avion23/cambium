@@ -1570,16 +1570,15 @@ def test_concatenated_actions_first_action_parsed_trailing_noted(tmp_path: Path)
 
 
 def test_three_invalid_actions_fail_fast_with_no_progress(tmp_path: Path) -> None:
-    """Invalid (unparseable) actions count toward the no-progress guard and
-    fail fast at the 3rd consecutive one instead of burning the turn budget."""
+    """Distinct malformed responses hit the dedicated invalid-action bound."""
     repo = tmp_path / "repo"
     worktree = _make_worktree(repo)
     config = _agent_config(worktree)
     router = _ScriptedRouter(
         [
-            '{"type":"plan"',
-            '{"type":"plan"',
-            '{"type":"plan"',
+            "not-json-one",
+            "not-json-two",
+            "not-json-three",
             '{"type":"finish","summary":"must never be reached","objective_met":true}',
         ]
     )
@@ -1587,10 +1586,52 @@ def test_three_invalid_actions_fail_fast_with_no_progress(tmp_path: Path) -> Non
     outcome = asyncio.run(_drive_loop(config, worktree, router))
 
     assert outcome["status"] == "failed"
-    assert "no progress" in outcome["failure_reason"]
+    assert outcome["failure_reason"] == "agent emitted 3 consecutive invalid actions"
     assert "max turns exceeded" not in outcome["failure_reason"]
     assert outcome["turn"] == 3  # failed on the 3rd consecutive invalid action
     assert len(router.prompts) == 3  # no further router calls
+
+
+def test_valid_action_resets_consecutive_invalid_action_bound(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = _make_worktree(repo)
+    config = _agent_config(worktree)
+    router = _ScriptedRouter(
+        [
+            "malformed-before-reset",
+            '{"type":"plan","steps":["continue"]}',
+            "malformed-after-reset-one",
+            "malformed-after-reset-two",
+            "malformed-after-reset-three",
+        ]
+    )
+
+    outcome = asyncio.run(_drive_loop(config, worktree, router))
+
+    assert outcome["status"] == "failed"
+    assert outcome["failure_reason"] == "agent emitted 3 consecutive invalid actions"
+    assert outcome["turn"] == 5
+    assert len(router.prompts) == 5
+
+
+def test_tool_schema_failure_does_not_increment_invalid_action_bound(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = _make_worktree(repo)
+    config = _agent_config(worktree)
+    router = _ScriptedRouter(
+        [
+            '{"type":"tool_call","name":"read_batch","arguments":{}}',
+            "malformed-one",
+            "malformed-two",
+            '{"type":"finish","summary":"tool feedback handled","objective_met":true}',
+        ]
+    )
+
+    outcome = asyncio.run(_drive_loop(config, worktree, router))
+
+    assert outcome["status"] == "succeeded"
+    assert outcome["summary"] == "tool feedback handled"
+    assert len(router.prompts) == 4
 
 
 # ---------------------------------------------------------------------------

@@ -1328,6 +1328,64 @@ def test_token_bucket_rpm_one_second_call_cascades(tmp_path, monkeypatch) -> Non
 # --------------------------------------------------------------------------- #
 
 
+def test_consecutive_all_provider_failures_trip_and_success_resets_cap(tmp_path) -> None:
+    server = FakeServer(
+        [
+            (429, _error_payload("rate limit"), 0.0),
+            (429, _error_payload("rate limit"), 0.0),
+            (200, _ok_payload("recovered"), 0.0),
+            (429, _error_payload("rate limit"), 0.0),
+            (429, _error_payload("rate limit"), 0.0),
+            (429, _error_payload("rate limit"), 0.0),
+            (200, _ok_payload("must not be called"), 0.0),
+        ]
+    )
+    router = Diffundo(
+        (_config("flapping", server, "K_FLAPPING", model="m", cooldown_s=0.0),),
+        pause_timeout_s=0.0,
+    )
+    try:
+        for _ in range(2):
+            with pytest.raises(AllProvidersFailed):
+                asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert router._consecutive_all_provider_failures == 2
+
+        recovered = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert recovered.content == "recovered"
+        assert router._consecutive_all_provider_failures == 0
+
+        for _ in range(3):
+            with pytest.raises(AllProvidersFailed) as raised:
+                asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert "3 consecutive calls" in str(raised.value)
+        assert router._consecutive_all_provider_failures == 3
+
+        with pytest.raises(AllProvidersFailed, match="provider failure circuit is open"):
+            asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert len(server.calls) == 6
+    finally:
+        server.close()
+
+
+def test_successful_provider_fallback_does_not_trip_all_failure_cap(tmp_path) -> None:
+    bad = FakeServer([(429, _error_payload("rate limit"), 0.0)])
+    good = FakeServer([(200, _ok_payload("fallback"), 0.0)])
+    router = Diffundo(
+        (
+            _config("flapping-bad", bad, "K_FLAPPING_BAD", model="m", cooldown_s=0.0),
+            _config("flapping-good", good, "K_FLAPPING_GOOD", model="m", cooldown_s=0.0),
+        ),
+        pause_timeout_s=0.0,
+    )
+    try:
+        result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert result.content == "fallback"
+        assert router._consecutive_all_provider_failures == 0
+    finally:
+        bad.close()
+        good.close()
+
+
 @pytest.mark.slow  # cooldown recovery wait; asserts elapsed >= 0.5
 def test_exhaustion_pause_wakes_when_provider_recovers(tmp_path, monkeypatch) -> None:
     # D8f recovery monitor: after the provider's cooldown elapses mid-pause, the

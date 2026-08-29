@@ -189,6 +189,9 @@ MAX_SUMMARY_CHARS = 2_000
 # Consecutive non-novel actions (valid plans, tool calls, and
 # invalid/unparseable actions) before the agent loop fails fast.
 MAX_NO_PROGRESS_ACTIONS = 2
+# Invalid provider output is a separate bound from content-based stall
+# detection: changing malformed text must not reset this counter.
+MAX_CONSECUTIVE_INVALID_ACTIONS = 3
 # Content identities keep repeated reads from masquerading as progress without
 # retaining unbounded tool output.
 MAX_PROGRESS_CONTENT_HASHES = 8
@@ -2987,6 +2990,9 @@ def _is_content_flagged(exc: BaseException) -> bool:
 
 def _provider_call_failure_reason(exc: BaseException) -> str:
     """Keep the provider content outcome parseable in the loop result."""
+    explicit_reason = getattr(exc, "reason", None)
+    if isinstance(explicit_reason, str) and explicit_reason:
+        return explicit_reason
     suffix = " (content_flagged)" if _is_content_flagged(exc) else ""
     return f"provider call failed: {exc.__class__.__name__}{suffix}"
 
@@ -3291,7 +3297,12 @@ def _failure_usage_event(
     }
     if isinstance(model, str) and model:
         event["model"] = model
-    failure_reason = exc.__class__.__name__
+    explicit_reason = getattr(exc, "reason", None)
+    failure_reason = (
+        explicit_reason
+        if isinstance(explicit_reason, str) and explicit_reason
+        else exc.__class__.__name__
+    )
     provider: str | None = None
     retry_after_s: float | None = None
     request_rate_status: str | None = None
@@ -3302,7 +3313,8 @@ def _failure_usage_event(
         retry_after_s = error.retry_after_s
         request_rate_status = error.request_rate_status
         account_quota_owner = error.account_quota_owner
-        failure_reason = f"{error.outcome.value}: {error.message}"
+        if not (isinstance(explicit_reason, str) and explicit_reason):
+            failure_reason = f"{error.outcome.value}: {error.message}"
     if provider is not None:
         event["provider"] = provider
         if request_rate_status is None:
@@ -3352,10 +3364,20 @@ def _write_checkpoint_file(
     commits_so_far: list[str],
     *,
     compaction_deferred: bool = False,
+    consecutive_compaction_deferrals: int = 0,
     code_changed: bool = False,
 ) -> Path | None:
     if config.checkpoint_root is None:
         return None
+    if (
+        isinstance(consecutive_compaction_deferrals, bool)
+        or not isinstance(consecutive_compaction_deferrals, int)
+        or consecutive_compaction_deferrals < 0
+        or consecutive_compaction_deferrals > MAX_CONSECUTIVE_COMPACTION_DEFERRALS
+    ):
+        raise ValueError("invalid consecutive compaction deferral count")
+    if compaction_deferred and consecutive_compaction_deferrals == 0:
+        consecutive_compaction_deferrals = 1
     directory = config.checkpoint_root / _safe_task_id(config.task_id)
     path = directory / f"turn-{turn:03d}.json"
     payload: dict[str, Any] = {
@@ -3368,6 +3390,7 @@ def _write_checkpoint_file(
         "commits_so_far": commits_so_far,
         "workspace_hash": _workspace_hash(config.worktree),
         "compaction_deferred": compaction_deferred,
+        "consecutive_compaction_deferrals": consecutive_compaction_deferrals,
         "code_changed": code_changed,
     }
     redactor = config.redactor or _checkpoint_redactor(config.provider_env_keys)
@@ -3405,6 +3428,7 @@ async def _persist_checkpoint(
     commits_so_far: list[str],
     *,
     compaction_deferred: bool = False,
+    consecutive_compaction_deferrals: int = 0,
     code_changed: bool = False,
 ) -> None:
     path = await asyncio.to_thread(
@@ -3415,6 +3439,7 @@ async def _persist_checkpoint(
         usage,
         commits_so_far,
         compaction_deferred=compaction_deferred,
+        consecutive_compaction_deferrals=consecutive_compaction_deferrals,
         code_changed=code_changed,
     )
     if path is not None:
@@ -4273,6 +4298,7 @@ def _load_turn_checkpoint(config: AgentConfig, checkpoint_ref: str) -> dict[str,
     optional_keys = checkpoint_keys - expected_keys
     if not expected_keys <= checkpoint_keys or not optional_keys <= {
         "compaction_deferred",
+        "consecutive_compaction_deferrals",
         "code_changed",
     }:
         raise ContextForkError("checkpoint has an invalid key set")
@@ -4310,6 +4336,16 @@ def _load_turn_checkpoint(config: AgentConfig, checkpoint_ref: str) -> dict[str,
     compaction_deferred = data.get("compaction_deferred", False)
     if type(compaction_deferred) is not bool:
         raise ContextForkError("checkpoint compaction_deferred invalid")
+    consecutive_compaction_deferrals = data.get(
+        "consecutive_compaction_deferrals",
+        int(compaction_deferred),
+    )
+    if (
+        isinstance(consecutive_compaction_deferrals, bool)
+        or not isinstance(consecutive_compaction_deferrals, int)
+        or not 0 <= consecutive_compaction_deferrals <= MAX_CONSECUTIVE_COMPACTION_DEFERRALS
+    ):
+        raise ContextForkError("checkpoint consecutive compaction deferral count invalid")
     code_changed = data.get("code_changed", False)
     if type(code_changed) is not bool:
         raise ContextForkError("checkpoint code_changed invalid")
@@ -4320,6 +4356,7 @@ def _load_turn_checkpoint(config: AgentConfig, checkpoint_ref: str) -> dict[str,
         "commits_so_far": list(commits),
         "workspace_hash": workspace_hash,
         "compaction_deferred": compaction_deferred,
+        "consecutive_compaction_deferrals": consecutive_compaction_deferrals,
         "code_changed": code_changed,
     }
 
@@ -5185,17 +5222,17 @@ async def _bound_context_continuation(
                 raise
             compaction_deferred = True
             consecutive_compaction_deferrals += 1
-            if last_turn_checkpoint is not None:
-                await asyncio.to_thread(
-                    _write_checkpoint_file,
-                    config,
-                    last_turn_checkpoint,
-                    transcript,
-                    cumulative_usage,
-                    [],
-                    compaction_deferred=True,
-                    code_changed=code_changed,
-                )
+            await asyncio.to_thread(
+                _write_checkpoint_file,
+                config,
+                last_turn_checkpoint if last_turn_checkpoint is not None else turn,
+                transcript,
+                cumulative_usage,
+                [],
+                compaction_deferred=True,
+                consecutive_compaction_deferrals=consecutive_compaction_deferrals,
+                code_changed=code_changed,
+            )
             deferred_reason = str(exc).strip() or exc.__class__.__name__
             if writer is not None:
                 await _emit_compaction_deferred(
@@ -5443,6 +5480,7 @@ async def _run_agent_loop(
     compaction_armed = True
     compaction_deferred = False
     consecutive_compaction_deferrals = 0
+    consecutive_invalid_actions = 0
     usage_epoch: int | None = None
     usage_fork_of: str | None = None
     first_turn = 1
@@ -5490,6 +5528,9 @@ async def _run_agent_loop(
             for child_result in resume["child_results"]:
                 transcript.append({"role": "user", "content": _child_result_lines(child_result)})
             compaction_deferred = turn_checkpoint["compaction_deferred"]
+            consecutive_compaction_deferrals = turn_checkpoint[
+                "consecutive_compaction_deferrals"
+            ]
             outcome["commits_so_far"] = turn_checkpoint["commits_so_far"]
         except ContextForkError as exc:
             return _loop_result(
@@ -5860,6 +5901,7 @@ async def _run_agent_loop(
                         "latency_s": 0.0,
                         "transcript": transcript,
                         "compaction_deferred": compaction_deferred,
+                        "consecutive_compaction_deferrals": consecutive_compaction_deferrals,
                     }
                 return _loop_result(
                     outcome,
@@ -6002,14 +6044,7 @@ async def _run_agent_loop(
                     forced_finalization=forced_finalization,
                     finalization_grace_used=finalization_grace_used,
                 )
-                stalled = _observe_progress(progress_detector, response_content)
-                no_progress_actions = progress_detector.no_progress_actions
-                if stalled and not _finalization_due(
-                    turn, finalized, budget_new_tokens, soft_cap, config
-                ):
-                    return _no_progress_failure(
-                        outcome, no_progress_actions, turn, cumulative_usage, transcript
-                    )
+                consecutive_invalid_actions += 1
                 if final_synthesis_call:
                     return _loop_result(
                         outcome,
@@ -6019,7 +6054,25 @@ async def _run_agent_loop(
                         cumulative_usage,
                         transcript,
                     )
+                if consecutive_invalid_actions >= MAX_CONSECUTIVE_INVALID_ACTIONS:
+                    return _loop_result(
+                        outcome,
+                        "failed",
+                        f"agent emitted {consecutive_invalid_actions} consecutive invalid actions",
+                        turn,
+                        cumulative_usage,
+                        transcript,
+                    )
+                stalled = _observe_progress(progress_detector, response_content)
+                no_progress_actions = progress_detector.no_progress_actions
+                if stalled and not _finalization_due(
+                    turn, finalized, budget_new_tokens, soft_cap, config
+                ):
+                    return _no_progress_failure(
+                        outcome, no_progress_actions, turn, cumulative_usage, transcript
+                    )
                 continue
+            consecutive_invalid_actions = 0
             trailing = _action_trailing(result.content)
             action_message = _canonical_action_message(action)
             if (
@@ -6370,6 +6423,7 @@ async def _run_agent_loop(
                     "latency_s": max(0.0, float(result.latency_s)),
                     "transcript": transcript,
                     "compaction_deferred": compaction_deferred,
+                    "consecutive_compaction_deferrals": consecutive_compaction_deferrals,
                 }
             name, arguments = action["name"], action["arguments"]
             if not final_synthesis_call and budget_new_tokens > config.max_tokens:
@@ -6520,6 +6574,7 @@ async def _run_agent_loop(
                     cumulative_usage,
                     [],
                     compaction_deferred=compaction_deferred,
+                    consecutive_compaction_deferrals=consecutive_compaction_deferrals,
                     code_changed=code_changed,
                 )
                 last_turn_checkpoint = turn
@@ -6661,6 +6716,7 @@ async def _run_agent_loop(
                         "epoch": checkpoint.epoch,
                         "checkpoint_ref": checkpoint.checkpoint_ref,
                         "compaction_deferred": compaction_deferred,
+                        "consecutive_compaction_deferrals": consecutive_compaction_deferrals,
                     }
         if base_messages is not None and config.resume is not None:
             return _loop_result(
@@ -6701,6 +6757,7 @@ async def _run_agent_loop(
             "latency_s": last_latency_s,
             "transcript": transcript,
             "compaction_deferred": compaction_deferred,
+            "consecutive_compaction_deferrals": consecutive_compaction_deferrals,
         }
     except GenerationFenceError as exc:
         return _loop_result(
@@ -7069,6 +7126,9 @@ def _finalize_worktree(
             loop_outcome.get("usage", {}),
             [sha],
             compaction_deferred=bool(loop_outcome.get("compaction_deferred", False)),
+            consecutive_compaction_deferrals=int(
+                loop_outcome.get("consecutive_compaction_deferrals", 0)
+            ),
             code_changed=True,
         )
         terminal_checkpoint = _write_terminal_epoch()
