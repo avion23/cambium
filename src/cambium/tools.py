@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import os
 import shlex
+import shutil
 import signal
 import stat
 import subprocess
@@ -18,6 +19,7 @@ import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from inspect import isawaitable
+from itertools import count
 from pathlib import Path
 from typing import Any, cast
 
@@ -29,10 +31,16 @@ from .tasktree import TaskKind
 MAX_READ_BYTES = 100 * 1024
 MAX_READ_LINES = 2_000
 MAX_OUTPUT_BYTES = 64 * 1024
+SHELL_OUTPUT_MAX_BYTES = 16 * 1024
+SHELL_OUTPUT_HEAD_BYTES = 4 * 1024
+SHELL_OUTPUT_TAIL_BYTES = 4 * 1024
+LINT_FEEDBACK_MAX_BYTES = 960
 GIT_TIMEOUT_S = 30
 BATCH_READ_MAX_CONCURRENCY = 4
 READ_TRUNCATION_MARKER = "\n... [file truncated]"
 OUTPUT_TRUNCATION_MARKER = "\n... [output truncated]"
+LINT_FEEDBACK_TRUNCATION_MARKER = "\n... [lint diagnostics truncated]"
+_SPILL_COUNTER = count(1)
 _ALLOWED_TASK_KINDS = frozenset(member.value for member in TaskKind)
 _ALLOWED_TASK_KINDS_TEXT = ", ".join(member.value for member in TaskKind)
 
@@ -236,10 +244,42 @@ async def _read_file(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
 
 def _lint_feedback(ctx: ToolContext, path: Path) -> str:
     if ctx.lint is None:
-        return ""
-    diagnostics = ctx.lint.lint_file(path)
-    feedback = ctx.lint.format_diags(diagnostics)
-    return feedback if isinstance(feedback, str) else str(feedback)
+        return "lint: clean"
+    try:
+        diagnostics = ctx.lint.lint_file(path)
+        if not isinstance(diagnostics, list):
+            diagnostics = list(diagnostics)
+        diagnostics = [item for item in diagnostics if isinstance(item, dict)]
+        if not diagnostics:
+            return "lint: clean"
+
+        def is_warning(diagnostic: dict[str, Any]) -> bool:
+            severity = diagnostic.get("severity", diagnostic.get("level"))
+            if isinstance(severity, str):
+                return severity.casefold() in {"warning", "warn", "w"}
+            if isinstance(severity, int):
+                return severity == 2
+            code = diagnostic.get("code", diagnostic.get("rule", ""))
+            return isinstance(code, str) and code.upper().startswith("W")
+
+        warnings = sum(is_warning(diagnostic) for diagnostic in diagnostics)
+        errors = len(diagnostics) - warnings
+        summary = (
+            f"lint: {errors} error{'s' if errors != 1 else ''}, "
+            f"{warnings} warning{'s' if warnings != 1 else ''}"
+        )
+        error_lines = [diagnostic for diagnostic in diagnostics if not is_warning(diagnostic)][:3]
+        if error_lines:
+            details = ctx.lint.format_diags(error_lines)
+            if not isinstance(details, str):
+                details = str(details)
+            if details:
+                summary += f"\nLint diagnostics:\n{details}"
+        return _truncate_text(summary, LINT_FEEDBACK_MAX_BYTES, LINT_FEEDBACK_TRUNCATION_MARKER)
+    except Exception:
+        # Lint is advisory: a broken/missing linter must never turn a durable
+        # write into a failed tool call.
+        return "lint: unavailable"
 
 
 async def _write_file(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
@@ -252,7 +292,7 @@ async def _write_file(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
     output = f"wrote {_display_path(ctx, path)}"
     feedback = await asyncio.to_thread(_lint_feedback, ctx, path)
     if feedback:
-        output += f"\nLint diagnostics:\n{feedback}"
+        output += f"\n{feedback}"
     return _Outcome(ok=True, output=output)
 
 
@@ -286,7 +326,7 @@ async def _edit_file(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
     output = f"edited {_display_path(ctx, path)}"
     feedback = await asyncio.to_thread(_lint_feedback, ctx, path)
     if feedback:
-        output += f"\nLint diagnostics:\n{feedback}"
+        output += f"\n{feedback}"
     return _Outcome(ok=True, output=output)
 
 
@@ -306,6 +346,165 @@ def _process_output(stdout: Any, stderr: Any) -> str:
 _PROCESS_CAPTURE_BYTES = MAX_OUTPUT_BYTES + 1
 _PROCESS_READ_CHUNK_BYTES = 8192
 _PROCESS_DRAIN_TIMEOUT_S = 0.5
+
+
+def _spill_directory(ctx: ToolContext) -> Path:
+    session_id = os.environ.get("CAMBIUM_SESSION_ID")
+    root = Path(session_id).expanduser() if session_id else Path(ctx.cwd)
+    return root.resolve() / ".cambium" / "spill"
+
+
+def _read_logical_slice(
+    stdout: Any,
+    stdout_size: int,
+    separator: bytes,
+    stderr: Any,
+    stderr_size: int,
+    start: int,
+    length: int,
+) -> bytes:
+    if length <= 0:
+        return b""
+    wanted_end = start + length
+    cursor = 0
+    pieces: list[bytes] = []
+    for source, size in ((stdout, stdout_size), (separator, len(separator)), (stderr, stderr_size)):
+        overlap_start = max(start, cursor)
+        overlap_end = min(wanted_end, cursor + size)
+        if overlap_start < overlap_end:
+            source_start = overlap_start - cursor
+            source_length = overlap_end - overlap_start
+            if isinstance(source, bytes):
+                pieces.append(source[source_start : source_start + source_length])
+            else:
+                source.seek(source_start)
+                pieces.append(source.read(source_length))
+        cursor += size
+    return b"".join(pieces)
+
+
+def _write_spill(
+    stdout: Any,
+    stderr: Any,
+    separator: bytes,
+    directory: Path,
+) -> Path | None:
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+
+    while True:
+        path = directory / f"run-{os.getpid()}-{next(_SPILL_COUNTER)}.txt"
+        try:
+            descriptor = os.open(
+                path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+        except FileExistsError:
+            continue
+        except OSError:
+            return None
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                descriptor = -1
+                stdout.seek(0)
+                shutil.copyfileobj(stdout, handle)
+                if separator:
+                    handle.write(separator)
+                stderr.seek(0)
+                shutil.copyfileobj(stderr, handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError:
+            if descriptor >= 0:
+                os.close(descriptor)
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            return None
+        return path
+
+
+def _shell_output(stdout: Any, stderr: Any, ctx: ToolContext) -> str:
+    stdout.seek(0, os.SEEK_END)
+    stdout_size = stdout.tell()
+    stderr.seek(0, os.SEEK_END)
+    stderr_size = stderr.tell()
+
+    separator = b""
+    if stdout_size and stderr_size:
+        stdout.seek(stdout_size - 1)
+        separator = b"" if stdout.read(1) == b"\n" else b"\n"
+    total = stdout_size + len(separator) + stderr_size
+    if total <= SHELL_OUTPUT_MAX_BYTES:
+        return _read_logical_slice(
+            stdout, stdout_size, separator, stderr, stderr_size, 0, total
+        ).decode("utf-8", errors="replace")
+
+    spill_path = _write_spill(stdout, stderr, separator, _spill_directory(ctx))
+    full_output = str(spill_path) if spill_path is not None else "unavailable"
+    head = _read_logical_slice(
+        stdout,
+        stdout_size,
+        separator,
+        stderr,
+        stderr_size,
+        0,
+        SHELL_OUTPUT_HEAD_BYTES,
+    )
+    tail_start = max(0, total - SHELL_OUTPUT_TAIL_BYTES)
+    tail = _read_logical_slice(
+        stdout,
+        stdout_size,
+        separator,
+        stderr,
+        stderr_size,
+        tail_start,
+        SHELL_OUTPUT_TAIL_BYTES,
+    )
+    marker = f"\n[... {total} bytes truncated, full output: {full_output} ...]\n"
+    return head.decode("utf-8", errors="replace") + marker + tail.decode("utf-8", errors="replace")
+
+
+async def _run_shell_process(
+    command: list[str], cwd: Path, timeout_s: int, ctx: ToolContext
+) -> subprocess.CompletedProcess[str]:
+    # File-backed capture keeps an unbounded command from consuming worker
+    # memory while still allowing the handler to preserve the complete output.
+    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            cwd=cwd,
+            env=scrub_environment(),
+            stdout=stdout,
+            stderr=stderr,
+            start_new_session=True,
+        )
+        try:
+            await asyncio.wait_for(process.wait(), timeout_s)
+        except (TimeoutError, asyncio.CancelledError) as exc:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(process.wait(), _PROCESS_DRAIN_TIMEOUT_S)
+            except TimeoutError:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                await process.wait()
+            output = _shell_output(stdout, stderr, ctx)
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            raise subprocess.TimeoutExpired(command, timeout_s, output=output) from exc
+
+        output = _shell_output(stdout, stderr, ctx)
+        return subprocess.CompletedProcess(command, process.returncode, output, "")
 
 
 async def _read_process_stream(stream: Any, chunks: list[bytes]) -> None:
@@ -423,10 +622,10 @@ async def _run_shell(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
         raise _ToolFailure("run_shell timeout_s must be greater than zero")
 
     try:
-        result = await _run_process(command, Path(ctx.cwd), timeout_s)
+        result = await _run_shell_process(command, Path(ctx.cwd), timeout_s, ctx)
     except subprocess.TimeoutExpired as exc:
-        output = _truncate_text(
-            _process_output(exc.stdout, exc.stderr), MAX_OUTPUT_BYTES, OUTPUT_TRUNCATION_MARKER
+        output = (
+            exc.output if isinstance(exc.output, str) else _process_output(exc.stdout, exc.stderr)
         )
         return _Outcome(False, output, f"run_shell timed out after {timeout_s}s")
     except FileNotFoundError as exc:
@@ -434,11 +633,7 @@ async def _run_shell(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
     except OSError as exc:
         raise _ToolFailure(f"could not run command {command[0]!r}: {exc}") from exc
 
-    output = _truncate_text(
-        _process_output(result.stdout, result.stderr),
-        MAX_OUTPUT_BYTES,
-        OUTPUT_TRUNCATION_MARKER,
-    )
+    output = result.stdout
     if result.returncode != 0:
         return _Outcome(False, output, f"run_shell exited with status {result.returncode}")
     return _Outcome(True, output)
@@ -697,9 +892,13 @@ async def run_tool(name: str, args: dict[str, Any], ctx: ToolContext) -> ToolRes
 
 __all__ = [
     "BATCH_READ_MAX_CONCURRENCY",
+    "LINT_FEEDBACK_MAX_BYTES",
     "MAX_OUTPUT_BYTES",
     "MAX_READ_BYTES",
     "MAX_READ_LINES",
+    "SHELL_OUTPUT_HEAD_BYTES",
+    "SHELL_OUTPUT_MAX_BYTES",
+    "SHELL_OUTPUT_TAIL_BYTES",
     "TOOL_DISPATCH",
     "TOOL_SCHEMAS",
     "ToolContext",

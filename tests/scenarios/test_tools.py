@@ -19,6 +19,8 @@ from cambium.tools import (
     MAX_OUTPUT_BYTES,
     MAX_READ_BYTES,
     MAX_READ_LINES,
+    SHELL_OUTPUT_HEAD_BYTES,
+    SHELL_OUTPUT_TAIL_BYTES,
     ToolContext,
     run_read_batch,
     run_tool,
@@ -402,8 +404,33 @@ def test_run_shell_output_is_capped(tmp_path: Path) -> None:
     result = _run("run_shell", {"cmd": command}, ToolContext(tmp_path))
 
     assert result.ok
-    assert "[output truncated]" in result.output
+    assert "bytes truncated, full output:" in result.output
     assert len(result.output.encode()) <= MAX_OUTPUT_BYTES
+
+
+@pytest.mark.slow  # python interpreter spawn; asserts complete spill persistence
+def test_run_shell_spills_oversized_output_to_session_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_dir = tmp_path / "session"
+    worktree = session_dir / "worktree"
+    worktree.mkdir(parents=True)
+    monkeypatch.setenv("CAMBIUM_SESSION_ID", str(session_dir))
+    expected = "HEAD\n" + ("middle\n" * 5000) + "TAIL\n"
+    command = [sys.executable, "-c", "import sys; sys.stdout.write(sys.argv[1])", expected]
+
+    result = _run("run_shell", {"cmd": command}, ToolContext(worktree))
+
+    assert result.ok
+    assert result.output.startswith(expected[:SHELL_OUTPUT_HEAD_BYTES])
+    assert result.output.endswith(expected[-SHELL_OUTPUT_TAIL_BYTES:])
+    marker = next(line for line in result.output.splitlines() if line.startswith("[... "))
+    spill_files = sorted((session_dir / ".cambium" / "spill").glob("run-*.txt"))
+    assert len(spill_files) == 1
+    spill_path = spill_files[0]
+    assert f"{len(expected.encode())} bytes truncated" in marker
+    assert f"full output: {spill_path} ..." in marker
+    assert spill_path.read_text(encoding="utf-8") == expected
 
 
 @pytest.mark.slow  # real subprocess tree and timeout
@@ -457,6 +484,43 @@ def test_write_file_reports_lint_timeout(tmp_path: Path) -> None:
 
     assert result.ok
     assert "lint-timeout lint timed out after 0.1s" in result.output
+
+
+def test_write_file_keeps_success_when_lint_reports_syntax_error(tmp_path: Path) -> None:
+    lint = LintDiag(
+        lint_cmd=[
+            sys.executable,
+            "-c",
+            (
+                'print(\'[{"code":"invalid-syntax","message":"bad syntax",'
+                '"filename":"broken.py","location":{"row":1,"column":1}}]\')'
+            ),
+        ]
+    )
+
+    result = _run(
+        "write_file",
+        {"path": "broken.py", "content": "def broken(:\n"},
+        ToolContext(tmp_path, lint=lint),
+    )
+
+    assert result.ok
+    assert (tmp_path / "broken.py").read_text(encoding="utf-8") == "def broken(:\n"
+    assert "lint: 1 error, 0 warnings" in result.output
+    assert "E999 bad syntax" in result.output
+
+
+def test_write_file_reports_clean_lint_suffix(tmp_path: Path) -> None:
+    lint = LintDiag(lint_cmd=[sys.executable, "-c", "print('[]')"])
+
+    result = _run(
+        "write_file",
+        {"path": "clean.py", "content": "value = 1\n"},
+        ToolContext(tmp_path, lint=lint),
+    )
+
+    assert result.ok
+    assert result.output.endswith("lint: clean")
 
 
 @pytest.mark.slow  # python interpreter spawn; asserts subprocess execution

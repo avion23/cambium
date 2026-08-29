@@ -23,7 +23,7 @@ from cambium.diffundo import Diffundo, ProviderTier
 from cambium.observability import snapshot_from_events
 from cambium.oneshot import OneShotConfig
 from cambium.supervisor import run_plan
-from cambium.tools import MAX_OUTPUT_BYTES, OUTPUT_TRUNCATION_MARKER, ToolContext, run_tool
+from cambium.tools import MAX_OUTPUT_BYTES, ToolContext, run_tool
 from cambium.tui_screen import ActivityState, _char_width
 
 
@@ -410,7 +410,7 @@ def test_command_and_tool_edge_probes_are_stable(
         )
     )
     assert huge.ok
-    assert huge.output.endswith(OUTPUT_TRUNCATION_MARKER)
+    assert "bytes truncated, full output:" in huge.output
     assert len(huge.output.encode()) <= MAX_OUTPUT_BYTES
     assert _char_width("界") == 2
     assert _char_width("\u0301") == 0
