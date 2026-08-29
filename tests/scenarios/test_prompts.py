@@ -10,16 +10,7 @@ def test_prompt_constants_match_worker_text() -> None:
 
     assert prompts.PROMPTS_VERSION == 1
     assert prompts.SEMANTIC_SUMMARIZER == "\n".join(worker.SUMMARY_PROTOCOL_LINES)
-    expected = prompts.CODING_AGENT.replace(
-        '  finish:    {"type": "finish", "summary": <non-empty summary>}',
-        '  finish:    {"type": "finish", "summary": <non-empty summary>, '
-        '"objective_met": <boolean>}',
-    ).replace(
-        '{"type": "finish", "summary": "implemented and verified the change"}',
-        '{"type": "finish", "summary": "implemented and verified the change", '
-        '"objective_met": true}',
-    )
-    assert system == expected + "\n[]"
+    assert system == prompts.CODING_AGENT + "\n[]"
 
 
 def test_semantic_summarizer_preserves_findings_and_next_actions() -> None:
@@ -44,3 +35,9 @@ def test_semantic_summarizer_preserves_findings_and_next_actions() -> None:
         assert keyword in contract
 
     assert "Never discard preserved findings" in contract
+    assert 'The object must contain "objective" and "outcome"' in contract
+    assert "source_sha256, source_message_count, and through_turn" in contract
+    assert "<cambium-summary-entry>" in contract
+    assert 'Example: {"objective": "find the paging bug"' in contract
+    assert "hard limit 32" in contract
+    assert "relevant_failed_approaches and verification_results first" in contract
