@@ -36,7 +36,6 @@ cat > ~/.config/cambium/providers.json <<'JSON'
     "name": "openai",
     "tier": "strong",
     "base_url": "https://api.openai.com/v1",
-    "api_key_env": "CAMBIUM_PROVIDER_OPENAI_API_KEY",
     "api_key": "replace-with-your-api-key",
     "model": "gpt-5.6"
   }]

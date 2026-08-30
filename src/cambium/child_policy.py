@@ -18,7 +18,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, cast
+from typing import Any, TypeVar
+
+_T = TypeVar("_T", bound=StrEnum)
 
 
 class ContextMode(StrEnum):
@@ -48,7 +50,7 @@ class ChildPolicyError(ValueError):
     """A delegated child did not declare a coherent branch policy."""
 
 
-def _enum_value(spec: Mapping[str, Any], key: str, enum: type[StrEnum]) -> StrEnum:
+def _enum_value(spec: Mapping[str, Any], key: str, enum: type[_T]) -> _T:
     value = spec.get(key)
     if not isinstance(value, str):
         raise ChildPolicyError(f"child {key} must be a string")
@@ -78,8 +80,8 @@ def parse_child_policy(spec: Mapping[str, Any]) -> ChildPolicy:
     if context_mode is ContextMode.TRUNK and placement is Placement.SPREAD:
         raise ChildPolicyError("child context_mode=trunk requires placement=inherit")
     return ChildPolicy(
-        context_mode=cast(ContextMode, context_mode),
-        placement=cast(Placement, placement),
+        context_mode=context_mode,
+        placement=placement,
     )
 
 
