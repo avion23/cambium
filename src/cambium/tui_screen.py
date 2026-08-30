@@ -4339,7 +4339,12 @@ class Cockpit:
         live_turn = turn_active or bool(activity_line)
         self._turn_active = live_turn and not force
         if self._final_hold_conversation_rows is not None:
-            if not request[1].live_final:
+            if not request[1].live_final or force:
+                # A force draw after finish_stream must repaint the
+                # conversation: the hold snapshot was captured while the
+                # assistant text was still un-committed stream state, so a
+                # stale hold would keep the committed response out of the
+                # transcript rows.
                 self._final_hold_conversation_rows = None
             elif (
                 not force

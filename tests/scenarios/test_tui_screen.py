@@ -1163,6 +1163,58 @@ def test_cockpit_replaces_failed_to_idle_status_in_place() -> None:
     assert stream.getvalue().count("┌ Cambium · conversation") == 1
 
 
+def test_result_commits_into_conversation_rows_after_final_hold() -> None:
+    """A finished assistant response must appear in the conversation rows.
+
+    Regression: the final-hold snapshot was captured while the assistant text
+    was still un-committed stream state, and the hold was never cleared on a
+    force draw, so the committed response stayed invisible in the transcript
+    area (only the bottom live rows showed it).
+    """
+    class _Tty(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    stream = _Tty()
+    transcript = Transcript()
+    cockpit = Cockpit(stream)
+    with cockpit:
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+            activity_line="⠋ WAITING · thinking… 0s",
+            turn_active=True,
+        )
+        cockpit.move_to_input()
+        transcript.observe_event(
+            {
+                "kind": "result",
+                "task_id": "interactive-main",
+                "payload": {"status": "succeeded", "summary": "found one issue"},
+            }
+        )
+        transcript.finish_stream("found one issue")
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=1",
+            activity_line="✓ DONE",
+            turn_active=False,
+            force=True,
+        )
+        # The conversation frame is repainted on the force draw; the committed
+        # assistant entry must be visible in the transcript rows.
+        output = stream.getvalue()
+        assert "┌ Cambium · conversation" in output
+        assert "found one issue" in output
+        assert transcript.entries[-1].text == "found one issue"
+
+
 def test_cockpit_forces_completed_frame_while_input_read_is_pending() -> None:
     class _Tty(io.StringIO):
         flush_count = 0
