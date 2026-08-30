@@ -248,9 +248,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "PROPOSES the child. With context reuse, a successful proposal suspends this "
             "task; the supervisor may later resume it with a bounded child-result envelope. "
             "Without context reuse, child admission waits for this task's terminal boundary. "
-            "Make spec.task self-contained. An exact compatible child may receive the "
-            "immutable checkpoint prefix; otherwise it receives semantic summaries. It never "
-            "receives sibling context or hidden reasoning."
+            "Make spec.task self-contained. Declare context_mode and placement when you need "
+            "them: trunk+inherit reuses the exact checkpoint prefix on the same provider; "
+            "semantic imports only the immutable summaries; fresh drops parent context. "
+            "placement=spread prefers another feasible provider; inherit keeps the parent's. "
+            "The child never receives sibling context or hidden reasoning."
         ),
         "parameters": _parameters(
             {
@@ -282,6 +284,27 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                                 "area, done criteria, and verification. Example: 'In "
                                 "src/parser/, add offset paging to read_lines(); done when "
                                 "tests/test_parser.py::test_paging passes.'"
+                            ),
+                        },
+                        "context_mode": {
+                            "type": "string",
+                            "enum": ["trunk", "semantic", "fresh"],
+                            "description": (
+                                "Which parent context representation seeds the child. "
+                                "trunk = exact same-provider checkpoint prefix (requires "
+                                "placement=inherit); semantic = immutable summary trunk only; "
+                                "fresh = no parent context. Defaults to the supervisor's "
+                                "automatic compatibility resolution when omitted."
+                            ),
+                        },
+                        "placement": {
+                            "type": "string",
+                            "enum": ["inherit", "spread"],
+                            "description": (
+                                "Provider-affinity preference. inherit keeps the parent "
+                                "provider/model; spread prefers another feasible provider lane "
+                                "and falls back to the full feasible set. Defaults to inherit "
+                                "when omitted."
                             ),
                         },
                         "requirements": {
@@ -507,7 +530,7 @@ def _validate_object(
         property_schema = properties.get(name)
         if property_schema is None:
             additional = schema.get("additionalProperties")
-            if additional is False:
+            if additional == False:  # noqa: E712
                 errors.append(f"validation failed: unknown argument '{label}'")
             elif isinstance(additional, dict):
                 errors.extend(_validate_value(additional, value, label))

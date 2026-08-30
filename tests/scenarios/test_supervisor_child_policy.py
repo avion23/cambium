@@ -100,18 +100,17 @@ def test_exact_compatible_child_inherits_provider_and_model(tmp_path: Path) -> N
     assert fork_events[0]["compatible"] is True
 
 
-def test_missing_parent_epoch_skips_pin_without_error(tmp_path: Path) -> None:
-    """_pin_fork_child returns silently when no parent epoch exists."""
+def test_missing_parent_epoch_rejects_declared_semantic(tmp_path: Path) -> None:
+    """A declared semantic child without a parent checkpoint is rejected,
+    never silently downgraded (owner spec: no auto fallback)."""
     runtime = _Runtime(tmp_path, None)
     child_spec: dict[str, Any] = {
         "context_mode": "semantic",
         "placement": "spread",
     }
 
-    # No epoch for task "missing" — method returns, no error.
-    asyncio.run(runtime._pin_fork_child(child_spec, "missing", "child", "investigation"))
-
-    assert child_spec == {"context_mode": "semantic", "placement": "spread"}
+    with pytest.raises(ValueError, match="requires an unredacted parent checkpoint"):
+        asyncio.run(runtime._pin_fork_child(child_spec, "missing", "child", "investigation"))
 
 
 def test_parse_child_policy_rejects_trunk_spread_combination() -> None:

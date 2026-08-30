@@ -18,7 +18,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any
+from typing import Any, cast
 
 
 class ContextMode(StrEnum):
@@ -65,15 +65,22 @@ def parse_child_policy(spec: Mapping[str, Any]) -> ChildPolicy:
     ``trunk`` means an exact same-provider checkpoint prefix.  Combining it
     with ``spread`` would promise both byte-identical provider cache affinity
     and another provider, so the combination is rejected rather than silently
-    downgraded.
+    downgraded.  A child that declares neither field is undeclared: it keeps
+    the supervisor's automatic compatibility resolution (legacy path) and
+    parses to ``None``.
     """
     if not isinstance(spec, Mapping):
         raise ChildPolicyError("child spec must be an object")
+    if spec.get("context_mode") is None and spec.get("placement") is None:
+        return None  # type: ignore[return-value]
     context_mode = _enum_value(spec, "context_mode", ContextMode)
     placement = _enum_value(spec, "placement", Placement)
     if context_mode is ContextMode.TRUNK and placement is Placement.SPREAD:
         raise ChildPolicyError("child context_mode=trunk requires placement=inherit")
-    return ChildPolicy(context_mode=context_mode, placement=placement)
+    return ChildPolicy(
+        context_mode=cast(ContextMode, context_mode),
+        placement=cast(Placement, placement),
+    )
 
 
 __all__ = [

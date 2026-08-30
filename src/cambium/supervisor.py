@@ -84,6 +84,7 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, cast
 
+from cambium.child_policy import ChildPolicyError, parse_child_policy
 from cambium.fencing import (
     is_cache_artifact_path,
     next_generation,
@@ -3455,6 +3456,29 @@ class _Runtime:
                 proposal=original_proposal,
             )
             return []
+        try:
+            parse_child_policy(proposal.get("spec", {}))
+        except ChildPolicyError as exc:
+            await self.emit(
+                "child_rejected",
+                task_id=parent_task_id,
+                request_id=request_id,
+                parent_task_id=parent_task_id,
+                child_task_id=child_task_id,
+                child_kind=kind,
+                reason=exc.__class__.__name__,
+                message=str(exc)[:512],
+            )
+            await self._record_revision_conversation(
+                outcome="rejected",
+                parent_task_id=parent_task_id,
+                child_task_id=child_task_id,
+                child_kind=kind,
+                request_id=request_id,
+                reason=exc.__class__.__name__,
+                proposal=original_proposal,
+            )
+            return []
         candidate = {
             "task_id": child_task_id,
             "kind": kind,
@@ -3775,19 +3799,107 @@ class _Runtime:
         child_task_id: str,
         kind: str | None,
     ) -> None:
-        """Reuse a parent trunk exactly when legal, otherwise semantically cold.
+        """Resolve one child's context representation and placement.
 
-        Exact provider/model/protocol compatibility pins the child and preserves
-        the provider cache prefix. Any other non-redacted epoch is supplied as
-        ``summary_trunk_ref``: the child builds a fresh provider-specific head
-        and imports only the immutable semantic summary entries.
+        When the child declares ``context_mode``/``placement``, that policy is
+        authoritative (owner spec): trunk requires an exact compatible parent
+        checkpoint and is REJECTED (raised) when impossible; semantic imports
+        only the immutable summary trunk; fresh removes all parent context.
+        ``placement=spread`` prefers another feasible provider lane and falls
+        back to the full feasible set; ``inherit`` keeps the parent
+        provider/model. An undeclared child keeps the automatic
+        compatibility resolution (exact fork when legal, otherwise semantic).
         """
         if not self._context_reuse:
             return
         epoch = self._task_epochs.get(parent_task_id)
-        if epoch is None:
+        cache_key = epoch.get("cache_key") if isinstance(epoch, dict) else None
+        declared = _declared_child_policy(child_spec)
+        if declared is not None:
+            context_mode, placement = declared
+            parent_provider = cache_key.get("provider") if isinstance(cache_key, dict) else None
+            if context_mode == "trunk":
+                if not self._pin_exact_fork(
+                    child_spec, epoch, parent_task_id, child_task_id, kind
+                ):
+                    raise ChildPolicyError(
+                        "child context_mode=trunk requires an exact compatible "
+                        "parent checkpoint; use semantic or fresh instead"
+                    )
+                if placement == "spread":
+                    self._apply_spread(child_spec, parent_provider)
+                await self._emit_child_fork_event(
+                    parent_task_id,
+                    child_task_id,
+                    kind,
+                    epoch,
+                    compatible=True,
+                    semantic_reuse=False,
+                    context_mode=context_mode,
+                    placement=placement,
+                    spread_from_provider=(
+                        parent_provider if placement == "spread" else None
+                    ),
+                )
+                return
+            checkpoint_ref = (
+                epoch.get("checkpoint_ref") if isinstance(epoch, dict) else None
+            )
+            if context_mode == "semantic":
+                if not (
+                    isinstance(cache_key, dict)
+                    and cache_key.get("redacted") is False
+                    and isinstance(checkpoint_ref, str)
+                ):
+                    raise ChildPolicyError(
+                        "child context_mode=semantic requires an unredacted "
+                        "parent checkpoint"
+                    )
+                child_spec["summary_trunk_ref"] = checkpoint_ref
+                if placement == "spread":
+                    self._apply_spread(child_spec, parent_provider)
+                else:
+                    self._pin_parent_provider(child_spec, parent_provider, cache_key)
+                await self._emit_child_fork_event(
+                    parent_task_id,
+                    child_task_id,
+                    kind,
+                    epoch,
+                    compatible=False,
+                    semantic_reuse=True,
+                    context_mode=context_mode,
+                    placement=placement,
+                    spread_from_provider=(
+                        parent_provider if placement == "spread" else None
+                    ),
+                )
+                return
+            # context_mode == "fresh": remove all parent context.
+            child_spec.pop("summary_trunk_ref", None)
+            child_spec.pop("context_fork", None)
+            child_spec.pop("parent_envelope", None)
+            if placement == "spread":
+                self._apply_spread(child_spec, parent_provider)
+            else:
+                self._pin_parent_provider(child_spec, parent_provider, cache_key)
+            await self._emit_child_fork_event(
+                parent_task_id,
+                child_task_id,
+                kind,
+                epoch,
+                compatible=False,
+                semantic_reuse=False,
+                context_mode=context_mode,
+                placement=placement,
+                spread_from_provider=(
+                    parent_provider if placement == "spread" else None
+                ),
+            )
             return
-        cache_key = epoch.get("cache_key")
+
+        # Undeclared: automatic compatibility resolution (legacy path).
+        if not isinstance(epoch, dict):
+            return
         authorized = frozenset(child_spec.get("authorized_providers") or ())
         compatible, reason = _fork_cache_compatible_supervisor(child_spec, epoch, authorized)
         semantic_reuse = (
@@ -3831,19 +3943,48 @@ class _Runtime:
                 reason=reason or "incompatible epoch",
             )
             return
+        self._apply_exact_fork(
+            child_spec, epoch, parent_task_id, child_task_id, kind, cache_key
+        )
+
+    def _pin_exact_fork(
+        self,
+        child_spec: dict[str, Any],
+        epoch: dict[str, Any] | None,
+        parent_task_id: str,
+        child_task_id: str,
+        kind: str | None,
+    ) -> bool:
+        """Pin an exact cache-compatible fork; return False when impossible."""
+        if not isinstance(epoch, dict):
+            return False
+        cache_key = epoch.get("cache_key")
+        if not isinstance(cache_key, dict):
+            return False
+        authorized = frozenset(child_spec.get("authorized_providers") or ())
+        compatible, _reason = _fork_cache_compatible_supervisor(child_spec, epoch, authorized)
+        if not compatible:
+            return False
+        self._apply_exact_fork(
+            child_spec, epoch, parent_task_id, child_task_id, kind, cache_key
+        )
+        return True
+
+    def _apply_exact_fork(
+        self,
+        child_spec: dict[str, Any],
+        epoch: dict[str, Any],
+        parent_task_id: str,
+        child_task_id: str,
+        kind: str | None,
+        cache_key: dict[str, Any],
+    ) -> None:
+        """Pin the child to the epoch's provider/model with a context fork."""
         provider = cache_key.get("provider")
         if not isinstance(provider, str):
             return
         boundary = cache_key.get("provider_boundary")
         if not isinstance(boundary, dict):
-            await self.emit(
-                "context_fork_skipped",
-                task_id=parent_task_id,
-                parent_task_id=parent_task_id,
-                child_task_id=child_task_id,
-                epoch=epoch.get("epoch"),
-                reason="epoch provider boundary is missing",
-            )
             return
         descriptor = {
             "checkpoint_ref": epoch["checkpoint_ref"],
@@ -3868,6 +4009,63 @@ class _Runtime:
             lane.in_flight += 1
             child_spec["_lane_reserved"] = True
 
+    def _pin_parent_provider(
+        self,
+        child_spec: dict[str, Any],
+        parent_provider: Any,
+        cache_key: dict[str, Any] | None,
+    ) -> None:
+        """Pin the parent provider/model (semantic/fresh + inherit)."""
+        if not isinstance(parent_provider, str) or not isinstance(cache_key, dict):
+            return
+        model = cache_key.get("model")
+        if not isinstance(model, str):
+            return
+        child_spec["assigned_provider"] = parent_provider
+        fanout = child_spec.get("fanout_config")
+        if not isinstance(fanout, dict):
+            fanout = child_spec["fanout_config"] = {}
+        fanout["model"] = model
+
+    def _apply_spread(self, child_spec: dict[str, Any], parent_provider: Any) -> None:
+        """Prefer another feasible provider; parent remains the fallback."""
+        child_spec.pop("assigned_provider", None)
+        fanout = child_spec.get("fanout_config")
+        if isinstance(fanout, dict):
+            fanout.pop("provider", None)
+            fanout.pop("assigned_provider", None)
+        if isinstance(parent_provider, str):
+            child_spec["spread_from_provider"] = parent_provider
+
+    async def _emit_child_fork_event(
+        self,
+        parent_task_id: str,
+        child_task_id: str,
+        kind: str | None,
+        epoch: dict[str, Any] | None,
+        *,
+        compatible: bool,
+        semantic_reuse: bool,
+        context_mode: str,
+        placement: str,
+        spread_from_provider: str | None,
+    ) -> None:
+        """Emit one context_fork event with requested and resolved policy."""
+        await self.emit(
+            "context_fork",
+            task_id=parent_task_id,
+            parent_task_id=parent_task_id,
+            child_task_id=child_task_id,
+            child_kind=kind,
+            epoch=epoch.get("epoch") if isinstance(epoch, dict) else None,
+            compatible=compatible,
+            semantic_reuse=semantic_reuse,
+            context_mode=context_mode,
+            placement=placement,
+            resolved_context_mode=context_mode,
+            resolved_placement=placement,
+            spread_from_provider=spread_from_provider,
+        )
     async def _record_revision_conversation(
         self,
         *,
@@ -7992,18 +8190,38 @@ def _resolve_model_candidates(
     pinned_tier = raw_pinned_tier if isinstance(raw_pinned_tier, str) and raw_pinned_tier else None
     _ensure_lanes(lanes, providers)
     requirements = spec.get("requirements")
-    try:
-        assignment = resolve_assignment(
-            providers,
-            candidates,
-            debt,
-            lanes,
-            requirements=requirements if requirements else None,
-            authorized=authorized,
-            pinned_tier=pinned_tier,
-        )
-    except ValueError as exc:
-        raise ValueError(f"task {spec.get('task_id')}: provider assignment failed: {exc}") from exc
+    spread_from = spec.get("spread_from_provider")
+    spread_providers = (
+        [provider for provider in providers if provider.name != spread_from]
+        if isinstance(spread_from, str) and spread_from
+        else providers
+    )
+
+    def _resolve(pool: list[Any]) -> Any:
+        try:
+            return resolve_assignment(
+                pool,
+                candidates,
+                debt,
+                lanes,
+                requirements=requirements if requirements else None,
+                authorized=authorized,
+                pinned_tier=pinned_tier,
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"task {spec.get('task_id')}: provider assignment failed: {exc}"
+            ) from exc
+
+    # Spread is a strong soft preference: consume another feasible provider
+    # lane when one exists, otherwise fall back to the full feasible set so
+    # spread can never turn a feasible task into an unnecessary failure.
+    if spread_providers is providers:
+        assignment = _resolve(providers)
+    else:
+        assignment = _resolve(spread_providers)
+        if assignment is None:
+            assignment = _resolve(providers)
     if assignment is None:
         return False
     # The (provider, model, tier) assignment is one atomic unit: the worker
@@ -8083,6 +8301,28 @@ def _release_lane(lanes: dict[str, LaneState], spec: Mapping[str, Any]) -> None:
         lane.in_flight -= 1
     if isinstance(spec, dict):
         spec["_lane_reserved"] = False
+
+
+def _declared_child_policy(
+    child_spec: Mapping[str, Any],
+) -> tuple[str, str] | None:
+    """Return the child's declared (context_mode, placement), or None.
+
+    Absent or malformed declarations fall back to automatic compatibility
+    resolution; explicit values must already have passed ``parse_child_policy``
+    at admission (which rejects ``trunk + spread``).
+    """
+    mode = child_spec.get("context_mode")
+    placement = child_spec.get("placement")
+    if mode is None and placement is None:
+        return None
+    if not isinstance(mode, str) or not isinstance(placement, str):
+        return None
+    if mode not in {"trunk", "semantic", "fresh"}:
+        return None
+    if placement not in {"inherit", "spread"}:
+        return None
+    return mode, placement
 
 
 def _fork_cache_compatible_supervisor(
