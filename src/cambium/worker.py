@@ -2004,9 +2004,7 @@ def _parse_agent_action(content: str) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         raise ValueError("agent action must be exactly one JSON object")
     if text[_end:].strip():
-        raise ValueError(
-            "agent action must be exactly one JSON object (no trailing content)"
-        )
+        raise ValueError("agent action must be exactly one JSON object (no trailing content)")
     action_type = parsed.get("type")
     if action_type == "plan":
         if not _action_keys(parsed, frozenset({"type", "steps"})):
