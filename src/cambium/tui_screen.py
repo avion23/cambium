@@ -4452,7 +4452,12 @@ class Cockpit:
             value = _readline.get_line_buffer()
         except (AttributeError, OSError, RuntimeError):
             return ""
-        return _sanitize(value).replace("\r", " ").replace("\n", " ").replace("\t", " ")
+        value = _sanitize(value)
+        # Native readline retains the completed line plus its newline until
+        # the next prompt is edited; do not repaint that stale buffer.
+        if value.endswith("\n"):
+            return ""
+        return value.replace("\r", " ").replace("\n", " ").replace("\t", " ")
 
     def _restore_input_line(self, text: str, *, force: bool = False) -> None:
         if not self._input_active:
@@ -4561,7 +4566,7 @@ class Cockpit:
         else:
             if self._fixed_frame and not self._small_frame:
                 self.stream.write(f"\r{_CLEAR_LINE}")
-            self.stream.write("\n".join(lines))
+            self.stream.write("\r\n".join(lines))
             self.stream.flush()
         status_rows = tuple(
             _status_rows(
@@ -4743,13 +4748,24 @@ class Cockpit:
         live_only: bool = False,
     ) -> None:
         input_text = self._input_line_text()
-        live_only_render = live_only or (
-            force
-            and self._fixed_frame
-            and (
-                request[1].live_final
-                or request[1].live_revision != self._last_live_revision
-                or _terminal_activity_status(request[-1]) is not None
+        # A result event can be live-only before finish_stream commits it.
+        # Promote only the post-commit revision into the conversation frame.
+        final_response_pending = (
+            request[1].live_final
+            and bool(request[1]._live_text)
+            and not request[1].streaming_text
+            and request[1].live_revision != self._last_live_revision
+        )
+        live_only_render = not final_response_pending and (
+            live_only
+            or (
+                force
+                and self._fixed_frame
+                and (
+                    request[1].live_final
+                    or request[1].live_revision != self._last_live_revision
+                    or _terminal_activity_status(request[-1]) is not None
+                )
             )
         )
         self._draw_in_flight = True
@@ -4869,7 +4885,7 @@ class Cockpit:
                 show_detail=self._show_detail,
                 primary_rows=conversation_rows,
             )
-            self.stream.write("\n".join(lines))
+            self.stream.write("\r\n".join(lines))
             self.stream.write("\x1b[1A\r")
             self.stream.flush()
             self._fixed_frame = True

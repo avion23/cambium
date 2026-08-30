@@ -1163,18 +1163,21 @@ def test_cockpit_replaces_failed_to_idle_status_in_place() -> None:
     assert stream.getvalue().count("┌ Cambium · conversation") == 1
 
 
-def test_result_commits_into_conversation_rows_after_final_hold() -> None:
+def test_result_commits_into_conversation_rows_after_final_hold(monkeypatch) -> None:
     """A finished assistant response must appear in the conversation rows.
 
     Regression: the final-hold snapshot was captured while the assistant text
-    was still un-committed stream state, and the hold was never cleared on a
-    force draw, so the committed response stayed invisible in the transcript
-    area (only the bottom live rows showed it).
+    was still un-committed stream state.  The force draw then stayed on the
+    live-only path, so the committed response stayed invisible in the
+    transcript area (only the bottom live rows showed it).
     """
+
     class _Tty(io.StringIO):
         def isatty(self) -> bool:
             return True
 
+    now = [10.0]
+    monkeypatch.setattr(tui_screen.time, "monotonic", lambda: now[0])
     stream = _Tty()
     transcript = Transcript()
     cockpit = Cockpit(stream)
@@ -1196,7 +1199,21 @@ def test_result_commits_into_conversation_rows_after_final_hold() -> None:
                 "payload": {"status": "succeeded", "summary": "found one issue"},
             }
         )
+        now[0] = 10.2
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=1",
+            activity_line="✓ DONE",
+            turn_active=True,
+        )
+        assert cockpit._final_hold_conversation_rows == cockpit._last_conversation_rows
+        assert transcript.entries == ()
+
         transcript.finish_stream("found one issue")
+        before = stream.getvalue()
         cockpit.draw(
             _snapshot(),
             transcript,
@@ -1209,9 +1226,13 @@ def test_result_commits_into_conversation_rows_after_final_hold() -> None:
         )
         # The conversation frame is repainted on the force draw; the committed
         # assistant entry must be visible in the transcript rows.
-        output = stream.getvalue()
+        output = stream.getvalue()[len(before) :]
         assert "┌ Cambium · conversation" in output
-        assert "found one issue" in output
+        assert "CAMBIUM ▸ found one issue" in output
+        assert any(
+            role == "assistant" and "found one issue" in text
+            for role, text in cockpit._last_conversation_rows
+        )
         assert transcript.entries[-1].text == "found one issue"
 
 
@@ -1265,14 +1286,18 @@ def test_cockpit_forces_completed_frame_while_input_read_is_pending() -> None:
         assert "completed response" not in mid
 
         # Release the input FIRST, then flush: the pending completion frame
-        # must be delivered in place without repainting a second frame.
+        # must be delivered as a fresh conversation frame.
         cockpit.hide_cursor()
         cockpit.flush()
 
         after = stream.getvalue()
         assert "completed response" in after
-        assert after.count("┌ Cambium · conversation") == 1
-        assert "conversation · done" not in after
+        assert after.count("┌ Cambium · conversation") == 2
+        assert "conversation · done" in after
+        assert any(
+            role == "assistant" and "completed response" in text
+            for role, text in cockpit._last_conversation_rows
+        )
         assert "20k tok" in after
         assert after != before
         assert stream.flush_count > flushes_before_completion
@@ -1355,7 +1380,7 @@ def test_live_window_updates_two_fixed_rows_without_reflow() -> None:
     assert "\n" not in delta
 
 
-def test_live_window_replaces_the_same_rows_with_a_bounded_result() -> None:
+def test_completed_response_moves_from_live_window_into_conversation() -> None:
     class _Tty(io.StringIO):
         def isatty(self) -> bool:
             return True
@@ -1407,12 +1432,13 @@ def test_live_window_replaces_the_same_rows_with_a_bounded_result() -> None:
         delta = stream.getvalue()[len(middle) :]
 
     assert "final line" in delta
-    assert "┌ Cambium · conversation" not in delta
-    assert "\n" not in delta
+    assert "┌ Cambium · conversation" in delta
+    assert "CAMBIUM ▸ final" in delta
+    assert "\n" in delta
     assert len(cockpit._last_status_rows) == 5
     assert len(cockpit._last_status_rows[1:3]) == 2
     assert all(_display_width(row) <= 118 for row in cockpit._last_status_rows[1:3])
-    assert stream.getvalue().count("┌ Cambium · conversation") == 1
+    assert stream.getvalue().count("┌ Cambium · conversation") == 2
     assert first != middle
 
 

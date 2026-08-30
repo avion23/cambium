@@ -226,6 +226,9 @@ def test_live_tui_resize_repaints_one_input_prompt(tmp_path: Path) -> None:
         os.write(master_fd, b"hello\n")
         assert server.request_started.wait(5.0)
         _read_into(master_fd, output, 0.2)
+        echo_end = output.index(b"hello\r\n") + len(b"hello\r\n")
+        assert b"\x1b[1A\r\x1b[2K" in output[echo_end : echo_end + 100]
+        assert b"\r\x1b[2K\xe2\x80\xba hello " not in output[echo_end:]
 
         _set_size(master_fd, 90)
         _read_into(master_fd, output, 0.6)
