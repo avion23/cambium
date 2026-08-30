@@ -6095,7 +6095,14 @@ async def _run_agent_loop(
                     {"role": "assistant", "content": assistant_content},
                     {
                         "role": "user",
-                        "content": _bounded_text(f"invalid action: {exc}", MAX_OBSERVATION_BYTES),
+                        "content": _bounded_text(
+                            f"invalid action: {exc}. Reply with exactly ONE JSON object of "
+                            "one of these shapes, and nothing else (no prose, no "
+                            'markdown): {"type":"plan","steps":["..."]} | '
+                            '{"type":"tool_call","name":"<tool>","arguments":{...}} | '
+                            '{"type":"finish","summary":"...","objective_met":true}',
+                            MAX_OBSERVATION_BYTES,
+                        ),
                     },
                 ]
                 if base_messages is None:
