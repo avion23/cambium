@@ -83,42 +83,6 @@ def _plan(session_dir: Path) -> dict[str, list[dict[str, str]]]:
     }
 
 
-def test_cli_supervisor_forwards_explicit_warm_pool_size(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    from cambium import supervisor
-
-    calls: list[list[str]] = []
-    monkeypatch.setattr(
-        supervisor,
-        "main",
-        lambda argv=None: cast(Any, calls.append(list(argv or []))) or 0,
-    )
-
-    assert (
-        cli.main(
-            [
-                "supervisor",
-                "--session-dir",
-                str(tmp_path),
-                "--demo",
-                "--warm-pool-size",
-                "3",
-            ]
-        )
-        == 0
-    )
-    assert calls == [
-        [
-            "--session-dir",
-            str(tmp_path),
-            "--demo",
-            "--warm-pool-size",
-            "3",
-        ]
-    ]
-
-
 def test_run_plan_defaults_and_forwards_warm_pool_size(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

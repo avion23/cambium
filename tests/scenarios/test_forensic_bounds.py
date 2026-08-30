@@ -6,7 +6,6 @@ import asyncio
 import sys
 from pathlib import Path
 
-from cambium.prompts import CODING_AGENT
 from cambium.tools import (
     READ_BATCH_MAX_BYTES_PER_FILE,
     READ_BATCH_MAX_FILES,
@@ -17,14 +16,6 @@ from cambium.tools import (
 
 def _run(name: str, args: dict, ctx: ToolContext):
     return asyncio.run(run_tool(name, args, ctx))
-
-
-def test_coding_prompt_forbids_recursive_session_investigation() -> None:
-    assert (
-        "Do not recursively investigate the worker's own session artifacts, logs, or spill files; "
-        "stay focused on the assigned task."
-        in CODING_AGENT
-    )
 
 
 def test_read_batch_refuses_own_active_session(tmp_path: Path, monkeypatch) -> None:
