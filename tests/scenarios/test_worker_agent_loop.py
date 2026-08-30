@@ -184,12 +184,17 @@ class _SummaryFlushRouter:
         self.prompts.append(prompt)
         self.allow_model_substitution.append(allow_model_substitution)
         messages = prompt.get("messages")
-        last_content = (
-            messages[-1].get("content")
-            if isinstance(messages, list) and messages and isinstance(messages[-1], dict)
-            else None
-        )
-        if isinstance(last_content, str) and last_content.startswith("<cambium-summary-control>\n"):
+        control_content = None
+        if isinstance(messages, list):
+            for message in reversed(messages):
+                if (
+                    isinstance(message, dict)
+                    and isinstance(message.get("content"), str)
+                    and message["content"].startswith("<cambium-summary-control>\n")
+                ):
+                    control_content = message["content"]
+                    break
+        if control_content is not None:
             if not allow_model_substitution:
                 raise AssertionError("summary calls must authorize model substitution")
             if self.all_providers_dead:
@@ -203,7 +208,7 @@ class _SummaryFlushRouter:
                     fell_back_from="dead-primary",
                 )
             control = json.loads(
-                last_content.removeprefix("<cambium-summary-control>\n").removesuffix(
+                control_content.removeprefix("<cambium-summary-control>\n").removesuffix(
                     "\n</cambium-summary-control>"
                 )
             )
@@ -458,7 +463,7 @@ def test_malformed_summary_defers_and_task_completes(tmp_path: Path) -> None:
     )
     writer = _FakeWriter()
     router = _SummaryFlushRouter(
-        malformed_summaries=1,
+        malformed_summaries=2,
         responses=[
             '{"type":"plan","steps":["continue"]}',
             '{"type":"finish","summary":"done","objective_met":true}',
@@ -500,7 +505,7 @@ def test_two_malformed_summaries_fail_on_the_third_fold_attempt(tmp_path: Path) 
     )
     writer = _FakeWriter()
     router = _SummaryFlushRouter(
-        malformed_summaries=3,
+        malformed_summaries=6,
         responses=[
             '{"type":"plan","steps":["first"]}',
             '{"type":"plan","steps":["second"]}',
@@ -1034,12 +1039,13 @@ def test_plan_and_thought_round_trip_through_parser() -> None:
         '{"type":"finish","summary":"done","objective_met":true,"thought":"verified"}'
     ) == {"type": "finish", "summary": "done", "objective_met": True}
 
-    # Concatenated actions: the FIRST complete object is parsed; the rest is
-    # surfaced via _action_trailing.
-    assert worker._parse_agent_action(
-        '{"type":"finish","summary":"done","objective_met":true}'
-        '{"type":"tool_call","name":"read_batch","arguments":{"paths":["a.py"]}}'
-    ) == {"type": "finish", "summary": "done", "objective_met": True}
+    # Concatenated actions are rejected: exactly one top-level JSON object
+    # is the contract; trailing content raises.
+    with pytest.raises(ValueError, match="no trailing content"):
+        worker._parse_agent_action(
+'{"type":"finish","summary":"done","objective_met":true}'
+'{"type":"tool_call","name":"read_batch","arguments":{"paths":["a.py"]}}'
+        )
     assert worker._action_trailing(
         '{"type":"finish","summary":"done","objective_met":true}'
         '{"type":"tool_call","name":"read_batch","arguments":{"paths":["a.py"]}}'
@@ -1542,18 +1548,19 @@ def test_plan_then_tool_resets_consecutive_plan_counter(tmp_path: Path) -> None:
     assert len(router.prompts) == 5
 
 
-def test_concatenated_actions_first_action_parsed_trailing_noted(tmp_path: Path) -> None:
-    """A response carrying several concatenated JSON actions parses as the
-    first action, notes the ignored trailing JSON to the model, and continues
-    instead of failing as invalid."""
+def test_concatenated_actions_are_rejected(tmp_path: Path) -> None:
+    """A response carrying several concatenated JSON actions is invalid:
+    exactly one top-level object is the action contract, so the loop treats
+    it as an invalid action and the model is told so."""
     repo = tmp_path / "repo"
     worktree = _make_worktree(repo)
     config = _agent_config(worktree)
     router = _ScriptedRouter(
         [
-            '{"type":"plan","steps":["read both files"]}'
             '{"type":"tool_call","name":"read_batch","arguments":'
-            '{"paths":["alpha.txt","beta.txt"]}}',
+            '{"paths":["alpha.txt"]}}'
+            '{"type":"tool_call","name":"read_batch","arguments":'
+            '{"paths":["beta.txt"]}}',
             '{"type":"finish","summary":"read both files","objective_met":true}',
         ]
     )
@@ -1563,9 +1570,8 @@ def test_concatenated_actions_first_action_parsed_trailing_noted(tmp_path: Path)
     assert outcome["status"] == "succeeded"
     assert outcome["summary"] == "read both files"
     assert outcome["turn"] == 2
-    assert len(router.prompts) == 2
     assert any(
-        "trailing JSON was ignored" in message["content"] for message in outcome["transcript"]
+        "no trailing content" in message["content"] for message in outcome["transcript"]
     )
 
 

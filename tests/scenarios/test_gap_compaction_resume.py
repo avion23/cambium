@@ -92,14 +92,24 @@ class _SummaryRouter:
     ) -> _CallResult:
         del model, budget_usd, allow_model_substitution
         self.prompts.append(prompt)
-        last = prompt["messages"][-1]["content"]
-        if isinstance(last, str) and last.startswith("<cambium-summary-control>\n"):
+        control_content = None
+        messages = prompt.get("messages")
+        if isinstance(messages, list):
+            for message in reversed(messages):
+                if (
+                    isinstance(message, dict)
+                    and isinstance(message.get("content"), str)
+                    and message["content"].startswith("<cambium-summary-control>\n")
+                ):
+                    control_content = message["content"]
+                    break
+        if control_content is not None:
             self.summary_calls += 1
             if self.malformed_summaries:
                 self.malformed_summaries -= 1
                 return _CallResult("{}{}")
             control = json.loads(
-                last.removeprefix("<cambium-summary-control>\n").removesuffix(
+                control_content.removeprefix("<cambium-summary-control>\n").removesuffix(
                     "\n</cambium-summary-control>"
                 )
             )
@@ -198,7 +208,7 @@ def test_compaction_deferral_count_survives_generation_boundary(tmp_path: Path) 
     worktree = _worktree(tmp_path / "repo")
     checkpoint_root = tmp_path / "checkpoints"
     first_config = _config(worktree, checkpoint_root, max_turns=10)
-    first_router = _SummaryRouter(malformed_summaries=1)
+    first_router = _SummaryRouter(malformed_summaries=2)
     first_router.responses = [
         '{"type":"tool_call","name":"run_shell","arguments":{"cmd":["true"]}}',
         "not-an-action",
@@ -227,8 +237,10 @@ def test_compaction_deferral_count_survives_generation_boundary(tmp_path: Path) 
             "workspace_changed": False,
         },
     )
-    resumed_router = _SummaryRouter(malformed_summaries=2)
+    resumed_router = _SummaryRouter(malformed_summaries=4)
     resumed_router.responses = [
+        '{"type":"plan","steps":["continue"]}',
+        '{"type":"plan","steps":["continue again"]}',
         '{"type":"plan","steps":["continue"]}',
         '{"type":"plan","steps":["continue again"]}',
     ]
@@ -250,7 +262,7 @@ def test_compaction_deferral_count_survives_generation_boundary(tmp_path: Path) 
     assert len(
         [message for message in resumed_writer.messages() if message["type"] == "compaction_failed"]
     ) == 1
-    assert resumed_router.summary_calls == 2
+    assert resumed_router.summary_calls == 4
 
 
 def _write_restart_worker(path: Path, wire_log: Path, prompt_log: Path, init_log: Path) -> None:
@@ -327,21 +339,29 @@ def _write_restart_worker(path: Path, wire_log: Path, prompt_log: Path, init_log
                     return ""
 
                 async def call(self, _tier, prompt, **_kwargs):
-                    last = prompt["messages"][-1].get("content", "")
-                    is_summary = isinstance(last, str) and last.startswith(
-                        "<cambium-summary-control>\\n"
-                    )
+                    control_content = None
+                    messages = prompt.get("messages")
+                    if isinstance(messages, list):
+                        for message in reversed(messages):
+                            if (
+                                isinstance(message, dict)
+                                and isinstance(message.get("content"), str)
+                                and message["content"].startswith("<cambium-summary-control>\\n")
+                            ):
+                                control_content = message["content"]
+                                break
+                    is_summary = control_content is not None
                     append(PROMPTS, {
                         "generation": self.generation,
                         "summary": is_summary,
-                        "last": last[:200],
+                        "last": (control_content or "")[:200],
                     })
                     if is_summary:
                         self.summary_calls += 1
                         if self.generation == 1:
                             return Result("{}{}")
                         control = json.loads(
-                            last.removeprefix("<cambium-summary-control>\\n").removesuffix(
+                            control_content.removeprefix("<cambium-summary-control>\\n").removesuffix(
                                 "\\n</cambium-summary-control>"
                             )
                         )

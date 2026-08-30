@@ -1981,10 +1981,10 @@ def _decode_action_json(text: str) -> tuple[Any, int]:
 
 
 def _parse_agent_action(content: str) -> dict[str, Any]:
-    """Strictly parse ONE agent action; a response may carry several
-    concatenated JSON actions, in which case the first complete action is
-    used (trailing actions are ignored and surfaced to the loop).  Raises
-    ``ValueError`` on any deviation.
+    """Strictly parse ONE agent action; the response must be exactly one
+    top-level JSON object.  Any prose, trailing JSON, or concatenated
+    actions are rejected (the owner overrode trailing-prose tolerance).
+    Raises ``ValueError`` on any deviation.
 
     Accepted shapes (each may optionally carry a ``thought`` field for
     reasoning; the action fields themselves must be exact):
@@ -2003,6 +2003,10 @@ def _parse_agent_action(content: str) -> dict[str, Any]:
         raise ValueError(f"action is not valid JSON: {exc}") from None
     if not isinstance(parsed, dict):
         raise ValueError("agent action must be exactly one JSON object")
+    if text[_end:].strip():
+        raise ValueError(
+            "agent action must be exactly one JSON object (no trailing content)"
+        )
     action_type = parsed.get("type")
     if action_type == "plan":
         if not _action_keys(parsed, frozenset({"type", "steps"})):
@@ -2529,6 +2533,34 @@ def _render_rolling_compaction(
 
 
 _CONTENT_FLAGGED_RETRY_MARKER = "\n*** [redacted]"
+
+
+def _correct_summary_contract_prompt(
+    prompt: dict[str, Any], error: SummaryTrunkError
+) -> dict[str, Any]:
+    """Append one concise contract correction to the summary prompt.
+
+    The model occasionally answers the summary request with a tool-call-
+    shaped envelope (e.g. ``{"name": ..., "arguments": ...}``) instead of a
+    summary entry.  Instead of immediately deferring compaction, tell the
+    model exactly which field set was invalid and retry once.
+    """
+    retry_prompt = copy.deepcopy(prompt)
+    messages = retry_prompt.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return retry_prompt
+    messages.append(
+        {
+            "role": "user",
+            "content": _bounded_text(
+                f"Your previous response was rejected: {error}. "
+                "Emit exactly one summary_entry JSON object with only the "
+                "declared fields (summary, outcome, objective, open_items).",
+                MAX_OBSERVATION_BYTES,
+            ),
+        }
+    )
+    return retry_prompt
 
 
 def _transform_content_flagged_summary_prompt(
@@ -5145,6 +5177,7 @@ async def _bound_context_continuation(
         )
         summary_result: CallResult | None = None
         sent_summary_prompt = copy.deepcopy(summary_prompt)
+        summary_entry: SummaryEntry | None = None
         for summary_attempt in range(2):
             sent_summary_prompt = copy.deepcopy(summary_prompt)
             try:
@@ -5207,9 +5240,22 @@ async def _bound_context_continuation(
                         f"{_cap_utf8(inner_message, MAX_ENVELOPE_FIELD_CHARS)}"
                     )
                 raise ContextForkError(f"summary provider call failed: {detail}") from exc
-            break
-        if summary_result is None:
-            raise ContextForkError("summary provider call failed")
+            try:
+                summary_entry = parse_summary_response(summary_result.content, expectation)
+                break
+            except SummaryTrunkError as exc:
+                # A tool-call-shaped envelope (e.g. {"name", "arguments"}) or
+                # prose reaching the summary parser is a contract violation:
+                # correct the model once with the concise violation, then fall
+                # through to the deferred-compaction path.
+                if summary_attempt == 0:
+                    summary_prompt = _correct_summary_contract_prompt(summary_prompt, exc)
+                    continue
+                break
+        # A successful parse in the loop already set summary_entry.  A failed
+        # one falls through to the second parse below, whose SummaryTrunkError
+        # handler owns the deferred-compaction decision (including the
+        # MAX_CONSECUTIVE_COMPACTION_DEFERRALS bound).
         if time.monotonic() >= wall_deadline:
             raise ContextForkError("wall budget exceeded during summary flush")
         declared_summary_model = router.declared_model(summary_result.provider)
