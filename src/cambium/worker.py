@@ -1031,6 +1031,31 @@ def _task_requirements(
     return validated or None
 
 
+async def _emit_provider_fallback(
+    writer: asyncio.StreamWriter | None,
+    config: AgentConfig,
+    *,
+    fell_back_from: str,
+    served_provider: str,
+    served_model: str,
+    request_id: str | None = None,
+) -> None:
+    """Durably record one provider fallback (assigned -> actually served)."""
+    if writer is None:
+        return
+    payload: dict[str, Any] = {
+        "type": "provider_fallback",
+        "task_id": config.task_id,
+        "generation": config.generation,
+        "fell_back_from": fell_back_from,
+        "served_provider": served_provider,
+        "served_model": served_model,
+    }
+    if isinstance(request_id, str) and request_id:
+        payload["request_id"] = request_id
+    await send(writer, payload)
+
+
 def _model_identity(
     providers: list[Any],
     tier: ProviderTier,
@@ -5264,6 +5289,13 @@ async def _bound_context_continuation(
         if isinstance(fallback_origin, str):
             outcome["fell_back_from"] = fallback_origin
             outcome["model"] = summary_result.model
+            await _emit_provider_fallback(
+                writer,
+                config,
+                fell_back_from=fallback_origin,
+                served_provider=summary_result.provider,
+                served_model=summary_result.model,
+            )
         invalid_usage_fields = _invalid_usage_fields(summary_result.usage)
         if invalid_usage_fields:
             raise ContextForkError("summary usage contains invalid token counts")
@@ -6025,6 +6057,29 @@ async def _run_agent_loop(
             if isinstance(fallback_origin, str):
                 outcome["fell_back_from"] = fallback_origin
                 outcome["model"] = result.model
+                await _emit_provider_fallback(
+                    writer,
+                    config,
+                    fell_back_from=fallback_origin,
+                    served_provider=result.provider,
+                    served_model=result.model,
+                    request_id=run_request_id,
+                )
+                correction = {
+                    "role": "user",
+                    "content": _bounded_text(
+                        f"Note: the assigned provider was unavailable; the provider "
+                        f"serving this turn is {result.provider}/{result.model}.",
+                        MAX_OBSERVATION_BYTES,
+                    ),
+                }
+                if base_messages is None:
+                    transcript.append(correction)
+                else:
+                    context_continuation.append(correction)
+                    transcript = _sync_context_transcript(
+                        base_messages, context_continuation, transcript
+                    )
             invalid_usage_fields = _invalid_usage_fields(result.usage)
             if invalid_usage_fields:
                 return _loop_result(
@@ -6139,6 +6194,18 @@ async def _run_agent_loop(
                     finalization_grace_used=finalization_grace_used,
                 )
                 consecutive_invalid_actions += 1
+                if writer is not None:
+                    await send(
+                        writer,
+                        {
+                            "type": "invalid_action",
+                            "task_id": config.task_id,
+                            "generation": config.generation,
+                            "turn": turn,
+                            "error": _cap_utf8(str(exc), MAX_ENVELOPE_FIELD_CHARS),
+                            "consecutive_invalid_actions": consecutive_invalid_actions,
+                        },
+                    )
                 if final_synthesis_call:
                     return _loop_result(
                         outcome,
