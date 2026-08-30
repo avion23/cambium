@@ -5126,7 +5126,14 @@ class Cockpit:
         self._last_restored_input_text = None
         if self.enabled:
             if self._fixed_frame:
-                self.stream.write(f"\r{_CLEAR_LINE}")
+                if self._native_input:
+                    # Native readline echoed the submitted line AND a trailing
+                    # newline, so the cursor is one row below the echoed text.
+                    # Move up before clearing, otherwise the submitted prompt
+                    # stays visible above the fresh input line.
+                    self.stream.write(f"\x1b[1A\r{_CLEAR_LINE}")
+                else:
+                    self.stream.write(f"\r{_CLEAR_LINE}")
                 if commit and not self._small_frame and self._last_request is not None:
                     self._redraw_bottom(self._last_request, self._last_status_rows)
             elif commit:
