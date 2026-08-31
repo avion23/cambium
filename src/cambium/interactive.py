@@ -38,6 +38,7 @@ from .summary_trunk import (
     summary_entries,
 )
 
+fcntl: Any
 try:
     import fcntl
 except ImportError:  # pragma: no cover - exercised on Windows
@@ -1268,7 +1269,7 @@ class InteractiveSession:
                 changes["model"] = self._seed.model
             if changes:
                 config = replace(config, **changes)
-        changes: dict[str, Any] = {}
+        changes = {}
         if self._provider_preference is not None:
             changes.update(
                 {

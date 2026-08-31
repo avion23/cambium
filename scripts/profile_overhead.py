@@ -37,7 +37,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -237,7 +237,9 @@ def _provider_request_measurements(
         },
     )
     previous_opener = diffundo_module.urllib.request.build_opener
-    diffundo_module.urllib.request.build_opener = lambda *_args, **_kwargs: _NoNetworkOpener()
+    cast(Any, diffundo_module.urllib.request).build_opener = (
+        lambda *_args, **_kwargs: _NoNetworkOpener()
+    )
     previous_key = os.environ.get(chat_provider.api_key_env)
     os.environ[chat_provider.api_key_env] = "profile-key"
 
@@ -501,7 +503,7 @@ def _git_merge_measurement(*, iterations: int, warmups: int) -> Measurement:
         repo = Path(temporary) / "repo"
         repo.mkdir()
         base, branches, staging_paths = _init_profile_repo(repo, total)
-        state = {"expected_old": base, "index": 0}
+        state: dict[str, Any] = {"expected_old": base, "index": 0}
 
         def merge_one() -> None:
             index = state["index"]

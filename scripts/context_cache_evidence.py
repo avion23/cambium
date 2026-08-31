@@ -151,9 +151,9 @@ def _classify_events(
             continue
         epoch = payload.get("epoch")
         if isinstance(epoch, int) and not isinstance(epoch, bool) and epoch > 0:
-            key = (task_id, generation, epoch)
-            first = key not in resume_seen
-            resume_seen.add(key)
+            resume_key = (task_id, generation, epoch)
+            first = resume_key not in resume_seen
+            resume_seen.add(resume_key)
             classified.append(("resume_first" if first else "resume_later", payload))
             continue
         classified.append(("baseline", payload))

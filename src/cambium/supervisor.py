@@ -4844,6 +4844,7 @@ class _Runtime:
             await self.emit("task_assigned", **assigned_payload)
             restarts = 0
             worker_summary: str | None = None
+            resume_payload: dict[str, Any] | None
             # Eval-3 ADOPT: only the first generation may pop the warm pool.
             # Restart generations always spawn a fresh process (a restarted
             # worker must never reuse a pooled process).
@@ -7760,7 +7761,7 @@ class _Runtime:
             elif isinstance(exc, MergeConflictError):
                 summary = str(exc)[:512]
                 diff_evidence = exc.diff_evidence
-                conflict_payload = {
+                conflict_payload: dict[str, Any] = {
                     # Keep the old event kind and fields so renderers and
                     # operators consuming merge_failed remain compatible.
                     "merge_error": error_type,
@@ -8175,10 +8176,10 @@ def _resolve_model_candidates(
                 for item in recorded
                 if isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], str)
             }
-            for provider, reason in infeasible:
-                if provider not in known:
-                    recorded.append((provider, reason))
-                    known.add(provider)
+            for provider_name, reason in infeasible:
+                if provider_name not in known:
+                    recorded.append((provider_name, reason))
+                    known.add(provider_name)
         if not feasible:
             raise NoCredentialFeasibleProvidersError()
         providers = feasible

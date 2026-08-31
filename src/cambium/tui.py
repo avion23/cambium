@@ -31,6 +31,7 @@ from .store import StoreError, read_events_file
 from .terminal import sanitize_terminal_text
 from .tui_screen import ActivityState, Cockpit, Transcript, render_quota_rows
 
+_readline: Any
 try:
     import readline as _readline
 except ImportError:  # pragma: no cover - platform dependent
@@ -966,6 +967,7 @@ async def _run_interactive(
 
                 transcript.user(prompt)
                 prompts = _take_queued_task_prompts(pending_prompts, prompt)
+                queued_prompt: str | None
                 for queued_prompt in prompts[1:]:
                     transcript.user(queued_prompt)
                 turns = (
