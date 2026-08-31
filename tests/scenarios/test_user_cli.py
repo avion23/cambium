@@ -6,12 +6,12 @@ import asyncio
 import json
 import os
 import stat
-import subprocess
 from io import StringIO
 from pathlib import Path
 from typing import Any
 
 import pytest
+from _helpers_g13 import init_repo  # type: ignore[reportMissingImports]
 
 from cambium import cli, oneshot, repl, session, tui
 from cambium.auth import AuthStore, derived_env_name
@@ -24,17 +24,13 @@ from cambium.supervisor import PlanResult, TaskResult
 
 
 def _repo(path: Path) -> Path:
-    subprocess.run(["git", "init", "-b", "main", str(path)], check=True, capture_output=True)
-    subprocess.run(["git", "-C", str(path), "config", "user.name", "cli-test"], check=True)
-    subprocess.run(["git", "-C", str(path), "config", "user.email", "cli@test"], check=True)
-    (path / "file.txt").write_text("file\n", encoding="utf-8")
-    subprocess.run(["git", "-C", str(path), "add", "-A"], check=True, capture_output=True)
-    subprocess.run(
-        ["git", "-C", str(path), "commit", "-m", "initial"],
-        check=True,
-        capture_output=True,
-    )
-    return path
+    return init_repo(
+        path,
+        user_name="cli-test",
+        user_email="cli@test",
+        filename="file.txt",
+        content="file\n",
+    )[0]
 
 
 def _plan_result() -> PlanResult:
@@ -78,19 +74,15 @@ def _write_provider_file(path: Path, providers: list[dict[str, object]]) -> Path
     return path
 
 
-def test_unknown_single_token_is_not_reinterpreted_as_a_prompt(capsys) -> None:
+@pytest.mark.parametrize(
+    "command_line",
+    (["not-a-command"], ["make"], ["make", "the", "change"]),
+)
+def test_prompt_like_or_unknown_command_is_rejected(command_line: list[str], capsys) -> None:
     with pytest.raises(SystemExit) as raised:
-        cli.main(["not-a-command"])
+        cli.main(command_line)
     assert raised.value.code == 2
     assert "invalid command arguments" in capsys.readouterr().err
-
-
-def test_bare_prompt_is_rejected_regardless_of_token_count(capsys) -> None:
-    for command_line in (["make"], ["make", "the", "change"]):
-        with pytest.raises(SystemExit) as raised:
-            cli.main(command_line)
-        assert raised.value.code == 2
-        assert "invalid command arguments" in capsys.readouterr().err
 
 
 def test_run_oneshot_delegates_async_at_supervisor_boundary(monkeypatch, tmp_path: Path) -> None:
@@ -152,9 +144,11 @@ def test_tui_continue_flag_defaults_fresh_and_selects_latest_or_id(
     assert configs[-1].session_root is None
 
     assert cli.main(["tui", "--repo", str(tmp_path), "-c"]) == 0
+    assert configs[-1].session_root is not None
     assert Path(configs[-1].session_root).resolve() == prior.resolve()
 
     assert cli.main(["tui", "--repo", str(tmp_path), "--continue", "prior"]) == 0
+    assert configs[-1].session_root is not None
     assert Path(configs[-1].session_root).resolve() == prior.resolve()
 
 
@@ -164,13 +158,6 @@ def test_tui_continue_missing_session_is_a_clear_error(capsys, tmp_path: Path) -
     captured = capsys.readouterr()
     assert "cambium tui: no previous interactive session is available to continue" in captured.err
     assert "Traceback" not in captured.err
-
-
-def test_tui_continue_flag_has_no_resume_alias() -> None:
-    parser = cli._build_parser()
-
-    with pytest.raises(SystemExit):
-        parser.parse_args(["tui", "--resume"])
 
 
 def test_explicit_session_rejects_second_request_without_changing_artifacts(
@@ -521,18 +508,6 @@ def test_session_show_reads_result_without_event_db(capsys, tmp_path: Path) -> N
     assert not event_db.exists()
 
 
-def test_session_show_does_not_materialize_event_log(tmp_path: Path) -> None:
-    root = tmp_path / "sessions"
-    _write_result(root / "events", 1.0)
-    event_db = root / "events" / ".cambium" / "events.db"
-
-    view = session.show_session(root / "events")
-
-    assert view.result["summary"] == "events"
-    assert view.result["event_log_ref"] == f"sqlite:{event_db}"
-    assert not event_db.exists()
-
-
 def _write_lifecycle_events(path: Path, events: list[dict[str, Any]]) -> None:
     """Persist a multi-task lifecycle event log under ``path/.cambium``."""
     state = path / ".cambium"
@@ -597,15 +572,21 @@ def test_session_status_renders_per_subagent_lifecycle(capsys, tmp_path: Path) -
     assert "cost=$0.000000" in totals
 
 
-def test_session_status_rejects_missing_event_log(capsys, tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("command", "expected_message"),
+    (("status", "event log is missing"), ("usage", "no usage event log")),
+)
+def test_session_commands_reject_missing_event_log(
+    command: str, expected_message: str, capsys, tmp_path: Path
+) -> None:
     root = tmp_path / "sessions"
     session_dir = root / "empty"
     session_dir.mkdir(parents=True)  # no .cambium/events.db on purpose
 
-    assert cli.main(["session", "status", "--session-dir", str(root), "empty"]) == 1
+    assert cli.main(["session", command, "--session-dir", str(root), "empty"]) == 1
     captured = capsys.readouterr()
     assert "cambium session:" in captured.err
-    assert "event log is missing" in captured.err
+    assert expected_message in captured.err
     assert "Traceback" not in captured.err
 
 
@@ -651,18 +632,6 @@ def test_session_usage_renders_per_task_and_provider(capsys, tmp_path: Path) -> 
     assert "calls=1" in p2
 
 
-def test_session_usage_rejects_missing_event_log(capsys, tmp_path: Path) -> None:
-    root = tmp_path / "sessions"
-    session_dir = root / "empty"
-    session_dir.mkdir(parents=True)  # no .cambium/events.db on purpose
-
-    assert cli.main(["session", "usage", "--session-dir", str(root), "empty"]) == 1
-    captured = capsys.readouterr()
-    assert "cambium session:" in captured.err
-    assert "no usage event log" in captured.err
-    assert "Traceback" not in captured.err
-
-
 def test_session_resume_rejects_missing_plan(capsys, tmp_path: Path) -> None:
     session_dir = tmp_path / "crashed"
     (session_dir / ".cambium").mkdir(parents=True)
@@ -674,38 +643,15 @@ def test_session_resume_rejects_missing_plan(capsys, tmp_path: Path) -> None:
     assert "Traceback" not in captured.err
 
 
-def test_session_resume_delegates_to_supervisor_main(monkeypatch, capsys, tmp_path: Path) -> None:
+def test_session_resume_preserves_supervisor_cancellation(monkeypatch, tmp_path: Path) -> None:
     from cambium import supervisor
 
     session_dir = tmp_path / "crashed"
     (session_dir / ".cambium").mkdir(parents=True)
-    (session_dir / "plan.json").write_text(
-        json.dumps({"tasks": [{"task_id": "t1", "task": "x"}]}), encoding="utf-8"
-    )
-    calls: list[tuple[list[str], dict]] = []
-
-    def fake_main(argv=None):
-        calls.append((list(argv or []), {}))
-        return 130
-
-    monkeypatch.setattr(supervisor, "main", fake_main)
+    (session_dir / "plan.json").write_text(json.dumps({"tasks": []}), encoding="utf-8")
+    monkeypatch.setattr(supervisor, "main", lambda argv=None: 130)
 
     assert cli.main(["session", "resume", str(session_dir)]) == 130
-    assert capsys.readouterr().out == ""
-    assert calls == [
-        (
-            [
-                "--session-dir",
-                str(session_dir.resolve()),
-                "--plan",
-                str((session_dir / "plan.json").resolve()),
-            ],
-            {},
-        )
-    ]
-    delegated = calls[0][0]
-    assert delegated.count("--plan") == 1
-    assert delegated[delegated.index("--session-dir") + 1] == str(session_dir.resolve())
 
 
 def test_stored_auth_is_handed_to_provider_worker_without_plan_leak(

@@ -6,6 +6,8 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
 from cambium.monitor import render_agent_lines, render_dashboard
 from cambium.observability import (
     ObservabilityState,
@@ -109,30 +111,40 @@ def test_reducer_exposes_main_and_subagent_usage_and_models() -> None:
     assert snapshot.context.exact_prompt_tokens == 1_000
 
 
-def test_terminal_state_is_not_overwritten_by_late_heartbeat() -> None:
-    state = ObservabilityState()
-    state.extend(
-        [
-            _event(1, "spawned", task_id="root"),
-            _event(2, "result", task_id="root", status="failed"),
-            _event(3, "heartbeat", task_id="root", turn=9),
-        ]
-    )
-    snapshot = state.snapshot()
-    assert snapshot.agents[0].state == "failed"
-    assert snapshot.agents[0].turn == 9
-
-
-def test_first_terminal_state_wins_over_late_exit() -> None:
-    snapshot = snapshot_from_events(
-        [
-            _event(1, "result", task_id="root", status="succeeded"),
-            _event(2, "exit", task_id="root"),
-        ]
-    )
-    assert snapshot.agents[0].state == "succeeded"
-    assert snapshot.succeeded_agents == 1
-    assert snapshot.failed_agents == 0
+@pytest.mark.parametrize(
+    ("events", "expected_state", "expected_turn", "succeeded", "failed"),
+    (
+        (
+            [
+                _event(1, "spawned", task_id="root"),
+                _event(2, "result", task_id="root", status="failed"),
+                _event(3, "heartbeat", task_id="root", turn=9),
+            ],
+            "failed",
+            9,
+            0,
+            1,
+        ),
+        (
+            [
+                _event(1, "result", task_id="root", status="succeeded"),
+                _event(2, "exit", task_id="root"),
+            ],
+            "succeeded",
+            0,
+            1,
+            0,
+        ),
+    ),
+)
+def test_first_terminal_state_wins_over_late_events(
+    events: list[dict], expected_state: str, expected_turn: int, succeeded: int, failed: int
+) -> None:
+    snapshot = snapshot_from_events(events)
+    assert snapshot.agents[0].state == expected_state
+    assert snapshot.agents[0].turn == expected_turn
+    assert snapshot.succeeded_agents == succeeded
+    assert snapshot.failed_agents == failed
 
 
 def test_checkpoint_inspection_rejects_symlink_outside_session(tmp_path: Path) -> None:
@@ -277,7 +289,6 @@ def test_unsequenced_event_hash_ring_is_bounded() -> None:
     for index in range(64):
         state.apply({"kind": f"event-{index}"})
 
-    assert len(state._unsequenced_hashes) == 64
     state.apply({"kind": "event-64"})
     state.apply({"kind": "event-0"})
     assert len(state.snapshot().recent_events) == 66

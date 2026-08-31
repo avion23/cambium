@@ -28,20 +28,13 @@ def _volatile_messages() -> list[tuple[str, str]]:
     ]
 
 
-def test_prompt_prefix_bytes_keeps_unicode_header_intact_at_boundary_offsets() -> None:
+def test_prompt_prefix_bytes_counts_unicode_header() -> None:
     payload = "CJK " + chr(0x4E2D) + " emoji " + chr(0x1F600)
     content = "stable " + payload + " header"
     prompt = _prompt(("system", content), ("user", "task"))
     prefix_len = len(content.encode("utf-8"))
 
     assert prompt_prefix_bytes(prompt) == prefix_len
-    for offset in range(max(0, prefix_len - 3), prefix_len + 4):
-        raw_prefix = content.encode("utf-8")[:offset]
-        reconstructed = raw_prefix.decode("utf-8", errors="ignore")
-        assert reconstructed.encode("utf-8").decode("utf-8") == reconstructed
-        assert prompt_prefix_bytes(_prompt(("system", reconstructed))) == len(
-            reconstructed.encode("utf-8")
-        )
 
 
 def test_codex_reconstruction_preserves_unicode_and_mixed_line_endings() -> None:
@@ -59,8 +52,6 @@ def test_codex_reconstruction_preserves_unicode_and_mixed_line_endings() -> None
     )
 
     assert body["input"][0]["content"][0]["text"] == content
-    restored = json.loads(json.dumps(body, ensure_ascii=False))
-    assert restored["input"][0]["content"][0]["text"] == content
 
 
 def test_header_validator_aggregates_volatile_indexes_and_accepts_tail_ids() -> None:

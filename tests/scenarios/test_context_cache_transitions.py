@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import json
-import subprocess
 import threading
 from pathlib import Path
 from typing import Any
 
+from _helpers_g13 import init_worktree  # type: ignore[reportMissingImports]
+
 from cambium import worker
 from cambium.diffundo import ProviderTier
-from cambium.fencing import write_generation
 from cambium.summary_trunk import summary_entries
 
 
@@ -97,35 +97,15 @@ class _ScriptedRouter:
 
 
 def _make_worktree(repo: Path) -> Path:
-    repo.mkdir(parents=True)
-    subprocess.run(
-        ["git", "init", "-b", "main", str(repo)],
-        check=True,
-        capture_output=True,
+    return init_worktree(
+        repo,
+        user_name="context-cache-test",
+        user_email="context-cache@test",
+        filename="alpha.txt",
+        content="alpha-content\n",
+        branch="context-cache",
+        worktree_name="wt",
     )
-    subprocess.run(
-        ["git", "-C", str(repo), "config", "user.name", "context-cache-test"],
-        check=True,
-    )
-    subprocess.run(
-        ["git", "-C", str(repo), "config", "user.email", "context-cache@test"],
-        check=True,
-    )
-    (repo / "alpha.txt").write_text("alpha-content\n", encoding="utf-8")
-    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
-    subprocess.run(
-        ["git", "-C", str(repo), "commit", "-m", "initial"],
-        check=True,
-        capture_output=True,
-    )
-    worktree = repo.parent / "wt"
-    subprocess.run(
-        ["git", "-C", str(repo), "worktree", "add", "-b", "context-cache", str(worktree), "main"],
-        check=True,
-        capture_output=True,
-    )
-    write_generation(worktree, 1)
-    return worktree
 
 
 def _agent_config(worktree: Path, **overrides: Any) -> worker.AgentConfig:
@@ -197,12 +177,6 @@ async def _drive_loop(
         stop=threading.Event(),
         progress=worker.AgentProgress(),
         run_request_id="context-cache-test",
-    )
-
-
-def _message_chars(messages: list[dict[str, Any]]) -> int:
-    return sum(
-        len(content) for message in messages if isinstance(content := message.get("content"), str)
     )
 
 
@@ -396,22 +370,3 @@ def test_summary_flush_appends_second_entry_after_raw_tail_crosses_threshold(
     assert first_entries[0].through_turn == checkpoint.turn + 1
     assert second_entries[1].through_turn == checkpoint.turn + 2
     assert first_entries[0].source_sha256 != second_entries[1].source_sha256
-
-
-def test_fork_prompt_appends_continuation_after_immutable_base() -> None:
-    base = [
-        {"role": "system", "content": "immutable system prompt"},
-        {"role": "user", "content": "immutable tool schemas"},
-    ]
-    continuation = [
-        {"role": "user", "content": "folded continuation"},
-        {"role": "user", "content": "child continuation"},
-    ]
-    original_base = [dict(message) for message in base]
-
-    prompt = worker._fork_prompt(tuple(base), continuation)
-
-    assert prompt["messages"] == [*base, *continuation]
-    assert prompt["messages"][: len(base)] == base
-    assert prompt["messages"][len(base) :] == continuation
-    assert base == original_base

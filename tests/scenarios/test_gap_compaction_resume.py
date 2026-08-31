@@ -5,13 +5,13 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import subprocess
 import textwrap
 import threading
 from pathlib import Path
 from typing import Any
 
 import pytest
+from _helpers_g13 import init_repo, init_worktree  # type: ignore[reportMissingImports]
 
 from cambium import worker
 from cambium.diffundo import ProviderTier
@@ -120,23 +120,15 @@ class _SummaryRouter:
 
 
 def _worktree(repo: Path) -> Path:
-    repo.mkdir(parents=True)
-    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
-    subprocess.run(["git", "-C", str(repo), "config", "user.name", "compaction-test"], check=True)
-    subprocess.run(["git", "-C", str(repo), "config", "user.email", "compaction@test"], check=True)
-    (repo / "state.txt").write_text("base\n", encoding="utf-8")
-    subprocess.run(["git", "-C", str(repo), "add", "state.txt"], check=True, capture_output=True)
-    subprocess.run(
-        ["git", "-C", str(repo), "commit", "-m", "initial"], check=True, capture_output=True
+    return init_worktree(
+        repo,
+        user_name="compaction-test",
+        user_email="compaction@test",
+        filename="state.txt",
+        content="base\n",
+        branch="compaction",
+        worktree_name="worktree",
     )
-    worktree = repo.parent / "worktree"
-    subprocess.run(
-        ["git", "-C", str(repo), "worktree", "add", "-b", "compaction", str(worktree), "main"],
-        check=True,
-        capture_output=True,
-    )
-    write_generation(worktree, 1)
-    return worktree
 
 
 def _config(worktree: Path, checkpoint_root: Path, **overrides: Any) -> worker.AgentConfig:
@@ -440,21 +432,13 @@ def test_deferred_compaction_survives_stall_restart_and_later_folds(
 ) -> None:
     session = tmp_path / "session"
     repo = session / "repo"
-    repo.mkdir(parents=True)
-    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
-    subprocess.run(["git", "-C", str(repo), "config", "user.name", "compaction-test"], check=True)
-    subprocess.run(["git", "-C", str(repo), "config", "user.email", "compaction@test"], check=True)
-    (repo / "state.txt").write_text("base\n", encoding="utf-8")
-    subprocess.run(["git", "-C", str(repo), "add", "state.txt"], check=True, capture_output=True)
-    subprocess.run(
-        ["git", "-C", str(repo), "commit", "-m", "initial"], check=True, capture_output=True
+    _, base = init_repo(
+        repo,
+        user_name="compaction-test",
+        user_email="compaction@test",
+        filename="state.txt",
+        content="base\n",
     )
-    base = subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
 
     wire_log = tmp_path / "wire.jsonl"
     prompt_log = tmp_path / "prompts.jsonl"
