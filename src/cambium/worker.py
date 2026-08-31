@@ -71,8 +71,11 @@ agent loop instead: it loads the provider file named by the worker's absolute
 ``Diffundo.call`` turns, each accepting exactly one JSON action:
 
     {"type": "plan", "steps": [<non-empty strings>]}
-    {"type": "tool_call", "name": <schema name>, "arguments": {...}}
+    {"type": "tool_call", "calls": [{"name": <schema name>, "arguments": {...}}, ...]}
     {"type": "finish", "summary": <non-empty summary>, "objective_met": <boolean>}
+
+Legacy tool actions with top-level ``name``/``arguments`` remain accepted and
+are normalized to a one-call batch.
 
 The agent is instructed to emit a short ``plan`` action before any
 ``tool_call``; the plan is kept in the transcript. With durable context reuse,
@@ -2005,6 +2008,53 @@ def _decode_action_json(text: str) -> tuple[Any, int]:
         return _LENIENT_ACTION_DECODER.raw_decode(text)
 
 
+def _normalize_tool_calls(action: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Validate a tool action's call shape and return calls in input order."""
+    if "calls" in action:
+        raw_calls = action.get("calls")
+        if not isinstance(raw_calls, list):
+            raise ValueError("tool_call calls must be an array")
+        if not raw_calls:
+            raise ValueError("tool_call calls must be a non-empty array")
+        normalized: list[dict[str, Any]] = []
+        errors: list[str] = []
+        for index, raw_call in enumerate(raw_calls):
+            if not isinstance(raw_call, dict):
+                errors.append(f"tool_call calls[{index}] must be an object")
+                continue
+            if set(raw_call) != {"name", "arguments"}:
+                errors.append(
+                    f"tool_call calls[{index}] must carry exactly name/arguments"
+                )
+                continue
+            name = raw_call.get("name")
+            arguments = raw_call.get("arguments")
+            entry_errors: list[str] = []
+            if not isinstance(name, str) or not name:
+                entry_errors.append("name must be a non-empty string")
+            elif name not in _ALL_TOOL_NAMES:
+                entry_errors.append(f"unknown tool: {name!r}")
+            if not isinstance(arguments, dict):
+                entry_errors.append("arguments must be an object")
+            if entry_errors:
+                errors.extend(f"tool_call calls[{index}] {error}" for error in entry_errors)
+                continue
+            normalized.append({"name": name, "arguments": arguments})
+        if errors:
+            raise ValueError("; ".join(errors))
+        return normalized
+
+    name = action.get("name")
+    arguments = action.get("arguments")
+    if not isinstance(name, str) or not name:
+        raise ValueError("tool_call name must be a non-empty string")
+    if not isinstance(arguments, dict):
+        raise ValueError("tool_call arguments must be an object")
+    if name not in _ALL_TOOL_NAMES:
+        raise ValueError(f"unknown tool: {name!r}")
+    return [{"name": name, "arguments": arguments}]
+
+
 def _parse_agent_action(content: str) -> dict[str, Any]:
     """Strictly parse ONE agent action; the response must be exactly one
     top-level JSON object.  Any prose, trailing JSON, or concatenated
@@ -2014,8 +2064,11 @@ def _parse_agent_action(content: str) -> dict[str, Any]:
     Accepted shapes (each may optionally carry a ``thought`` field for
     reasoning; the action fields themselves must be exact):
         {"type": "plan", "steps": [<non-empty strings>]}
-        {"type": "tool_call", "name": <schema name>, "arguments": {...}}
+        {"type": "tool_call", "calls": [{"name": <schema name>, "arguments": {...}}, ...]}
         {"type": "finish", "summary": <non-empty str>, "objective_met": <boolean>}
+
+    The legacy tool-call shape with top-level ``name``/``arguments`` is also
+    accepted and normalized to one entry in ``calls``.
     """
     text = content.strip()
     if not text:
@@ -2043,19 +2096,16 @@ def _parse_agent_action(content: str) -> dict[str, Any]:
             raise ValueError("plan steps must be a non-empty array of non-empty strings")
         return {"type": "plan", "steps": list(steps)}
     if action_type == "tool_call":
-        if not _action_keys(parsed, frozenset({"type", "name", "arguments"})):
-            raise ValueError(
-                "tool_call must carry exactly type/name/arguments (plus optional thought)"
-            )
-        name = parsed.get("name")
-        arguments = parsed.get("arguments")
-        if not isinstance(name, str) or not name:
-            raise ValueError("tool_call name must be a non-empty string")
-        if not isinstance(arguments, dict):
-            raise ValueError("tool_call arguments must be an object")
-        if name not in _ALL_TOOL_NAMES:
-            raise ValueError(f"unknown tool: {name!r}")
-        return {"type": "tool_call", "name": name, "arguments": arguments}
+        if "calls" in parsed:
+            required = frozenset({"type", "calls"})
+            shape = "type/calls"
+        else:
+            required = frozenset({"type", "name", "arguments"})
+            shape = "type/name/arguments"
+        if not _action_keys(parsed, required):
+            raise ValueError(f"tool_call must carry exactly {shape} (plus optional thought)")
+        calls = _normalize_tool_calls(parsed)
+        return {"type": "tool_call", "calls": calls}
     if action_type == "finish":
         if not _action_keys(parsed, frozenset({"type", "summary", "objective_met"})):
             raise ValueError(
@@ -2421,6 +2471,9 @@ def _summarize_transcript(
 
 _READ_TOOL_NAMES = frozenset({"read_file", "read_batch"})
 _EDIT_TOOL_NAMES = frozenset({"edit_file", "write_file"})
+_MUTATING_TOOL_NAMES = frozenset(
+    {"write_file", "edit_file", "run_shell", "git_op", "run_python", "delegate"}
+)
 
 
 def _call_paths(name: str, arguments: dict[str, Any]) -> list[str]:
@@ -2457,25 +2510,32 @@ def _strip_for_fold(continuation: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         if not isinstance(action, dict) or action.get("type") != "tool_call":
             continue
-        name = action.get("name")
-        arguments = action.get("arguments")
-        if not isinstance(name, str) or not isinstance(arguments, dict):
+        try:
+            tool_calls = _normalize_tool_calls(action)
+        except ValueError:
             continue
-        obs_index = index + 1
-        while obs_index < len(continuation):
-            candidate = continuation[obs_index]
-            if candidate.get("role") == "assistant":
+        next_observation = index + 1
+        for tool_call in tool_calls:
+            name = tool_call["name"]
+            arguments = tool_call["arguments"]
+            obs_index = next_observation
+            while obs_index < len(continuation):
+                candidate = continuation[obs_index]
+                if candidate.get("role") == "assistant":
+                    break
+                obs_content = candidate.get("content")
+                if (
+                    candidate.get("role") == "user"
+                    and isinstance(obs_content, str)
+                    and (match := _OBSERVATION_HEADER_RE.match(obs_content)) is not None
+                    and match.group("name") == name
+                ):
+                    calls.append((index, obs_index, name, arguments, match.group("ok") == "True"))
+                    next_observation = obs_index + 1
+                    break
+                obs_index += 1
+            else:
                 break
-            obs_content = candidate.get("content")
-            if (
-                candidate.get("role") == "user"
-                and isinstance(obs_content, str)
-                and (match := _OBSERVATION_HEADER_RE.match(obs_content)) is not None
-                and match.group("name") == name
-            ):
-                calls.append((index, obs_index, name, arguments, match.group("ok") == "True"))
-                break
-            obs_index += 1
 
     # suffix_paths[p] = paths read or edited by any call after position p.
     suffix_paths: list[set[str]] = [set() for _ in range(len(calls) + 1)]
@@ -2975,29 +3035,35 @@ def _tool_observation(name: str, result: ToolResult) -> str:
 
 
 def _native_tool_action(result: CallResult) -> dict[str, Any] | None:
-    """Translate exactly one provider-native function call to Cambium's action ADT."""
+    """Translate provider-native function calls to one Cambium batch action."""
 
     calls = getattr(result, "tool_calls", None)
     if not calls:
         return None
-    if len(calls) != 1:
-        raise ValueError("provider returned more than one tool call for a sequential turn")
-    call = calls[0]
-    function = call.get("function") if isinstance(call, dict) else None
-    if not isinstance(function, dict):
-        raise ValueError("provider native tool call has no function object")
-    name = function.get("name")
-    arguments = function.get("arguments", {})
-    if not isinstance(name, str) or not name:
-        raise ValueError("provider native tool call has no function name")
-    if isinstance(arguments, str):
-        try:
-            arguments = json.loads(arguments)
-        except json.JSONDecodeError as exc:
-            raise ValueError("provider native tool arguments are invalid JSON") from exc
-    if not isinstance(arguments, dict):
-        raise ValueError("provider native tool arguments must be an object")
-    return {"type": "tool_call", "name": name, "arguments": arguments}
+    normalized: list[dict[str, Any]] = []
+    for index, call in enumerate(calls):
+        function = call.get("function") if isinstance(call, dict) else None
+        if not isinstance(function, dict):
+            raise ValueError(f"provider native tool call {index} has no function object")
+        name = function.get("name")
+        arguments = function.get("arguments", {})
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"provider native tool call {index} has no function name")
+        if name not in _ALL_TOOL_NAMES:
+            raise ValueError(f"unknown tool: {name!r}")
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"provider native tool call {index} arguments are invalid JSON"
+                ) from exc
+        if not isinstance(arguments, dict):
+            raise ValueError(
+                f"provider native tool call {index} arguments must be an object"
+            )
+        normalized.append({"name": name, "arguments": arguments})
+    return {"type": "tool_call", "calls": normalized}
 
 
 def _bind_router_provider(router: Any, result: CallResult, task_id: str) -> None:
@@ -3130,10 +3196,15 @@ class _ProgressDetector:
         """Record one assistant result and return whether the loop is stalled."""
         signature = _progress_signature(content, action)
         repeated_read = False
+        tool_calls: list[dict[str, Any]] = []
+        if isinstance(action, Mapping) and action.get("type") == "tool_call":
+            try:
+                tool_calls = _normalize_tool_calls(action)
+            except ValueError:
+                tool_calls = []
         if (
-            isinstance(action, Mapping)
-            and action.get("type") == "tool_call"
-            and action.get("name") in _READ_TOOL_NAMES
+            tool_calls
+            and all(call["name"] in _READ_TOOL_NAMES for call in tool_calls)
             and isinstance(result_content, str)
         ):
             result_hash = _progress_content_hash(result_content)
@@ -3149,33 +3220,41 @@ class _ProgressDetector:
 
     def restore(self, messages: Sequence[Mapping[str, Any]]) -> None:
         """Seed recent assistant signatures from a resumed checkpoint."""
-        pending_read_result = False
+        pending_read_results = 0
         for message in messages:
-            if message.get("role") == "user" and pending_read_result:
+            if message.get("role") == "user" and pending_read_results:
                 content = message.get("content")
                 if isinstance(content, str):
                     _, separator, result = content.partition("\n")
                     self._recent_content_hashes.append(
                         _progress_content_hash(result if separator else content)
                     )
-                pending_read_result = False
+                pending_read_results -= 1
                 continue
             if message.get("role") != "assistant":
                 continue
             content = message.get("content")
             if not isinstance(content, str):
-                pending_read_result = False
+                pending_read_results = 0
                 continue
             try:
                 action = _parse_agent_action(content)
             except ValueError:
                 signature = _progress_signature(content)
-                pending_read_result = False
+                pending_read_results = 0
             else:
                 signature = _progress_signature(None, action=action)
-                pending_read_result = (
-                    action.get("type") == "tool_call" and action.get("name") in _READ_TOOL_NAMES
-                )
+                try:
+                    tool_calls = _normalize_tool_calls(action)
+                except ValueError:
+                    pending_read_results = 0
+                else:
+                    pending_read_results = (
+                        len(tool_calls)
+                        if action.get("type") == "tool_call"
+                        and all(call["name"] in _READ_TOOL_NAMES for call in tool_calls)
+                        else 0
+                    )
             if signature:
                 self._recent_signatures.append(signature)
 
@@ -5534,7 +5613,7 @@ async def _bound_context_continuation(
     )
 
 
-async def _run_agent_loop(
+async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
     *,
     config: AgentConfig,
     router: Diffundo,
@@ -6152,7 +6231,7 @@ async def _run_agent_loop(
                             f"invalid action: {exc}. Reply with exactly ONE JSON object of "
                             "one of these shapes, and nothing else (no prose, no "
                             'markdown): {"type":"plan","steps":["..."]} | '
-                            '{"type":"tool_call","name":"<tool>","arguments":{...}} | '
+                            '{"type":"tool_call","calls":[{"name":"<tool>","arguments":{...}}]} | '
                             '{"type":"finish","summary":"...","objective_met":true}',
                             MAX_OBSERVATION_BYTES,
                         ),
@@ -6288,7 +6367,12 @@ async def _run_agent_loop(
                         transcript,
                     )
                 break
-            read_action = action["type"] == "tool_call" and action.get("name") in _READ_TOOL_NAMES
+            tool_calls = (
+                _normalize_tool_calls(action) if action["type"] == "tool_call" else []
+            )
+            read_action = bool(tool_calls) and all(
+                call["name"] in _READ_TOOL_NAMES for call in tool_calls
+            )
             if not read_action:
                 stalled = _observe_progress(progress_detector, action=action)
                 no_progress_actions = progress_detector.no_progress_actions
@@ -6590,7 +6674,389 @@ async def _run_agent_loop(
                     "compaction_deferred": compaction_deferred,
                     "consecutive_compaction_deferrals": consecutive_compaction_deferrals,
                 }
-            name, arguments = action["name"], action["arguments"]
+            if len(tool_calls) > 1:
+                if not final_synthesis_call and budget_new_tokens > config.max_tokens:
+                    return _loop_result(
+                        outcome,
+                        "failed",
+                        _phase_failure(
+                            "token budget exceeded", final_synthesis=final_synthesis_call
+                        ),
+                        turn,
+                        cumulative_usage,
+                        transcript,
+                    )
+
+                denials: list[str | None] = []
+                for tool_call in tool_calls:
+                    name = tool_call["name"]
+                    arguments = tool_call["arguments"]
+                    denial = _permission_denied(name, arguments, config)
+                    if denial is None and name == "run_shell" and not config.shell_permission:
+                        denial = "permission_denied:shell"
+                    denials.append(denial)
+                if any(denial is not None for denial in denials):
+                    batch_messages: list[dict[str, Any]] = [action_message]
+                    if trailing:
+                        batch_messages.append(
+                            {"role": "user", "content": _TRAILING_ACTION_NOTE}
+                        )
+                    for denial in denials:
+                        batch_messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"action rejected: {denial}"
+                                    if denial is not None
+                                    else "not executed: batch contained a denied action"
+                                ),
+                            }
+                        )
+                    if base_messages is None:
+                        transcript.extend(batch_messages)
+                    else:
+                        context_continuation.extend(copy.deepcopy(batch_messages))
+                        transcript = _sync_context_transcript(
+                            base_messages, context_continuation, transcript
+                        )
+                    base_messages, context_continuation, transcript = (
+                        await _maybe_restore_turn_context(
+                            turn_checkpoint_resumed=turn_checkpoint_resumed,
+                            compaction_deferred=compaction_deferred,
+                            base_messages=base_messages,
+                            context_continuation=context_continuation,
+                            transcript=transcript,
+                            config=config,
+                            tools=tools,
+                            model_identity=model_identity,
+                        )
+                    )
+                    (
+                        finalized,
+                        forced_finalization,
+                        finalization_grace_used,
+                        context_continuation,
+                        transcript,
+                    ) = _arm_finalization(
+                        turn,
+                        base_messages=base_messages,
+                        context_continuation=context_continuation,
+                        transcript=transcript,
+                        config=config,
+                        budget_new_tokens=budget_new_tokens,
+                        soft_cap=soft_cap,
+                        finalized=finalized,
+                        forced_finalization=forced_finalization,
+                        finalization_grace_used=finalization_grace_used,
+                    )
+                    progress.tool = None
+                    continue
+                if stop.is_set():
+                    return _loop_result(
+                        outcome, "cancelled", None, turn - 1, cumulative_usage, transcript
+                    )
+
+                batch_results: list[tuple[str, dict[str, Any], ToolResult]] = []
+                successful_delegate: dict[str, Any] | None = None
+                if any(
+                    tool_call["name"] in _MUTATING_TOOL_NAMES for tool_call in tool_calls
+                ):
+                    for tool_call in tool_calls:
+                        name = tool_call["name"]
+                        arguments = tool_call["arguments"]
+                        progress.tool = name
+                        progress_sink = (
+                            _tool_progress_callback(writer, config, name, turn)
+                            if writer is not None and name in {"run_shell", "git_op"}
+                            else None
+                        )
+                        with ToolContext(
+                            worktree,
+                            lint=lint_diag,
+                            policy=ToolPermissionPolicy(
+                                shell=config.shell_permission,
+                                network=config.network_permission,
+                            ),
+                            progress=progress_sink,
+                        ) as ctx:
+                            try:
+                                tool_result = await run_tool(name, arguments, ctx)
+                            finally:
+                                progress.tool = None
+                                if progress_sink is not None:
+                                    await cast(Any, progress_sink).flush()
+                        if name == "delegate" and tool_result.ok:
+                            successful_delegate = arguments
+                            if writer is not None:
+                                await _emit_delegated_child(
+                                    writer, config, arguments, request_id=run_request_id
+                                )
+                        if tool_result.ok:
+                            if name in ("write_file", "edit_file"):
+                                code_changed = True
+                                verified_after_change = False
+                                verification_failed = False
+                            elif name == "run_shell":
+                                verified_after_change = True
+                                verification_failed = False
+                        elif name == "run_shell":
+                            verification_failed = True
+                            verified_after_change = False
+                        batch_results.append((name, arguments, tool_result))
+                else:
+                    with ToolContext(
+                        worktree,
+                        lint=lint_diag,
+                        policy=ToolPermissionPolicy(
+                            shell=config.shell_permission,
+                            network=config.network_permission,
+                        ),
+                        progress=None,
+                    ) as ctx:
+                        try:
+                            gathered = await asyncio.gather(
+                                *(
+                                    run_tool(
+                                        tool_call["name"], tool_call["arguments"], ctx
+                                    )
+                                    for tool_call in tool_calls
+                                ),
+                                return_exceptions=True,
+                            )
+                        finally:
+                            progress.tool = None
+                    for tool_call, gathered_result in zip(tool_calls, gathered, strict=True):
+                        name = tool_call["name"]
+                        arguments = tool_call["arguments"]
+                        if isinstance(gathered_result, asyncio.CancelledError):
+                            raise gathered_result
+                        if isinstance(gathered_result, Exception):
+                            tool_result = ToolResult(
+                                ok=False,
+                                error=f"{name} failed: {gathered_result}",
+                            )
+                        else:
+                            tool_result = cast(ToolResult, gathered_result)
+                        batch_results.append((name, arguments, tool_result))
+
+                batch_messages = [action_message]
+                if trailing:
+                    batch_messages.append({"role": "user", "content": _TRAILING_ACTION_NOTE})
+                result_contents: list[str] = []
+                for name, _arguments, tool_result in batch_results:
+                    result_content = (
+                        tool_result.output
+                        if tool_result.ok
+                        else (tool_result.error or tool_result.output or "")
+                    )
+                    result_contents.append(result_content)
+                    observation = {"role": "user", "content": _tool_observation(name, tool_result)}
+                    batch_messages.append(observation)
+                continuation_suffix = copy.deepcopy(batch_messages)
+                if base_messages is None:
+                    transcript.extend(batch_messages)
+                else:
+                    context_continuation.extend(copy.deepcopy(batch_messages))
+                    transcript = _sync_context_transcript(
+                        base_messages, context_continuation, transcript
+                    )
+                if read_action:
+                    stalled = _observe_progress(
+                        progress_detector,
+                        action=action,
+                        result_content="\n".join(result_contents),
+                    )
+                    no_progress_actions = progress_detector.no_progress_actions
+                    if stalled and not _finalization_due(
+                        turn, finalized, budget_new_tokens, soft_cap, config
+                    ):
+                        return _no_progress_failure(
+                            outcome, no_progress_actions, turn, cumulative_usage, transcript
+                        )
+                base_messages, context_continuation, transcript = (
+                    await _maybe_restore_turn_context(
+                        turn_checkpoint_resumed=turn_checkpoint_resumed,
+                        compaction_deferred=compaction_deferred,
+                        base_messages=base_messages,
+                        context_continuation=context_continuation,
+                        transcript=transcript,
+                        config=config,
+                        tools=tools,
+                        model_identity=model_identity,
+                    )
+                )
+                (
+                    finalized,
+                    forced_finalization,
+                    finalization_grace_used,
+                    context_continuation,
+                    transcript,
+                ) = _arm_finalization(
+                    turn,
+                    base_messages=base_messages,
+                    context_continuation=context_continuation,
+                    transcript=transcript,
+                    config=config,
+                    budget_new_tokens=budget_new_tokens,
+                    soft_cap=soft_cap,
+                    finalized=finalized,
+                    forced_finalization=forced_finalization,
+                    finalization_grace_used=finalization_grace_used,
+                )
+                if writer is not None:
+                    for name, arguments, tool_result in batch_results:
+                        await _emit_tool_event(writer, config, name, arguments, turn, tool_result)
+                        await _persist_checkpoint(
+                            writer,
+                            config,
+                            turn,
+                            transcript,
+                            cumulative_usage,
+                            [],
+                            compaction_deferred=compaction_deferred,
+                            consecutive_compaction_deferrals=consecutive_compaction_deferrals,
+                            code_changed=code_changed,
+                        )
+                    last_turn_checkpoint = turn
+                if config.context_reuse and successful_delegate is not None and not finalized:
+                    batch_checkpoint: ContextCheckpoint | None = None
+                    batch_checkpoint_was_emitted = False
+                    if base_messages is not None and config.checkpoint_root is not None:
+                        (
+                            _folded,
+                            compaction_failure,
+                            (
+                                base_messages,
+                                context_continuation,
+                                current_epoch_checkpoint,
+                                epoch_count,
+                                compaction_armed,
+                                compaction_deferred,
+                                usage_epoch,
+                                cumulative_usage,
+                                budget_new_tokens,
+                                previous_prompt_tokens,
+                                previous_usage_source,
+                                consecutive_compaction_deferrals,
+                                finalized,
+                                forced_finalization,
+                                finalization_grace_used,
+                                transcript,
+                            ),
+                        ) = await _bound_context_continuation(
+                            turn,
+                            force=True,
+                            config=config,
+                            router=router,
+                            tier=tier,
+                            model=model,
+                            writer=writer,
+                            progress=progress,
+                            run_request_id=run_request_id,
+                            outcome=outcome,
+                            tools=tools,
+                            budget_usd=budget_usd,
+                            absolute_wall_deadline=absolute_wall_deadline,
+                            wall_deadline=wall_deadline,
+                            base_messages=base_messages,
+                            context_continuation=context_continuation,
+                            current_epoch_checkpoint=current_epoch_checkpoint,
+                            epoch_count=epoch_count,
+                            compaction_armed=compaction_armed,
+                            compaction_deferred=compaction_deferred,
+                            consecutive_compaction_deferrals=consecutive_compaction_deferrals,
+                            usage_epoch=usage_epoch,
+                            usage_fork_of=usage_fork_of,
+                            cumulative_usage=cumulative_usage,
+                            budget_new_tokens=budget_new_tokens,
+                            previous_prompt_tokens=previous_prompt_tokens,
+                            previous_usage_source=previous_usage_source,
+                            no_progress_actions=no_progress_actions,
+                            code_changed=code_changed,
+                            verified_after_change=verified_after_change,
+                            verification_failed=verification_failed,
+                            provider_compat=provider_compat,
+                            provider_boundaries=provider_boundaries,
+                            finalization_cap=finalization_cap,
+                            soft_cap=soft_cap,
+                            finalized=finalized,
+                            forced_finalization=forced_finalization,
+                            finalization_grace_used=finalization_grace_used,
+                            last_turn_checkpoint=last_turn_checkpoint,
+                            transcript=transcript,
+                        )
+                        if compaction_failure is not None:
+                            return _loop_result(
+                                outcome,
+                                "failed",
+                                f"compaction_failed: {compaction_failure}",
+                                turn,
+                                cumulative_usage,
+                                transcript,
+                            )
+                        batch_checkpoint = current_epoch_checkpoint
+                        batch_checkpoint_was_emitted = batch_checkpoint is not None
+                    if batch_checkpoint is None:
+                        epoch_count += 1
+                        if base_messages is None:
+                            continuation_suffix = [
+                                *continuation_suffix,
+                                _context_state_message(
+                                    code_changed=code_changed,
+                                    verified_after_change=verified_after_change,
+                                    verification_failed=verification_failed,
+                                    no_progress_actions=no_progress_actions,
+                                    budget_new_tokens=budget_new_tokens,
+                                    previous_prompt_tokens=previous_prompt_tokens,
+                                    turn=turn,
+                                    context_epoch=epoch_count,
+                                    max_tokens=config.max_tokens,
+                                ),
+                            ]
+                        batch_checkpoint = await asyncio.to_thread(
+                            _write_epoch_checkpoint,
+                            config,
+                            turn=turn,
+                            epoch=epoch_count,
+                            provider_messages=copy.deepcopy(sent_prompt["messages"]),
+                            continuation_suffix=continuation_suffix,
+                            provider=result.provider,
+                            model=model,
+                            tools_sha256=_sha256_hex(
+                                json.dumps(tools, sort_keys=True).encode("utf-8")
+                            ),
+                            provider_compat=provider_compat,
+                            provider_boundary=provider_boundaries.get(result.provider),
+                            code_changed=code_changed,
+                            verified_after_change=verified_after_change,
+                            verification_failed=verification_failed,
+                            no_progress_actions=no_progress_actions,
+                            budget_new_tokens=budget_new_tokens,
+                            previous_prompt_tokens=previous_prompt_tokens,
+                            cumulative_usage=cumulative_usage,
+                            wall_deadline=absolute_wall_deadline,
+                        )
+                    if batch_checkpoint is not None:
+                        if writer is not None and not batch_checkpoint_was_emitted:
+                            await _emit_context_checkpoint(
+                                writer, config, batch_checkpoint, request_id=run_request_id
+                            )
+                        return {
+                            **outcome,
+                            "status": TaskStatus.SUSPENDED.value,
+                            "turn": turn,
+                            "usage": cumulative_usage,
+                            "provider": batch_checkpoint.cache_key.provider or result.provider,
+                            "latency_s": max(0.0, float(result.latency_s)),
+                            "transcript": transcript,
+                            "epoch": batch_checkpoint.epoch,
+                            "checkpoint_ref": batch_checkpoint.checkpoint_ref,
+                            "compaction_deferred": compaction_deferred,
+                            "consecutive_compaction_deferrals": consecutive_compaction_deferrals,
+                        }
+                continue
+
+            name, arguments = tool_calls[0]["name"], tool_calls[0]["arguments"]
             if not final_synthesis_call and budget_new_tokens > config.max_tokens:
                 return _loop_result(
                     outcome,

@@ -4,6 +4,7 @@ import cambium.prompts as prompts
 
 
 def test_semantic_summarizer_preserves_findings_and_next_actions() -> None:
+    assert prompts.PROMPTS_VERSION == 2
     contract = prompts.SEMANTIC_SUMMARIZER
 
     for keyword in (

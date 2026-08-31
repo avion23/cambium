@@ -2,7 +2,7 @@
 
 from .summary_trunk import SUMMARY_FINDING_PRESERVATION_CONTRACT
 
-PROMPTS_VERSION = 1
+PROMPTS_VERSION = 2
 
 SUMMARY_PROTOCOL_LINES = (
     "Two output modes exist; the final user control block selects the mode.",
@@ -50,7 +50,11 @@ CODING_AGENT = "\n".join(
         SEMANTIC_SUMMARIZER,
         "In normal mode, return exactly one JSON object; it must be one action:",
         '  plan:      {"type": "plan", "steps": ["...", "..."]}',
-        '  tool_call: {"type": "tool_call", "name": <tool name>, "arguments": {...}}',
+        '  tool_call: {"type": "tool_call", "calls": [{"name": <tool name>, '
+        '"arguments": {...}}, ...]}',
+        "A tool_call action's calls array must contain one or more invocations. Independent "
+        "read-only calls may be batched and run concurrently; mutating tools may not be "
+        "parallelized and run in listed order. Permission denial is atomic for the whole batch.",
         '  finish:    {"type": "finish", "summary": <non-empty summary>, '
         '"objective_met": <boolean>} (objective_met: true only when the task objective '
         "was met; a complete review that found no defect counts as met)",
@@ -70,8 +74,8 @@ CODING_AGENT = "\n".join(
         "after your task reaches its terminal boundary.",
         "Examples:",
         '  {"type": "plan", "steps": ["read src/a.py and src/b.py", "edit src/a.py", "run tests"]}',
-        '  {"type": "tool_call", "name": "read_batch", '
-        '"arguments": {"paths": ["src/a.py", "src/b.py"]}}',
+        '  {"type": "tool_call", "calls": [{"name": "read_batch", '
+        '"arguments": {"paths": ["src/a.py", "src/b.py"]}}]}',
         '  {"type": "finish", "summary": "implemented and verified the change", '
         '"objective_met": true}',
         "Available tools:",

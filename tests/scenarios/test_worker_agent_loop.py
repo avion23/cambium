@@ -928,6 +928,107 @@ def test_plan_before_act_plan_read_batch_finish(tmp_path: Path) -> None:
     assert "read_batch" in tool_names
 
 
+def test_batched_tool_calls_keep_order_and_deny_atomically(tmp_path: Path) -> None:
+    repo = tmp_path / "read-repo"
+    worktree = _make_worktree(repo)
+    config = _agent_config(worktree)
+    router = _ScriptedRouter(
+        [
+            json.dumps(
+                {
+                    "type": "tool_call",
+                    "calls": [
+                        {"name": "read_batch", "arguments": {"paths": ["alpha.txt"]}},
+                        {"name": "read_batch", "arguments": {"paths": ["beta.txt"]}},
+                    ],
+                }
+            ),
+            '{"type":"finish","summary":"read both files","objective_met":true}',
+        ]
+    )
+
+    outcome = asyncio.run(_drive_loop(config, worktree, router))
+
+    assert outcome["status"] == "succeeded"
+    tool_actions = [
+        json.loads(message["content"])
+        for message in outcome["transcript"]
+        if message["role"] == "assistant"
+        and json.loads(message["content"]).get("type") == "tool_call"
+    ]
+    assert tool_actions == [
+        {
+            "type": "tool_call",
+            "calls": [
+                {"name": "read_batch", "arguments": {"paths": ["alpha.txt"]}},
+                {"name": "read_batch", "arguments": {"paths": ["beta.txt"]}},
+            ],
+        }
+    ]
+    observations = [
+        message["content"]
+        for message in outcome["transcript"]
+        if message["role"] == "user" and message["content"].startswith("tool read_batch")
+    ]
+    assert len(observations) == 2
+    assert "alpha-content" in observations[0]
+    assert "beta-content" in observations[1]
+
+    denied_repo = tmp_path / "denied" / "repo"
+    denied_worktree = _make_worktree(denied_repo)
+    denied_config = _agent_config(denied_worktree)
+    denied_router = _ScriptedRouter(
+        [
+            json.dumps(
+                {
+                    "type": "tool_call",
+                    "calls": [
+                        {
+                            "name": "git_op",
+                            "arguments": {"op": "commit", "args": "blocked"},
+                        },
+                        {
+                            "name": "write_file",
+                            "arguments": {"path": "blocked.txt", "content": "nope\n"},
+                        },
+                    ],
+                }
+            ),
+            '{"type":"finish","summary":"denial handled","objective_met":true}',
+        ]
+    )
+
+    denied_outcome = asyncio.run(_drive_loop(denied_config, denied_worktree, denied_router))
+
+    assert denied_outcome["status"] == "succeeded"
+    assert not (denied_worktree / "blocked.txt").exists()
+    denied_transcript = "\n".join(
+        message["content"] for message in denied_outcome["transcript"]
+    )
+    assert "action rejected: git_op is restricted" in denied_transcript
+    assert "not executed: batch contained a denied action" in denied_transcript
+    assert worker._parse_agent_action(
+        '{"type":"tool_call","name":"read_batch","arguments":{"paths":["legacy.txt"]}}'
+    ) == {
+        "type": "tool_call",
+        "calls": [{"name": "read_batch", "arguments": {"paths": ["legacy.txt"]}}],
+    }
+    assert worker._native_tool_action(
+        SimpleNamespace(
+            tool_calls=(
+                {"function": {"name": "read_batch", "arguments": '{"paths":["a"]}'}},
+                {"function": {"name": "read_batch", "arguments": '{"paths":["b"]}'}},
+            )
+        )
+    ) == {
+        "type": "tool_call",
+        "calls": [
+            {"name": "read_batch", "arguments": {"paths": ["a"]}},
+            {"name": "read_batch", "arguments": {"paths": ["b"]}},
+        ],
+    }
+
+
 def test_exposed_tool_schemas_offer_batch_reading_only(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     worktree = _make_worktree(repo)
@@ -1034,10 +1135,24 @@ def test_plan_and_thought_round_trip_through_parser() -> None:
     assert worker._parse_agent_action(
         '{"type":"tool_call","name":"read_batch","arguments":{"paths":["a.py"]},'
         '"thought":"need context"}'
-    ) == {"type": "tool_call", "name": "read_batch", "arguments": {"paths": ["a.py"]}}
+    ) == {
+        "type": "tool_call",
+        "calls": [{"name": "read_batch", "arguments": {"paths": ["a.py"]}}],
+    }
     assert worker._parse_agent_action(
         '{"type":"finish","summary":"done","objective_met":true,"thought":"verified"}'
     ) == {"type": "finish", "summary": "done", "objective_met": True}
+    for bad, match in (
+        ('{"type":"tool_call","calls":[]}', "non-empty array"),
+        ('{"type":"tool_call","calls":[null]}', "calls\\[0\\] must be an object"),
+        (
+            '{"type":"tool_call","calls":[{"name":"nope","arguments":{}},'
+            '{"name":"read_batch","arguments":3}]}',
+            "calls\\[0\\].*calls\\[1\\]",
+        ),
+    ):
+        with pytest.raises(ValueError, match=match):
+            worker._parse_agent_action(bad)
 
     # Concatenated actions are rejected: exactly one top-level JSON object
     # is the contract; trailing content raises.
@@ -1074,8 +1189,12 @@ def test_lenient_parse_accepts_raw_control_characters_in_strings() -> None:
     )
     assert worker._parse_agent_action(action) == {
         "type": "tool_call",
-        "name": "write_file",
-        "arguments": {"path": "hello.py", "content": "print('hello world')\n\t"},
+        "calls": [
+            {
+                "name": "write_file",
+                "arguments": {"path": "hello.py", "content": "print('hello world')\n\t"},
+            }
+        ],
     }
     assert worker._action_trailing(action) == ""
     assert worker._action_trailing(action + '{"type":"plan","steps":["a"]}').startswith(
