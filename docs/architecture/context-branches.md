@@ -476,4 +476,4 @@ schemas and examples are in
 practical decomposition guide is in
 [`../how-to/context-branches.md`](../how-to/context-branches.md). Evaluation is
 specified in
-[`../research/context-branch-evaluation.md`](../research/context-branch-evaluation.md).
+[`../research/agent-system-evaluation.md`](../research/agent-system-evaluation.md).
