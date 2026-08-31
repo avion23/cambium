@@ -112,7 +112,7 @@ def _session_events(session_dir: Path) -> list[dict[str, Any]]:
 
 def _run_gate(
     tmp_path: Path, provider: Any, key: str, task_text: str
-) -> tuple[Any, Path, str]:
+) -> tuple[Any, Path, str, Path]:
     # The real worker confines worktree_path to the scratch repo's parent:
     # repo at <session>/repo, worktree at <session>/wt.
     session_dir = tmp_path / "session"
@@ -165,7 +165,7 @@ def _run_gate(
         },
         "provider_env_keys": [provider.api_key_env],
         "max_wall_s": 300.0,
-        "max_turns": 6,
+        "max_turns": 10,
     }
     result = asyncio.run(
         supervisor.run_plan(
@@ -175,7 +175,7 @@ def _run_gate(
             max_concurrent_tasks=1,
         )
     )
-    return result, repo, base
+    return result, repo, base, session_dir
 
 
 def _main_head(repo: Path) -> str:
@@ -200,11 +200,12 @@ def test_live_coding_gate(tmp_path: Path) -> None:
         pytest.skip("no configured provider credential is resolvable for the live gate")
     provider, key = resolved
 
-    result, repo, base = _run_gate(
+    result, repo, base, session_dir = _run_gate(
         tmp_path,
         provider,
         key,
-        "In calc.py, add a one-line docstring to the add function. Do not run git.",
+        "In calc.py, add a one-line docstring to the add function, then verify it "
+        'by running: python3 -c "import calc; print(calc.add(2, 3))". Do not run git.',
     )
     outcomes = list(result.results)
     assert outcomes, "run_plan produced no task results"
@@ -215,17 +216,25 @@ def test_live_coding_gate(tmp_path: Path) -> None:
     # The model actually edited the file and exactly one commit was published.
     changed = _main_changed_files(repo, base)
     assert changed == ["calc.py"], f"publication touched unexpected files: {changed}"
-    head_text = (repo / "calc.py").read_text(encoding="utf-8")
-    assert '"""' in head_text, "docstring did not land in the published file"
+    diff = subprocess.run(
+        ["git", "diff", f"{base}..refs/heads/main", "--", "calc.py"],
+        cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout
+    added = [line[1:] for line in diff.splitlines() if line.startswith("+")]
+    assert any(
+        '"""' in line or "'''" in line for line in added
+    ), f"published commit did not add a docstring; diff:\n{diff[:1500]}"
 
     # The session durably recorded provider usage and tool execution.
-    events = _session_events(tmp_path / "session-0")
+    events = _session_events(session_dir)
     events_json = json.dumps(events)
     usage_rows = [e for e in events if e.get("kind") == "usage_event"]
     assert usage_rows, "no usage_event rows were recorded"
-    assert any((e.get("payload") or {}).get("tokens") for e in usage_rows), (
-        "usage events carry no token counts"
-    )
+    assert any(
+        isinstance((e.get("payload") or {}).get("usage"), Mapping)
+        and bool(e["payload"]["usage"])
+        for e in usage_rows
+    ), "usage events carry no token counts"
     assert any(e.get("kind") == "tool_event" for e in events), (
         "no tool events were recorded; the model never called a tool"
     )
@@ -241,7 +250,7 @@ def test_live_coding_gate_impossible_task_publishes_nothing(tmp_path: Path) -> N
         pytest.skip("no configured provider credential is resolvable for the live gate")
     provider, key = resolved
 
-    result, repo, base = _run_gate(
+    result, repo, base, _session_dir = _run_gate(
         tmp_path,
         provider,
         key,
