@@ -502,8 +502,10 @@ def _invalid_provider_boundary_degraded_fields(msg: dict[str, Any]) -> list[str]
             invalid.append(field)
     if type(msg.get("generation")) is not int or msg["generation"] <= 0:
         invalid.append("generation")
-    if "request_id" in msg and msg["request_id"] is not None and not isinstance(
-        msg["request_id"], str
+    if (
+        "request_id" in msg
+        and msg["request_id"] is not None
+        and not isinstance(msg["request_id"], str)
     ):
         invalid.append("request_id")
     return invalid
@@ -743,9 +745,7 @@ def _invalid_tool_output_delta_fields(msg: dict[str, Any]) -> list[str]:
     invalid = sorted(set(msg) - allowed)
     for field in ("turn", "monotonic_ms"):
         value = msg.get(field)
-        if field in msg and not (
-            type(value) is int and value >= 0
-        ):
+        if field in msg and not (type(value) is int and value >= 0):
             invalid.append(field)
     tool = msg.get("tool")
     if not isinstance(tool, str) or not tool:
@@ -3819,9 +3819,7 @@ class _Runtime:
             context_mode, placement = declared
             parent_provider = cache_key.get("provider") if isinstance(cache_key, dict) else None
             if context_mode == "trunk":
-                if not self._pin_exact_fork(
-                    child_spec, epoch, parent_task_id, child_task_id, kind
-                ):
+                if not self._pin_exact_fork(child_spec, epoch, parent_task_id, child_task_id, kind):
                     raise ChildPolicyError(
                         "child context_mode=trunk requires an exact compatible "
                         "parent checkpoint; use semantic or fresh instead"
@@ -3837,14 +3835,10 @@ class _Runtime:
                     semantic_reuse=False,
                     context_mode=context_mode,
                     placement=placement,
-                    spread_from_provider=(
-                        parent_provider if placement == "spread" else None
-                    ),
+                    spread_from_provider=(parent_provider if placement == "spread" else None),
                 )
                 return
-            checkpoint_ref = (
-                epoch.get("checkpoint_ref") if isinstance(epoch, dict) else None
-            )
+            checkpoint_ref = epoch.get("checkpoint_ref") if isinstance(epoch, dict) else None
             if context_mode == "semantic":
                 if not (
                     isinstance(cache_key, dict)
@@ -3852,8 +3846,7 @@ class _Runtime:
                     and isinstance(checkpoint_ref, str)
                 ):
                     raise ChildPolicyError(
-                        "child context_mode=semantic requires an unredacted "
-                        "parent checkpoint"
+                        "child context_mode=semantic requires an unredacted parent checkpoint"
                     )
                 child_spec["summary_trunk_ref"] = checkpoint_ref
                 if placement == "spread":
@@ -3869,9 +3862,7 @@ class _Runtime:
                     semantic_reuse=True,
                     context_mode=context_mode,
                     placement=placement,
-                    spread_from_provider=(
-                        parent_provider if placement == "spread" else None
-                    ),
+                    spread_from_provider=(parent_provider if placement == "spread" else None),
                 )
                 return
             # context_mode == "fresh": remove all parent context.
@@ -3891,9 +3882,7 @@ class _Runtime:
                 semantic_reuse=False,
                 context_mode=context_mode,
                 placement=placement,
-                spread_from_provider=(
-                    parent_provider if placement == "spread" else None
-                ),
+                spread_from_provider=(parent_provider if placement == "spread" else None),
             )
             return
 
@@ -3943,9 +3932,7 @@ class _Runtime:
                 reason=reason or "incompatible epoch",
             )
             return
-        self._apply_exact_fork(
-            child_spec, epoch, parent_task_id, child_task_id, kind, cache_key
-        )
+        self._apply_exact_fork(child_spec, epoch, parent_task_id, child_task_id, kind, cache_key)
 
     def _pin_exact_fork(
         self,
@@ -3965,9 +3952,7 @@ class _Runtime:
         compatible, _reason = _fork_cache_compatible_supervisor(child_spec, epoch, authorized)
         if not compatible:
             return False
-        self._apply_exact_fork(
-            child_spec, epoch, parent_task_id, child_task_id, kind, cache_key
-        )
+        self._apply_exact_fork(child_spec, epoch, parent_task_id, child_task_id, kind, cache_key)
         return True
 
     def _apply_exact_fork(
@@ -4066,6 +4051,7 @@ class _Runtime:
             resolved_placement=placement,
             spread_from_provider=spread_from_provider,
         )
+
     async def _record_revision_conversation(
         self,
         *,
@@ -6161,9 +6147,7 @@ class _Runtime:
         # validates the revision against the session tree (build_tree over the
         # accumulated tasks list).
         msg = {**msg, "_parent_budget": _proposal_parent_budget(state)}
-        self._pending_children.setdefault(state.task_id, []).append(
-            (state.generation, msg)
-        )
+        self._pending_children.setdefault(state.task_id, []).append((state.generation, msg))
 
     async def _handle_reuse_ready_message(
         self, state: _GenerationState, msg: dict[str, Any]
@@ -6203,9 +6187,7 @@ class _Runtime:
         )
         return True
 
-    async def _handle_heartbeat_message(
-        self, state: _GenerationState, msg: dict[str, Any]
-    ) -> None:
+    async def _handle_heartbeat_message(self, state: _GenerationState, msg: dict[str, Any]) -> None:
         heartbeat_turn = msg.get("turn")
         if type(heartbeat_turn) is int and heartbeat_turn >= 0:
             state.turn = max(state.turn, heartbeat_turn)
@@ -6273,11 +6255,7 @@ class _Runtime:
             )
             return
         state.sandbox_failure_reason = _sandbox_usage_reason(msg.get("failure_reason"))
-        forwarded = {
-            field: msg[field]
-            for field in _USAGE_EVENT_FORWARD_FIELDS
-            if field in msg
-        }
+        forwarded = {field: msg[field] for field in _USAGE_EVENT_FORWARD_FIELDS if field in msg}
         await self.emit(
             "usage_event",
             task_id=state.task_id,
@@ -6514,9 +6492,7 @@ class _Runtime:
             pass
 
     async def _finalize_generation(self, state: _GenerationState) -> _GenOutcome:
-        generation_proposals = self._take_generation_proposals(
-            state.task_id, state.generation
-        )
+        generation_proposals = self._take_generation_proposals(state.task_id, state.generation)
         terminal_verdict = (
             state.envelope is not None
             and state.correlated
@@ -6547,8 +6523,7 @@ class _Runtime:
             state.exit_reason is not None
             and terminal_verdict
             and (
-                exit_code == 0
-                or cast(dict[str, Any], state.envelope).get("status") != "succeeded"
+                exit_code == 0 or cast(dict[str, Any], state.envelope).get("status") != "succeeded"
             )
         )
         reason: str | None
@@ -9114,9 +9089,7 @@ def _builtin_demo_spec(session_dir: Path) -> dict[str, Any]:
     """Built-in CLI demo: one protocol-fixture task against a seeded repo."""
     return {
         "task_id": "demo-001",
-        "worker": str(
-            Path(__file__).resolve().parents[2] / "scripts" / "fake_worker.py"
-        ),
+        "worker": str(Path(__file__).resolve().parents[2] / "scripts" / "fake_worker.py"),
         "repo": str(session_dir / "scratch"),
         "worktree_path": str(session_dir / "wt"),
         "branch": "wt-demo-001",

@@ -211,9 +211,10 @@ def resolve_repo(repo: str | Path) -> Path:
 
 def _reject_nested_ephemeral(repo: Path) -> None:
     """Keep supervised workers from starting another ephemeral session inside one."""
-    if not os.environ.get("CAMBIUM_SESSION_ID") or os.environ.get(
-        "CAMBIUM_ALLOW_NESTED_EPHEMERAL"
-    ) == "1":
+    if (
+        not os.environ.get("CAMBIUM_SESSION_ID")
+        or os.environ.get("CAMBIUM_ALLOW_NESTED_EPHEMERAL") == "1"
+    ):
         return
     roots = (
         os.environ["CAMBIUM_SESSION_ID"],
@@ -864,9 +865,7 @@ def build_plan(
         spec["provider_config_path"] = str(Path(config.provider_config_path).resolve())
     base_commit = config.base_commit
     if base_commit is None:
-        base_commit = _git_stdout(
-            target_repo, "rev-parse", "--verify", "refs/heads/main^{commit}"
-        )
+        base_commit = _git_stdout(target_repo, "rev-parse", "--verify", "refs/heads/main^{commit}")
     if base_commit is not None:
         spec["base_commit"] = base_commit
     if config.target_file is not None:

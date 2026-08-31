@@ -101,9 +101,7 @@ def _prepare_worktree(
             return "worker branch is missing"
         git("branch", "-D", branch, cwd=scratch)
         base_ref = run.get("base_commit") or "main"
-        rc, _out, err = git(
-            "worktree", "add", "-b", branch, str(worktree), base_ref, cwd=scratch
-        )
+        rc, _out, err = git("worktree", "add", "-b", branch, str(worktree), base_ref, cwd=scratch)
         if rc != 0:
             return f"worktree add failed: {err}"
         _write_generation(worktree, generation)

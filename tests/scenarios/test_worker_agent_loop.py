@@ -1002,9 +1002,7 @@ def test_batched_tool_calls_keep_order_and_deny_atomically(tmp_path: Path) -> No
 
     assert denied_outcome["status"] == "succeeded"
     assert not (denied_worktree / "blocked.txt").exists()
-    denied_transcript = "\n".join(
-        message["content"] for message in denied_outcome["transcript"]
-    )
+    denied_transcript = "\n".join(message["content"] for message in denied_outcome["transcript"])
     assert "action rejected: git_op is restricted" in denied_transcript
     assert "not executed: batch contained a denied action" in denied_transcript
     assert worker._parse_agent_action(
@@ -1136,7 +1134,7 @@ def test_tool_call_batch_cap_rejects_text_and_native_actions(tmp_path: Path) -> 
 
     native_result = _FakeCallResult("")
     native_result.tool_calls = [
-        {"function": {"name": call["name"], "arguments": json.dumps(call["arguments"])} }
+        {"function": {"name": call["name"], "arguments": json.dumps(call["arguments"])}}
         for call in calls
     ]
     native_results = [native_result] * 3
@@ -1295,8 +1293,8 @@ def test_plan_and_thought_round_trip_through_parser() -> None:
     # is the contract; trailing content raises.
     with pytest.raises(ValueError, match="no trailing content"):
         worker._parse_agent_action(
-'{"type":"finish","summary":"done","objective_met":true}'
-'{"type":"tool_call","name":"read_batch","arguments":{"paths":["a.py"]}}'
+            '{"type":"finish","summary":"done","objective_met":true}'
+            '{"type":"tool_call","name":"read_batch","arguments":{"paths":["a.py"]}}'
         )
     assert worker._action_trailing(
         '{"type":"finish","summary":"done","objective_met":true}'
@@ -1479,9 +1477,7 @@ def test_agent_loop_bounds_transcript_before_every_provider_call(tmp_path: Path)
             transcript = transcript[1:]
         if transcript and transcript[-1].get("content") in {"Begin.", "Continue."}:
             transcript = transcript[:-1]
-        if transcript and str(transcript[-1].get("content", "")).startswith(
-            "<cambium-loop-state>"
-        ):
+        if transcript and str(transcript[-1].get("content", "")).startswith("<cambium-loop-state>"):
             transcript = transcript[:-1]
         assert worker._transcript_chars(transcript) <= budget
 
@@ -1670,9 +1666,7 @@ def test_heartbeats_stay_waiting_without_provider_deltas(tmp_path: Path) -> None
     repo = tmp_path / "repo"
     worktree = _make_worktree(repo)
     config = _agent_config(worktree)
-    router = _StreamingScriptedRouter(
-        ['{"type":"finish","summary":"done","objective_met":true}']
-    )
+    router = _StreamingScriptedRouter(['{"type":"finish","summary":"done","objective_met":true}'])
 
     outcome, messages = asyncio.run(_drive_loop_with_heartbeats(config, worktree, router))
 
@@ -1829,9 +1823,7 @@ def test_concatenated_actions_are_rejected(tmp_path: Path) -> None:
     assert outcome["status"] == "succeeded"
     assert outcome["summary"] == "read both files"
     assert outcome["turn"] == 2
-    assert any(
-        "no trailing content" in message["content"] for message in outcome["transcript"]
-    )
+    assert any("no trailing content" in message["content"] for message in outcome["transcript"])
 
 
 def test_three_invalid_actions_fail_fast_with_no_progress(tmp_path: Path) -> None:
@@ -1903,17 +1895,19 @@ def test_final_synthesis_retry_feedback_identifies_invalid_response(
         message.get("content") == worker.FINAL_SYNTHESIS_DIRECTIVE
         for message in router.prompts[1]["messages"]
     )
-    assert sum(
-        message.get("content") == invalid_response
-        for prompt in router.prompts
-        for message in prompt["messages"]
-    ) == 1
+    assert (
+        sum(
+            message.get("content") == invalid_response
+            for prompt in router.prompts
+            for message in prompt["messages"]
+        )
+        == 1
+    )
     retry_messages = router.prompts[2]["messages"]
     corrections = [
         message
         for message in retry_messages
-        if message.get("role") == "user"
-        and "Parse defect:" in str(message.get("content", ""))
+        if message.get("role") == "user" and "Parse defect:" in str(message.get("content", ""))
     ]
     assert len(corrections) == 1
     correction = corrections[0]["content"]
@@ -2263,9 +2257,7 @@ def test_run_shell_delivery_survives_backpressure_and_reports_final_tail(
     ]
     router = _ScriptedRouter(
         [
-            json.dumps(
-                {"type": "tool_call", "name": "run_shell", "arguments": {"cmd": command}}
-            ),
+            json.dumps({"type": "tool_call", "name": "run_shell", "arguments": {"cmd": command}}),
             '{"type":"finish","summary":"done","objective_met":true}',
         ]
     )

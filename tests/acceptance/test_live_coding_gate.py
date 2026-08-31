@@ -33,9 +33,7 @@ from cambium.store import read_events_file
 
 # Provider preference: cheapest proven coding plan first.
 _PROVIDER_PREFERENCE = ("zai", "opencode-go", "opencode-zen", "openrouter")
-_AUTH_STORE_PATHS = (
-    Path.home() / ".local" / "share" / "opencode" / "auth.json",
-)
+_AUTH_STORE_PATHS = (Path.home() / ".local" / "share" / "opencode" / "auth.json",)
 # OpenCode's credential store names differ from Cambium's provider profiles.
 _AUTH_ALIASES: dict[str, tuple[str, ...]] = {
     "zai": ("zai-coding-plan", "zai"),
@@ -88,17 +86,27 @@ def _pick_provider() -> tuple[Any, str] | None:
 def _scratch_repo(tmp_path: Path) -> tuple[Path, str]:
     repo = tmp_path / "repo"
     repo.mkdir(parents=True)
-    env = {**os.environ, "GIT_AUTHOR_NAME": "gate", "GIT_COMMITTER_NAME": "gate",
-           "GIT_AUTHOR_EMAIL": "gate@invalid", "GIT_COMMITTER_EMAIL": "gate@invalid"}
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "gate",
+        "GIT_COMMITTER_NAME": "gate",
+        "GIT_AUTHOR_EMAIL": "gate@invalid",
+        "GIT_COMMITTER_EMAIL": "gate@invalid",
+    }
+
     def git(*args: str) -> None:
         subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, env=env)
+
     git("init", "-q", "-b", "main")
     (repo / "calc.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
     git("add", "calc.py")
     git("commit", "-qm", "init")
     base = subprocess.run(
-        ["git", "rev-parse", "refs/heads/main"], cwd=repo, check=True,
-        capture_output=True, text=True,
+        ["git", "rev-parse", "refs/heads/main"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
     return repo, base
 
@@ -180,15 +188,21 @@ def _run_gate(
 
 def _main_head(repo: Path) -> str:
     return subprocess.run(
-        ["git", "rev-parse", "refs/heads/main"], cwd=repo, check=True,
-        capture_output=True, text=True,
+        ["git", "rev-parse", "refs/heads/main"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
 
 
 def _main_changed_files(repo: Path, base: str) -> list[str]:
     out = subprocess.run(
         ["git", "diff", "--name-only", f"{base}..refs/heads/main"],
-        cwd=repo, check=True, capture_output=True, text=True,
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout
     return [line for line in out.splitlines() if line.strip()]
 
@@ -218,12 +232,15 @@ def test_live_coding_gate(tmp_path: Path) -> None:
     assert changed == ["calc.py"], f"publication touched unexpected files: {changed}"
     diff = subprocess.run(
         ["git", "diff", f"{base}..refs/heads/main", "--", "calc.py"],
-        cwd=repo, check=True, capture_output=True, text=True,
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout
     added = [line[1:] for line in diff.splitlines() if line.startswith("+")]
-    assert any(
-        '"""' in line or "'''" in line for line in added
-    ), f"published commit did not add a docstring; diff:\n{diff[:1500]}"
+    assert any('"""' in line or "'''" in line for line in added), (
+        f"published commit did not add a docstring; diff:\n{diff[:1500]}"
+    )
 
     # The session durably recorded provider usage and tool execution.
     events = _session_events(session_dir)
@@ -231,8 +248,7 @@ def test_live_coding_gate(tmp_path: Path) -> None:
     usage_rows = [e for e in events if e.get("kind") == "usage_event"]
     assert usage_rows, "no usage_event rows were recorded"
     assert any(
-        isinstance((e.get("payload") or {}).get("usage"), Mapping)
-        and bool(e["payload"]["usage"])
+        isinstance((e.get("payload") or {}).get("usage"), Mapping) and bool(e["payload"]["usage"])
         for e in usage_rows
     ), "usage events carry no token counts"
     assert any(e.get("kind") == "tool_event" for e in events), (
