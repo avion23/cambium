@@ -6107,8 +6107,18 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                     },
                 ]
                 if final_synthesis_call:
+                    parse_error = str(exc)
+                    parse_defect = (
+                        'your response was missing the required "type":"finish" field'
+                        if parse_error == "unknown agent action type: None"
+                        else f"the parser reported: {parse_error}"
+                    )
+                    final_synthesis_excerpt = _cap_utf8(assistant_content, 200)
                     invalid_messages[1]["content"] = _bounded_text(
-                        f"invalid action: {exc}. Reply with exactly ONE JSON object of "
+                        f"invalid action: {parse_error}. "
+                        f"Model response excerpt (first 200 characters): "
+                        f"{final_synthesis_excerpt!r}. Parse defect: {parse_defect}. "
+                        "Reply with exactly ONE JSON object of "
                         "this shape, and nothing else (no prose, no markdown): "
                         '{"type":"finish","summary":"...","objective_met":true}',
                         MAX_OBSERVATION_BYTES,
