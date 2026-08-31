@@ -1,12 +1,5 @@
 # Operations
 
-To measure cache reuse and provider cost from one or more durable sessions, run
-`python scripts/cache_eval.py .cambium/sessions/run-id` (add `--repo .` to
-scan every session, `--provider-config PATH` when pricing is not discoverable,
-or `--json` for automation). The report shows prompt, cached, output, call,
-cache-hit percentage, and estimated-cost totals per session and provider;
-providers without known tariffs are labeled `subscription`.
-
 ## PLAN MODE
 
 Plan file `P` is JSON; minimal plan. (src/cambium/supervisor.py:8495-8546,8547-8553)
