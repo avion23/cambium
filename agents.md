@@ -49,9 +49,10 @@ failed name search is not proof of absence.
 ## Run
 
 Cambium is a Python-native multi-agent coding-agent harness run directly from
-source. No wheel is built and no install is required or supported. Use `uv`
-only for environment setup; direct runs and the commands below use the system
-interpreter.
+source. Development runs use `PYTHONPATH=src`; installation is not required
+for development. The published package/CI install path remains the README
+quickstart (`pip install -e .`). Use `uv` only for environment setup; direct
+runs and the commands below use the system interpreter.
 
 ```sh
 cd /home/ubuntu/cambium
@@ -60,7 +61,8 @@ PYTHONPATH=src python3.14 -m cambium.cli --help
 ```
 
 The `cambium` CLI exposes `auth`, `supervisor`, `doctor`, `bench`,
-`module-test`, `version`, `run`, `repl`, `tui`, `session`, and `architectus`
+`module-test`, `version`, `run`, `repl`, `tui`, `monitor`, `quota`, `optimize`,
+`session`, and `architectus`
 (`session list/latest/show/status/resume/usage` reads or resumes session
 artifacts); prefer it over the internal supervisor module. Supervisor runs
 require `--plan`, `--task-spec`, or `--demo` alongside `--session-dir`.

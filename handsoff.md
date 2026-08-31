@@ -73,7 +73,7 @@ editing there. Do NOT commit. Do NOT edit anything under `/home/ubuntu/cambium`.
 | 15 | modules | `src/cambium/module_conformance.py`, `modules/example/dataset.py`, `modules/example/dspy_program.py`, `modules/should_review/dataset.py`; `tests/scenarios/test_warm_pool_contract.py` |
 | 16 | tools/ast | `src/cambium/tools.py`, `ast_tools.py`; `tests/scenarios/test_tools.py`, `test_marker_required_fields.py` |
 | 17 | redact | `src/cambium/redact.py`; `tests/scenarios/test_redact.py`, `test_redact_drift.py` |
-| 18 | misc src | `src/cambium/architectus.py`, `bench.py`, `orchestrator.py`, `doctor.py`, `jlens.py`, `schemas.py`, `fencing.py` |
+| 18 | misc src | `src/cambium/architectus.py`, `bench.py`, `doctor.py`, `jlens.py`, `schemas.py`, `fencing.py` |
 | 19 | fixtures/misc tests | `tests/fixtures/env_worker.py`, `tests/fixtures/hierarchy_worker.py`; `tests/scenarios/test_context_epochs.py`, `test_system_health_boundaries.py` |
 | 20 | diffundo tests b | `tests/scenarios/test_diffundo_codex.py`, `test_diffundo_weighted.py` |
 

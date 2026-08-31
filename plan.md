@@ -37,8 +37,10 @@ part of this plan and must not be staged, edited, or deleted.
 - The last recorded full verification used Python 3.14: `911 passed, 1
   deselected`. The deselected test is the known hanging
   `tests/scenarios/test_optimize.py::test_main_tiny_budget_fails_without_crashing`.
-  Python 3.12 produced a false `os.process_cpu_count` failure and must not be
-  used. Ruff is `/home/ubuntu/.local/bin/ruff`.
+  In that local environment, Python 3.12 produced a false
+  `os.process_cpu_count` failure; use the recorded Python 3.14 interpreter for
+  this verification. The project floor is Python 3.12. Ruff is
+  `/home/ubuntu/.local/bin/ruff`.
 
 ### Pending
 
@@ -254,7 +256,7 @@ The authoritative top-level command table is `cli._build_parser`
 
 ```text
 auth, supervisor, doctor, bench, module-test, version,
-run, repl, tui, session, architectus
+run, repl, tui, monitor, quota, optimize, session, architectus
 ```
 
 There is no top-level `tasktree` command in that parser. The current README and
@@ -341,9 +343,10 @@ credential in shell history, a plan, an event, or this document. The README and
 supervisor demo. Use a clear command reference, not generic marketing. State
 that context reuse is on by default and there is no replacement flag.
 
-`pyproject.toml:5-14` requires Python `>=3.14` and declares packaging metadata;
-the requested workflow remains direct source execution. Do not add a new
-script, install step, or binary-oriented documentation.
+`pyproject.toml:5-14` requires Python `>=3.12` and declares packaging metadata;
+the requested workflow remains direct source execution. The recorded local
+verification uses Python 3.14; the project floor is Python 3.12. Do not add a
+new script, install step, or binary-oriented documentation.
 
 ## 6. Cache, byte exactness, Codex, and child compatibility
 
@@ -475,7 +478,8 @@ PYTHONPATH=src python3.14 -m pytest -q \
 ```
 
 The prior baseline was `911 passed, 1 deselected`; report the new exact count.
-Do not substitute Python 3.12.
+For this local verification, use the recorded Python 3.14 interpreter; Python
+3.12 is the project floor.
 
 ### Lint, type checks, evidence, and final review
 
@@ -516,8 +520,9 @@ read-only and must not make live provider calls.
 - **Codex claims:** retain Codex OAuth and transport support, but never turn
   sparse/non-monotonic Codex telemetry into an acceptance gate or savings claim.
 - **Repository hygiene:** do not touch credentials, live evidence, or
-  `optimized/`; do not install a binary; do not commit this task; do not use
-  Python 3.12; and do not use TDD.
+  `optimized/`; do not install a binary; do not commit this task; use the
+  recorded local Python 3.14 interpreter for verification (the project floor is
+  Python 3.12); and do not use TDD.
 - If the default-on change causes a verified regression, rollback must be a
   controlled source revert of the implementation change, not a hidden
   fallback, catch-all, or silently restored public flag. Preserve this plan
