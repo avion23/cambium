@@ -1122,28 +1122,6 @@ def test_worker_context_reuse_fork_resume_is_byte_exact(tmp_path, monkeypatch) -
         assert "fork_of" not in parent_usage[-1]
         assert all("epoch" not in payload for payload in parent_usage[:3])
 
-        evidence_env = dict(os.environ)
-        evidence_env["PYTHONPATH"] = str(ROOT / "src")
-        evidence = subprocess.run(
-            [
-                sys.executable,
-                str(ROOT / "scripts" / "context_cache_evidence.py"),
-                "--json",
-                str(session_dir),
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-            env=evidence_env,
-        )
-        report = json.loads(evidence.stdout)
-        buckets = report["providers"]["loopback-provider"]["buckets"]
-        assert buckets["baseline"]["calls"] == 3
-        assert buckets["fork_first"]["calls"] == 1
-        assert buckets["resume_first"]["calls"] == 1
-        assert buckets["fork_later"]["calls"] == 0
-        assert buckets["resume_later"]["calls"] == 1
-
         assert result.exit_code == 0
         assert {item.task_id for item in result.results} == {task["task_id"], child_task_id}
         assert all(item.status == "succeeded" for item in result.results)

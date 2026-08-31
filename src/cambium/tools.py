@@ -607,7 +607,10 @@ async def _run_shell_process(
         stdout.flush()
         stderr.flush()
         output = _shell_output(stdout, stderr, ctx)
-        return subprocess.CompletedProcess(command, process.returncode, output, "")
+        returncode = process.returncode
+        if returncode is None:  # the process has exited; None would mean still running
+            raise subprocess.TimeoutExpired(command, timeout_s, output=output)
+        return subprocess.CompletedProcess(command, returncode, output, "")
 
 
 async def _capture_process_stream(

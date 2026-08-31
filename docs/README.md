@@ -90,13 +90,8 @@ focused architecture documents until dedicated guides exist.
 - [`research/agent-system-evaluation.md`](research/agent-system-evaluation.md) —
   target whole-system experiments for orientation, retrieval, accretion,
   delegation, resources, and recovery.
-- [`research/context-branch-evaluation.md`](research/context-branch-evaluation.md)
-  — focused context-branch policy experiments.
 - [`research/codex-activation.md`](research/codex-activation.md) — provider
   activation research; verify conclusions against current transports/config.
-- [`research/coding-constitution.md`](research/coding-constitution.md) —
-  historical/research coding principles.
-- [`research/README.md`](research/README.md) — research-directory notes.
 
 ## Documentation rules
 

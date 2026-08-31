@@ -354,7 +354,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     commands = parser.add_subparsers(
         dest="command",
-        metavar="{auth,supervisor,doctor,bench,module-test,version,run,repl,tui,monitor,quota,optimize,session,architectus}",
+        metavar="{auth,supervisor,doctor,module-test,version,run,repl,tui,monitor,quota,optimize,session,architectus}",
         required=True,
         parser_class=_SafeArgumentParser,
     )
@@ -441,24 +441,6 @@ def _build_parser() -> argparse.ArgumentParser:
         "reachability plus a real refresh-token exchange (consumes quota; "
         "never makes a model call)",
     )
-
-    bench = commands.add_parser(
-        "bench",
-        help="run benchmark report, gate, re-anchor, or quality",
-        description="Run the Cambium benchmark plugin CLI.",
-    )
-    bench_commands = bench.add_subparsers(dest="bench_command", required=True)
-    for mode in ("report", "gate", "re-anchor", "quality"):
-        mode_parser = bench_commands.add_parser(mode, help=f"run the bench {mode}")
-        mode_parser.add_argument("--full", action="store_true", help="full run")
-        mode_parser.add_argument(
-            "--drift-report",
-            action="store_true",
-            help="write a drift artifact to the baseline root",
-        )
-        mode_parser.add_argument("--bench-root", type=Path, metavar="PATH")
-        mode_parser.add_argument("--bench-metric-delta", type=float, metavar="FLOAT")
-        mode_parser.add_argument("--bench-wall-ratio", type=float, metavar="FLOAT")
 
     run = commands.add_parser(
         "run",
@@ -975,34 +957,6 @@ def _run_auth(args: argparse.Namespace) -> int:
     if args.auth_command == "run" and args.profile == "supervisor":
         return _run_auth_supervisor(args)
     raise AssertionError(f"unhandled auth command: {args.auth_command!r}")
-
-
-def _run_bench(args: argparse.Namespace) -> int:
-    try:
-        bench = importlib.import_module("cambium.bench")
-    except ModuleNotFoundError as exc:
-        if exc.name in {"pytest", "tree_sitter", "tree_sitter_python"}:
-            missing = exc.name.replace("_", "-")
-            print(
-                f"cambium bench: {missing} is not installed; run `pip install cambium[test]`",
-                file=sys.stderr,
-            )
-            return 1
-        if exc.name == "cambium.bench":
-            print("cambium bench: cambium.bench is not installed", file=sys.stderr)
-            return 1
-        raise
-
-    delegated = [args.bench_command]
-    if args.full:
-        delegated.append("--full")
-    if args.drift_report:
-        delegated.append("--drift-report")
-    for option in ("bench_root", "bench_metric_delta", "bench_wall_ratio"):
-        value = getattr(args, option)
-        if value is not None:
-            delegated.extend((f"--{option.replace('_', '-')}", str(value)))
-    return bench.main(delegated)
 
 
 def _run_module_test(args: argparse.Namespace) -> int:
@@ -1561,8 +1515,6 @@ async def async_main(argv: list[str] | None = None) -> int:
             return _run_auth(args)
         case "doctor":
             return _run_doctor(args)
-        case "bench":
-            return await asyncio.to_thread(_run_bench, args)
         case "module-test":
             return await asyncio.to_thread(_run_module_test, args)
         case "session":

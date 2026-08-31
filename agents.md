@@ -185,7 +185,6 @@ Prefer the public CLI over internal module entry points:
 auth
 supervisor
 doctor
-bench
 module-test
 version
 run
