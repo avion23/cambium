@@ -233,10 +233,9 @@ read_batch
 delegate
 ```
 
-`branch_history.py`, `code_index.py`, and `lsp_query.py` are implemented library
-boundaries but are not yet in that active roster. Do not describe them as model
-capabilities until the schema, dispatch, prompt, provider-tool hash, and live
-scenario path are wired.
+Branch-history and repository-navigation tools are target capabilities only.
+Do not add implementation-only modules or tests before schema, dispatch, prompt,
+provider-tool hash, and a live scenario can land in the same vertical slice.
 
 ## 7. Context and branch rules
 
@@ -324,7 +323,9 @@ acceptance tests may issue live calls and are separate from hermetic CI.
 Scenario tests prove process, Git, persistence, concurrency, context, and
 provider boundaries. Module tests prove deterministic data-in/data-out logic.
 Do not test an interface merely for existing; test an externally meaningful
-state transition or invariant.
+state transition or invariant. Whole-tree syntax belongs to `compileall`, not a
+pytest reimplementation. Prompt tests should exercise parsing or consumer
+behavior rather than exact prose fragments.
 
 The live coding gate outranks synthetic suites: a task that changes the
 execution loop ends with `pytest -m acceptance tests/acceptance/test_live_coding_gate.py`
