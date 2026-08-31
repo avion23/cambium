@@ -1794,13 +1794,13 @@ def _install_codex_progress_observer(router: Any, progress: AgentProgress) -> No
                 response, provider_name, progress.observe_delta
             )
 
-        _diffundo_module._read_provider_response = _read
+        cast(Any, _diffundo_module)._read_provider_response = _read
         try:
             return codex_post(provider, prompt, timeout_s)
         finally:
             _diffundo_module._read_provider_response = original_reader
 
-    router._codex_post_sync = _observed_codex_post
+    cast(Any, router)._codex_post_sync = _observed_codex_post
 
 
 def _cap_utf8(text: str, limit: int) -> str:
@@ -2471,9 +2471,9 @@ def _summarize_transcript(
 
 _READ_TOOL_NAMES = frozenset({"read_file", "read_batch"})
 _EDIT_TOOL_NAMES = frozenset({"edit_file", "write_file"})
-_MUTATING_TOOL_NAMES = frozenset(
-    {"write_file", "edit_file", "run_shell", "git_op", "run_python", "delegate"}
-)
+# Allowlist, not a denylist: a batch runs concurrently only when EVERY call is
+# a known read-only tool. Anything new or unknown defaults to sequential.
+_CONCURRENT_TOOL_NAMES = frozenset({"read_file", "read_batch"})
 
 
 def _call_paths(name: str, arguments: dict[str, Any]) -> list[str]:
@@ -3003,7 +3003,7 @@ def _build_agent_prompt(
     model_identity: str = "",
     parent_envelope: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    system_lines = CODING_AGENT.splitlines()
+    system_lines = [str(line) for line in CODING_AGENT.splitlines()]
     if model_identity:
         system_lines.insert(
             -1,
@@ -5343,6 +5343,8 @@ async def _bound_context_continuation(
                     )
                 raise ContextForkError(f"summary provider call failed: {detail}") from exc
             try:
+                if summary_result is None:  # narrowing aid: captured by closures below
+                    raise ContextForkError("summary provider call returned no result")
                 summary_entry = parse_summary_response(summary_result.content, expectation)
                 break
             except SummaryTrunkError as exc:
@@ -5360,6 +5362,8 @@ async def _bound_context_continuation(
         # MAX_CONSECUTIVE_COMPACTION_DEFERRALS bound).
         if time.monotonic() >= wall_deadline:
             raise ContextForkError("wall budget exceeded during summary flush")
+        if summary_result is None:  # unreachable: every loop exit follows a provider call
+            raise ContextForkError("summary provider call returned no result")
         declared_summary_model = router.declared_model(summary_result.provider)
         if declared_summary_model and summary_result.model != declared_summary_model:
             raise ContextForkError("summary response model mismatch")
@@ -6758,8 +6762,8 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
 
                 batch_results: list[tuple[str, dict[str, Any], ToolResult]] = []
                 successful_delegate: dict[str, Any] | None = None
-                if any(
-                    tool_call["name"] in _MUTATING_TOOL_NAMES for tool_call in tool_calls
+                if not all(
+                    tool_call["name"] in _CONCURRENT_TOOL_NAMES for tool_call in tool_calls
                 ):
                     for tool_call in tool_calls:
                         name = tool_call["name"]
@@ -7139,7 +7143,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                         # Deliver any pending (throttled) tail before the
                         # tool's completion event so the newest process
                         # output is the last emitted delta.
-                        await progress_sink.flush()
+                        await cast(Any, progress_sink).flush()
             if name == "delegate" and tool_result.ok and writer is not None:
                 await _emit_delegated_child(writer, config, arguments, request_id=run_request_id)
             if tool_result.ok:
