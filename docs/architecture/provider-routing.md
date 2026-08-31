@@ -1,132 +1,311 @@
-# Provider routing
+# Provider routing and resource control
 
-## Problems
+**Status:** current routing ownership contract plus target agent-visible resource
+projection. Source and tests remain authoritative.
 
-1. Providers fail heterogeneously: authentication, quota, configuration,
-   stalls, overload, and content policy require different responses. Blind
-   retries burn budget or damage healthy lanes.
+## 1. Problem
 
-2. Every provider eventually has an outage, so single-provider operation is
-   unacceptable for work that must complete.
+A provider decision is not merely “pick the best model.” It is admission under
+hard constraints followed by optimization under uncertain, changing evidence:
 
-3. Switching providers invalidates prompt-cache affinity and may fork context
-   unless task identity and progress move with the switch.
+```text
+credentials and authorization
+context/output/tool capability
+provider/model enablement
+task quality constraints
+request rate and in-flight capacity
+token/quota windows
+prepaid cash or subscription scarcity
+provider health and Retry-After
+prompt-cache affinity and switching cost
+wall deadline
+```
 
-4. Large code contexts can trigger moderation false positives on benign tasks,
-   turning a provider-specific interpretation into an avoidable task failure.
+Parent continuation and independent child work have different affinity needs.
+A root semantic branch should remain stable while feasible; a separable child
+may use another lane when that improves capability, capacity, cost, or
+independent review value.
 
-5. Deep-reasoning calls legitimately exceed naive timeouts, so a fixed short
-   deadline mistakes slow useful work for failure.
-
-6. Credential-less lanes waste attempts and pollute health statistics when
-   missing credentials are discovered only during a call.
-
-7. Parent and child tasks have different affinity needs. A continuation of one
-   semantic branch should remain sticky, while an independent child may be
-   admitted on another provider when that improves capability, capacity, or
-   cost.
-
-## Ownership
+## 2. One ownership path
 
 Routing is split by time scale, not duplicated:
 
 ```text
-supervisor admission
-    |
-    | hard feasibility, credentials, task constraints,
-    | lane capacity, debt, cache affinity
-    v
-assigned provider/model lease
-    |
-    v
+provider configuration
+  capabilities, auth/protocol mode, tariffs, cache/quota declarations
+            |
+            v
+supervisor admission / routing.py
+  hard feasibility, authorization, credential readiness,
+  model constraints, lane/quota availability, ranking, lease
+            |
+            v
+worker pinned to provider/model lease
+            |
+            v
 Diffundo call-time execution
-    |
-    | direct health evidence, retry, cooldown, bounded cascade
-    v
-provider transport
+  direct health evidence, deadlines, retry, cooldown, bounded cascade
+            |
+            v
+transport/provider response
+  usage, cache, rate, quota, error evidence
+            |
+            v
+usage debt / quota reconciliation / next admission
 ```
 
-The supervisor owns admission and the provider/model lease. Diffundo owns
-attempt execution after admission. Provider configuration describes
-capabilities. The quota ledger owns observed windows. None of these modules is a
-second scheduler.
+`provider_scheduler.py` owns shared immutable lease/cache/quota values and
+transactional reservations. It is not another scheduler. `routing.py` owns
+admission. `diffundo.py` owns attempts after admission. `provider_config.py`
+owns declared capabilities. The supervisor owns the branch lease.
 
-## Admission
+## 3. Hard feasibility
 
-Admission constructs a hard-feasible set before ranking:
+Admission first constructs a hard-feasible set. A candidate is excluded when:
 
-- provider and model are enabled;
-- credentials are available;
-- task capability requirements are satisfied;
-- the provider is inside the inherited authorization boundary;
-- lane capacity and quota reservations permit dispatch;
-- the requested model constraints are satisfied.
+- provider or model is disabled;
+- required credentials are unavailable;
+- the provider lies outside inherited authorization;
+- context/output or declared capability cannot satisfy the task;
+- task quality, paid/free, or model constraints reject it;
+- quota/cash reservation or lane capacity blocks dispatch;
+- an exact context request is incompatible with provider/model/protocol/prompt/
+  tool/checkpoint identity;
+- a permanent configuration/authentication quarantine applies.
 
-A task can constrain admission with `requirements`, `model_candidates`,
-`authorized_providers`, and `authorized_providers_explicit`. Prompt prose does
-not override these fields.
+Prompt prose cannot override these facts. Unknown capability does not satisfy a
+positive hard requirement.
 
-Within the feasible set, routing may consider quality, measured throughput,
-cash cost, quota scarcity, verification cost, and cache switching cost. The
-policy must not turn a hard constraint into a soft score.
+Only after this filter may Cambium rank candidates.
 
-## Leases and failures
+## 4. Ranking objective
 
-- Each lane uses an evidence-based health state machine: open admits work,
-  cooldown withholds transiently, half-open permits a bounded probe, and
-  disabled quarantines proven authentication or configuration failures.
-- Direct success, quota, stall, overload, transport, endpoint, and policy
-  evidence drive distinct transitions. Health is never inferred from another
-  lane’s result.
-- Content-policy flags cascade without damaging provider health.
-- Each attempt receives an effort-aware deadline inside the hard task wall.
-  Backoff and retries cannot overrun the wall.
-- Budget charging is uncached-only where provider evidence permits it: count
-  fresh input and newly generated output, not reused cached work.
-- Safe checkpoints preserve progress across a legal failover.
+Within the feasible set, the target policy minimizes regret using measured or
+configured evidence:
 
-## Root and child affinity
+```text
+utility =
+    expected quality
+  + expected throughput
+  + useful idle-capacity value
+  - cash cost
+  - quota shadow price
+  - expected verification/rework cost
+  - provider/cache switching cost
+  - uncertainty penalty for weak evidence
+```
 
-A Cambium child is a supervised task, not a provider-native subagent. See
-[`subagents.md`](subagents.md).
+The exact formula is versioned and auditable. A hard requirement is never given
+a finite penalty that allows a sufficiently attractive score to bypass it.
 
-| Task relationship | Admission rule | Context construction |
-| --- | --- | --- |
-| Same semantic branch | Keep provider/model lease while feasible | Resume exact checkpoint |
-| Exact compatible child | Pin to parent provider/model | Byte-identical prefix plus child task |
-| Independent child | Admit from its own feasible set | Fresh head; semantic summaries when available |
-| Incompatible child | Do not claim cache reuse | `summary_trunk_ref` or fresh prompt |
-| Permanently infeasible lease | Explicit migration/failure path | Latest safe checkpoint, never silent substitution |
+Current source already records requests, tokens, failures, cost, cache-hit
+count, latency, throughput evidence, Retry-After pressure, and durable
+configuration/auth quarantine. A placeholder token-window allowance remains
+where real account contracts are unavailable. Target work replaces persuasive
+placeholders with measured/configured windows or `unknown`.
 
-An exact child is cache-affine only when provider, model, protocol, reasoning
-effort, tool schema, system prompt, checkpoint hashes, and authorization
-boundary are compatible. Otherwise the supervisor clears inherited assignment
-and may give the child a provider-neutral semantic trunk.
+## 5. Leases
 
-This is an affinity-scheduling problem with switching costs. The root branch has
-a hard lease until infeasible. Independent children may use spare or
-better-matched capacity because their execution does not require the root’s
-provider-local cache.
+A lease is branch state:
 
-## Invariants
+```text
+provider
+model
+protocol/reasoning identity
+credential authority fingerprint (never secret value)
+context/checkpoint affinity
+acquired_at / source evidence
+migration status
+```
 
-- Provider health changes only on direct evidence.
-- Content flags never damage health.
-- Pinned-model tasks never silently switch model on transient failure.
-- Every legal failover preserves task progress through a safe checkpoint.
-- Admission never spawns a lane that cannot authenticate.
-- A child cannot widen the parent provider authorization boundary.
-- A cache hit is claimed only from provider evidence.
+### Root continuation
+
+The root keeps its provider/model lease through normal turns while feasible.
+Transient slowness or one failed request does not silently create a new semantic
+branch.
+
+### Exact child
+
+`trunk + inherit` pins the compatible parent provider/model and exact checkpoint
+prefix. If compatibility fails, the explicit request is rejected rather than
+downgraded.
+
+### Semantic/fresh child with inherit
+
+The child keeps the parent provider/model but uses semantic-only or fresh
+context as requested. Context representation and placement are orthogonal.
+
+### Semantic/fresh child with spread
+
+Inherited hard pinning is removed. Admission first prefers another feasible
+lane and then falls back to the complete feasible set. Spread is a throughput
+preference, not permission to violate capability, authorization, quota, or cash
+constraints.
+
+### Migration
+
+A permanently infeasible root lease uses an explicit transition:
+
+```text
+latest safe checkpoint
+    -> classify infeasibility
+    -> select hard-feasible migration target
+    -> construct exact/semantic/fresh continuation honestly
+    -> reserve target resources
+    -> emit provider_lease_migrated
+    -> continue under new lease
+```
+
+Migration loss of cache affinity is visible. It is never hidden inside a retry.
+
+## 6. Failure classification
+
+Provider outcomes require different state transitions:
+
+| Class | Treatment |
+| --- | --- |
+| invalid/revoked credential | quarantine until credential identity changes or explicit recovery |
+| missing entitlement/configuration | disable affected provider/model configuration |
+| quota/rate/billing | cooldown/block until reset or top-up evidence |
+| policy/content refusal | fail/fall through this request without damaging provider health |
+| WAF/network/overload/stall | bounded retry/cooldown health transition |
+| malformed provider output | request/model evidence; do not infer credential failure |
+| success | update usage/throughput/cache evidence and clear eligible quarantine |
+
+Health changes only from direct evidence about the attempted lane. A sibling
+provider result cannot rehabilitate or damage another lane.
+
+## 7. Accounting dimensions
+
+Keep separate ledgers or fields for:
+
+```text
+request-rate tokens
+in-flight slots
+input tokens
+cached input tokens
+cache write tokens/cost
+output tokens
+time-window quotas
+prepaid cash
+subscription scarcity
+wall time
+retry/backoff
+verification and rework
+```
+
+Cached tokens are not automatically free and may still count against provider
+limits. Unknown tariffs/limits remain unknown. Each reservation has an owner,
+expiry/reconciliation path, and durable result.
+
+## 8. Cache capability
+
+Provider configuration may describe:
+
+```text
+minimum cacheable tokens
+cache TTL
+cache block granularity
+cache-read price
+cache-write price
+```
+
+CAST may use this to decide breakpoint batching and K0 rollover economics. A
+configured TTL supports only a pre-call warm estimate. `provider_cache_hit`
+comes from provider evidence after the call.
+
+Exact fork compatibility additionally requires provider/model/protocol,
+reasoning mode, stable system prompt, tool-schema hash, checkpoint hashes, and
+authorization identity. Cross-provider semantic reuse is always cold on the new
+provider even when summary text matches.
+
+## 9. ResourceEnvelope for the agent
+
+The target model surface is a bounded policy projection, not raw scheduler
+state:
+
+```text
+remaining turns and wall
+context pressure
+uncached-token pressure
+provider/model lease
+cache affinity and warm estimate
+quota pressure
+cash pressure
+delegation overhead
+alternative feasible lane availability
+```
+
+Common values use `low`, `medium`, `high`, `critical/blocked`, or `unknown`.
+Exact underlying values remain available through `inspect_state(resources)`.
+Thresholds are versioned.
+
+The ResourceEnvelope lets the agent decide whether to continue, retrieve,
+delegate, verify, or finish. It does not let the model choose a credential or
+bypass admission.
+
+Examples:
+
+- high context pressure favors exact evidence retrieval over transcript replay;
+- low wall time makes non-critical child creation unattractive;
+- a warm exact root lease favors continuation for coupled work;
+- idle alternative capacity favors `semantic + spread` only for separable work;
+- high quota pressure discourages speculative calls but cannot justify skipping
+  required verification silently.
+
+## 10. Observability and explanation
+
+A provider decision should be reconstructible from durable bounded evidence:
+
+```text
+request/task constraints
+excluded candidates and hard reasons
+candidate scores and evidence age/sample count
+selected lease
+reservation result
+attempt outcomes
+usage/cache/quota evidence
+migration or release
+```
+
+The TUI and model SituationFrame share lease and pressure semantics through the
+target BranchState. Secrets, bearer tokens, and raw credential material never
+enter these records.
+
+## 11. Invariants
+
+- One scheduler ownership path.
+- Hard feasibility before ranking.
+- Credentials never enter task specs, prompts, events, or commits.
+- Health changes only on direct evidence.
+- Content/policy refusal does not poison provider health.
+- Pinned-model/root-lease behavior is explicit.
+- Every legal migration starts from a safe checkpoint.
+- Request rate, concurrency, tokens, windows, cash, and cache remain separate.
+- A child cannot widen parent provider authority.
 - Cross-provider semantic reuse is never labelled a cache hit.
-- The prompt cannot directly select a provider or bypass admission.
+- Unknown economics remain unknown.
+- The model expresses intent; the supervisor resolves the actual lease.
 
-## Violations this design prevents
+## 12. Current versus target
 
-- Typed outcomes and evidence-only health replace blind retry.
-- Feasibility filtering removes credential-less and capability-incompatible
-  lanes before dispatch.
-- Leases and checkpoint identity keep a continuation on one semantic branch.
-- Explicit cache-affine and semantic-reuse modes prevent cross-provider cache
-  claims.
-- Effort-aware deadlines distinguish useful slow reasoning from an overrun.
-- Separate admission and call-time ownership prevent competing schedulers.
+Current:
+
+- admission from credential/capability/authorization constraints;
+- usage-debt and lane-aware selection;
+- provider/model pinning;
+- cache/quota value objects and transactional reservations;
+- typed call outcomes, deadlines, retry/cooldown, and bounded cascade;
+- declared child inherit/spread materialization;
+- operator usage/quota projection.
+
+Target:
+
+- real account-window/cash models replacing placeholders;
+- explicit root lease migration event/protocol;
+- uncertainty-aware ranking and recorded explanation;
+- model-visible ResourceEnvelope from the canonical BranchState;
+- measured switching/delegation/verification costs;
+- held-out policy evaluation before promotion.
+
+The target work is ordered in `../../implementation-plan.md` Phase 6.

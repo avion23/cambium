@@ -1,231 +1,384 @@
-# Context-branch requirements
+# Agent and context-branch requirements
 
-**Status:** normative. `MUST`, `MUST NOT`, `SHOULD`, and `MAY` have their usual
-requirements meaning. The architecture rationale is in
-[`context-branches.md`](context-branches.md).
+**Status:** target normative contract. `MUST`, `MUST NOT`, `SHOULD`, and `MAY`
+have their usual requirements meaning. Current compatibility behavior and open
+work are listed explicitly in section 13 and `implementation-plan.md`.
+
+Rationale is in [`agent-operating-model.md`](agent-operating-model.md).
 
 ## 1. Terminology
 
-- **Task tree:** parent/child ownership and scheduling structure.
-- **Conversation branch:** one LM task's transcript, tool calls, and checkpoints.
-- **Git graph:** artifact commits and integration order.
+- **Branch:** one bounded unit of agency with task, context, authority,
+  resources, children, result, and artifact state.
+- **Task tree:** parent/child ownership and lifetime structure.
+- **Conversation branch:** one model branch's transcript, tool calls, and
+  checkpoints.
+- **Git artifact graph:** commits and accepted integration order.
 - **Cache lineage:** exact provider-request-prefix compatibility.
-- **Trunk:** append-only semantic history plus a bounded raw tail.
-- **Branch capsule:** bounded child result returned to the parent.
-- **Tool reference:** `tool:<task-id>:<generation>:<turn>`.
+- **BranchState:** canonical derived state for one branch.
+- **SituationFrame:** bounded model-facing projection of BranchState.
+- **WorkLedger:** derived current semantic items and append-only transitions.
+- **ResultCapsule:** bounded child result returned to a parent.
+- **Evidence reference:** stable identifier for a tool, event, checkpoint,
+  source window, check, branch, or commit.
 
-These structures MUST remain distinct in code, events, documentation, and UI.
+These concepts MUST remain distinct in source, events, documentation, and UI.
 
-## 2. Recursive branch model
+## 2. Authority and truth
 
-1. The root and every child MUST use the same worker/session abstraction.
-2. A child MAY create children subject to the same depth, width, budget, and
-   lifecycle bounds as the root.
-3. A child proposal MUST contain a self-contained `task` and explicit
-   `context_mode` and `placement` values.
-4. There MUST be no implicit default, alias, or silent downgrade for those two
-   policy fields.
-5. A proposal that requests an impossible combination MUST be rejected before
-   durable child admission.
-6. `context_mode=trunk` MUST require `placement=inherit`.
+1. Durable events, immutable checkpoints, provider evidence, and Git objects
+   MUST remain the reconstructible authority for runtime state.
+2. BranchState MUST be a pure materialized view; it MUST NOT become another
+   mutable store.
+3. A model response MAY propose a claim, decision, plan, tool call, child, or
+   finish verdict. It MUST NOT directly mutate worker, supervisor, provider,
+   checkpoint, quota, or Git state.
+4. A semantic claim MUST NOT be treated as proof of a tool result, provider
+   result, verification, or artifact publication.
+5. Unknown, stale, inferred, and directly observed values MUST be represented
+   distinctly.
+6. Every accepted effect MUST retain the branch/generation identity that owned
+   it.
+7. Every lossy projection item SHOULD retain one or more stable evidence refs.
+8. Higher layers MUST use validated lower-layer interfaces rather than reach
+   into their mutable internals.
 
-## 3. Context modes
+## 3. Canonical BranchState
 
-### 3.1 Trunk
+1. One BranchState reducer MUST own shared derived semantics for supervisor
+   inspection, model context, TUI, monitor, and reconnect.
+2. The same ordered sources and validated Git snapshot MUST produce
+   byte-identical canonical state.
+3. BranchState MUST distinguish at least:
+   - task, parent, generation, and lifecycle;
+   - mission, constraints, done criteria, and authority;
+   - context checkpoint/epoch/lineage;
+   - base, worktree, and accepted integration heads;
+   - provider/model lease and resource facts;
+   - plan, open obligations, blockers, and verification;
+   - children in deterministic admission order;
+   - stable evidence anchors.
+4. Context epoch, worker generation, and artifact head MUST NOT be inferred from
+   one another.
+5. Completion-time ordering MUST NOT replace admission or event ordering.
+6. A reducer MUST fail or mark unknown when required source identity is missing;
+   it MUST NOT invent a plausible current value.
+7. Frontends MAY derive display-specific fields, but shared semantic fields MUST
+   come from BranchState.
 
-- A trunk child MUST receive the complete immutable parent checkpoint prefix.
-- Provider, model, protocol, reasoning mode, tool schema, system prompt,
-  authorization identity, and prefix hashes MUST be exact-compatible.
-- A failed compatibility check MUST reject the proposal; it MUST NOT silently
-  become a semantic or fresh child.
-- The parent provider/model lease MUST be inherited.
+## 4. SituationFrame
 
-### 3.2 Semantic
+1. Every normal model decision SHOULD receive one SituationFrame built from the
+   latest BranchState immediately before dispatch.
+2. The frame MUST contain a projection version, source watermark, branch,
+   generation, context epoch, artifact head, and digest.
+3. Canonical section order MUST be:
 
-- A semantic child MUST receive the immutable semantic trunk under a fresh
-  provider-specific head.
-- It MUST NOT claim an exact provider-cache hit merely because summary bytes
-  match.
-- The parent checkpoint MUST be present and suitable for semantic projection.
-- `placement=spread` SHOULD remove the inherited provider/model pin and allow
-  normal admission to prefer another feasible lane.
+   ```text
+   MISSION, AUTHORITY, ACCEPTED, DELTA, OPEN, CHILDREN, RESOURCES, ANCHORS
+   ```
+4. The frame MUST be bounded globally and per section.
+5. Truncation MUST be visible and SHOULD expose an `inspect_state` continuation.
+6. The frame MUST be harness-authored and MUST label model proposals,
+   observations, accepted facts, unknowns, and stale data accurately.
+7. It MUST NOT contain credentials, secrets, hidden reasoning, or an unbounded
+   transcript.
+8. It MUST be appended as a changing suffix and MUST NOT rewrite the stable
+   system/tool head or published CAST entries.
+9. Summary mode MUST NOT accidentally promote frame control text into semantic
+   evidence.
+10. The action produced from a frame MUST be auditable against its frame digest
+    and source watermark.
 
-### 3.3 Fresh
-
-- A fresh child MUST receive no parent checkpoint or summary-trunk reference.
-- Its task contract and stable system/tool head MAY still include ordinary
-  repository instructions and tool definitions.
-- Fresh mode SHOULD be used for blind review, independent reproduction, or
-  deliberate assumption isolation.
-
-## 4. Placement
-
-1. `inherit` MUST preserve parent provider affinity when a parent provider is
-   known and feasible.
-2. `spread` MUST remove an inherited hard provider pin.
-3. `spread` SHOULD prefer a different credential-ready provider when one
-   satisfies all hard task constraints.
-4. `spread` MUST fall back to any feasible provider rather than fail solely
-   because another provider is unavailable.
-5. Natural-language prompt text MUST NOT bypass provider feasibility or select
-   credentials directly.
-
-## 5. Trunk and raw history
+## 5. Context and accretion
 
 1. The semantic trunk MUST remain append-only within an epoch.
-2. Existing trunk bytes MUST NOT be rewritten merely to inspect historical
-   detail.
-3. Raw tool calls, observations, and branch transcripts MUST remain outside the
-   normal trunk unless summarized through the normal trunk protocol.
-4. A history read MUST be appended as a temporary tool observation after the
-   stable prefix.
-5. A durable conclusion learned from history SHOULD be promoted through a later
-   summary entry; the raw read itself MUST NOT mutate old entries.
-6. No second evidence, memory, or search database may be introduced for this
-   feature. Existing event logs and immutable checkpoints are authoritative.
+2. A summary entry MUST cover one exact disjoint raw range.
+3. Existing summary bytes MUST NOT be rewritten during a normal fold.
+4. Raw history MUST remain durable and reopenable after compaction or K0
+   rollover.
+5. Current active decisions, valid facts, constraining failed approaches,
+   verification state, and open obligations MUST survive compaction.
+6. Corrections MUST append supersession or invalidation transitions; they MUST
+   NOT erase prior history.
+7. Routine execution noise SHOULD be excluded from active semantic state.
+8. An expensive observation SHOULD retain an exact evidence ref.
+9. A verification MUST identify the artifact state it tested.
+10. A later overlapping accepted artifact change MUST mark affected
+    verification stale until rerun.
+11. Missing evidence MUST NOT be hidden by a numeric confidence value.
+12. No vector database, second evidence store, or hidden-reasoning archive MAY be
+    introduced solely for agent memory.
 
-## 6. Historical tool references
+## 6. Inspection and retrieval
 
-1. Every retrievable tool call MUST be identified by task branch, worker
-   generation, and LM turn.
-2. Listing tool calls MUST expose the stable reference.
-3. Reopening a reference MUST return the corresponding durable tool-event
-   metadata and, when available, the assistant tool action plus tool
-   observation from the matching checkpoint.
-4. A history read MUST NOT re-execute the historical tool call.
-5. A malformed or missing reference MUST fail explicitly.
-6. History queries MUST have deterministic row and byte bounds.
-7. All task branches in the current session are readable; this feature has no
-   per-branch access-control model.
+1. Current state, historical evidence, and repository location MUST have
+   separate model-facing interfaces.
+2. `inspect_state` MUST read BranchState only and MUST NOT execute effects.
+3. `branch_history` MUST read existing events/checkpoints only; it MUST NOT
+   re-execute a historical tool call.
+4. `repo_query` MUST stay inside the assigned repository root and return bounded
+   locations/windows.
+5. Canonical tool-history references MUST include task, generation, turn, and
+   zero-based batch index. A legacy reference without batch index MAY resolve to
+   index zero for previously recorded sessions.
+6. State/history cursors MUST be tied to a source watermark. A stale cursor MUST
+   fail explicitly or state that it was rebased.
+7. Retrieval SHOULD follow progressive disclosure:
 
-## 7. Child result and artifact join
+   ```text
+   SituationFrame -> capsule/state section -> exact ref -> transcript window -> raw artifact
+   ```
+8. Typed code navigation SHOULD precede broad shell search when it can answer the
+   same question.
+9. Large tool output SHOULD retain a bounded artifact/spill reference rather
+   than be silently discarded.
+10. All outputs MUST have deterministic row, item, and byte caps.
 
-1. A branch capsule MUST remain bounded.
-2. A parent MAY inspect the child's branch history after receiving the capsule.
-3. Accepting a semantic result MUST NOT imply that the child's Git artifacts
-   were integrated.
-4. Parent resume after child code changes MUST verify the accepted integration
-   head separately.
-5. Completion order MUST NOT change deterministic admission or integration
-   order.
+## 7. Agent action protocol
 
-## 8. Prompt ownership and optimization
+1. The first model action MUST be a short plan tied to observable outcomes.
+2. The agent SHOULD use the loop:
 
-1. Model-facing policy text MUST have one authoritative source in
-   `src/cambium/prompts.py`.
-2. Branch-decision and history-recall guidance MUST be named prompt components,
-   not duplicated strings in worker code.
-3. Each component SHOULD be independently replaceable by the DSPy optimization
-   pipeline while the tool schemas and runtime invariants remain fixed.
-4. Promotion of an optimized component MUST require held-out and canary
-   evaluation.
-5. Prompt optimization MUST NOT alter hard runtime validation.
+   ```text
+   orient -> locate -> act -> observe -> verify -> externalize -> finish
+   ```
+3. Plans MAY change after new evidence and MUST NOT be treated as authority.
+4. Independent read-only calls MAY run in one batch.
+5. Mutating calls MUST execute in declared order and MUST NOT be parallelized
+   unless the effect boundary provides a stronger transactional contract.
+6. A failed tool call MUST be returned as evidence; the agent SHOULD diagnose it
+   before changing source.
+7. The model MUST NOT be required to expose hidden chain of thought. Short plans,
+   typed actions, claims, and externally useful summaries are sufficient.
+8. `objective_met=true` MUST require agreement with task done criteria and
+   required current verification.
 
-## 9. Observability
+## 8. Recursive child branches
 
-The durable `child_admitted` and `context_fork` events MUST expose:
+1. Root and children MUST use the same branch/worker abstraction.
+2. A child MAY delegate recursively within supervisor depth, width, budget, and
+   lifetime bounds.
+3. Every model-originated child proposal MUST contain a self-contained task
+   contract and explicit `context_mode` and `placement`.
+4. There MUST be no silent downgrade of an explicit policy.
+5. `trunk + spread` MUST be rejected as contradictory.
+6. `trunk + inherit` MUST require exact provider/model/protocol/reasoning/tool/
+   prompt/checkpoint/authorization compatibility.
+7. `semantic` MUST import only the immutable semantic state under a fresh
+   provider-specific head.
+8. `fresh` MUST receive no parent checkpoint, semantic trunk, or parent result
+   envelope.
+9. `inherit` MUST preserve the parent provider/model lease when known and
+   feasible.
+10. `spread` MUST remove inherited hard pinning, prefer another feasible lane,
+    and fall back to the full hard-feasible set rather than fail solely for lack
+    of an alternative.
+11. A child MUST NOT widen parent filesystem, tool, credential, or provider
+    authority.
+12. Admission MUST be durable before child creation/spawn.
+13. Parents MUST own child lifetime under structured concurrency unless a named
+    policy explicitly transfers ownership.
+14. Completion order MUST NOT determine result or artifact join order.
+
+## 9. ResultCapsule and joins
+
+1. A child result MUST be versioned, schema-validated, and bounded.
+2. A ResultCapsule SHOULD contain outcome, evidence-linked claims/decisions,
+   artifacts, verification, open obligations/blockers, usage, and a recommended
+   parent action.
+3. A capsule MUST NOT contain the complete child transcript.
+4. A parent MAY retrieve exact child history after reading the capsule.
+5. Semantic result acceptance MUST NOT imply artifact acceptance.
+6. `artifacts.changed=true` MUST NOT imply the parent contains the child change.
+7. Parent resume after child code changes MUST require:
+
+   ```text
+   child terminal result represented
+   AND accepted artifact integration
+   AND parent worktree HEAD == accepted integration HEAD
+   AND required combined-tree verification state
+   ```
+8. Conflict evidence MUST be bounded and routed through one ordered resolver
+   authority.
+9. A failed critical child MUST remain a blocking parent obligation unless the
+   parent explicitly changes the plan.
+
+## 10. Resources and providers
+
+1. Provider hard feasibility MUST be resolved before ranking.
+2. Credentials, authorization, context/output capacity, required capabilities,
+   quota blocks, and artifact/context compatibility MUST remain hard
+   constraints.
+3. Request rate, in-flight capacity, token windows, wall time, cash, cache
+   state, and verification cost MUST remain separate accounting dimensions.
+4. Unknown tariff/quota/cache evidence MUST remain unknown.
+5. The model SHOULD receive a bounded ResourceEnvelope containing
+   decision-relevant pressure and availability, not credentials or raw internal
+   scheduler state.
+6. Cache warmth MAY be estimated from capability and elapsed time, but a cache
+   hit MUST be claimed only from provider evidence.
+7. The agent MAY express context/placement/capability intent. The supervisor MUST
+   choose the actual provider/model from the feasible set.
+8. Root provider migration MUST be an explicit durable transition from a safe
+   checkpoint; it MUST NOT be hidden as an ordinary retry.
+9. Summaries, children, retrieval, retries, and verification MUST consume
+   explicit branch/session budgets.
+10. Resource pressure MUST be visible before the next decision when it can
+    change the optimal action.
+
+## 11. Human/model control agreement
+
+1. TUI, monitor, status commands, SituationFrame, and `inspect_state` MUST derive
+   shared fields from BranchState.
+2. At the same watermark they MUST agree on branch lifecycle, generation,
+   context lineage, accepted artifact head, children, blockers, verification,
+   provider lease, and resources.
+3. Operator steering MUST enter through a validated durable event.
+4. An accepted steer MUST appear once in the next relevant SituationFrame
+   delta/open state.
+5. Frontend exit/reconnect MUST NOT require reconstructing state from widget
+   memory.
+6. Monitoring MUST remain read-only.
+7. Color or glyphs MUST NOT be the only representation of semantic state.
+
+## 12. Evaluation and promotion
+
+1. New agent-facing state or policy MUST be evaluated on frozen repository/task
+   fixtures with executable acceptance criteria.
+2. Correct accepted outcome is the primary metric.
+3. Resource claims MUST keep uncached input, cached input, cache write, output,
+   summary, retrieval, navigation, verification, cash, quota, and wall time
+   separate.
+4. Evaluation MUST include long-session compaction, restart, child join,
+   provider migration, and reconnect.
+5. Promotion MUST require held-out and canary non-inferiority on severe
+   correctness failures.
+6. Prompt optimization MUST freeze runtime validators, tool schemas, provider
+   configuration, repository state, and budgets within a comparison.
+7. Training data MUST contain only visible/reproducible decisions and outcomes;
+   hidden reasoning and self-reported success MUST NOT become labels.
+8. Negative results MUST remain available.
+
+## 13. Current compatibility gaps
+
+These are current-source facts, not exceptions to the target requirements:
+
+- The active `delegate` schema currently permits `context_mode` and `placement`
+  to be omitted. The supervisor then performs automatic exact/semantic
+  compatibility resolution. Phase 0 must remove this ambiguity from the public
+  model contract or give the compatibility path an explicit name.
+- `branch_history.py`, `code_index.py`, and `lsp_query.py` exist, but the active
+  worker tool schema/dispatch roster currently contains only `write_file`,
+  `edit_file`, `git_op`, `run_shell`, `read_batch`, and `delegate`.
+- `prompts.py` currently exports the coding and summary prompts, not all named
+  branch-decision/history components claimed by earlier documents.
+- `observability.py` is an event-sourced operator reducer, but there is no shared
+  canonical BranchState or model SituationFrame yet.
+- The existing strict child envelope and SummaryEntry are the migration base for
+  ResultCapsule and WorkLedger; target schemas are not current wire claims.
+
+The ordered convergence work is in `../../implementation-plan.md`.
+
+## 14. Acceptance scenarios
+
+### A1 — current-state agreement
 
 ```text
-parent_task_id
-child_task_id
-child_kind
-context_mode
-placement
+Given one durable event prefix and validated Git snapshot
+When BranchState, SituationFrame, and TUI snapshots are produced
+Then every shared semantic field agrees exactly
 ```
 
-When available they SHOULD also expose:
+### A2 — no stale action
 
 ```text
-provider/model
-checkpoint epoch
-exact compatibility
-semantic reuse
+Given a child join advances the accepted integration head
+When the next model call is built
+Then its SituationFrame shows the new head and stales affected verification
 ```
 
-The TUI SHOULD display task-tree parentage independently from context lineage
-and provider placement.
-
-## 10. Acceptance scenarios
-
-### R1 — exact cached branch
+### A3 — explicit child policy
 
 ```text
-Given a parent with a compatible checkpoint
-When it delegates trunk + inherit
-Then the child receives context_fork
-And assigned_provider equals the parent provider
-And the full old prefix is byte-identical
+When a model proposes a child without context_mode or placement
+Then model-facing validation rejects the call
+And no hidden automatic policy is selected
 ```
 
-### R2 — semantic spread branch
+### A4 — exact branch
 
 ```text
-Given a parent with an immutable semantic checkpoint
-When it delegates semantic + spread
-Then the child receives summary_trunk_ref
-And it receives no context_fork
-And inherited provider pinning is removed
-And normal routing may choose another feasible provider
+Given a fully compatible parent checkpoint
+When a child requests trunk + inherit
+Then the exact prefix is byte-identical
+And the parent provider/model lease is inherited
 ```
 
-### R3 — fresh spread branch
+### A5 — impossible exact branch
 
 ```text
-When a parent delegates fresh + spread
-Then the child receives neither context_fork nor summary_trunk_ref
-And inherited provider pinning is removed
-```
-
-### R4 — impossible request
-
-```text
-When a proposal declares trunk + spread
+Given an incompatible parent checkpoint
+When a child requests trunk + inherit
 Then admission rejects it before child_admitted
-And no worker is spawned
+And it does not silently become semantic or fresh
 ```
 
-### R5 — branch-local tool recall
+### A6 — progressive recall
 
 ```text
-Given a tool_event and matching checkpoint for task T, generation G, turn N
-When branch_history lists tools
-Then it emits tool:T:G:N
-When that reference is reopened
-Then the original assistant action and observation are returned
-And the tool is not executed again
+Given a capsule omits one required detail
+When the model lists child tool refs and opens one exact batched-call ref
+Then it obtains the matching action/observation without transcript replay
 ```
 
-### R6 — recursive use
+### A7 — obligation retention
 
 ```text
-Given a child branch within the configured depth bound
-When that child delegates another explicit branch policy
-Then the same admission, routing, checkpoint, and join rules apply
+Given an open required check
+When the branch crosses summary flush, K0 rollover, restart, and reconnect
+Then the obligation remains open until matching verification satisfies it
 ```
 
-### R7 — cache-stable drill-down
+### A8 — verification staleness
 
 ```text
-Given an existing trunk prefix P
-When branch_history returns historical detail D
-Then the next request is P + current-tail + D
-And no byte inside P changes
+Given check V passed at artifact head H1
+When an overlapping artifact change produces H2
+Then V is stale in BranchState, SituationFrame, and TUI until rerun at H2
 ```
 
-## 11. Definition of done
+### A9 — resource-aware delegation
 
 ```text
-[ ] explicit child-policy parser has no defaults
-[ ] delegate schema requires task/context_mode/placement
-[ ] supervisor rejects impossible policy before spawn
-[ ] trunk/semantic/fresh paths have focused tests
-[ ] spread removes inherited provider pinning
-[ ] branch_history lists branches and stable tool refs
-[ ] branch_history reopens one tool action/observation
-[ ] branch_history pages a task transcript
-[ ] history uses only current event/checkpoint artifacts
-[ ] prompt components are named and DSPy-ready
-[ ] architecture/reference/how-to/evaluation docs agree with source
-[ ] fast and slow CI suites pass
-[ ] final remote main SHA is independently fetched and verified
+Given high delegation overhead and a small local edit
+When the model chooses the next action
+Then it continues locally unless independent information or critical-path gain
+justifies the child
+```
+
+### A10 — crash recovery
+
+```text
+Given a worker dies after a safe checkpoint and before terminal result
+When the branch is recovered
+Then accepted artifact/context state is restored
+And open obligations and stale verification are represented correctly
+```
+
+## 15. Definition of done
+
+```text
+[ ] one canonical BranchState reducer and vocabulary
+[ ] deterministic bounded SituationFrame before every normal model action
+[ ] inspect_state, branch_history, and repo_query wired and bounded
+[ ] explicit model-originated child context/placement policy
+[ ] evidence-linked current claims, decisions, obligations, and verification
+[ ] versioned bounded ResultCapsule
+[ ] semantic/artifact/verification joins cannot diverge
+[ ] model-visible ResourceEnvelope with unknown-safe semantics
+[ ] model and operator projections agree at one watermark
+[ ] held-out evaluation proves non-inferior correctness and lower waste
+[ ] long soak and fault injection preserve cognitive and artifact state
+[ ] source, schemas, prompts, tests, UI, reference docs, and plan agree
 ```

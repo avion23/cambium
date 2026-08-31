@@ -1,258 +1,367 @@
 # agents.md — Cambium operating contract
 
-Read this file before work. Use source, tests, and recorded commands for
-current behavior. Do not infer implementation from a role name or a draft.
+Read this before changing the repository. Use the task request, current source,
+executable tests, durable records, and accepted Git state as authority. A role
+name, README claim, design target, old review, branch name, or green test count
+is not proof that a runtime path is wired.
 
-## Development mode
+## 1. Orient before acting
 
-This repository is under active development. KISS is the default. Implement
-only what the task asks for. Unless the task explicitly requests it:
+Start every task with a small situation note:
 
-- Do not add gates, approval systems, admission controls, containment,
-  sandboxes, retries, fallbacks, readiness checks, or production hardening.
-- Do not add hashes, checksums, signatures, provenance records, attestations,
-  evidence artifacts, accounting, or observability systems.
-- Do not add environment, dependency, credential, platform, configuration,
-  input, or schema validation unless the task explicitly requests it. Preserve
-  existing boundary validation.
-- Do not add tests for unrequested behavior. Prefer one scenario test for the
-  requested path when a change affects behavior.
-- Do not add abstractions, configuration options, compatibility layers, or new
-  modules when direct code is sufficient.
-- Do not treat security, deployment, packaging, observability, performance, or
-  production-readiness findings as implementation scope. They are notes.
-- Reviewers may report findings, but findings do not become tasks unless the
-  request asks for them.
-- A successful direct source run is sufficient acceptance unless the task
-  defines additional criteria.
-- Preserve existing repository-integrity checks. Do not introduce new policy
-  checks.
-
-## Authority and workflow
-
-Authority order is: task request; this contract; source and tests. Start at
-route registration, command tables, and imports. Trace callers and tests. A
-failed name search is not proof of absence.
-
-- Keep the requested file scope. Report any required expansion before editing.
-- Work in an isolated worktree. Children do not merge branches; the root
-  integrates, verifies, and cleans up.
-- Reproduce before changing code. Remove the cause; do not mask it with a
-  fallback, retry, default, or catch-all. Preserve protocol, schema, worktree,
-  and module boundaries.
-- Use adversarial review for consequential changes. Report exact commands,
-  working directories, exit statuses, and observed evidence.
-- Do not force-push, rewrite shared history, reset another worktree, or delete
-  work to hide a failure. Secrets stay in the environment and never in task
-  specs, events, logs, or commits.
-
-## Run
-
-Cambium is a Python-native multi-agent coding-agent harness run directly from
-source. Development runs use `PYTHONPATH=src`; installation is not required
-for development. The published package/CI install path remains the README
-quickstart (`pip install -e .`). Use `uv` only for environment setup; direct
-runs and the commands below use the system interpreter.
-
-```sh
-cd /home/ubuntu/cambium
-PYTHONPATH=src python3.14 -m cambium.cli supervisor --session-dir demo --demo
-PYTHONPATH=src python3.14 -m cambium.cli --help
+```text
+objective       what observable outcome is requested
+done_when       exact completion and verification criteria
+authority       files/modules/branches you may change
+current_truth   current branch/head and relevant live entry points
+unknowns        facts that still require source or executable evidence
+next_evidence   cheapest action that can resolve the largest uncertainty
 ```
 
-The `cambium` CLI exposes `auth`, `supervisor`, `doctor`, `bench`,
-`module-test`, `version`, `run`, `repl`, `tui`, `monitor`, `quota`, `optimize`,
-`session`, and `architectus`
-(`session list/latest/show/status/resume/usage` reads or resumes session
-artifacts); prefer it over the internal supervisor module. Supervisor runs
-require `--plan`, `--task-spec`, or `--demo` alongside `--session-dir`.
-Context reuse is on by default for operator-facing commands and has no public
-disable flag.
-Worker subprocesses receive an absolute `PYTHONPATH` to the source tree, so
-child imports resolve without an install.
-Root `conftest.py` exports `src` on `PYTHONPATH` so scenario subprocesses
-import `cambium` without a manual export.
+Then trace one complete live path before editing:
 
-### Provider auth modes
+```text
+public command/API/schema
+    -> dispatcher/caller
+    -> owning module
+    -> effect boundary
+    -> durable result/event
+    -> scenario tests
+```
 
-Provider entries carry a tagged `auth`/`protocol` mode in `providers.json`
-(`src/cambium/provider_config.py`). The legacy `api_key` + `chat_completions`
-pair is unchanged and still requires `base_url`/`api_key_env`; `codex_chatgpt`
-is pinned to the `CODEX_CHATGPT_PROFILE` module constants, requires protocol
-`codex_responses`, and rejects `base_url`/`api_key_env` in the file so a
-modified provider file can never redirect the bearer token.
+A failed name search is not proof of absence. Check imports, registries, schemas,
+entry points, and tests. When docs and source disagree, state the disagreement;
+do not silently choose the more attractive story.
 
-The `codex_responses` transport (`src/cambium/diffundo.py`) posts the
-Responses-API shape to the profile endpoint, streams SSE `output_text` deltas,
-and maps errors to retryable / CONFIG-quarantine / refusal classes. The bearer
-token and ChatGPT account id come from an injected `CredentialSource` only
-(absent -> AUTH_ERROR fail-closed); optional `reasoning_effort` (codex entry
-sets "max") rides the request body.
+For system-level work, read in this order:
 
-### Usage evidence
+1. [`docs/architecture/agent-operating-model.md`](docs/architecture/agent-operating-model.md)
+2. [`docs/architecture/architecture.md`](docs/architecture/architecture.md)
+3. [`implementation-plan.md`](implementation-plan.md)
+4. the focused subsystem document and source/tests
 
-`supervisor.run_plan` resolves un-pinned provider tasks (`model_candidates`)
-at admission from the usage-debt ledger (`DebtStore`,
-`~/.config/cambium/routing-state.json`) and presets the worker's Diffundo
-primary to the assigned provider.
+## 2. Authority order
 
-Provider lanes (H1): one concurrency lane per provider
-(`routing.LaneState`); `run_plan` pre-assigns each wave's un-pinned tasks in
-one batch pass, and 429 pressure decays a lane's in-flight cap.
+```text
+1. explicit user task and constraints
+2. this operating contract
+3. accepted current source and tests
+4. current architecture/reference documents
+5. implementation plan for open work
+6. research and historical reviews
+```
 
-Capability/quality-constrained selection (H2): a task may declare
-`requirements` (`quality` high/normal, optional `min_context_window`); the
-supervisor then filters providers strictly by capability and picks the lowest
-`routing.score_providers` score (utilization, cache-hit rate, latency, shadow
-price) instead of `select_lane`, and the `task_assigned` event carries the
-requirements. Unknown requirement keys fail closed.
+Source is not automatically correct, but it is the current executable fact.
+Target documents explain where it should go. Do not report target behavior as
+landed.
 
-`scripts/usage_evidence.py` aggregates durable per-call usage events
-across session stores (positional session dirs and/or `--repo <path>`,
-which globs `.cambium/sessions/*`) into per-provider routing evidence:
-request counts, tokens, latency, cost, provider-reported cache-hit
-rate, prompt-prefix stability, Retry-After, request-rate status,
-failure reasons, and quota owners (`--json` for machine-readable
-output). Sessions without usage events are skipped; missing event DBs
-warn and exit 0.
+## 3. System model
 
-## Eval isolation
+Cambium is one linked control system, not a bag of utilities:
 
-`scripts/isolated_eval.sh --repo <path> [--eval module-test|bench|pytest|all]
-[--worktree <path>] [--bench-root <path>]` snapshots a repository's committed
-state with `git clone --shared`, makes the copy read-only (ro bind mount when
-permitted, `chmod -R a-w` fallback), and runs the eval from that copy with the
-cambium venv interpreter, so the suite never executes inside a mutable agent
-worktree and working-tree tampering cannot reach the eval. Results go to
-stdout and to a file under /tmp; the source repo is never written.
+```text
+repository/providers/operator intent
+        -> tools/workers/transports/merge
+        -> events/checkpoints/Git/quota
+        -> CAST/artifact/provider views
+        -> canonical BranchState          target integration layer
+        -> model SituationFrame + TUI
+        -> agent/supervisor decisions
+        -> evaluation and policy promotion
+```
 
-## Current entry points and behavior
+Keep these identities separate:
 
-- `supervisor.run_plan` validates a flat task list, starts one runtime, and
-  fans tasks out under an `asyncio.TaskGroup`. It creates `store.EventStore`
-  and writes `.cambium/result.json`. A clean worker whose envelope reports
-  `succeeded` with a commit publishes that commit by an expected-old update of
-  `refs/heads/main`. A provider-backed task that changed no files completes
-  successfully with a conversational/read-only answer: no commit is made and
-  nothing is merged or published — no empty commit or merge occurs. There is
-  no task-command pre-merge gate: a succeeded envelope with a commit proceeds
-  to merge only after the repository-integrity checks pass (worker success
-  integrity, fencing, expected-old ref publication, session admission,
-  worktree confinement, protocol/request correlation, and quarantine).
-  Publication is ref-only; it does not refresh a checkout.
-- Operator-facing one-shot and supervisor entry points enable context reuse by
-  default. Internal callers may pass `context_reuse=False` for targeted legacy
-  or compatibility paths; absent wire fields still fail closed in workers.
-- Rolling transcript compaction is the default policy within context reuse.
-  The supervisor forwards the policy on the existing worker init message. A
-  fold creates and activates the next immutable context epoch, updates the
-  supervisor's fork metadata, and leaves every prior epoch byte-exact.
-- Each worker is a process group in a Git worktree. Its stdout is NDJSON only;
-  diagnostics use stderr/logging. The supervisor bounds each worker's decoded
-  stdout queue and routes emitted records through `EventStore`.
-- Dynamic secret registration: `Redactor.register_secret(value)` adds an
-  exact value to the replacement set at any time (thread-safe, idempotent),
-  so OAuth tokens rotated mid-session are redacted by later calls without
-  rebuilding the session redactor. `sanitize_oauth_document` returns a copy
-  of an OAuth document with token fields replaced by `<redacted>` and
-  `account_id` reduced to a SHA-256 fingerprint (first 8 hex chars); OAuth
-  field names (`access_token`, `refresh_token`, `id_token`,
-  `authorization_code`, `code_verifier`, `device_auth_id`, `user_code`) are
-  structured secret names redacted in JSON-looking text.
-- Warm worker pool (eval-3 ADOPT): the supervisor can keep a bounded
-  session-scoped pool of idle reuse-ready workers and rebind them to new
-  worktrees via a full second init instead of spawning a fresh interpreter
-  per task. The pool is opt-in: `--warm-pool-size N` (default 0, disabled);
-  the `CAMBIUM_WARM_POOL_SIZE` environment variable is not read. Only the
-  first generation of a task may pop the pool; restarts always spawn fresh;
-  pooled workers are killed at session end. A pooled worker only serves a
-  task whose env matches (session, provider config, credentials) and rebuilds
-  all per-task state (agent loop, transcripts, tool state, LM clients) from
-  the rebind init.
-- `worker.do_work` selects deterministic marker mode unless `fanout_config` is
-  present. Provider mode runs the bounded `Diffundo` loop: one provider call
-  per turn, strict `tool_call`/`finish` parsing, schema and permission checks,
-  tool events, checkpoints, and one fenced commit when the agent changed
-  files. A provider task that changed no files completes successfully with a
-  conversational/read-only answer and no commit; its summary is carried in the
-  result and the rendered output. The deterministic marker worker always
-  writes its marker and commits.
-- Worker-exposed `run_shell` and inspection-only `git_op` run without an
-  `ApprovalGate` or `CompileGate`; mutating Git operations are not
-  worker-exposed. `approval.py` and `resources.py` are deleted.
-- `tasktree.build_tree` validates dependency specs. `run_plan` builds a plan
-  that carries `depends_on` into one validated `TaskTree` and dispatches
-  static ready-node waves (width-bounded admission; a failed node cascades so
-  descendants are never spawned); a flat plan (no `depends_on`) keeps the
-  one-`TaskGroup` fan-out. `run_plan` accepts an optional `architectus`
-  decision port (an `ArchitectusCore` or an `aggregate`/`step` adapter) and a
-  `conversations` flag that opens `ConversationStore` at
-  `<session-dir>/.cambium/conversations.db`; `cambium supervisor
-  --conversations` exposes the flag on the CLI, and `cambium architectus`
-  runs one live or scripted Architectus decision session directly.
-- `cambium.oauth` provides Codex
-  ChatGPT-subscription OAuth: a hardened per-provider `OAuthStore`
-  (`~/.local/share/cambium/oauth.json`, 0700 dir/0600 file, fail-closed
-  corruption with explicit `repair()`), a flock'd `TokenManager` refresh
-  transaction with a persistent per-provider lock file, the device flow
-  (`DeviceFlow`), and `import_codex_cli_session` for the codex CLI's
-  existing `~/.codex/auth.json` session. It reuses auth.py's hardening
-  primitives and never stores the id_token or email.
-- OAuth wiring: `run_plan` preflights codex_chatgpt tasks against the LOCAL
-  oauth store (present + unexpired-or-refreshable; no network probe), and each
-  worker spawn injects `CAMBIUM_OAUTH_ACCESS_<PROVIDER>`/`CAMBIUM_OAUTH_ACCOUNT_<PROVIDER>`
-  from the supervisor's `TokenManager` — never the refresh token — registering
-  the access token with the session redactor. `cambium auth oauth` manages the
-  session (device flow, `--status`, `--logout`, `--import-codex-cli`);
-  `cambium doctor --oauth-live` is an opt-in live refresh/reachability probe
-  that consumes quota and never makes a model call.
+```text
+task tree
+conversation branch
+Git artifact graph
+provider-cache lineage
+semantic/epistemic projection
+```
 
-- `doctor` reports runtime, worktree, provider/auth, optional stores, dataset
-  integrity, advisory host health, and (opt-in `--oauth-live`) Codex OAuth
-  refreshability and issuer reachability.
+The root and every child use the same branch abstraction. The model proposes
+intent. The supervisor owns admission, provider lease, process lifecycle,
+children, budgets, join, publication, and recovery. Git owns artifact identity;
+provider responses own cache-hit evidence; tests own only the checks they
+actually ran at a particular artifact state.
 
-## Boundary invariants
+## 4. Development mode
 
-- IPC framing is bounded and correlated by `request_id` (generation is not
-  enforced for message correlation). Malformed lines that fail JSON parsing are
-  counted and skipped up to a bound; a valid JSON line that is not an object is
-  counted and skipped the same way (never fails supervision). Fatal framing,
-  missing correlated results, non-zero exits, and deadline failures fail or
-  restart the task according to the boundary policy.
-- A merge conflict, non-fast-forward, stale expected-old ref, or quarantine
-  violation never publishes `main`.
-- A provider-backed task may complete successfully with a conversational/
-  read-only answer and no file/commit; no empty commit or merge occurs. An
-  edit task still commits once and merges normally; the marker worker always
-  writes its marker and commits.
-- Provider keys are allowlisted environment values. Never put credentials or
-  sensitive content in task specs, event payloads, or durable artifacts.
-- Keep blocking disk and subprocess I/O at existing thread/process boundaries.
+KISS is the default. Implement only the requested behavior and the minimum
+support needed to make it correct and reviewable.
 
-## Checks and handoff
+Unless the task explicitly requests it:
 
-Module tests are per-module data-in/data-out pairs: deterministic module
-input produces the expected module output, gated by `cambium module-test
-NAME` for the `example` and `should_review` modules. The scenario suite also
-covers process, git, persistence, and concurrency behavior. Run the narrowest
-real check, then the affected package check when a boundary changes. Useful
-system commands from the repository root:
+- do not add gates, approvals, sandboxes, retries, fallbacks, readiness checks,
+  or production-hardening systems;
+- do not add hashes, attestations, evidence stores, accounting, or observability
+  merely because they might be useful;
+- do not add environment, dependency, credential, platform, configuration,
+  input, or schema validation beyond preserving an existing boundary;
+- do not add abstractions, compatibility layers, options, or modules when a
+  direct change is sufficient;
+- do not turn review findings into implementation scope;
+- do not add broad interface tests; prefer one scenario that proves the changed
+  behavior through its live path;
+- do not micro-optimize Python before measuring a local bottleneck;
+- do not refactor unrelated code while repairing a concrete defect.
+
+When the task explicitly changes an architectural boundary, add the smallest
+value object/reducer/interface that gives that boundary one owner. Avoid a
+second scheduler, memory database, frontend state machine, or worker hierarchy.
+
+## 5. Change workflow
+
+### 5.1 Pull and establish the baseline
 
 ```sh
-PYTHONPATH=src python3.14 -m cambium.cli supervisor --session-dir demo
-python3.14 -m pytest -q src/cambium/modules/example/tests/
-python3.14 -m compileall src tests
+git status --short --branch
+git fetch --all --prune
+git rebase origin/main          # or the explicitly requested target branch
+git rev-parse HEAD
+git log -1 --oneline
+```
+
+Do not overwrite unrelated local work. Use an isolated branch/worktree for
+changes unless the task explicitly authorizes direct target-branch work.
+
+### 5.2 Reproduce or prove the gap
+
+For a bug, run the smallest real reproduction before editing. For a missing
+integration, trace the symbol from schema/entry point through dispatch and show
+where it stops. For documentation work, compare each implementation claim with
+the current source path.
+
+Record:
+
+```text
+command or source path
+working directory / branch / commit
+observed output or absence
+expected invariant
+```
+
+### 5.3 Change one owner
+
+Remove the cause at its owning boundary. Do not mask it with a default, catch-all,
+retry, duplicate state, or wrapper. Preserve protocol, schema, task-tree,
+worktree, provider, context, and publication ownership.
+
+### 5.4 Verify in layers
+
+```text
+syntax/static check
+    -> focused reproduction
+    -> affected scenario/module suite
+    -> combined integration check
+    -> full fast/slow gates when required
+```
+
+Inspect the diff before broad tests. A passing check is evidence only for the
+artifact/configuration it tested. Rerun overlapping checks after later edits.
+
+### 5.5 Commit and publish
+
+```sh
+git diff --check
+git status --short
+git diff --stat
+git diff --cached
+git commit -m "<focused message>"
+git push <remote> <requested-branch>
+git ls-remote <remote> refs/heads/<requested-branch>
+```
+
+Never claim a push, branch, tag, merge, or CI result without fetching the remote
+state. Do not force-push or rewrite shared history unless the user explicitly
+requires it and the expected old remote SHA is verified.
+
+## 6. Runtime entry points
+
+Prefer the public CLI over internal module entry points:
+
+```text
+auth
+supervisor
+doctor
+bench
+module-test
+version
+run
+repl
+tui
+monitor
+quota
+optimize
+session
+architectus
+```
+
+Typical development commands:
+
+```sh
 PYTHONPATH=src python3.14 -m cambium.cli --help
+PYTHONPATH=src python3.14 -m cambium.cli supervisor --session-dir demo --demo
+uv run cambium tui --repo . --auto
+uv run cambium doctor
+```
+
+Supervisor plans require a session directory and `--plan`, `--task-spec`, or
+`--demo`. Operator-facing context reuse is on by default.
+
+Current main flow:
+
+```text
+CLI/interactive/plan
+    -> supervisor.run_plan
+    -> task/provider admission
+    -> isolated worktree + worker process
+    -> worker provider/tool loop
+    -> checkpoint/result/exit events
+    -> integrity and join/publication
+    -> canonical result and cleanup/recovery
+```
+
+Current active model tools are:
+
+```text
+write_file
+edit_file
+git_op
+run_shell
+read_batch
+delegate
+```
+
+`branch_history.py`, `code_index.py`, and `lsp_query.py` are implemented library
+boundaries but are not yet in that active roster. Do not describe them as model
+capabilities until the schema, dispatch, prompt, provider-tool hash, and live
+scenario path are wired.
+
+## 7. Context and branch rules
+
+- The active context is a stable system/tool head, immutable CAST summary
+  entries, and a bounded raw tail.
+- A summary covers one disjoint raw range. Existing entries are immutable.
+- K0 is a bounded current-state materialization, not a second summary tier.
+- Exact cache reuse requires byte/identity compatibility; provider cache hits
+  come only from provider evidence.
+- Current supervisor source consumes declared child `context_mode` and
+  `placement`. The model schema still permits omission and automatic
+  exact/semantic resolution; treat this as a current compatibility gap, not an
+  implicit normative default.
+- A child cannot widen parent filesystem, tool, credential, or provider
+  authority.
+- Admission is durable before spawn. Child completion order does not determine
+  join order.
+- Semantic child result and Git artifact acceptance are separate. A parent may
+  resume with write authority only when its worktree matches the accepted
+  integration head.
+
+Use [`docs/architecture/context-engine.md`](docs/architecture/context-engine.md),
+[`docs/architecture/context-branches.md`](docs/architecture/context-branches.md),
+and [`docs/architecture/subagents.md`](docs/architecture/subagents.md) for the
+focused contracts.
+
+## 8. Provider and credential rules
+
+- Provider admission belongs to `routing.py`/supervisor; call-time attempts
+  belong to `diffundo.py`; quota/cache/lease values belong to
+  `provider_scheduler.py`; configuration belongs to `provider_config.py`.
+- Do not create another scheduler or let prompt prose select credentials.
+- Hard feasibility precedes ranking.
+- Missing credentials fail before worker spawn where possible.
+- Request rate, in-flight capacity, token windows, cash, wall time, and cache
+  state are separate dimensions.
+- OAuth refresh tokens remain in the supervisor-side store. Workers receive
+  only the access token/account identity needed for the assigned provider.
+- Secrets stay in approved environment/store boundaries and never enter task
+  specs, prompts, events, logs, tests, fixtures, or commits.
+- Redaction and terminal sanitization are boundary contracts; preserve them.
+
+Focused references:
+
+- [`docs/architecture/provider-routing.md`](docs/architecture/provider-routing.md)
+- [`docs/research/codex-activation.md`](docs/research/codex-activation.md)
+- `src/cambium/provider_config.py`
+- `src/cambium/oauth.py`
+- `src/cambium/auth.py`
+- `src/cambium/diffundo.py`
+
+## 9. Process, Git, and persistence invariants
+
+- Worker stdout is bounded NDJSON; diagnostics use stderr/log events.
+- Request IDs correlate protocol messages; generation tokens own effects.
+- Blocking disk/subprocess work stays at existing thread/process boundaries.
+- One worker generation owns at most one fenced commit.
+- A provider-backed read-only task may succeed without a commit; no empty commit
+  or merge is created.
+- A dirty, detached, wrong-branch, stale-base, conflicted, quarantined, or
+  envelope-inconsistent worker result is not published.
+- Publication is expected-old and ref-only. Do not reset a caller-owned primary
+  checkout to make it visually match.
+- Recovery preserves salvage and the last safe checkpoint; resume requires a
+  matching workspace identity.
+- Frontends and monitors derive state from durable records and do not mutate the
+  runtime directly.
+
+## 10. Testing guidance
+
+Run the narrowest real check first. Useful commands from the repository root:
+
+```sh
+uv run ruff check src tests
+uv run pytest -q tests/scenarios/<focused-file>.py
+uv run pytest -m "not slow" -q
+uv run pytest -m slow -q
+python3.14 -m compileall -q src tests
 git diff --check
 ```
 
-Before commit, inspect status and diff and stage only intended files. Before
-handoff, verify the worktree is clean. Every handoff states:
+Use the repository's locked/dev environment when available. Credential-gated
+acceptance tests may issue live calls and are separate from hermetic CI.
 
-- Scope and files in scope.
-- Authority and entry points read.
-- Baseline/reproduction command, cwd, and result.
-- Change and preserved boundary.
-- Checks with command, cwd, exit status, and evidence.
-- Status: `VERIFIED`, `UNVERIFIED`, or `BLOCKED`.
-- Next action.
+Scenario tests prove process, Git, persistence, concurrency, context, and
+provider boundaries. Module tests prove deterministic data-in/data-out logic.
+Do not test an interface merely for existing; test an externally meaningful
+state transition or invariant.
+
+## 11. Documentation work
+
+Documentation categories have distinct purposes:
+
+```text
+architecture     rationale, ownership, invariants, current/target boundary
+reference        exact public or target values
+how-to           recommended workflow
+research         hypotheses and evaluation
+implementation-plan ordered open work only
+```
+
+For an implemented claim, name the live source/test path. For target behavior,
+label it target. Remove stale source line numbers and branch-ledger prose rather
+than preserving a misleading history in active docs.
+
+When changing an enum, tool, prompt component, event, public state, or command,
+update all executable and documentary consumers in the same change.
+
+## 12. Handoff
+
+Every handoff states:
+
+```text
+scope and ownership
+base branch and starting SHA
+entry points/source/tests inspected
+baseline or reproduction and observed result
+changes and preserved invariants
+verification commands, cwd, exit status, and evidence
+commit SHA and remote branch
+independent remote verification
+status: VERIFIED | UNVERIFIED | BLOCKED
+remaining exact next action
+```
+
+Do not say “all tests pass,” “merged,” “pushed,” or “implemented” when the
+corresponding command or remote state was not observed.

@@ -1,68 +1,94 @@
 # Decompose work with context branches
 
-Use this guide when a root task or `plan.md` contains several separable
-problems. The exact schema is in
+**Status:** current policy guide with target inspection steps labelled. Exact
+current/target values are in
 [`../reference/context-branches.md`](../reference/context-branches.md).
+The complete agent decision loop is in
+[`agent-driving-loop.md`](agent-driving-loop.md).
 
 ## 1. Decide whether to stay in the current branch
 
 Continue locally when the next step:
 
-- depends on the current unsummarized tool result;
+- depends on the current unsummarized observation;
 - edits the same small ownership region;
-- takes fewer calls than a child would need to reconstruct and verify;
-- must be ordered before any other useful work.
+- can be answered by one direct tool call;
+- must complete before any other useful work;
+- would cost less than child context, spawn, join, and verification.
 
-Delegate when the work has an independent objective, ownership boundary, and
-definition of done.
+Delegate when the work has an independent objective, ownership boundary,
+definition of done, and enough expected benefit to repay coordination.
 
 ```text
-current step
+next work
    |
-   +-- tightly coupled / tiny ----------> continue
+   +-- coupled / tiny / one tool ----------> continue
    |
-   +-- separable and worth parallelism --> choose child policy
+   +-- separable and useful in parallel ---> choose child policy
 ```
 
-## 2. Choose the child policy
+## 2. Choose context separately from placement
 
-### Default: complete cached trunk
+### Exact full context: `trunk + inherit`
 
-Use this for most substantial children that need project/task context.
+Use when the child needs current project decisions, exact parent tail, or the
+complete compatible provider prefix.
 
 ```json
 {
   "type": "tool_call",
+  "calls": [{
+    "name": "delegate",
+    "arguments": {
+      "child_task_id": "implement-parser-window",
+      "kind": "feature",
+      "spec": {
+        "task": "Own src/parser.py and focused parser tests. Add bounded offset/limit reads. Do not edit provider routing. Done when the focused regression and existing parser scenarios pass.",
+        "context_mode": "trunk",
+        "placement": "inherit"
+      }
+    }
+  }]
+}
+```
+
+An explicit trunk request fails closed if the parent epoch is not exactly
+compatible. Use it for correctness, not merely because cache reuse sounds
+cheap.
+
+### Summary continuity on the same provider: `semantic + inherit`
+
+Use when accepted decisions/facts are enough but provider affinity is still
+valuable.
+
+```json
+{
   "name": "delegate",
   "arguments": {
-    "child_task_id": "implement-parser-window",
-    "kind": "feature",
+    "child_task_id": "document-routing-contract",
+    "kind": "docs",
     "spec": {
-      "task": "Own src/parser.py and focused parser tests. Add bounded offset/limit reads. Do not edit provider routing. Done when the new focused tests and existing parser scenarios pass.",
-      "context_mode": "trunk",
+      "task": "Own docs/architecture/provider-routing.md only. Align it to accepted source facts and report any unresolved discrepancy. Verify links and git diff --check.",
+      "context_mode": "semantic",
       "placement": "inherit"
     }
   }
 }
 ```
 
-Why: the full trunk is already small and information-dense; on the same
-provider its old prefix is usually the cheapest and most complete context.
+### Summary continuity on another lane: `semantic + spread`
 
-### Independent semantic child on another subscription
-
-Use this when the summaries contain enough state and the task can run in
-parallel on another feasible provider.
+Use for separable work when another provider may improve throughput, capacity,
+cost, or diversity.
 
 ```json
 {
-  "type": "tool_call",
   "name": "delegate",
   "arguments": {
     "child_task_id": "audit-tui-resize",
     "kind": "investigation",
     "spec": {
-      "task": "Inspect only TUI resize and narrow-terminal behavior. Own no production files. Produce concrete defects, reproducing tests, and recommended minimal fixes.",
+      "task": "Read-only audit of TUI resize and narrow-terminal behavior. Return concrete defects, exact evidence, reproductions, and no production edits.",
       "context_mode": "semantic",
       "placement": "spread",
       "model_candidates": ["model-a", "model-b"]
@@ -71,22 +97,22 @@ parallel on another feasible provider.
 }
 ```
 
-Why: summary continuity is enough, while provider spreading increases total
-throughput and consumes otherwise idle subscription capacity.
+Spread prefers another hard-feasible lane and falls back to the full feasible
+set. It does not bypass credentials, authorization, capability, quota, or cash
+constraints.
 
-### Fresh independent review
+### Independent review: `fresh + spread`
 
-Use this to avoid inherited assumptions.
+Use when inherited assumptions are a liability.
 
 ```json
 {
-  "type": "tool_call",
   "name": "delegate",
   "arguments": {
     "child_task_id": "blind-review-routing",
     "kind": "investigation",
     "spec": {
-      "task": "Review src/cambium/routing.py from first principles. Do not read parent conclusions. Report only defects supported by source or executable tests.",
+      "task": "Review src/cambium/routing.py from source and executable tests only. Do not rely on parent conclusions. Report claims with exact evidence and no edits.",
       "context_mode": "fresh",
       "placement": "spread"
     }
@@ -94,121 +120,165 @@ Use this to avoid inherited assumptions.
 }
 ```
 
-## 3. Split a large `plan.md`
+`fresh + inherit` is also valid when the same provider/model is required but the
+child must not inherit semantic assumptions.
 
-Suppose the plan contains:
+## 3. Assign ownership before parallelism
+
+Suppose a plan contains:
 
 ```text
-- add branch history reads
-- improve provider spreading
-- redesign TUI branch display
-- document the architecture
+wire history reads
+improve provider spreading
+redesign branch display
+update documentation
 ```
 
-Do not create four writers that all edit the same files. Assign ownership:
+Unsafe:
+
+```text
+four children may edit supervisor.py, schemas.py, README, and the same tests
+```
+
+Safer:
 
 ```text
 root
 ├── history-runtime
-│   owns: branch_history.py, tools.py, history tests
+│   owns: branch_history integration, tool schema/dispatch, focused tests
 ├── routing-review
-│   owns: child_policy.py, supervisor routing tests
+│   read-only: reports policy/routing defects to root
 ├── tui-review
-│   read-only: reports changes to root
+│   read-only: reports projection/layout changes
 └── documentation
-    owns: docs/context-branch documents
+    owns: named documents after source decisions are accepted
 ```
 
-A safe wave is:
+A useful sequence:
 
 ```text
-wave 1: history-runtime || routing-review || tui-review
-wave 2: root integrates findings and fixes overlap
-wave 3: documentation reflects the accepted implementation
-wave 4: root runs full verification
+wave 1  independent implementation/reviews
+wave 2  root integrates evidence and resolves overlap
+wave 3  one documentation owner updates accepted behavior
+wave 4  root runs combined verification
 ```
 
-The root should delegate `trunk+inherit` to a child that needs the complete
-architecture context. Use `semantic+spread` for a clearly bounded review or
-documentation task. Use `fresh+spread` for an independent second opinion.
+One writer owns a semantic area. Another child may review it without write
+authority. When two edits truly depend on one another, serialize them.
 
-## 4. Inspect a child after it returns
+## 4. Make the child task self-contained
 
-Start with the child's bounded result. Drill down only when necessary.
+A child task should state:
 
-### List branches
+```text
+objective
+owned files/symbols or read-only area
+forbidden scope
+observable done criteria
+verification/evidence required
+```
+
+Do not assume the child has the parent's hidden reasoning. Even a trunk child
+receives an explicit task message; semantic and fresh children need enough
+contract to work without the raw parent transcript.
+
+## 5. Interpret the child result correctly
+
+A child has two products:
+
+```text
+semantic result   claims/outcome for parent reasoning
+artifact result   commits that may be integrated
+```
+
+The parent must not treat a summary or `files_changed` list as proof that its
+worktree contains the child artifact. After an accepted code join, verify the
+parent worktree head and run the required combined-tree checks.
+
+Start from the bounded result. The target inspection ladder is:
+
+```text
+ResultCapsule
+    -> inspect_state(children)
+    -> branch_history branches/tools
+    -> one exact tool ref
+    -> bounded transcript window
+```
+
+Current wiring note: `branch_history.py` implements this projection, but it is
+not yet in the active worker tool roster. The JSON examples below become live
+model calls only after `implementation-plan.md` Phase 3 lands.
+
+### Target: list branches
 
 ```json
 {
-  "type":"tool_call",
-  "name":"branch_history",
-  "arguments":{"action":"branches"}
+  "name": "branch_history",
+  "arguments": {"action": "branches"}
 }
 ```
 
-### List one branch's calls
+### Target: list one branch's calls
 
 ```json
 {
-  "type":"tool_call",
-  "name":"branch_history",
-  "arguments":{"action":"tools","task_id":"routing-review","limit":20}
+  "name": "branch_history",
+  "arguments": {"action": "tools", "task_id": "routing-review", "limit": 20}
 }
 ```
 
-### Reopen the suspicious call
+### Target: reopen one call
 
 ```json
 {
-  "type":"tool_call",
-  "name":"branch_history",
-  "arguments":{"action":"tool","ref":"tool:routing-review:1:6"}
+  "name": "branch_history",
+  "arguments": {"action": "tool", "ref": "tool:routing-review:1:6:0"}
 }
 ```
 
-### Read a broader transcript window
+The final coordinate is the zero-based index within a batched tool action.
+Legacy references without it resolve to batch index zero.
+
+### Target: broader transcript window
 
 ```json
 {
-  "type":"tool_call",
-  "name":"branch_history",
-  "arguments":{
-    "action":"transcript",
-    "task_id":"routing-review",
-    "offset":12,
-    "limit":8
+  "name": "branch_history",
+  "arguments": {
+    "action": "transcript",
+    "task_id": "routing-review",
+    "offset": 12,
+    "limit": 8
   }
 }
 ```
 
-The returned detail becomes a normal tool observation at the end of the active
-request. It does not rewrite the cached trunk.
+A historical read appends a normal bounded observation. It never rewrites an
+old CAST entry or re-executes the tool.
 
-## 5. Promote a recovered conclusion
+## 6. Promote corrected knowledge
 
-Suppose a reopened test call shows that an earlier child summary was wrong.
-The root should:
-
-1. inspect the exact call and relevant transcript window;
-2. reproduce the result in the current accepted worktree if it affects code;
-3. state the corrected conclusion;
-4. let the normal semantic flush add `facts_invalidated` or
-   `decisions_superseded` and the new fact;
-5. keep the raw old branch unchanged.
+When exact history disproves a prior child or parent conclusion:
 
 ```text
-old branch evidence ----------- immutable
-             |
-             v
-branch_history read ----------- temporary suffix
-             |
-             v
-new verified conclusion ------- next trunk delta
+old evidence remains immutable
+        |
+        v
+reopen exact reference
+        |
+        v
+reproduce against current accepted artifact when relevant
+        |
+        v
+append fact invalidation / decision supersession / new obligation
 ```
 
-## 6. Recursive delegation
+Do not edit old summary text. Preserve the corrected conclusion and precise
+next action in the next semantic delta.
 
-A child can use the same rules:
+## 7. Recursive delegation
+
+The same rules apply at every depth:
 
 ```text
 root
@@ -217,36 +287,47 @@ root
         └── header-check  fresh + spread
 ```
 
-Each branch is bounded by the same supervisor depth, fan-out, token, wall, and
-join rules. There is no special “sub-main” class.
+Each branch remains bounded by task-tree depth/width, parent lifetime, resource
+budget, provider authority, isolated worktree, and ordered join rules.
 
-## 7. Common mistakes
+## 8. Common mistakes
 
 ### Delegating a tiny local edit
 
-The context/spawn/join overhead dominates. Continue locally.
+Spawn/context/join cost dominates. Continue locally.
 
-### Using semantic mode merely because another provider exists
+### Using semantic mode when raw tail matters
 
-Use it only when the child can work from summary state. Otherwise use the full
-trunk and preserve correctness.
+Semantic state cannot reconstruct omitted unsummarized detail. Use exact trunk
+or keep the step in the parent.
 
-### Asking `transcript` before `tool`
+### Using trunk only for hoped-for cache savings
 
-A whole transcript is usually much larger. List calls and reopen the exact one
-first.
+Exact compatibility is a hard requirement and the child remains coupled to the
+parent provider. Use it because complete state is needed.
 
-### Treating a child summary as artifact proof
+### Creating overlapping writers
 
-After child code changes, verify the accepted Git head and run combined-tree
-tests.
+Parallel execution does not help when the root must untangle conflicts and
+reverify both changes.
 
-### Writing retrieved history into the system prompt
+### Asking for a whole transcript first
 
-Do not rebuild the stable instruction prefix. The history tool already returns
-it as an ordinary suffix observation.
+Use the result, current state, and exact evidence refs before a broad transcript
+window.
 
-### Creating another memory/index database
+### Treating child verification as parent verification
 
-Do not. Branch history is reconstructed from existing event and checkpoint
-artifacts.
+A check run on the child head may be stale or incomplete after integration.
+Verify the accepted combined artifact.
+
+### Creating another memory database
+
+Do not. Branch history and current state are derived from existing events,
+checkpoints, CAST, and Git.
+
+### Relying on omitted policy fields
+
+Current source has an automatic compatibility path, but omission is not an
+agent-intuitive decision. Declare policy explicitly; the target contract will
+require it.
