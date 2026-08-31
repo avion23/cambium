@@ -2023,9 +2023,7 @@ def _normalize_tool_calls(action: Mapping[str, Any]) -> list[dict[str, Any]]:
                 errors.append(f"tool_call calls[{index}] must be an object")
                 continue
             if set(raw_call) != {"name", "arguments"}:
-                errors.append(
-                    f"tool_call calls[{index}] must carry exactly name/arguments"
-                )
+                errors.append(f"tool_call calls[{index}] must carry exactly name/arguments")
                 continue
             name = raw_call.get("name")
             arguments = raw_call.get("arguments")
@@ -3059,9 +3057,7 @@ def _native_tool_action(result: CallResult) -> dict[str, Any] | None:
                     f"provider native tool call {index} arguments are invalid JSON"
                 ) from exc
         if not isinstance(arguments, dict):
-            raise ValueError(
-                f"provider native tool call {index} arguments must be an object"
-            )
+            raise ValueError(f"provider native tool call {index} arguments must be an object")
         normalized.append({"name": name, "arguments": arguments})
     return {"type": "tool_call", "calls": normalized}
 
@@ -6371,9 +6367,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                         transcript,
                     )
                 break
-            tool_calls = (
-                _normalize_tool_calls(action) if action["type"] == "tool_call" else []
-            )
+            tool_calls = _normalize_tool_calls(action) if action["type"] == "tool_call" else []
             read_action = bool(tool_calls) and all(
                 call["name"] in _READ_TOOL_NAMES for call in tool_calls
             )
@@ -6702,9 +6696,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                 if any(denial is not None for denial in denials):
                     batch_messages: list[dict[str, Any]] = [action_message]
                     if trailing:
-                        batch_messages.append(
-                            {"role": "user", "content": _TRAILING_ACTION_NOTE}
-                        )
+                        batch_messages.append({"role": "user", "content": _TRAILING_ACTION_NOTE})
                     for denial in denials:
                         batch_messages.append(
                             {
@@ -6723,17 +6715,19 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                         transcript = _sync_context_transcript(
                             base_messages, context_continuation, transcript
                         )
-                    base_messages, context_continuation, transcript = (
-                        await _maybe_restore_turn_context(
-                            turn_checkpoint_resumed=turn_checkpoint_resumed,
-                            compaction_deferred=compaction_deferred,
-                            base_messages=base_messages,
-                            context_continuation=context_continuation,
-                            transcript=transcript,
-                            config=config,
-                            tools=tools,
-                            model_identity=model_identity,
-                        )
+                    (
+                        base_messages,
+                        context_continuation,
+                        transcript,
+                    ) = await _maybe_restore_turn_context(
+                        turn_checkpoint_resumed=turn_checkpoint_resumed,
+                        compaction_deferred=compaction_deferred,
+                        base_messages=base_messages,
+                        context_continuation=context_continuation,
+                        transcript=transcript,
+                        config=config,
+                        tools=tools,
+                        model_identity=model_identity,
                     )
                     (
                         finalized,
@@ -6762,9 +6756,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
 
                 batch_results: list[tuple[str, dict[str, Any], ToolResult]] = []
                 successful_delegate: dict[str, Any] | None = None
-                if not all(
-                    tool_call["name"] in _CONCURRENT_TOOL_NAMES for tool_call in tool_calls
-                ):
+                if not all(tool_call["name"] in _CONCURRENT_TOOL_NAMES for tool_call in tool_calls):
                     for tool_call in tool_calls:
                         name = tool_call["name"]
                         arguments = tool_call["arguments"]
@@ -6820,9 +6812,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                         try:
                             gathered = await asyncio.gather(
                                 *(
-                                    run_tool(
-                                        tool_call["name"], tool_call["arguments"], ctx
-                                    )
+                                    run_tool(tool_call["name"], tool_call["arguments"], ctx)
                                     for tool_call in tool_calls
                                 ),
                                 return_exceptions=True,
@@ -6877,17 +6867,15 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                         return _no_progress_failure(
                             outcome, no_progress_actions, turn, cumulative_usage, transcript
                         )
-                base_messages, context_continuation, transcript = (
-                    await _maybe_restore_turn_context(
-                        turn_checkpoint_resumed=turn_checkpoint_resumed,
-                        compaction_deferred=compaction_deferred,
-                        base_messages=base_messages,
-                        context_continuation=context_continuation,
-                        transcript=transcript,
-                        config=config,
-                        tools=tools,
-                        model_identity=model_identity,
-                    )
+                base_messages, context_continuation, transcript = await _maybe_restore_turn_context(
+                    turn_checkpoint_resumed=turn_checkpoint_resumed,
+                    compaction_deferred=compaction_deferred,
+                    base_messages=base_messages,
+                    context_continuation=context_continuation,
+                    transcript=transcript,
+                    config=config,
+                    tools=tools,
+                    model_identity=model_identity,
                 )
                 (
                     finalized,
