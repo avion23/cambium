@@ -5556,6 +5556,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
     compaction_deferred = False
     consecutive_compaction_deferrals = 0
     consecutive_invalid_actions = 0
+    final_synthesis_retry_used = False
     usage_epoch: int | None = None
     usage_fork_of: str | None = None
     first_turn = 1
@@ -5751,7 +5752,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
 
     wall_deadline = time.monotonic() + max(0.0, absolute_wall_deadline - time.time())
     try:
-        for turn in range(first_turn, config.max_turns + 2):
+        for turn in range(first_turn, config.max_turns + 3):
             progress.turn = turn
             progress.status = "working"
             final_synthesis_call = finalized
@@ -6105,7 +6106,22 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                         ),
                     },
                 ]
-                if base_messages is None:
+                if final_synthesis_call:
+                    invalid_messages[1]["content"] = _bounded_text(
+                        f"invalid action: {exc}. Reply with exactly ONE JSON object of "
+                        "this shape, and nothing else (no prose, no markdown): "
+                        '{"type":"finish","summary":"...","objective_met":true}',
+                        MAX_OBSERVATION_BYTES,
+                    )
+                    for invalid_message in invalid_messages:
+                        context_continuation, transcript = _append_context_message(
+                            invalid_message,
+                            base_messages,
+                            context_continuation,
+                            transcript,
+                            config,
+                        )
+                elif base_messages is None:
                     transcript.extend(invalid_messages)
                 else:
                     context_continuation.extend(invalid_messages)
@@ -6154,14 +6170,17 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                         },
                     )
                 if final_synthesis_call:
-                    return _loop_result(
-                        outcome,
-                        "failed",
-                        _phase_failure(f"invalid action: {exc}", final_synthesis=True),
-                        turn,
-                        cumulative_usage,
-                        transcript,
-                    )
+                    if final_synthesis_retry_used:
+                        return _loop_result(
+                            outcome,
+                            "failed",
+                            _phase_failure(f"invalid action: {exc}", final_synthesis=True),
+                            turn,
+                            cumulative_usage,
+                            transcript,
+                        )
+                    final_synthesis_retry_used = True
+                    continue
                 if consecutive_invalid_actions >= MAX_CONSECUTIVE_INVALID_ACTIONS:
                     return _loop_result(
                         outcome,
