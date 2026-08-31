@@ -59,9 +59,8 @@ obligation:<percent-encoded-task-id>:<sequence>
 verification:<percent-encoded-task-id>:<sequence>
 ```
 
-Tool batch index is zero-based. The current branch-history reader also accepts
-the legacy form without `:<batch-index>` and resolves it to index zero. New
-references should use the canonical five-part form.
+Tool batch index is zero-based. New history tooling must emit and accept the
+canonical five-part form; omission must not acquire compatibility semantics.
 
 A reference identifies evidence; it does not grant authority or re-execute an
 effect. Missing or stale references fail explicitly.
@@ -412,10 +411,12 @@ Target model-facing schema:
 }
 ```
 
-Portable actions use the bounded `code_index.py` implementation. Rich
-definition/reference/diagnostic actions may use the optional one-shot LSP
-boundary. An unavailable LSP returns an explicit unsupported result and may
-fall back only to a semantically equivalent portable query.
+Portable actions require a bounded repository-local implementation. Rich
+definition/reference/diagnostic actions may use an optional one-shot LSP
+boundary. Both must land with their schema, dispatcher, prompt, provider-tool
+hash, and live scenario; no standalone implementation is part of the current
+runtime. An unavailable LSP returns an explicit unsupported result and may fall
+back only to a semantically equivalent portable query.
 
 ## 11. Projection events
 

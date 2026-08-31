@@ -78,6 +78,9 @@ def test_subprocess_environment_rejects_credential_shaped_inheritance(
     assert environment["LC_ALL"] == "C"
     assert environment["GIT_TERMINAL_PROMPT"] == "0"
     assert environment["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert environment["GIT_CONFIG_COUNT"] == "1"
+    assert environment["GIT_CONFIG_KEY_0"] == "core.hooksPath"
+    assert environment["GIT_CONFIG_VALUE_0"] == "/dev/null"
     assert "HOME" not in environment
     assert environment["TMPDIR"] == "/host/tmp"
     assert environment["EMPTY_ALLOWED"] == ""
