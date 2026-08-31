@@ -147,10 +147,10 @@ execute bounded tools, append observations, checkpoint, repeat
 ```
 
 Current model tools are `write_file`, `edit_file`, `git_op`, `run_shell`,
-`read_batch`, and `delegate`. Implementations of branch history, bounded code
-indexing, and optional LSP queries exist but are not yet wired into this active
-roster. Target state/history/navigation tools are defined in
-[`../reference/agent-state.md`](../reference/agent-state.md).
+`read_batch`, and `delegate`. Branch history and repository navigation remain
+target capabilities; they have no current schema, dispatcher, or production
+implementation. Phase 3 must land each capability end to end rather than
+keeping standalone code that only its own tests consume.
 
 ### 5.3 Context loop
 
@@ -266,9 +266,9 @@ versions of the session.
 
 | Data | Writer | Reader | Mutation rule |
 | --- | --- | --- | --- |
-| event log | supervisor/worker through EventStore | replay, TUI, monitor, history, target BranchState | append only |
-| ordinary checkpoint | worker | restart/recovery/history | immutable file |
-| context epoch | worker, supervisor validates | fork/resume/CAST/history | immutable; successor epoch only |
+| event log | supervisor/worker through EventStore | replay, TUI, monitor, target history/BranchState | append only |
+| ordinary checkpoint | worker | restart/recovery, target history | immutable file |
+| context epoch | worker, supervisor validates | fork/resume/CAST, target history | immutable; successor epoch only |
 | interactive manifest | InteractiveSession single writer | reconnect/TUI | atomic replace after successful turn |
 | routing debt | usage-event fold | admission/doctor | transactional merge |
 | quota ledger | reservation owner | admission/operator | transactional reservation/reconcile |
@@ -286,40 +286,39 @@ src/cambium/
   tui_screen.py             deterministic rendering
   observability.py          current event-sourced operator projection
 
-  supervisor.py            task/worker/child lifecycle, admission, join, publication
-  worker.py                model/tool/context loop and checkpoints
-  tasktree.py              static/dynamic hierarchy bounds
-  merge.py                 ref-only serialized publication and recovery
-  fencing.py               generation authority
+  supervisor.py             task/worker/child lifecycle, admission, join, publication
+  worker.py                 model/tool/context loop and checkpoints
+  tasktree.py               static/dynamic hierarchy bounds
+  merge.py                  ref-only serialized publication and recovery
+  fencing.py                generation authority
 
-  prompts.py               current coding and summary prompt text
-  schemas.py               model action/tool schemas
-  tools.py                 active executable worker tools
-  branch_history.py        bounded history projection; wiring pending
-  code_index.py            bounded portable navigation; wiring pending
-  lsp_query.py             optional one-shot LSP boundary; wiring pending
+  prompts.py                current coding and summary prompt text
+  schemas.py                model action/tool schemas
+  tools.py                  active executable worker tools
 
-  summary_trunk.py         semantic deltas and K0 projection
-  context_policy.py        hard CAST bounds
-  child_policy.py          child context/placement values
-  conversations.py         optional raw conversation rows
+  summary_trunk.py          semantic deltas and K0 projection
+  context_policy.py         hard CAST bounds
+  child_policy.py           child context/placement values
+  conversations.py          optional raw conversation rows
 
-  routing.py               provider/model admission and usage debt
-  provider_scheduler.py    leases, cache/quota values and reservations
-  provider_config.py       provider capability/auth/protocol configuration
-  diffundo.py              call-time execution and failure handling
-  oauth.py / auth.py       credential stores and safe worker handoff
+  routing.py                provider/model admission and usage debt
+  provider_scheduler.py     leases, cache/quota values and reservations
+  provider_config.py        provider capability/auth/protocol configuration
+  diffundo.py               call-time execution and failure handling
+  oauth.py / auth.py        credential stores and safe worker handoff
 
-  store.py                 durable events
-  results.py               canonical terminal result
-  modules/                 optimizable decision modules
+  store.py                  durable events
+  results.py                canonical terminal result
+  modules/                  optimizable decision modules
 ```
 
-Target additions should remain small:
+Target additions should remain small and must land with a live consumer:
 
 ```text
 branch_state.py            pure canonical reducer/value objects
 situation.py               bounded SituationFrame projection
+branch_history             bounded durable-history tool
+repo_query                 bounded repository-navigation tool
 ```
 
 Names may change, but ownership must not spread across another scheduler or
