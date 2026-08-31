@@ -419,7 +419,7 @@ def _bounded_process_delta(raw: bytes) -> str:
         text = "\n".join(lines[-_PROCESS_PROGRESS_MAX_LINES:])
     encoded = text.encode("utf-8")
     if len(encoded) > _PROCESS_PROGRESS_MAX_BYTES:
-        text = encoded[-_PROCESS_PROGRESS_MAX_BYTES :].decode("utf-8", errors="ignore")
+        text = encoded[-_PROCESS_PROGRESS_MAX_BYTES:].decode("utf-8", errors="ignore")
     return text
 
 
@@ -881,8 +881,7 @@ def _read_batch_limit_errors(batch_size: int) -> tuple[str, ...]:
     if batch_size <= READ_BATCH_MAX_FILES:
         return ()
     return (
-        "read_batch batch rejected atomically: "
-        f"maximum {READ_BATCH_MAX_FILES} files per batch",
+        f"read_batch batch rejected atomically: maximum {READ_BATCH_MAX_FILES} files per batch",
     )
 
 

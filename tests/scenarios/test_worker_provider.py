@@ -734,8 +734,7 @@ def test_worker_dirty_after_unfenced_provider_commit_fails_and_main_unchanged(
         )
         _enqueue('{"type":"tool_call","name":"run_shell","arguments":{"cmd":["true"]}}')
         _enqueue(
-            '{"type":"finish","summary":"committed directly then edited",'
-            '"objective_met":true}'
+            '{"type":"finish","summary":"committed directly then edited","objective_met":true}'
         )
 
         session_dir = tmp_path / "session"
@@ -922,8 +921,7 @@ def test_worker_context_reuse_fork_resume_is_byte_exact(tmp_path, monkeypatch) -
             '{"type":"tool_call","name":"delegate","arguments":' + json.dumps(delegate_args) + "}"
         )
         _enqueue(
-            '{"type":"finish","summary":"child provider call completed",'
-            '"objective_met":true}',
+            '{"type":"finish","summary":"child provider call completed","objective_met":true}',
             usage=cache_hit_usage,
         )
         _enqueue(
@@ -1051,9 +1049,11 @@ def test_worker_context_reuse_fork_resume_is_byte_exact(tmp_path, monkeypatch) -
             assert isinstance(state_content, str)
             assert state_content.startswith("<cambium-loop-state>")
             assert state_content.endswith("</cambium-loop-state>")
-            state_fields = state_content.removeprefix(
-                "<cambium-loop-state>"
-            ).removesuffix("</cambium-loop-state>").split()
+            state_fields = (
+                state_content.removeprefix("<cambium-loop-state>")
+                .removesuffix("</cambium-loop-state>")
+                .split()
+            )
             assert dict(field.split("=", 1) for field in state_fields) == {
                 "budget": "100%",
                 "turn": str(expected_turn),
@@ -1107,8 +1107,7 @@ def test_worker_context_reuse_fork_resume_is_byte_exact(tmp_path, monkeypatch) -
         assert child_usage[0]["fork_of"] == checkpoint_ref
         assert child_usage[0]["provider_cache_hit"] is True
         assert (
-            child_usage[0]["prompt_prefix_bytes"]
-            == checkpoint["meta"]["cache_key"]["prefix_bytes"]
+            child_usage[0]["prompt_prefix_bytes"] == checkpoint["meta"]["cache_key"]["prefix_bytes"]
         )
         # The resumed action call is followed by the terminal summary call.
         assert parent_usage[-2]["epoch"] == 1
@@ -1578,9 +1577,7 @@ def test_worker_ipc_observability_tool_event_checkpoint_heartbeat(tmp_path) -> N
             '"new_string":"fixture\\n// provider-alpha\\n"}}'
         )
         _enqueue('{"type":"tool_call","name":"run_shell","arguments":{"cmd":["true"]}}')
-        _enqueue(
-            '{"type":"finish","summary":"read and edited target.txt","objective_met":true}'
-        )
+        _enqueue('{"type":"finish","summary":"read and edited target.txt","objective_met":true}')
         with REQUEST_LOCK:
             global RESPONSE_DELAY_S
             # 0.5s tool window vs the 0.05s heartbeat cadence: under load the
@@ -1656,8 +1653,7 @@ def test_run_shell_output_deltas_reach_supervisor_and_tui_rows(tmp_path, monkeyp
             sys.executable,
             "-u",
             "-c",
-            "import time; [print(f'delta-{i}', flush=True) or time.sleep(.02) "
-            "for i in range(20)]",
+            "import time; [print(f'delta-{i}', flush=True) or time.sleep(.02) for i in range(20)]",
         ]
         _enqueue(
             json.dumps(
@@ -1668,10 +1664,7 @@ def test_run_shell_output_deltas_reach_supervisor_and_tui_rows(tmp_path, monkeyp
                 }
             )
         )
-        _enqueue(
-            '{"type":"finish","summary":"observed command output",'
-            '"objective_met":true}'
-        )
+        _enqueue('{"type":"finish","summary":"observed command output","objective_met":true}')
 
         session_dir = tmp_path / "session"
         repo = session_dir / "repo"
@@ -1734,16 +1727,13 @@ def test_run_shell_output_deltas_reach_supervisor_and_tui_rows(tmp_path, monkeyp
         assert 2 <= len(deltas) < 20
         assert all(event["payload"]["tool"] == "run_shell" for event in deltas)
         assert all(event["payload"]["stream"] == "stdout" for event in deltas)
-        assert all(
-            len(event["payload"]["delta"].encode("utf-8")) <= 2048 for event in deltas
-        )
+        assert all(len(event["payload"]["delta"].encode("utf-8")) <= 2048 for event in deltas)
         timestamps = [event["payload"]["monotonic_ms"] for event in deltas]
         # Deltas must be chronological; exact spacing is not a contract because a
         # pending tail is legitimately flushed immediately before the next direct
         # emit. The 2 <= len(deltas) < 20 bound already proves the throttle works.
         assert all(
-            later >= earlier
-            for earlier, later in zip(timestamps, timestamps[1:], strict=False)
+            later >= earlier for earlier, later in zip(timestamps, timestamps[1:], strict=False)
         )
         joined_deltas = "".join(event["payload"]["delta"] for event in deltas)
         assert "delta-0" in joined_deltas
