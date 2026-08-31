@@ -2,8 +2,9 @@
 
 This module deliberately creates no memory, evidence, or index database.  It
 projects the event log and immutable checkpoint files that Cambium already
-writes.  Tool-call references include the task branch, worker generation, and
-turn, so a call can be listed globally and then reopened independently.
+writes.  Tool-call references include the task branch, worker generation, turn,
+and batch index, so a call can be listed globally and then reopened
+independently.
 
 The feature has no branch access-control model: every task in the current
 session is visible.  Bounds below are resource and response-shape limits, not
@@ -69,26 +70,32 @@ def branch_ref(task_id: str) -> str:
     return f"branch:{quote(task_id, safe='')}"
 
 
-def tool_ref(task_id: str, generation: int, turn: int) -> str:
+def tool_ref(task_id: str, generation: int, turn: int, batch_index: int = 0) -> str:
     """Stable reference for one tool call on one LLM branch."""
-    return f"tool:{quote(task_id, safe='')}:{generation}:{turn}"
+    return f"tool:{quote(task_id, safe='')}:{generation}:{turn}:{batch_index}"
 
 
-def _parse_tool_ref(value: Any) -> tuple[str, int, int]:
+def _parse_tool_ref(value: Any) -> tuple[str, int, int, int, bool]:
     if not isinstance(value, str):
         raise BranchHistoryError("branch_history action=tool requires ref")
     parts = value.split(":")
-    if len(parts) != 4 or parts[0] != "tool":
-        raise BranchHistoryError("tool ref must be tool:<task>:<generation>:<turn>")
+    if len(parts) not in (4, 5) or parts[0] != "tool":
+        raise BranchHistoryError("tool ref must be tool:<task>:<generation>:<turn>[:<index>]")
+    legacy = len(parts) == 4
     try:
         task_id = unquote(parts[1])
         generation = int(parts[2])
         turn = int(parts[3])
+        batch_index = int(parts[4]) if not legacy else 0
     except ValueError:
-        raise BranchHistoryError("tool ref generation and turn must be integers") from None
-    if not task_id or generation < 0 or turn < 1:
-        raise BranchHistoryError("tool ref contains an invalid task, generation, or turn")
-    return task_id, generation, turn
+        raise BranchHistoryError(
+            "tool ref generation, turn, and index must be integers"
+        ) from None
+    if not task_id or generation < 0 or turn < 1 or batch_index < 0:
+        raise BranchHistoryError(
+            "tool ref contains an invalid task, generation, turn, or index"
+        )
+    return task_id, generation, turn, batch_index, legacy
 
 
 def _positive_limit(value: Any, default: int = 20) -> int:
@@ -256,13 +263,14 @@ def _tool_events(events: Sequence[_Event], task_id: str | None) -> list[_Event]:
     ]
 
 
-def _tool_identity(event: _Event) -> tuple[str, int, int]:
+def _tool_identity(event: _Event) -> tuple[str, int, int, int]:
     if event.task_id is None:
         raise BranchHistoryError("tool event has no task branch")
     return (
         event.task_id,
         _int(event.payload, "generation"),
         _int(event.payload, "turn"),
+        _int(event.payload, "batch_index"),
     )
 
 
@@ -272,11 +280,11 @@ def _list_tools(
     rows = _tool_events(events, task_id)
     lines = [f"tool_calls={len(rows)}"]
     for event in rows:
-        branch, generation, turn = _tool_identity(event)
+        branch, generation, turn, batch_index = _tool_identity(event)
         lines.append(
             " ".join(
                 (
-                    tool_ref(branch, generation, turn),
+                    tool_ref(branch, generation, turn, batch_index),
                     f"branch={branch_ref(branch)}",
                     f"tool={event.payload.get('tool', '-')}",
                     f"ok={str(bool(event.payload.get('ok'))).lower()}",
@@ -349,7 +357,9 @@ def _checkpoint_event(
     return matches[-1] if matches else None
 
 
-def _extract_tool_exchange(messages: Sequence[Mapping[str, str]], tool: str) -> tuple[str, str]:
+def _extract_tool_exchange(
+    messages: Sequence[Mapping[str, str]], tool: str, batch_index: int = 0
+) -> tuple[str, str]:
     for index in range(len(messages) - 1, -1, -1):
         message = messages[index]
         if message.get("role") != "assistant":
@@ -361,21 +371,36 @@ def _extract_tool_exchange(messages: Sequence[Mapping[str, str]], tool: str) -> 
             continue
         if not isinstance(action, Mapping) or action.get("type") != "tool_call":
             continue
-        if action.get("name") != tool:
+        calls = action.get("calls") if "calls" in action else [action]
+        if not isinstance(calls, list) or batch_index >= len(calls):
+            continue
+        selected_call = calls[batch_index]
+        if not isinstance(selected_call, Mapping) or selected_call.get("name") != tool:
             continue
         observation = ""
-        if index + 1 < len(messages) and messages[index + 1].get("role") == "user":
-            observation = messages[index + 1].get("content", "")
+        observation_count = 0
+        for candidate in messages[index + 1 :]:
+            if candidate.get("role") == "assistant":
+                break
+            if candidate.get("role") != "user":
+                continue
+            candidate_content = candidate.get("content", "")
+            if not candidate_content.startswith("tool "):
+                continue
+            if observation_count == batch_index:
+                observation = candidate_content
+                break
+            observation_count += 1
         return content, observation
     return "", ""
 
 
 def _read_tool(events: Sequence[_Event], ref: Any) -> str:
-    task_id, generation, turn = _parse_tool_ref(ref)
+    task_id, generation, turn, batch_index, _legacy = _parse_tool_ref(ref)
     matches = [
         event
         for event in _tool_events(events, task_id)
-        if _tool_identity(event) == (task_id, generation, turn)
+        if _tool_identity(event) == (task_id, generation, turn, batch_index)
     ]
     if not matches:
         raise BranchHistoryError(f"tool call not found: {ref}")
@@ -384,7 +409,8 @@ def _read_tool(events: Sequence[_Event], ref: Any) -> str:
     tool_name = tool if isinstance(tool, str) else "unknown"
     lines = [
         str(ref),
-        f"branch={branch_ref(task_id)} generation={generation} turn={turn}",
+        f"branch={branch_ref(task_id)} generation={generation} turn={turn} "
+        f"batch_index={batch_index}",
         f"tool={tool_name} ok={str(bool(event.payload.get('ok'))).lower()} ",
         f"cmd={event.payload.get('cmd', '-')}",
     ]
@@ -393,7 +419,7 @@ def _read_tool(events: Sequence[_Event], ref: Any) -> str:
         state_ref = checkpoint.payload.get("state_ref")
         if isinstance(state_ref, str):
             messages = _checkpoint_messages(Path(state_ref).expanduser().resolve())
-            action, observation = _extract_tool_exchange(messages, tool_name)
+            action, observation = _extract_tool_exchange(messages, tool_name, batch_index)
             if action:
                 lines.extend(("assistant_action:", _bounded(action, MAX_MESSAGE_BYTES)))
             if observation:
@@ -420,8 +446,12 @@ def _latest_transcript(
 
 def query_branch_history(session_dir: Path | str, arguments: Mapping[str, Any]) -> str:
     """Execute one bounded branch-history query against existing artifacts."""
+    action_value = arguments.get("action")
+    if not isinstance(action_value, str):
+        choices = ", ".join(action.value for action in HistoryAction)
+        raise BranchHistoryError(f"action must be one of: {choices}")
     try:
-        action = HistoryAction(arguments.get("action"))
+        action = HistoryAction(action_value)
     except (TypeError, ValueError):
         choices = ", ".join(action.value for action in HistoryAction)
         raise BranchHistoryError(f"action must be one of: {choices}") from None

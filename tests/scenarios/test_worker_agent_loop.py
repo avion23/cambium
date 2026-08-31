@@ -1029,6 +1029,143 @@ def test_batched_tool_calls_keep_order_and_deny_atomically(tmp_path: Path) -> No
     }
 
 
+def test_cancellation_mid_batch_persists_remaining_calls_as_unexecuted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    worktree = _make_worktree(repo)
+    checkpoint_root = tmp_path / "checkpoints"
+    config = _agent_config(worktree, checkpoint_root=checkpoint_root)
+    stop = threading.Event()
+    calls: list[str] = []
+
+    async def run_tool(name: str, _arguments: dict[str, Any], _ctx: Any) -> worker.ToolResult:
+        calls.append(name)
+        stop.set()
+        return worker.ToolResult(ok=True, output="first result", duration_ms=1)
+
+    monkeypatch.setattr(worker, "run_tool", run_tool)
+    router = _ScriptedRouter(
+        [
+            json.dumps(
+                {
+                    "type": "tool_call",
+                    "calls": [
+                        {"name": "write_file", "arguments": {"path": "one", "content": "1"}},
+                        {"name": "write_file", "arguments": {"path": "two", "content": "2"}},
+                        {"name": "run_shell", "arguments": {"cmd": ["echo", "three"]}},
+                    ],
+                }
+            )
+        ]
+    )
+    writer = _FakeWriter()
+
+    outcome = asyncio.run(
+        worker._run_agent_loop(
+            config=config,
+            router=router,  # type: ignore[arg-type]
+            tier=ProviderTier.FAST,
+            model="loopback-model",
+            worktree=worktree,
+            writer=writer,  # type: ignore[arg-type]
+            stop=stop,
+            progress=worker.AgentProgress(),
+        )
+    )
+
+    assert outcome["status"] == "cancelled"
+    assert outcome["turn"] == 0
+    assert calls == ["write_file"]
+    assert [message["content"] for message in outcome["transcript"][-3:]] == [
+        "tool write_file ok=True\nfirst result",
+        "not executed: batch cancelled",
+        "not executed: batch cancelled",
+    ]
+    checkpoint = checkpoint_root / "loop-agent" / "turn-001.json"
+    assert checkpoint.exists()
+    persisted = json.loads(checkpoint.read_text(encoding="utf-8"))
+    assert persisted["transcript"] == outcome["transcript"]
+    tool_events = [message for message in writer.messages() if message["type"] == "tool_event"]
+    assert len(tool_events) == 1
+    assert tool_events[0]["batch_index"] == 0
+
+
+def test_restore_hashes_a_read_batch_as_one_joined_result() -> None:
+    action = {
+        "type": "tool_call",
+        "calls": [
+            {"name": "read_batch", "arguments": {"paths": ["alpha.txt"]}},
+            {"name": "read_batch", "arguments": {"paths": ["beta.txt"]}},
+        ],
+    }
+    result_contents = ["--- alpha.txt ---\nalpha", "--- beta.txt ---\nbeta"]
+    live = worker._ProgressDetector(max_no_progress_actions=2, progress_window=3)
+    live.observe(action=action, result_content="\n".join(result_contents))
+
+    restored = worker._ProgressDetector(max_no_progress_actions=2, progress_window=3)
+    restored.restore(
+        [
+            worker._canonical_action_message(action),
+            {"role": "user", "content": worker._TRAILING_ACTION_NOTE},
+            *(
+                {
+                    "role": "user",
+                    "content": f"tool read_batch ok=True\n{result_content}",
+                }
+                for result_content in result_contents
+            ),
+        ]
+    )
+
+    assert len(live._recent_content_hashes) == 1
+    assert list(restored._recent_content_hashes) == list(live._recent_content_hashes)
+
+
+def test_tool_call_batch_cap_rejects_text_and_native_actions(tmp_path: Path) -> None:
+    calls = [
+        {"name": "read_batch", "arguments": {"paths": [f"file-{index}.txt"]}}
+        for index in range(worker.MAX_TOOL_CALLS_PER_BATCH + 4)
+    ]
+    action_text = json.dumps({"type": "tool_call", "calls": calls})
+    with pytest.raises(
+        ValueError,
+        match=r"tool_call calls\[20\] exceeds the maximum of 16 calls per batch",
+    ):
+        worker._parse_agent_action(action_text)
+
+    native_result = _FakeCallResult("")
+    native_result.tool_calls = [
+        {"function": {"name": call["name"], "arguments": json.dumps(call["arguments"])} }
+        for call in calls
+    ]
+    native_results = [native_result] * 3
+
+    async def native_call(*_args: Any, **_kwargs: Any) -> _FakeCallResult:
+        return native_results.pop(0)
+
+    router = SimpleNamespace(call=native_call, declared_model=lambda _name: "")
+    worktree = _make_worktree(tmp_path / "repo")
+    outcome = asyncio.run(
+        worker._run_agent_loop(
+            config=_agent_config(worktree),
+            router=router,
+            tier=ProviderTier.FAST,
+            model="loopback-model",
+            worktree=worktree,
+            writer=None,
+            stop=threading.Event(),
+            progress=worker.AgentProgress(),
+        )
+    )
+
+    assert outcome["status"] == "failed"
+    assert outcome["failure_reason"] == "agent emitted 3 consecutive invalid actions"
+    assert "tool_call calls[20] exceeds the maximum of 16 calls per batch" in "\n".join(
+        message["content"] for message in outcome["transcript"]
+    )
+
+
 def test_exposed_tool_schemas_offer_batch_reading_only(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     worktree = _make_worktree(repo)

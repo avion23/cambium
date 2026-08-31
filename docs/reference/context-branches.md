@@ -120,8 +120,8 @@ Example result:
 
 ```text
 tool_calls=2
-tool:routing:1:2 branch=branch:routing tool=read_batch ok=true duration_ms=7 cmd=read_batch {...}
-tool:routing:1:3 branch=branch:routing tool=run_shell ok=true duration_ms=91 cmd=python -m pytest ...
+tool:routing:1:2:0 branch=branch:routing tool=read_batch ok=true duration_ms=7 cmd=read_batch {...}
+tool:routing:1:3:0 branch=branch:routing tool=run_shell ok=true duration_ms=91 cmd=python -m pytest ...
 ```
 
 #### `tool`
@@ -136,11 +136,11 @@ checkpoint is available.
 Example result:
 
 ```text
-tool:routing:1:2
-branch=branch:routing generation=1 turn=2
+tool:routing:1:2:0
+branch=branch:routing generation=1 turn=2 batch_index=0
 tool=read_batch ok=true
 assistant_action:
-{"type":"tool_call","name":"read_batch","arguments":{"paths":["src/routing.py"]}}
+{"type":"tool_call","calls":[{"name":"read_batch","arguments":{"paths":["src/routing.py"]}}]}
 tool_observation:
 tool read_batch ok=True
 ...
@@ -176,18 +176,21 @@ branch:<percent-encoded-task-id>
 
 ```text
 tool:<percent-encoded-task-id>:<generation>:<turn>
+tool:<percent-encoded-task-id>:<generation>:<turn>:<batch-index>
 ```
 
 Examples:
 
 ```text
 branch:review-routing
-tool:review-routing:1:7
-tool:parser%3Awindows:2:11
+tool:review-routing:1:7:0
+tool:parser%3Awindows:2:11:0
 ```
 
 Generation is part of the identity because a restarted worker can repeat the
-same logical turn number.
+same logical turn number. The batch index is zero-based. The legacy
+three-part form without a batch index remains accepted and resolves to index
+zero; events written before batch indexes existed are treated the same way.
 
 ## Source data
 

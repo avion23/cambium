@@ -214,6 +214,7 @@ DEFAULT_MAX_TOKENS = 200_000
 DEFAULT_MAX_WALL_S = 3600.0
 CHECKPOINT_SCHEMA = 1
 MAX_ACTION_CONTENT_BYTES = 16 * 1024
+MAX_TOOL_CALLS_PER_BATCH = 16
 MAX_OBSERVATION_BYTES = 64 * 1024
 MAX_CMD_BYTES = 512
 MAX_TRANSCRIPT_CHARS = 120_000
@@ -2016,6 +2017,11 @@ def _normalize_tool_calls(action: Mapping[str, Any]) -> list[dict[str, Any]]:
             raise ValueError("tool_call calls must be an array")
         if not raw_calls:
             raise ValueError("tool_call calls must be a non-empty array")
+        if len(raw_calls) > MAX_TOOL_CALLS_PER_BATCH:
+            raise ValueError(
+                f"tool_call calls[{len(raw_calls)}] exceeds the maximum of "
+                f"{MAX_TOOL_CALLS_PER_BATCH} calls per batch"
+            )
         normalized: list[dict[str, Any]] = []
         errors: list[str] = []
         for index, raw_call in enumerate(raw_calls):
@@ -3059,7 +3065,7 @@ def _native_tool_action(result: CallResult) -> dict[str, Any] | None:
         if not isinstance(arguments, dict):
             raise ValueError(f"provider native tool call {index} arguments must be an object")
         normalized.append({"name": name, "arguments": arguments})
-    return {"type": "tool_call", "calls": normalized}
+    return {"type": "tool_call", "calls": _normalize_tool_calls({"calls": normalized})}
 
 
 def _bind_router_provider(router: Any, result: CallResult, task_id: str) -> None:
@@ -3217,33 +3223,49 @@ class _ProgressDetector:
     def restore(self, messages: Sequence[Mapping[str, Any]]) -> None:
         """Seed recent assistant signatures from a resumed checkpoint."""
         pending_read_results = 0
+        pending_read_expected = 0
+        pending_read_bodies: list[str] = []
         for message in messages:
             if message.get("role") == "user" and pending_read_results:
                 content = message.get("content")
-                if isinstance(content, str):
-                    _, separator, result = content.partition("\n")
-                    self._recent_content_hashes.append(
-                        _progress_content_hash(result if separator else content)
-                    )
+                if not isinstance(content, str):
+                    continue
+                header, separator, result = content.partition("\n")
+                if not header.startswith("tool "):
+                    continue
+                pending_read_bodies.append(result if separator else "")
                 pending_read_results -= 1
+                if pending_read_results == 0:
+                    if len(pending_read_bodies) == pending_read_expected:
+                        self._recent_content_hashes.append(
+                            _progress_content_hash("\n".join(pending_read_bodies))
+                        )
+                    pending_read_expected = 0
+                    pending_read_bodies = []
                 continue
             if message.get("role") != "assistant":
                 continue
             content = message.get("content")
             if not isinstance(content, str):
                 pending_read_results = 0
+                pending_read_expected = 0
+                pending_read_bodies = []
                 continue
             try:
                 action = _parse_agent_action(content)
             except ValueError:
                 signature = _progress_signature(content)
                 pending_read_results = 0
+                pending_read_expected = 0
+                pending_read_bodies = []
             else:
                 signature = _progress_signature(None, action=action)
                 try:
                     tool_calls = _normalize_tool_calls(action)
                 except ValueError:
                     pending_read_results = 0
+                    pending_read_expected = 0
+                    pending_read_bodies = []
                 else:
                     pending_read_results = (
                         len(tool_calls)
@@ -3251,6 +3273,8 @@ class _ProgressDetector:
                         and all(call["name"] in _READ_TOOL_NAMES for call in tool_calls)
                         else 0
                     )
+                    pending_read_expected = pending_read_results
+                    pending_read_bodies = []
             if signature:
                 self._recent_signatures.append(signature)
 
@@ -3301,6 +3325,7 @@ async def _emit_tool_event(
     args: dict[str, Any],
     turn: int,
     tool_result: ToolResult,
+    batch_index: int = 0,
 ) -> None:
     await send(
         writer,
@@ -3311,6 +3336,7 @@ async def _emit_tool_event(
             "tool": name,
             "cmd": _safe_cmd(name, args),
             "turn": turn,
+            "batch_index": batch_index,
             "ok": bool(tool_result.ok),
             "duration_ms": int(tool_result.duration_ms),
         },
@@ -6756,8 +6782,18 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
 
                 batch_results: list[tuple[str, dict[str, Any], ToolResult]] = []
                 successful_delegate: dict[str, Any] | None = None
+                batch_cancelled = False
+                batch_deadline_exceeded = False
                 if not all(tool_call["name"] in _CONCURRENT_TOOL_NAMES for tool_call in tool_calls):
                     for tool_call in tool_calls:
+                        if stop.is_set():
+                            batch_cancelled = True
+                            progress.tool = None
+                            break
+                        if time.monotonic() >= wall_deadline:
+                            batch_deadline_exceeded = True
+                            progress.tool = None
+                            break
                         name = tool_call["name"]
                         arguments = tool_call["arguments"]
                         progress.tool = name
@@ -6846,6 +6882,16 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                     result_contents.append(result_content)
                     observation = {"role": "user", "content": _tool_observation(name, tool_result)}
                     batch_messages.append(observation)
+                if batch_cancelled:
+                    batch_messages.extend(
+                        {"role": "user", "content": "not executed: batch cancelled"}
+                        for _tool_call in tool_calls[len(batch_results) :]
+                    )
+                elif batch_deadline_exceeded:
+                    batch_messages.extend(
+                        {"role": "user", "content": "not executed: wall budget exceeded"}
+                        for _tool_call in tool_calls[len(batch_results) :]
+                    )
                 continuation_suffix = copy.deepcopy(batch_messages)
                 if base_messages is None:
                     transcript.extend(batch_messages)
@@ -6896,8 +6942,28 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                     finalization_grace_used=finalization_grace_used,
                 )
                 if writer is not None:
-                    for name, arguments, tool_result in batch_results:
-                        await _emit_tool_event(writer, config, name, arguments, turn, tool_result)
+                    for batch_index, (name, arguments, tool_result) in enumerate(batch_results):
+                        await _emit_tool_event(
+                            writer,
+                            config,
+                            name,
+                            arguments,
+                            turn,
+                            tool_result,
+                            batch_index=batch_index,
+                        )
+                        await _persist_checkpoint(
+                            writer,
+                            config,
+                            turn,
+                            transcript,
+                            cumulative_usage,
+                            [],
+                            compaction_deferred=compaction_deferred,
+                            consecutive_compaction_deferrals=consecutive_compaction_deferrals,
+                            code_changed=code_changed,
+                        )
+                    if batch_cancelled and not batch_results:
                         await _persist_checkpoint(
                             writer,
                             config,
@@ -6910,6 +6976,21 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                             code_changed=code_changed,
                         )
                     last_turn_checkpoint = turn
+                if batch_cancelled:
+                    return _loop_result(
+                        outcome, "cancelled", None, turn - 1, cumulative_usage, transcript
+                    )
+                if batch_deadline_exceeded:
+                    return _loop_result(
+                        outcome,
+                        "failed",
+                        _phase_failure(
+                            "wall budget exceeded", final_synthesis=final_synthesis_call
+                        ),
+                        turn,
+                        cumulative_usage,
+                        transcript,
+                    )
                 if config.context_reuse and successful_delegate is not None and not finalized:
                     batch_checkpoint: ContextCheckpoint | None = None
                     batch_checkpoint_was_emitted = False
