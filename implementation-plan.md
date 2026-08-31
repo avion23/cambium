@@ -196,6 +196,7 @@ Give the model the smallest accurate operating picture before every decision.
    ```text
    MISSION, AUTHORITY, ACCEPTED, DELTA, OPEN, CHILDREN, RESOURCES, ANCHORS
    ```
+
 2. Add explicit whole-frame and per-section byte/item caps. Truncation must name
    the omitted section and include an `inspect_state` continuation anchor.
 3. Build the frame immediately before each provider call from the latest
