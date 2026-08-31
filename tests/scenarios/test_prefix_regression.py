@@ -179,3 +179,39 @@ def test_action_set_accepts_any_allowed_class(tmp_path: Path) -> None:
         '"arguments":{"path":"README.md"}}',
     )
     assert result["passed"] is True
+
+
+def test_native_multi_tool_call_response_parses_as_batch(tmp_path: Path) -> None:
+    """A provider response with two native tool calls replays as one batch turn."""
+
+    session = _synthetic_session(tmp_path)
+    response = {
+        "choices": [
+            {
+                "message": {
+                    "tool_calls": [
+                        {
+                            "function": {
+                                "name": "git_op",
+                                "arguments": "{\"op\": \"status\"}",
+                            }
+                        },
+                        {
+                            "function": {
+                                "name": "read_batch",
+                                "arguments": "{\"paths\": [\"pyproject.toml\"]}",
+                            }
+                        },
+                    ]
+                }
+            }
+        ]
+    }
+    result = run_prefix_regression(
+        session,
+        1,
+        "tool_call",
+        transport=lambda _prompt: response,
+    )
+    assert result["passed"] is True
+    assert result["action_class"] == "tool_call"

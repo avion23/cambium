@@ -7,10 +7,10 @@ import asyncio
 import inspect
 import json
 import sys
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -125,7 +125,7 @@ def _turn(value: object) -> int | None:
 
 def _locate(
     session: Path, requested_turn: int, task_id: str | None
-) -> tuple[_Candidate, Path, list[Mapping[str, Any]], dict[str, str]]:
+) -> tuple[_Candidate, Path, Sequence[Mapping[str, Any]], Mapping[str, str]]:
     db, root = _root_paths(session)
     try:
         events = read_events_file(db)
@@ -153,13 +153,14 @@ def _locate(
         reference = payload.get("state_ref" if kind == "checkpoint" else "checkpoint_ref")
         if (checkpoint_turn := _turn(value)) is None or not isinstance(reference, str):
             continue
+        seq = event.get("seq")
         candidates.append(
             _Candidate(
                 checkpoint_turn,
                 "turn" if kind == "checkpoint" else "context",
                 reference,
                 _task_id(event, payload),
-                event.get("seq") if isinstance(event.get("seq"), int) else index,
+                seq if isinstance(seq, int) else index,
             )
         )
     if not candidates:
@@ -168,16 +169,19 @@ def _locate(
                 data = _json(path)
             except PrefixRegressionError:
                 continue
-            body = data.get("content") if isinstance(data.get("content"), Mapping) else data
-            meta = data.get("meta") if isinstance(data.get("meta"), Mapping) else {}
+            raw_body = data.get("content")
+            body = raw_body if isinstance(raw_body, Mapping) else data
+            raw_meta = data.get("meta")
+            meta = raw_meta if isinstance(raw_meta, Mapping) else {}
             checkpoint_turn = _turn(body.get("turn")) or _turn(meta.get("turn"))
             if checkpoint_turn is None:
                 continue
             kind = "context" if isinstance(body.get("provider_messages"), list) else "turn"
             checkpoint_task = body.get("task_id")
             if not isinstance(checkpoint_task, str):
-                meta = data.get("meta")
-                checkpoint_task = meta.get("task_id") if isinstance(meta, Mapping) else None
+                fallback_meta = data.get("meta")
+                meta = fallback_meta if isinstance(fallback_meta, Mapping) else {}
+                checkpoint_task = meta.get("task_id")
             candidates.append(
                 _Candidate(
                     checkpoint_turn,
@@ -239,8 +243,10 @@ def _provider_hint(
 
 
 def _body_and_meta(data: Mapping[str, Any]) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
-    body = data.get("content") if isinstance(data.get("content"), Mapping) else data
-    meta = data.get("meta") if isinstance(data.get("meta"), Mapping) else {}
+    raw_body = data.get("content")
+    body = raw_body if isinstance(raw_body, Mapping) else data
+    raw_meta = data.get("meta")
+    meta = raw_meta if isinstance(raw_meta, Mapping) else {}
     return body, meta
 
 
@@ -248,7 +254,8 @@ def _metadata(data: Mapping[str, Any]) -> dict[str, Any]:
     body, meta = _body_and_meta(data)
     cache = body.get("cache_key")
     if not isinstance(cache, Mapping):
-        cache = meta.get("cache_key") if isinstance(meta.get("cache_key"), Mapping) else {}
+        meta_cache = meta.get("cache_key")
+        cache = meta_cache if isinstance(meta_cache, Mapping) else {}
     task_id = body.get("task_id")
     if not isinstance(task_id, str):
         task_id = meta.get("task_id")
@@ -301,24 +308,25 @@ def _action(response: Any) -> str:
         else getattr(response, "tool_calls", None)
     )
     if calls:
-        if not isinstance(calls, Sequence) or isinstance(calls, str | bytes) or len(calls) != 1:
-            raise PrefixRegressionError("provider returned more than one native tool call")
-        function = calls[0].get("function") if isinstance(calls[0], Mapping) else None
-        if not isinstance(function, Mapping) or not isinstance(function.get("name"), str):
-            raise PrefixRegressionError("provider returned an invalid native tool call")
-        arguments = function.get("arguments", {})
-        if isinstance(arguments, str):
-            try:
-                arguments = json.loads(arguments)
-            except json.JSONDecodeError as exc:
-                raise PrefixRegressionError(
-                    "provider returned invalid native tool arguments"
-                ) from exc
-        if not isinstance(arguments, Mapping):
-            raise PrefixRegressionError("provider returned invalid native tool arguments")
-        return _strict_action(
-            {"type": "tool_call", "name": function["name"], "arguments": dict(arguments)}
-        )
+        if not isinstance(calls, Sequence) or isinstance(calls, str | bytes) or not calls:
+            raise PrefixRegressionError("provider returned invalid native tool calls")
+        normalized: list[dict[str, Any]] = []
+        for index, call in enumerate(calls):
+            function = call.get("function") if isinstance(call, Mapping) else None
+            if not isinstance(function, Mapping) or not isinstance(function.get("name"), str):
+                raise PrefixRegressionError("provider returned an invalid native tool call")
+            arguments = function.get("arguments", {})
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except json.JSONDecodeError as exc:
+                    raise PrefixRegressionError(
+                        "provider returned invalid native tool arguments"
+                    ) from exc
+            if not isinstance(arguments, Mapping):
+                raise PrefixRegressionError("provider returned invalid native tool arguments")
+            normalized.append({"name": function["name"], "arguments": dict(arguments)})
+        return _strict_action({"type": "tool_call", "calls": normalized})
     content = response
     if isinstance(response, Mapping):
         content = (
@@ -342,7 +350,8 @@ def _await(value: Any) -> Any:
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(value)
+        # isawaitable() cannot express the Coroutine subtype asyncio.run needs.
+        return asyncio.run(cast("Coroutine[Any, Any, Any]", value))
     raise PrefixRegressionError("async replay transport cannot run inside an event loop")
 
 
