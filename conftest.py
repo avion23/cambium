@@ -61,4 +61,7 @@ def _isolate_routing_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
     isolated = tmp_path / "routing-state.json"
     monkeypatch.setattr(cambium.routing, "DEFAULT_ROUTING_STATE_PATH", isolated)
+    # Subprocess supervisors inherit this, so scenario tests that spawn
+    # ``-m cambium.supervisor`` also stay off the real ledger.
+    monkeypatch.setenv("CAMBIUM_ROUTING_STATE", str(isolated))
     yield

@@ -322,7 +322,14 @@ class DebtStore:
     """
 
     def __init__(self, path: str | Path | None = None) -> None:
-        self._path = Path(path) if path is not None else DEFAULT_ROUTING_STATE_PATH
+        if path is not None:
+            self._path = Path(path)
+        else:
+            # CAMBIUM_ROUTING_STATE lets a parent process (e.g. the test
+            # conftest) redirect every descendant supervisor's ledger without
+            # touching each call site.
+            configured = os.environ.get("CAMBIUM_ROUTING_STATE", "")
+            self._path = Path(configured) if configured else DEFAULT_ROUTING_STATE_PATH
         self._debts: dict[str, ProviderDebt] = {}
         # ``_baseline_debts`` is the in-memory view loaded at session start;
         # ``_source_debts`` is the un-decayed on-disk snapshot used to tell an

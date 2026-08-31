@@ -309,7 +309,7 @@ def _action(response: Any) -> str:
         if not isinstance(calls, Sequence) or isinstance(calls, str | bytes) or not calls:
             raise PrefixRegressionError("provider returned invalid native tool calls")
         normalized: list[dict[str, Any]] = []
-        for index, call in enumerate(calls):
+        for call in calls:
             function = call.get("function") if isinstance(call, Mapping) else None
             if not isinstance(function, Mapping) or not isinstance(function.get("name"), str):
                 raise PrefixRegressionError("provider returned an invalid native tool call")
