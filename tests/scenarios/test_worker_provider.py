@@ -34,6 +34,7 @@ from cambium.tui_screen import Cockpit, Transcript
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKER = "cambium.worker"
+FAKE_WORKER = str(ROOT / "scripts" / "fake_worker.py")
 PROVIDER_KEY = "CAMBIUM_PROVIDER_LOOPBACK_PROVIDER_API_KEY"
 PROVIDER_SECRET = "loopback-provider-secret"
 TASK_TEXT = "Append a single marker line starting with '// provider-' to target.txt."
@@ -781,7 +782,7 @@ def test_worker_delegate_tool_proposes_and_admits_child(tmp_path, monkeypatch) -
     message from the agent loop (not from a plan-declared proposal), the
     supervisor buffers it and validates the revision at the root's terminal
     envelope, durably admits the child (``child_admitted``), and the child
-    runs on the deterministic marker path (``spawned`` for the child id).
+    runs on the fake worker path (``spawned`` for the child id).
     """
     _reset_server()
     server = _FakeOpenAIServer()
@@ -809,6 +810,7 @@ def test_worker_delegate_tool_proposes_and_admits_child(tmp_path, monkeypatch) -
                 "repo": str(repo),
                 "worktree_path": str(session_dir / "child-wt"),
                 "branch": "worker-provider-child",
+                "worker": FAKE_WORKER,
                 "target_file": "notes.txt",
                 "marker": "// provider-child",
                 "write_marker": True,

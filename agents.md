@@ -326,6 +326,11 @@ provider boundaries. Module tests prove deterministic data-in/data-out logic.
 Do not test an interface merely for existing; test an externally meaningful
 state transition or invariant.
 
+The live coding gate outranks synthetic suites: a task that changes the
+execution loop ends with `pytest -m acceptance tests/acceptance/test_live_coding_gate.py`
+run against a real provider, or the handoff is BLOCKED. A green marker-fixture
+or loopback run is never evidence that the harness codes.
+
 ## 11. Documentation work
 
 Documentation categories have distinct purposes:

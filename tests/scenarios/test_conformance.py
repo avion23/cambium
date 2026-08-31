@@ -36,6 +36,7 @@ EXPECTED_EVENT_COLUMNS = {
     "generation": "INTEGER",
     "request_id": "TEXT",
 }
+FAKE_WORKER = Path(__file__).resolve().parents[2] / "scripts" / "fake_worker.py"
 
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -78,8 +79,7 @@ def test_real_worker_result_correlates_and_exit_has_no_request_id(tmp_path: Path
         proc = await asyncio.create_subprocess_exec(
             sys.executable,
             "-u",
-            "-m",
-            "cambium.worker",
+            str(FAKE_WORKER),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,

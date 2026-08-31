@@ -345,12 +345,28 @@ def _interactive_history_dirs(session_dir: str | Path | None) -> tuple[Path, ...
     return tuple(path for _number, path in sorted(turns))
 
 
+def _as_int(value: Any, default: int) -> int:
+    """Convert an operator/config integer without raising on adjacent junk."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_float(value: object) -> float | None:
+    """Convert pre-validated numerics without raising on adjacent junk."""
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
 def _usage_count(value: object) -> float | None:
     """Return a finite non-negative usage count without trusting event data."""
     if isinstance(value, bool) or not isinstance(value, int | float):
         return None
-    number = float(value)
-    if not math.isfinite(number) or number < 0:
+    number = _as_float(value)
+    if number is None or not math.isfinite(number) or number < 0:
         return None
     return number
 
@@ -428,11 +444,15 @@ def _interactive_wall_budget_s(
     deadline that is merely their nominal generation time.
     """
     if config.max_wall_s is not None:
-        return float(config.max_wall_s)
+        explicit = _as_float(config.max_wall_s)
+        if explicit is not None:
+            return explicit
     if not config.interactive:
         return DEFAULT_WALL_BUDGET_S
     if config.interactive_wall_budget_s is not None:
-        return float(config.interactive_wall_budget_s)
+        interactive_budget = _as_float(config.interactive_wall_budget_s)
+        if interactive_budget is not None:
+            return interactive_budget
 
     selected_name = config.provider
     candidates = list(providers)
@@ -440,9 +460,10 @@ def _interactive_wall_budget_s(
         candidates = [item for item in candidates if getattr(item, "name", None) == selected_name]
 
     configured_budgets = [
-        float(value)
-        for value in (getattr(item, "interactive_wall_budget_s", None) for item in candidates)
-        if isinstance(value, int | float) and not isinstance(value, bool) and value > 0
+        converted
+        for item in candidates
+        for converted in (_as_float(getattr(item, "interactive_wall_budget_s", None)),)
+        if converted is not None and not isinstance(converted, bool) and converted > 0
     ]
     if configured_budgets:
         # An auto/cascade turn may be assigned to any authorized candidate;
@@ -455,9 +476,10 @@ def _interactive_wall_budget_s(
         model=config.model,
     )
     hints = [
-        float(value)
-        for value in (getattr(item, "throughput_hint_tps", 0.0) for item in candidates)
-        if isinstance(value, int | float) and not isinstance(value, bool) and value > 0
+        converted
+        for item in candidates
+        for converted in (_as_float(getattr(item, "throughput_hint_tps", 0.0)),)
+        if converted is not None and not isinstance(converted, bool) and converted > 0
     ]
     throughput = observed_rate
     if throughput is None and hints:
@@ -472,14 +494,13 @@ def _interactive_wall_budget_s(
         # default until measured evidence can refine it.
         return DEFAULT_INTERACTIVE_WALL_BUDGET_S
 
-    estimated_output = max(
-        DEFAULT_INTERACTIVE_ESTIMATED_OUTPUT_TOKENS,
-        observed_output,
-    )
-    estimated_output = min(float(config.max_tokens), estimated_output)
-    scaled = (
-        estimated_output / throughput * max(2.0, float(config.interactive_throughput_safety_factor))
-    )
+    # observed_output is float and the constant is int: max() is already float.
+    estimated_output = max(DEFAULT_INTERACTIVE_ESTIMATED_OUTPUT_TOKENS, observed_output)
+    max_tokens = _as_float(config.max_tokens)
+    if max_tokens is not None:
+        estimated_output = min(max_tokens, estimated_output)
+    safety = _as_float(config.interactive_throughput_safety_factor)
+    scaled = estimated_output / throughput * max(2.0, safety if safety is not None else 2.0)
     return max(DEFAULT_INTERACTIVE_WALL_BUDGET_S, scaled)
 
 
@@ -825,8 +846,8 @@ def build_plan(
         "worker": config.worker,
         "provider_env_keys": list(config.provider_env_keys),
         "max_wall_s": effective_wall_s,
-        "max_tokens": int(config.max_tokens),
-        "max_turns": int(config.max_turns),
+        "max_tokens": _as_int(config.max_tokens, DEFAULT_MAX_TOKENS),
+        "max_turns": _as_int(config.max_turns, DEFAULT_MAX_TURNS),
         "max_restarts": max_restarts,
         "routing_mode": config.routing_mode.value,
         "session_mode": config.session_mode.value,
@@ -852,6 +873,9 @@ def build_plan(
         spec["target_file"] = config.target_file
     if config.marker is not None:
         spec["marker"] = config.marker
+        # Marker one-shots have no provider: they explicitly opt into the
+        # protocol-fixture worker instead of the fail-closed real worker.
+        spec["worker"] = str(Path(__file__).resolve().parents[2] / "scripts" / "fake_worker.py")
     return {"tasks": [spec]}
 
 

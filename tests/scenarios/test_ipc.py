@@ -4,7 +4,7 @@ Framing tests exercise ``cambium.ipc.read_message`` against an in-memory
 ``asyncio.StreamReader`` (partial-line delivery, garbage skipping, the
 over-limit raise + resync, and the EOF partial-line discard rule).
 
-Worker tests spawn a real ``cambium.worker`` subprocess and drive it with a
+Worker tests spawn the shipped ``scripts/fake_worker.py`` subprocess and drive it with a
 scripted supervisor mock over stdio:
 
 - happy path: init -> ready (rid + generation echoed), run_task ->
@@ -56,6 +56,7 @@ DIFF_CAP_BYTES = 64 * 1024
 # stress-loop signal of the 20x regression test while making the drain
 # negligible.
 TEST_HEARTBEAT_INTERVAL_S = 0.02
+FAKE_WORKER = Path(__file__).resolve().parents[2] / "scripts" / "fake_worker.py"
 
 
 def test_write_message_rejects_oversized_frame_without_writing() -> None:
@@ -148,7 +149,7 @@ def _run_task_msg(session_dir: Path, *, run_rid: str, **overrides: object) -> di
 
 
 class WorkerSupervisor:
-    """Scripted supervisor side: drives one cambium.worker subprocess."""
+    """Scripted supervisor side: drives one fake-worker subprocess."""
 
     def __init__(self, env: dict[str, str] | None = None) -> None:
         self.proc: asyncio.subprocess.Process | None = None
@@ -177,8 +178,7 @@ class WorkerSupervisor:
         self.proc = await asyncio.create_subprocess_exec(
             sys.executable,
             "-u",
-            "-m",
-            "cambium.worker",
+            str(FAKE_WORKER),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -949,14 +949,7 @@ def test_stale_worker_never_mutates_newer_generations_staged_work(
 
     hook_started = tmp_path / "fence-block-started"
     hook_release = tmp_path / "fence-block-release"
-    allow_stale_detection = threading.Event()
-    real_validate = worker_module.validate_worker_generation
     real_fenced_git = worker_module._fenced_git
-
-    def controlled_validate(actual: int, generation: int) -> bool:
-        if generation == 1 and actual == 2:
-            return not allow_stale_detection.is_set()
-        return real_validate(actual, generation)
 
     def blocking_fenced_git(
         worktree: Path, generation: int, *args: str, cwd: str | Path | None = None
@@ -973,28 +966,40 @@ def test_stale_worker_never_mutates_newer_generations_staged_work(
             time.sleep(0.01)
         return real_fenced_git(worktree, generation, *args, cwd=cwd)
 
-    monkeypatch.setattr(worker_module, "validate_worker_generation", controlled_validate)
-    monkeypatch.setattr(worker_module, "_fenced_git", blocking_fenced_git)
     result_holder: list[dict] = []
+    (worktree / "hello.txt").write_text("hello from the ipc test\n" + MARKER + "\n")
+
     worker_thread = threading.Thread(
         target=lambda: result_holder.append(
-            asyncio.run(
-                worker_module.do_work(
-                    {
-                        "scratch_repo": str(scratch),
-                        "worktree_path": str(worktree),
-                        "target_file": "hello.txt",
-                        "marker": MARKER,
-                        "write_marker": True,
-                        "task_id": "stale-generation-1",
-                        "generation": 1,
-                    },
-                    threading.Event(),
-                )
+            worker_module._finalize_worktree(
+                run={"scratch_repo": str(scratch)},
+                config=worker_module.AgentConfig(
+                    task_id="stale-generation-1",
+                    generation=1,
+                    task="finalize staged work",
+                    worktree=worktree,
+                    base_commit=base,
+                    fanout_config={"tier": "fast", "model": "fixture"},
+                    max_turns=1,
+                    max_tokens=1,
+                    shell_permission=False,
+                    network_permission=False,
+                    heartbeat_interval_s=0.05,
+                    max_wall_s=5.0,
+                    checkpoint_root=None,
+                    context_reuse=False,
+                    requires_commit=True,
+                ),
+                worktree=worktree,
+                generation=1,
+                worker_identity="stale-generation-worker",
+                stop=threading.Event(),
+                loop_outcome={"summary": "fixture finalize"},
             )
         ),
         daemon=True,
     )
+    monkeypatch.setattr(worker_module, "_fenced_git", blocking_fenced_git)
     worker_thread.start()
     deadline = time.monotonic() + 5.0
     while not hook_started.exists() and time.monotonic() < deadline:
@@ -1020,7 +1025,6 @@ def test_stale_worker_never_mutates_newer_generations_staged_work(
         text=True,
     ).stdout.splitlines()
 
-    allow_stale_detection.set()
     hook_release.touch()
     worker_thread.join(timeout=5.0)
 

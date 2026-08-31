@@ -5,7 +5,7 @@ processes and rebinds them to new worktrees instead of spawning + importing a
 fresh interpreter per task (spawn-to-ready dominates per-task latency).
 
 Scenarios:
-  (a) worker rebind unit: one cambium.worker process serves TWO worktrees
+  (a) worker rebind unit: one fake worker process serves TWO worktrees
       sequentially with ``worker_reuse`` enabled — same PID (single spawn),
       both results correct, clean exit on stdin close.
   (b) supervisor pool: two sequential tasks in one run_plan session with
@@ -38,6 +38,7 @@ from cambium.supervisor import read_events, run_plan
 ROOT = Path(__file__).resolve().parents[2]
 MARKER = "// cambium-pool"
 HEARTBEAT_INTERVAL_S = 0.05
+FAKE_WORKER = ROOT / "scripts" / "fake_worker.py"
 
 
 def _make_repo(repo: Path, files: dict[str, str]) -> str:
@@ -92,7 +93,7 @@ def _marker_task(
         "repo": str(repo),
         "worktree_path": str(session_dir / worktree),
         "branch": branch,
-        "worker": "cambium.worker",
+        "worker": str(FAKE_WORKER),
         "target_file": target_file,
         "marker": marker,
         "write_marker": True,
@@ -127,7 +128,7 @@ def _pid_is_alive(pid: int) -> bool:
 
 
 def _worker_pids() -> list[int]:
-    """Pids of live processes whose command line names the cambium worker."""
+    """Pids of live processes whose command line names the fake worker."""
     pids: list[int] = []
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
@@ -136,7 +137,7 @@ def _worker_pids() -> list[int]:
             cmdline = (entry / "cmdline").read_bytes().decode("utf-8", "replace")
         except OSError:
             continue
-        if "cambium.worker" in cmdline:
+        if "fake_worker.py" in cmdline:
             pids.append(int(entry.name))
     return pids
 
@@ -147,7 +148,7 @@ def _worker_pids() -> list[int]:
 
 
 class _WorkerDriver:
-    """Scripted supervisor side driving one reuse-enabled cambium.worker."""
+    """Scripted supervisor side driving one reuse-enabled fake worker."""
 
     def __init__(self, cwd: Path) -> None:
         self.proc: asyncio.subprocess.Process | None = None
@@ -159,8 +160,7 @@ class _WorkerDriver:
         self.proc = await asyncio.create_subprocess_exec(
             sys.executable,
             "-u",
-            "-m",
-            "cambium.worker",
+            str(FAKE_WORKER),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,

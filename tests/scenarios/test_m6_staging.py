@@ -22,6 +22,7 @@ from cambium.provider_config import load_providers  # noqa: E402
 from cambium.supervisor import read_events, run_plan  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
+FAKE_WORKER = str(ROOT / "scripts" / "fake_worker.py")
 DECISION = "append marker line to file target.txt: // m6-llm-marker"
 STATIC_PREFIX = (
     "You are Cambium's deterministic coding worker.\n"
@@ -312,7 +313,7 @@ def test_m6_provider_decision_and_atomic_publish(tmp_path: Path, monkeypatch) ->
                     "repo": str(repo),
                     "worktree_path": str(worktree),
                     "branch": branch,
-                    "worker": "cambium.worker",
+                    "worker": FAKE_WORKER,
                     "target_file": target_file,
                     "marker": marker,
                     "write_marker": True,

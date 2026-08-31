@@ -45,3 +45,20 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
             continue
         if relative_path in _PROVIDER_TIMING_FILES:
             item.add_marker(pytest.mark.xdist_group("provider-timing"))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_routing_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Keep every test away from the developer's real routing-state ledger.
+
+    The DebtStore defaults to ``~/.config/cambium/routing-state.json``;
+    without this fixture, supervisor tests recorded hundreds of loopback
+    requests into the real ledger. Tests that exercise ledger persistence
+    pass their own explicit path and are unaffected.
+    """
+
+    import cambium.routing
+
+    isolated = tmp_path / "routing-state.json"
+    monkeypatch.setattr(cambium.routing, "DEFAULT_ROUTING_STATE_PATH", isolated)
+    yield

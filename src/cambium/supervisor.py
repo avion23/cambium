@@ -9111,10 +9111,12 @@ def _ensure_repo_initialized(repo: Path) -> None:
 
 
 def _builtin_demo_spec(session_dir: Path) -> dict[str, Any]:
-    """Built-in CLI demo: one cambium.worker task against a seeded repo."""
+    """Built-in CLI demo: one protocol-fixture task against a seeded repo."""
     return {
         "task_id": "demo-001",
-        "worker": "cambium.worker",
+        "worker": str(
+            Path(__file__).resolve().parents[2] / "scripts" / "fake_worker.py"
+        ),
         "repo": str(session_dir / "scratch"),
         "worktree_path": str(session_dir / "wt"),
         "branch": "wt-demo-001",

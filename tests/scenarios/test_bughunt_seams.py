@@ -291,7 +291,7 @@ def test_timeout_fallback_does_not_reclaim_a_recovered_old_provider(
         sibling.close()
 
 
-def test_empty_fanout_config_does_not_silently_select_marker_worker(tmp_path: Path) -> None:
+def test_missing_fanout_config_fails_closed_without_marker_worker(tmp_path: Path) -> None:
     repo, _unused_worktree, base = _repo_with_worktree(tmp_path)
     session_dir = tmp_path / "session"
     result = asyncio.run(
@@ -306,7 +306,6 @@ def test_empty_fanout_config_does_not_silently_select_marker_worker(tmp_path: Pa
                         "worktree_path": str(session_dir / "wt"),
                         "branch": "empty-fanout",
                         "base_commit": base,
-                        "fanout_config": {},
                         "target_file": "a.txt",
                         "marker": "// must not be marker mode",
                     }
@@ -316,6 +315,10 @@ def test_empty_fanout_config_does_not_silently_select_marker_worker(tmp_path: Pa
     )
 
     assert result.results[0].status == "failed"
+    assert result.results[0].reason == (
+        "task has no provider configuration (fanout_config); "
+        "the deterministic marker worker was removed"
+    )
 
 
 def test_rejected_child_is_not_left_as_a_queued_observability_lane() -> None:

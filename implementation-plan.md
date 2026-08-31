@@ -80,6 +80,13 @@ pure value/reducer
 Do not build a broad abstraction without one live consumer. Do not change prompt
 policy before the facts it relies on are deterministic and measurable.
 
+The live coding gate outranks every phase. `tests/acceptance/test_live_coding_gate.py`
+runs one real provider-backed coding task through `run_plan` and asserts the
+commit, the tool calls, and the durable usage events. Any phase that touches the
+execution loop ends with that gate run against a real provider; a phase whose
+only green evidence is synthetic (marker fixtures, loopback stubs) is BLOCKED,
+not done.
+
 ---
 
 ## Phase 0 — converge repository truth

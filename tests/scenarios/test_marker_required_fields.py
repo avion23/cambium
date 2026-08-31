@@ -1,12 +1,10 @@
-"""Scenario: a minimal flat plan (five required fields only) fails cleanly.
+"""Scenario: the fake worker validates a minimal task payload cleanly.
 
 The supervisor's ``_run_payload`` forwards ``target_file`` and ``marker`` as
-``None`` when a deterministic marker task omits them. ``_do_work_marker`` must
-reject that with a task-level error instead of crashing on
-``worktree / None`` (``TypeError: unsupported operand type(s) for /:
-'PosixPath' and 'NoneType'``). This drives the real ``cambium.worker`` over
-stdio with the exact payload shape ``_run_payload`` produces for a spec that
-has only task_id / task / repo / worktree_path / branch.
+``None`` when a marker fixture omits them. The shipped fake worker rejects
+that with a task-level error instead of crashing on ``worktree / None``.
+This drives the worker over stdio with the exact payload shape ``_run_payload``
+produces for a spec that has only task_id / task / repo / worktree_path / branch.
 """
 
 from __future__ import annotations
@@ -21,14 +19,14 @@ from typing import cast
 from cambium.ipc import MAX_LINE_BYTES, read_message
 
 MARKER_ERROR = "marker task requires target_file and marker"
+FAKE_WORKER = Path(__file__).resolve().parents[2] / "scripts" / "fake_worker.py"
 
 
 async def _drive_worker(session_dir: Path) -> dict:
     proc = await asyncio.create_subprocess_exec(
         sys.executable,
         "-u",
-        "-m",
-        "cambium.worker",
+        str(FAKE_WORKER),
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,

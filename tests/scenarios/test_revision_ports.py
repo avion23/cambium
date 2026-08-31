@@ -46,6 +46,7 @@ TEST_RESOURCE_THRESHOLDS = {
     "load1_per_cpu": 1_000_000.0,
     "disk_free": 0,
 }
+FAKE_WORKER = str(Path(__file__).resolve().parents[2] / "scripts" / "fake_worker.py")
 
 
 def _make_repo(repo: Path, files: dict[str, str]) -> str:
@@ -84,7 +85,7 @@ def _task(
         "repo": str(repo),
         "worktree_path": str(session_dir / worktree),
         "branch": branch,
-        "worker": "cambium.worker",
+        "worker": FAKE_WORKER,
         "target_file": target_file,
         "marker": marker,
         "write_marker": True,

@@ -1742,8 +1742,11 @@ def test_run_task_drain_uses_config_heartbeat_interval(tmp_path: Path) -> None:
     outcome = asyncio.run(_run())
     elapsed = time.monotonic() - started
 
-    assert outcome["status"] == "failed"  # invalid generation fails fast
-    assert outcome["failure_reason"] == "invalid worker generation"
+    assert outcome["status"] == "failed"  # fail-closed tasks fail fast
+    assert outcome["failure_reason"] == (
+        "task has no provider configuration (fanout_config); "
+        "the deterministic marker worker was removed"
+    )
     # the old code waited HEARTBEAT_INTERVAL_S + 1.0 == 2.0s; the fixed code
     # drains as soon as the heartbeat observes the stop flag (~50ms).
     assert elapsed < 1.5

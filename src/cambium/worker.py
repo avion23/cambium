@@ -50,23 +50,16 @@ Defensive timeouts (worker self-protection if the supervisor dies):
       reason "idle", exit 0). No ``result_envelope`` is emitted for the
       aborted task — the supervisor is presumed gone.
 
-Task spec (the ``run_task`` body) is compatible with
-``scripts/fake_worker.py``'s task spec:
+Task spec (the ``run_task`` body) carries the task and worktree context:
 
     task_id         stable task id (echoed everywhere)
     scratch_repo    git repo the throwaway worktree is branched from
     worktree_path   where the throwaway worktree is created (must stay under
                     the scratch repo's parent — path safety)
     branch          name of the throwaway branch
-    target_file     file inside the worktree to edit (deterministic fallback;
-                    must not escape it)
-    marker          line appended to the target file (deterministic fallback)
-    write_marker    bool; false forces the task to fail
-    work_delay_s    optional float; pause before the edit (test hook so
-                    cancellation is observable)
 
-When ``init.fanout_config`` is present, the worker runs the provider-backed
-agent loop instead: it loads the provider file named by the worker's absolute
+The worker runs the provider-backed agent loop: it loads the provider file
+named by the worker's absolute
 ``CAMBIUM_PROVIDERS`` environment variable and iterates bounded
 ``Diffundo.call`` turns, each accepting exactly one JSON action:
 
@@ -914,12 +907,6 @@ def _require_generation(worktree: Path, generation: int) -> None:
             f"generation mismatch for {worktree}: worker={generation}, "
             "persisted generation is different or missing"
         )
-
-
-def _write_worktree_state(worktree: Path, generation: int, path: Path, content: str) -> None:
-    """Write worker state only while this process owns the current fence."""
-    _require_generation(worktree, generation)
-    path.write_text(content)
 
 
 def cap_diff(diff: str) -> tuple[str, bool]:
@@ -4625,161 +4612,6 @@ def _cumulative_provider_metadata(loop_outcome: dict[str, Any]) -> dict[str, Any
     return metadata
 
 
-def _do_work_marker(run: dict[str, Any], stop: threading.Event) -> dict[str, Any]:
-    """Execute one task: throwaway worktree, one-file edit, commit.
-
-    Returns the outcome dict:
-
-        status          "succeeded" | "failed" | "cancelled"
-        failure_reason  str | None (set when status != "succeeded")
-        commits         list[str] of SHAs produced
-        files_changed   list[str] of paths changed
-        diff            ``git diff <base_commit>..HEAD`` in the worktree,
-                        capped at ``MAX_DIFF_BYTES`` UTF-8 bytes
-        diff_truncated  bool; true when the diff was capped
-        summary         worker-authored, <= ``MAX_SUMMARY_CHARS``
-
-    Cooperative cancellation via ``stop``: the worker checks it between git
-    steps and reports status "cancelled" if it was set.
-    """
-    outcome: dict[str, Any] = {
-        "status": "failed",
-        "failure_reason": None,
-        "commits": [],
-        "files_changed": [],
-        "diff": "",
-        "diff_truncated": False,
-        "summary": "",
-    }
-    try:
-        scratch = Path(run["scratch_repo"]).resolve()
-        worktree = Path(run["worktree_path"]).resolve()
-        generation = run.get("generation")
-        if isinstance(generation, bool) or not isinstance(generation, int) or generation <= 0:
-            outcome["failure_reason"] = "invalid worker generation"
-            return outcome
-        raw_write_marker = run.get("write_marker", True)
-        if not isinstance(raw_write_marker, bool):
-            outcome["failure_reason"] = "write_marker must be a boolean"
-            return outcome
-        write_marker = raw_write_marker
-        provider_metadata: dict[str, Any] | None = None
-
-        target_file = run.get("target_file")
-        marker = run.get("marker")
-        if (
-            not isinstance(target_file, str)
-            or not target_file
-            or not isinstance(marker, str)
-            or not marker
-        ):
-            outcome["failure_reason"] = "marker task requires target_file and marker"
-            return outcome
-
-        session_root = scratch.parent
-        if not worktree.is_relative_to(session_root):
-            outcome["failure_reason"] = (
-                f"worktree_path {worktree} outside session scratch root {session_root}"
-            )
-            return outcome
-        target = (worktree / target_file).resolve()
-        if not target.is_relative_to(worktree):
-            outcome["failure_reason"] = f"target_file {target_file!r} escapes the worktree"
-            return outcome
-
-        def guarded_git(*args: str, cwd: str | Path | None = None) -> tuple[int, str, str]:
-            _require_generation(worktree, generation)
-            if args and args[0] in {"add", "commit"}:
-                return _fenced_git(worktree, generation, *args, cwd=cwd)
-            return git(*args, cwd=cwd)
-
-        _require_generation(worktree, generation)
-        base_ref = run.get("base_commit") or "HEAD"
-        rc, _out, err = guarded_git("rev-parse", str(base_ref), cwd=scratch)
-        if rc != 0:
-            outcome["failure_reason"] = f"cannot resolve base commit in scratch repo: {err}"
-            return outcome
-        base_commit = _out
-
-        if not worktree.exists():
-            outcome["failure_reason"] = f"worker worktree is missing: {worktree}"
-            return outcome
-        rc, _out, err = guarded_git("rev-parse", "HEAD", cwd=worktree)
-        if rc != 0:
-            outcome["failure_reason"] = f"cannot resolve worktree HEAD: {err}"
-            return outcome
-        worker_identity = secrets.token_hex(16)
-
-        # Optional work_delay_s pauses before the edit (testing hook); the
-        # pause polls ``stop`` so cancellation stays responsive.
-        delay = float(run.get("work_delay_s", 0.0) or 0.0)
-        deadline = time.monotonic() + delay
-        while time.monotonic() < deadline:
-            if stop.is_set():
-                outcome["status"] = "cancelled"
-                return outcome
-            time.sleep(min(0.05, deadline - time.monotonic()))
-
-        if stop.is_set():
-            outcome["status"] = "cancelled"
-            return outcome
-        _require_generation(worktree, generation)
-        if not write_marker:
-            outcome["failure_reason"] = "marker not written (write_marker=false)"
-            return outcome
-        if not target.exists():
-            outcome["failure_reason"] = f"target file missing: {target_file}"
-            return outcome
-        _require_generation(worktree, generation)
-        _write_worktree_state(
-            worktree,
-            generation,
-            target,
-            target.read_text().rstrip("\n") + "\n" + marker + "\n",
-        )
-        _require_generation(worktree, generation)
-        if marker not in target.read_text():
-            outcome["failure_reason"] = "edit missing: marker not present after write"
-            return outcome
-        if stop.is_set():
-            outcome["status"] = "cancelled"
-            return outcome
-
-        guarded_git("add", target_file, cwd=worktree)
-        rc, _out, err = guarded_git(
-            "commit",
-            "-m",
-            f"cambium-ipc: {run['task_id']}",
-            "-m",
-            f"Cambium-Worker-Generation: {generation}\nCambium-Worker-Identity: {worker_identity}",
-            cwd=worktree,
-        )
-        if rc != 0:
-            outcome["failure_reason"] = f"commit failed: {err}"
-            return outcome
-        _rc, sha, _err = guarded_git("rev-parse", "HEAD", cwd=worktree)
-        _rc, diff, _err = guarded_git("diff", f"{base_commit}..HEAD", cwd=worktree)
-        diff, diff_truncated = cap_diff(diff)
-        _require_generation(worktree, generation)
-        outcome.update(
-            status="succeeded",
-            failure_reason=None,
-            commits=[sha],
-            files_changed=[target_file],
-            diff=diff,
-            diff_truncated=diff_truncated,
-            summary=f"appended marker to {target_file}"[:MAX_SUMMARY_CHARS],
-            provider_metadata=provider_metadata,
-        )
-        return outcome
-    except GenerationFenceError as exc:
-        outcome["failure_reason"] = str(exc)
-        return outcome
-    except (OSError, subprocess.SubprocessError) as exc:
-        outcome["failure_reason"] = f"task crashed: {exc}"
-        return outcome
-
-
 async def do_work(
     run: dict[str, Any],
     stop: threading.Event,
@@ -4790,12 +4622,22 @@ async def do_work(
 ) -> dict[str, Any]:
     """Execute one task and return the outcome dict (result-envelope shape).
 
-    With no ``fanout_config`` this is the deterministic marker path
-    (``_do_work_marker``); provider-backed tasks run the bounded agent loop
-    and then ``_finalize_worktree``.
+    Tasks without ``fanout_config`` fail closed; provider-backed tasks run the
+    bounded agent loop and then ``_finalize_worktree``.
     """
     if _provider_fanout_config(run) is None:
-        return await asyncio.to_thread(_do_work_marker, run, stop)
+        return {
+            "status": "failed",
+            "failure_reason": (
+                "task has no provider configuration (fanout_config); "
+                "the deterministic marker worker was removed"
+            ),
+            "commits": [],
+            "files_changed": [],
+            "diff": "",
+            "diff_truncated": False,
+            "summary": "",
+        }
     if config is None:
         config = _config_from_run(run)
     if progress is None:

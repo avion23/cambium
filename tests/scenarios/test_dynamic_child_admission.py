@@ -28,6 +28,7 @@ import pytest
 from cambium.supervisor import read_events, run_plan
 
 ROOT = Path(__file__).resolve().parents[2]
+FAKE_WORKER = str(ROOT / "scripts" / "fake_worker.py")
 TEST_RESOURCE_THRESHOLDS = {
     "mem_available_frac": 0.0,
     "load1_per_cpu": 1_000_000.0,
@@ -75,7 +76,7 @@ def _task(
     branch: str,
     target_file: str,
     marker: str,
-    worker: str = "cambium.worker",
+    worker: str = FAKE_WORKER,
     **extra,
 ) -> dict:
     spec = {
