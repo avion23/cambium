@@ -133,8 +133,8 @@ unselected.
 
 ### Removed
 
-- Removed the repository's failing CI workflows; Cambium remains deliberately
-  CI-less and is verified through its local test and validation workflows.
+- Removed the repository's failing CI workflows; the current workflow set under
+  `.github/workflows/` was subsequently reintroduced.
 
 <!--
 Evidence trail for the unreleased entries (all hashes are commits reachable
