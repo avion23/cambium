@@ -218,9 +218,7 @@ def _messages(values: object, label: str, *, allow_empty: bool = False) -> list[
         raise PrefixRegressionError(f"checkpoint {label} is invalid: {exc}") from exc
 
 
-def _provider_hint(
-    events: Sequence[Mapping[str, Any]], candidate: _Candidate
-) -> dict[str, str]:
+def _provider_hint(events: Sequence[Mapping[str, Any]], candidate: _Candidate) -> dict[str, str]:
     """Recover provider identity for legacy turn checkpoints."""
     for event in reversed(events):
         if event.get("kind") != "usage_event":
@@ -439,8 +437,10 @@ def run_prefix_regression(
         "expected": list(expected),
     }
     try:
-        response = transport(prompt) if transport is not None else _provider_response(
-            prompt, metadata, resolved_task
+        response = (
+            transport(prompt)
+            if transport is not None
+            else _provider_response(prompt, metadata, resolved_task)
         )
         result["action_class"] = _action(_await(response))
     except Exception as exc:  # provider errors are failed measurements, not crashes
@@ -450,9 +450,7 @@ def run_prefix_regression(
                 "passed": False,
                 "action_class": None,
                 "error": (
-                    f"{exc.__class__.__name__}: {detail}"
-                    if detail
-                    else exc.__class__.__name__
+                    f"{exc.__class__.__name__}: {detail}" if detail else exc.__class__.__name__
                 )[:500],
             }
         )
@@ -481,9 +479,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", help="emit one JSON result")
     args = parser.parse_args(argv)
     try:
-        result = run_prefix_regression(
-            args.session_dir, args.turn, args.expect, task_id=args.task
-        )
+        result = run_prefix_regression(args.session_dir, args.turn, args.expect, task_id=args.task)
     except PrefixRegressionError as exc:
         result = {"passed": False, "error": str(exc)}
         exit_code = 2

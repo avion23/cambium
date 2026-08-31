@@ -159,8 +159,7 @@ def test_replays_production_turn_checkpoint_layout(tmp_path: Path) -> None:
         1,
         "finish",
         transport=lambda prompt: (
-            prompts.append(prompt)
-            or '{"type":"finish","summary":"done","objective_met":true}'
+            prompts.append(prompt) or '{"type":"finish","summary":"done","objective_met":true}'
         ),
     )
 
@@ -193,13 +192,13 @@ def test_native_multi_tool_call_response_parses_as_batch(tmp_path: Path) -> None
                         {
                             "function": {
                                 "name": "git_op",
-                                "arguments": "{\"op\": \"status\"}",
+                                "arguments": '{"op": "status"}',
                             }
                         },
                         {
                             "function": {
                                 "name": "read_batch",
-                                "arguments": "{\"paths\": [\"pyproject.toml\"]}",
+                                "arguments": '{"paths": ["pyproject.toml"]}',
                             }
                         },
                     ]
