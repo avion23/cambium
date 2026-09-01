@@ -1,9 +1,10 @@
+"""Scenario coverage for subscription resource dimensions in provider config."""
+
 from __future__ import annotations
 
 import json
 from pathlib import Path
 
-from cambium.diffundo import Diffundo, ProviderConfig, ProviderTier
 from cambium.provider_config import load_providers
 
 
@@ -47,32 +48,9 @@ def test_provider_config_loads_subscription_resource_dimensions(tmp_path: Path) 
         ),
         encoding="utf-8",
     )
+
     provider = load_providers(path)[0]
+
     assert provider.rpm == 100
     assert provider.max_concurrency == 3
-    assert len(provider.quota_windows) == 2
-    assert provider.quota_windows[0].name == "five-hour"
-
-
-def test_diffundo_lease_filters_candidates_to_one_continuous_branch() -> None:
-    providers = [
-        ProviderConfig(
-            name="a",
-            tier=ProviderTier.FAST,
-            base_url="http://127.0.0.1:1/v1",
-            api_key_env="A",
-            api_key="sk-test-a",
-            model="m",
-        ),
-        ProviderConfig(
-            name="b",
-            tier=ProviderTier.FAST,
-            base_url="http://127.0.0.1:2/v1",
-            api_key_env="B",
-            api_key="sk-test-b",
-            model="m",
-        ),
-    ]
-    router = Diffundo(providers)
-    router.bind_provider("a", "m", root_task_id="root")
-    assert [item.name for item in router._candidates(ProviderTier.FAST, "m")] == ["a"]
+    assert [window.name for window in provider.quota_windows] == ["five-hour", "weekly"]

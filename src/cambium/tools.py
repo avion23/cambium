@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from .auth import scrub_environment
+from .child_policy import ChildPolicyError, require_child_policy
 from .lint_diag import LintDiag
 from .schemas import TOOL_SCHEMAS, validate_tool_call
 from .tasktree import TaskKind
@@ -161,6 +162,17 @@ def _assigned_worktree_file(path: Path, worktree: Path) -> bool:
     return not relative.parts or relative.parts[0] not in {".git", ".cambium"}
 
 
+def _mutation_path(ctx: ToolContext, raw_path: str) -> Path:
+    worktree = Path(ctx.cwd).resolve()
+    path = (worktree / Path(raw_path).expanduser()).resolve()
+    if not _assigned_worktree_file(path, worktree):
+        raise _ToolFailure(
+            "mutation path must stay inside the assigned worktree and outside "
+            f"reserved .git/.cambium metadata: {raw_path}"
+        )
+    return path
+
+
 def _reject_active_session_read(
     ctx: ToolContext, requested_path: Path, resolved_path: Path
 ) -> None:
@@ -228,6 +240,22 @@ def _atomic_write(path: Path, content: str) -> None:
                 pass
 
 
+def _line_window(
+    lines: list[str],
+    start_line: int,
+    max_lines: int,
+    total_lines: int,
+    *,
+    truncated: bool,
+) -> str:
+    selected = lines[start_line - 1 : start_line - 1 + max_lines]
+    total = f"at least {total_lines}" if truncated else str(total_lines)
+    if not selected:
+        return f"showing no lines from {start_line}; file has {total} lines\n"
+    end_line = start_line + len(selected) - 1
+    return f"showing lines {start_line}-{end_line} of {total}\n" + "".join(selected)
+
+
 def _read_file_sync(
     path: Path,
     display_path: str,
@@ -249,11 +277,14 @@ def _read_file_sync(
             if len(raw) > READ_BATCH_MAX_BYTES_PER_FILE:
                 excerpt = raw[:READ_BATCH_MAX_BYTES_PER_FILE].decode("utf-8", errors="ignore")
                 lines = excerpt.splitlines(keepends=True)
-                total_lines = len(lines)
-                end_line = min(start_line + max_lines - 1, total_lines)
                 output = (
-                    f"showing lines {start_line}-{end_line} of at least {total_lines}\n"
-                    + "".join(lines[start_line - 1 : start_line - 1 + max_lines])
+                    _line_window(
+                        lines,
+                        start_line,
+                        max_lines,
+                        len(lines),
+                        truncated=True,
+                    )
                     + READ_TRUNCATION_MARKER
                 )
                 return _Outcome(
@@ -263,13 +294,14 @@ def _read_file_sync(
                     ),
                 )
             lines = _decode_utf8(raw, display_path).splitlines(keepends=True)
-            total_lines = len(lines)
-            end_line = min(start_line + max_lines - 1, total_lines)
             return _Outcome(
                 ok=True,
-                output=(
-                    f"showing lines {start_line}-{end_line} of {total_lines}\n"
-                    + "".join(lines[start_line - 1 : start_line - 1 + max_lines])
+                output=_line_window(
+                    lines,
+                    start_line,
+                    max_lines,
+                    len(lines),
+                    truncated=False,
                 ),
             )
 
@@ -344,7 +376,7 @@ def _lint_feedback(ctx: ToolContext, path: Path) -> str:
 
 
 async def _write_file(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
-    path = (Path(ctx.cwd) / Path(args["path"]).expanduser()).resolve()
+    path = _mutation_path(ctx, args["path"])
     try:
         await asyncio.to_thread(_atomic_write, path, args["content"])
     except OSError as exc:
@@ -368,7 +400,7 @@ def _edit_context(content: str, old_string: str) -> str:
 
 
 async def _edit_file(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
-    path = (Path(ctx.cwd) / Path(args["path"]).expanduser()).resolve()
+    path = _mutation_path(ctx, args["path"])
     content = await asyncio.to_thread(_read_text, path)
     old_string = args["old_string"]
     occurrences = content.count(old_string)
@@ -806,14 +838,12 @@ async def _read_batch(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
 
 
 async def _delegate(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
-    """Register one child proposal for supervisor validation.
+    """Validate and register one child proposal for supervisor admission.
 
-    The tool never touches the worktree: it only acknowledges the proposal
-    arguments (already validated against the ``delegate`` schema in
-    ``run_tool``). The worker agent loop emits the ``propose_child`` wire
-    message, and the supervisor re-validates the full revision with
-    ``tasktree.build_tree`` at this task's terminal envelope, then admits or
-    rejects the child.
+    The tool never touches the worktree. The worker emits the proposal after
+    this call succeeds; the supervisor independently validates identity,
+    task-tree bounds, policy, authority, and budgets before durable admission
+    and spawn.
     """
     child_task_id = args["child_task_id"]
     kind = args["kind"]
@@ -824,9 +854,13 @@ async def _delegate(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
                 f"validation failed: unknown task kind {kind} (allowed: {_ALLOWED_TASK_KINDS_TEXT})"
             ),
         )
+    try:
+        require_child_policy(args["spec"])
+    except ChildPolicyError as exc:
+        return _Outcome(ok=False, error=f"validation failed: {exc}")
     return _Outcome(
         ok=True,
-        output=(f"child {child_task_id} proposed; admission is validated when this task completes"),
+        output=f"child {child_task_id} proposed; supervisor admission pending",
     )
 
 

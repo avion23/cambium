@@ -1,6 +1,6 @@
 """Pure policy types for recursive context branches.
 
-The model chooses two orthogonal properties for every delegated child:
+Model-originated child proposals must name two orthogonal properties:
 
 ``context_mode``
     Which parent context representation seeds the child.
@@ -9,8 +9,10 @@ The model chooses two orthogonal properties for every delegated child:
     Whether routing preserves provider affinity or prefers another feasible
     provider lane.
 
-There are deliberately no aliases or implicit defaults.  A child proposal is
-an architectural decision and must name both values explicitly.
+The supervisor still accepts an undeclared policy from harness-originated
+``proposed_children`` fixtures. That internal automatic-compatibility path is
+represented by ``None`` and is deliberately kept out of the model tool
+contract. Model boundaries must call :func:`require_child_policy`.
 """
 
 from __future__ import annotations
@@ -59,28 +61,30 @@ def _enum_value[T: StrEnum](spec: Mapping[str, Any], key: str, enum: type[T]) ->
         raise ChildPolicyError(f"child {key} must be one of: {choices}") from None
 
 
-def parse_child_policy(spec: Mapping[str, Any]) -> ChildPolicy:
-    """Return the one authoritative policy declared by a child spec.
+def parse_child_policy(spec: Mapping[str, Any]) -> ChildPolicy | None:
+    """Parse a declared policy or the harness-only automatic path.
 
-    ``trunk`` means an exact same-provider checkpoint prefix.  Combining it
-    with ``spread`` would promise both byte-identical provider cache affinity
-    and another provider, so the combination is rejected rather than silently
-    downgraded.  A child that declares neither field is undeclared: it keeps
-    the supervisor's automatic compatibility resolution (legacy path) and
-    parses to ``None``.
+    ``None`` means neither policy dimension was supplied by an internal
+    harness-originated proposal. Partial declarations and contradictory
+    ``trunk + spread`` requests are always rejected.
     """
     if not isinstance(spec, Mapping):
         raise ChildPolicyError("child spec must be an object")
     if spec.get("context_mode") is None and spec.get("placement") is None:
-        return None  # type: ignore[return-value]
+        return None
     context_mode = _enum_value(spec, "context_mode", ContextMode)
     placement = _enum_value(spec, "placement", Placement)
     if context_mode is ContextMode.TRUNK and placement is Placement.SPREAD:
         raise ChildPolicyError("child context_mode=trunk requires placement=inherit")
-    return ChildPolicy(
-        context_mode=context_mode,
-        placement=placement,
-    )
+    return ChildPolicy(context_mode=context_mode, placement=placement)
+
+
+def require_child_policy(spec: Mapping[str, Any]) -> ChildPolicy:
+    """Return the explicit policy required at every model-facing boundary."""
+    policy = parse_child_policy(spec)
+    if policy is None:
+        raise ChildPolicyError("child context_mode and placement are required")
+    return policy
 
 
 __all__ = [
@@ -89,4 +93,5 @@ __all__ = [
     "ContextMode",
     "Placement",
     "parse_child_policy",
+    "require_child_policy",
 ]
