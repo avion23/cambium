@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -143,6 +144,24 @@ def test_read_batch_rejects_invalid_windows_and_non_utf8(
     assert binary.output == "--- binary.bin ---\nfile is not valid UTF-8: binary.bin"
 
 
+def test_read_batch_preserves_input_order_across_partial_failure(tmp_path: Path) -> None:
+    (tmp_path / "first.txt").write_text("first\n", encoding="utf-8")
+    (tmp_path / "last.txt").write_text("last\n", encoding="utf-8")
+
+    result = _run(
+        "read_batch",
+        {"paths": ["first.txt", "missing.txt", "last.txt"]},
+        ToolContext(tmp_path),
+    )
+
+    assert not result.ok
+    assert result.error is None
+    assert result.output.index("--- first.txt ---") < result.output.index("--- missing.txt ---")
+    assert result.output.index("--- missing.txt ---") < result.output.index("--- last.txt ---")
+    assert "file not found: missing.txt" in result.output
+    assert result.output.endswith("last\n")
+
+
 class _LintFeedback:
     def lint_file(self, path: Path) -> list[dict]:
         return [{"path": str(path), "line": 1, "col": 1, "code": "E999", "message": "bad"}]
@@ -187,7 +206,7 @@ def test_mutating_tools_stay_inside_normal_worktree_files(
     path: str,
     arguments: dict[str, str],
 ) -> None:
-    outside = tmp_path.parent / "outside.txt"
+    outside = tmp_path.parent / f"{tmp_path.name}-outside.txt"
     outside.write_text("one\n", encoding="utf-8")
     (tmp_path / ".git").mkdir()
     (tmp_path / "escape").symlink_to(tmp_path.parent, target_is_directory=True)
@@ -215,6 +234,60 @@ def test_edit_file_requires_exactly_one_occurrence(tmp_path: Path) -> None:
     assert "exactly one occurrence" in (result.error or "")
     assert "Context:" in (result.error or "")
     assert path.read_text(encoding="utf-8") == "one\none\n"
+
+
+def test_git_op_status_and_schema_denial_are_public_behavior(tmp_path: Path) -> None:
+    subprocess.run(
+        ["git", "init", "-b", "main", str(tmp_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    status = _run("git_op", {"op": "status", "args": "--short"}, ToolContext(tmp_path))
+    checkout = _run("git_op", {"op": "checkout", "args": "-- ."}, ToolContext(tmp_path))
+
+    assert status.ok
+    assert status.output == ""
+    assert not checkout.ok
+    assert "must be one of" in (checkout.error or "")
+
+
+def test_run_shell_preserves_argv_and_nonzero_output(tmp_path: Path) -> None:
+    marker = tmp_path / "shell-expanded"
+    argument = f"literal; touch {marker}"
+
+    result = _run(
+        "run_shell",
+        {
+            "cmd": [
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1]); raise SystemExit(7)",
+                argument,
+            ]
+        },
+        ToolContext(tmp_path),
+    )
+
+    assert not result.ok
+    assert result.output == argument + "\n"
+    assert result.error == "run_shell exited with status 7"
+    assert not marker.exists()
+
+
+def test_lint_failure_is_advisory_after_a_successful_write(tmp_path: Path) -> None:
+    target = tmp_path / "new.py"
+
+    result = _run(
+        "write_file",
+        {"path": target.name, "content": "value = 1\n"},
+        ToolContext(tmp_path, lint=LintDiag(lint_cmd=["definitely-missing-linter"])),
+    )
+
+    assert result.ok
+    assert result.output.startswith("wrote new.py")
+    assert target.read_text(encoding="utf-8") == "value = 1\n"
 
 
 @pytest.mark.slow
