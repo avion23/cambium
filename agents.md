@@ -24,8 +24,10 @@ Then trace one complete live path before editing:
 public command/API/schema
     -> dispatcher/caller
     -> owning module
+    -> runtime state transition
     -> effect boundary
     -> durable result/event
+    -> model or TUI projection
     -> scenario tests
 ```
 
@@ -74,9 +76,10 @@ Keep these identities separate:
 
 ```text
 task tree
-conversation branch
-Git artifact graph
+conversation branch tree
+Git artifact DAG
 provider-cache lineage
+provider topology
 semantic/epistemic projection
 ```
 
@@ -118,7 +121,7 @@ second scheduler, memory database, frontend state machine, or worker hierarchy.
 ```sh
 git status --short --branch
 git fetch --all --prune
-git rebase origin/main          # or the explicitly requested target branch
+git pull --rebase origin main
 git rev-parse HEAD
 git log -1 --oneline
 ```
@@ -168,9 +171,11 @@ git diff --check
 git status --short
 git diff --stat
 git diff --cached
+git fetch origin
+git rebase origin/main
 git commit -m "<focused message>"
-git push <remote> <requested-branch>
-git ls-remote <remote> refs/heads/<requested-branch>
+git push origin HEAD:main
+git ls-remote origin refs/heads/main
 ```
 
 Never claim a push, branch, tag, merge, or CI result without fetching the remote
@@ -233,10 +238,15 @@ read_batch
 delegate
 ```
 
+`write_file` and `edit_file` mutate only normal paths inside the assigned
+worktree. Parent paths, `.git`, `.cambium`, and symlink escapes are rejected at
+the effect boundary. `read_batch` remains a bounded inspection capability and
+may read permitted external paths.
+
 `branch_history.py`, `code_index.py`, and `lsp_query.py` are implemented library
-boundaries but are not yet in that active roster. Do not describe them as model
-capabilities until the schema, dispatch, prompt, provider-tool hash, and live
-scenario path are wired.
+boundaries but are not yet in the active model roster. Do not describe them as
+model capabilities until schema, dispatch, prompt, provider-tool hash, durable
+observation, and a live scenario are wired together.
 
 ## 7. Context and branch rules
 
@@ -246,10 +256,16 @@ scenario path are wired.
 - K0 is a bounded current-state materialization, not a second summary tier.
 - Exact cache reuse requires byte/identity compatibility; provider cache hits
   come only from provider evidence.
-- Current supervisor source consumes declared child `context_mode` and
-  `placement`. The model schema still permits omission and automatic
-  exact/semantic resolution; treat this as a current compatibility gap, not an
-  implicit normative default.
+- Model-originated `delegate` calls must declare both `context_mode` and
+  `placement`; the schema, prompt, parser, tool boundary, and supervisor enforce
+  that contract.
+- Valid model combinations are `trunk+inherit`, `semantic+inherit`,
+  `semantic+spread`, `fresh+inherit`, and `fresh+spread`.
+- `trunk+spread` is rejected and explicit policy never silently downgrades.
+- Harness-originated static proposals can still omit both fields and enter an
+  internal automatic compatibility path. Treat that as a current implementation
+  gap, not a public default; it must receive an explicit wire/event value or be
+  removed.
 - A child cannot widen parent filesystem, tool, credential, or provider
   authority.
 - Admission is durable before spawn. Child completion order does not determine
@@ -310,11 +326,11 @@ Focused references:
 Run the narrowest real check first. Useful commands from the repository root:
 
 ```sh
+python -m compileall -q src tests
 uv run ruff check src tests
 uv run pytest -q tests/scenarios/<focused-file>.py
 uv run pytest -m "not slow" -q
 uv run pytest -m slow -q
-python3.14 -m compileall -q src tests
 git diff --check
 ```
 
@@ -323,8 +339,10 @@ acceptance tests may issue live calls and are separate from hermetic CI.
 
 Scenario tests prove process, Git, persistence, concurrency, context, and
 provider boundaries. Module tests prove deterministic data-in/data-out logic.
-Do not test an interface merely for existing; test an externally meaningful
-state transition or invariant.
+Do not test an interface merely for existing, a private helper merely because it
+exists, exact prompt prose, or a standard-library property already owned by
+`compileall`. Prefer one public scenario that crosses schema, dispatch, owner,
+effect, and externally visible result.
 
 The live coding gate outranks synthetic suites: a task that changes the
 execution loop ends with `pytest -m acceptance tests/acceptance/test_live_coding_gate.py`
