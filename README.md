@@ -17,8 +17,8 @@ task contract
 + accepted artifact head
 ```
 
-The model proposes plans, tool calls, children, and finish verdicts. Cambium owns
-credentials, provider admission, process lifecycle, budgets, checkpoints,
+The model proposes plans, tool calls, child work, and finish verdicts. Cambium
+owns credentials, provider admission, process lifecycle, budgets, checkpoints,
 context forks, child joins, Git publication, cancellation, and recovery.
 
 ## Current capabilities
@@ -32,8 +32,12 @@ context forks, child joins, Git publication, cancellation, and recovery.
   leases, usage debt, quota reservations, effort-aware deadlines, typed failure,
   and bounded call-time failover.
 - **Recursive branches:** static and dynamic task trees, isolated child
-  worktrees, explicit context/placement behavior when declared, deterministic
+  worktrees, explicit model-originated context/placement policy, deterministic
   join barriers, and conflict-resolver support.
+- **Confined file effects:** `write_file` and `edit_file` may change only normal
+  files inside the assigned worktree; parent paths, `.git`, `.cambium`, and
+  symlink escapes are rejected. `read_batch` remains a bounded inspection tool
+  and may read permitted external paths.
 - **Persistent terminal session:** one interactive semantic branch across
   prompts, reconnect, queued follow-up, event replay, model/tool activity,
   context, usage, quota, and child-agent projection.
@@ -50,7 +54,7 @@ one canonical branch state, many projections
 
 The target system derives a compact current operating picture from events,
 checkpoints, Git, and provider records. The model receives it as a bounded
-`SituationFrame`; the human sees the same semantics in the TUI; precise current
+`SituationFrame`; the human sees the same semantics in the TUI. Precise current
 state, historical evidence, and repository location use separate inspection
 surfaces.
 
@@ -72,14 +76,16 @@ and the ordered [`implementation-plan.md`](implementation-plan.md).
 
 ## Current truth and target gaps
 
-Current source already consumes declared child `context_mode` and `placement`.
-For compatibility, the active delegate schema still permits omission and then
-uses automatic exact/semantic resolution. The target public model contract makes
-that choice explicit.
+Model-originated `delegate` calls must provide both `context_mode` and
+`placement`. The tool schema, prompt, parser, call-time validation, and
+supervisor admission agree on that contract. Harness-originated static proposals
+can still omit both fields and enter the internal automatic compatibility path;
+removing that path or assigning it an explicit wire/event value remains target
+work.
 
-The repository also contains implementations of branch-history projection,
-bounded code indexing, and optional one-shot LSP queries. They are not yet part
-of the active worker tool roster, which currently exposes:
+The repository contains implemented library boundaries for branch-history
+projection, bounded code indexing, and optional one-shot LSP queries. They are
+not active model tools. The current roster is:
 
 ```text
 write_file
@@ -91,8 +97,9 @@ delegate
 ```
 
 The automatic SituationFrame, shared BranchState reducer, `inspect_state`,
-evidence-linked WorkLedger, versioned ResultCapsule, and model-visible
-ResourceEnvelope are target work, not current implementation claims.
+evidence-linked WorkLedger, versioned ResultCapsule, model-visible
+ResourceEnvelope, and end-to-end history/navigation tool wiring are target work,
+not current implementation claims.
 
 ## Quick start
 
@@ -136,6 +143,7 @@ uv run cambium monitor /path/to/session
 ## Verification
 
 ```bash
+python -m compileall -q src tests
 uv run ruff check src tests
 uv run pytest -m "not slow" -q
 uv run pytest -m slow -q
