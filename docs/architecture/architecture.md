@@ -1,12 +1,12 @@
 # Cambium architecture
 
-**Status:** current runtime map plus target integration direction. Source and
-tests are authoritative for landed behavior. Target-only interfaces are labelled
-and ordered in `implementation-plan.md`.
+**Status:** current runtime map plus target integration direction. Source,
+executable scenarios, durable records, and accepted Git state are authoritative
+for landed behavior.
 
-The synthetic system model is defined in
+The target system model is in
 [`agent-operating-model.md`](agent-operating-model.md). This document maps that
-model to the repository and its current runtime boundaries.
+model to current repository ownership.
 
 ## 1. System definition
 
@@ -25,92 +25,59 @@ task contract
 + accepted artifact head
 ```
 
-The model proposes actions. Cambium owns authority, execution, persistence,
-resource limits, process lifecycle, child admission, context publication, Git
+The model proposes intent. Cambium owns authority, execution, persistence,
+resources, process lifecycle, child admission, context publication, Git
 integration, and recovery.
 
-A correct final message is not sufficient. Success requires agreement between:
+A plausible final message is not sufficient. Success requires agreement between:
 
 ```text
 semantic result
 accepted repository artifact
-required verification
+required current verification
 supervisor terminal verdict
 ```
 
-## 2. Tower of abstractions
+## 2. Tower and orthogonal structures
 
 ```text
-Evaluation / optimization
+evaluation and policy promotion
         ^
-Human + model projections
+model SituationFrame + human operator view
         ^
-Branch controller and policy
+branch controller and policy
         ^
-Canonical BranchState             target integration layer
+canonical BranchState               target integration layer
         ^
-CAST + artifact + lease views
+CAST + artifact + lease projections
         ^
-Events + checkpoints + Git + quota
+events + checkpoints + Git + quota
         ^
-Workers + tools + transports + merge
+tools + workers + transports + merge
         ^
-Repository + providers + operator intent
+repository + providers + operator intent
 ```
 
-Each layer owns one class of fact. A higher layer may derive or display lower
-state but cannot mutate it outside the lower layer's validated interface.
+Observations flow upward. Validated commands flow downward. Higher layers do not
+mutate lower-layer state outside explicit interfaces.
 
-The architectural rule is:
+Cambium keeps these structures separate:
 
-```text
-one canonical branch state, many projections
-```
-
-Today the operator projection is implemented in `observability.py`; the target
-is to factor its shared semantics into a pure BranchState reducer consumed by
-both the TUI and the model SituationFrame.
-
-## 3. Orthogonal structures
-
-Cambium must not collapse these structures into one vague “agent tree.”
-
-| Structure | Question it answers | Current authority |
+| Structure | Question | Current authority |
 | --- | --- | --- |
-| Task tree | Who owns which work and child lifetime? | supervisor/tasktree |
-| Conversation branches | What did each model branch see and do? | events/checkpoints |
-| Git artifact graph | Which filesystem states were accepted? | Git/merge/supervisor |
-| Provider-cache lineage | Which exact request prefixes are compatible? | checkpoint cache key/provider evidence |
-| Epistemic state projection | Which claims, decisions, obligations, and checks are current? | CAST summary today; target WorkLedger projection |
+| task tree | who owns which work and child lifetime? | supervisor/tasktree |
+| conversation branches | what did each model branch see and do? | events/checkpoints |
+| Git artifact DAG | which repository states were accepted? | Git/merge/supervisor |
+| provider-cache lineage | which request prefixes are exactly compatible? | checkpoint/cache-key/provider evidence |
+| provider topology | where does each branch run and what capacity exists? | routing/scheduler/provider config |
+| semantic projection | which facts, decisions, failures, checks, and obligations are current? | CAST today; target WorkLedger |
 
-The first four have distinct identity and failure modes. The fifth is a derived
-semantic view over durable records, not another database.
+Task ancestry is not cache compatibility. Provider placement is not parentage. A
+semantic result is not accepted Git state.
 
-## 4. Branch model
+## 3. Current runtime flow
 
-The root and every child share one conceptual entity:
-
-```text
-ContextBranch
-├── identity: session/task/parent/generation
-├── mission: objective/constraints/done criteria
-├── authority: repo/worktree/branch/tools/providers
-├── context: checkpoint/epoch/trunk/raw tail/lineage
-├── artifacts: base/head/accepted integration
-├── control: plan/open work/blockers
-├── resources: turns/wall/context/quota/cache/lease
-├── children: deterministic admission and join order
-├── verification: checks tied to artifact state
-└── result: bounded semantic capsule
-```
-
-Current source represents these fields across supervisor state, worker
-checkpoints, event records, Git, quota/routing values, and TUI reducers. The
-target BranchState composes them without changing their owners.
-
-## 5. Runtime flow
-
-### 5.1 Session and task admission
+### 3.1 Admission
 
 ```text
 CLI / interactive session / plan
@@ -125,16 +92,16 @@ persist plan and task_assigned
 create isolated worktree + generation fence
 ```
 
-Static dependency plans use validated ready waves. Dynamic children enter as
-typed proposals and are durably admitted before their coroutine/process exists.
+Static dependencies use validated ready waves. Dynamic children cross the same
+supervisor-owned task-tree, authority, budget, and provider checks.
 
-### 5.2 Worker decision loop
+### 3.2 Worker decision loop
 
 ```text
 supervisor init/run_task
         |
         v
-worker builds stable prompt head + CAST state + recent tail
+worker builds stable prompt head + CAST + recent tail
         |
         v
 provider call through Diffundo
@@ -143,16 +110,31 @@ provider call through Diffundo
 plan | tool_call batch | finish
         |
         v
-execute bounded tools, append observations, checkpoint, repeat
+validate and execute tools, append observations, checkpoint, repeat
 ```
 
-Current model tools are `write_file`, `edit_file`, `git_op`, `run_shell`,
-`read_batch`, and `delegate`. Implementations of branch history, bounded code
-indexing, and optional LSP queries exist but are not yet wired into this active
-roster. Target state/history/navigation tools are defined in
-[`../reference/agent-state.md`](../reference/agent-state.md).
+Current active model tools:
 
-### 5.3 Context loop
+```text
+write_file
+edit_file
+git_op
+run_shell
+read_batch
+delegate
+```
+
+`write_file` and `edit_file` resolve their targets and permit mutations only to
+normal paths inside the assigned worktree. Parent paths, `.git`, `.cambium`, and
+symlink escapes are rejected at the effect boundary. `read_batch` remains a
+bounded inspection capability and may read permitted external paths.
+
+The repository contains implemented library boundaries for branch-history
+projection, portable code indexing, and optional one-shot LSP queries. They are
+not active model tools because schema, dispatch, prompt/tool hash, durable
+observation, and public scenario wiring are still missing.
+
+### 3.3 Context loop
 
 ```text
 stable system/tool head
@@ -160,47 +142,57 @@ stable system/tool head
 + bounded raw working tail
 ```
 
-A summary flush covers one disjoint raw range. Existing summary entries are not
-rewritten. K0 rollover materializes current active semantic state under policy
-bounds while source entries remain durable. Provider cache is an optional
-performance outcome, never correctness state.
+A summary flush covers one disjoint raw range. Existing entries are immutable.
+K0 rollover materializes active semantic state while source records remain
+durable. Provider cache is a measured performance outcome, never correctness
+state.
 
 See [`context-engine.md`](context-engine.md).
 
-### 5.4 Child fork and join
+### 3.4 Child fork and join
 
 ```text
-parent delegate proposal
+model delegate proposal
         |
         v
-validate task tree + authority + budget + child policy
+schema + call-time tool validation
+        |
+        v
+supervisor tree/authority/budget/policy validation
+        |
+        v
+persist child_admitted before spawn
         |
         +--> trunk/inherit: exact compatible checkpoint
-        +--> semantic: immutable summary state under a fresh head
-        +--> fresh: task-only parent-independent context
+        +--> semantic: immutable summary state under fresh head
+        +--> fresh: task only
         |
         v
 child worker + isolated worktree
         |
         v
-bounded semantic result + artifact integration
+bounded semantic result + optional artifact
         |
         v
-verify parent HEAD == accepted integration HEAD
+ordered integration + combined verification
         |
         v
-parent resume
+parent HEAD == accepted integration HEAD
 ```
 
-Current supervisor source consumes declared context/placement policy. For
-compatibility, omitted policy still enters automatic exact/semantic resolution;
-the target public contract removes or explicitly names that ambiguity.
+Model-originated children must declare `context_mode` and `placement`.
+`trunk+spread` is rejected and explicit policy never silently downgrades.
+Harness-originated static `proposed_children` can still enter an internal
+automatic compatibility path when both fields are absent. That path is a known
+gap: it must receive an explicit schema/event value or be removed.
 
-See [`context-branches.md`](context-branches.md),
-[`context-branch-requirements.md`](context-branch-requirements.md), and
+A parent owns child lifetime under structured concurrency. Completion order does
+not determine result or artifact join order.
+
+See [`context-branches.md`](context-branches.md) and
 [`subagents.md`](subagents.md).
 
-### 5.5 Provider flow
+### 3.5 Provider flow
 
 ```text
 supervisor admission
@@ -217,184 +209,168 @@ Diffundo attempt execution
 transport and provider evidence
 ```
 
-There is one scheduler ownership path. Provider configuration describes
-capabilities; routing admits and ranks; Diffundo executes attempts; quota and
-usage stores supply evidence. Prompt prose does not select credentials.
+There is one scheduler ownership path. Configuration describes capabilities and
+credentials; routing admits and ranks; Diffundo executes attempts; quota and
+usage records supply evidence. Prompt prose does not choose credentials.
 
-See [`provider-routing.md`](provider-routing.md).
+### 3.6 Publication and recovery
 
-### 5.6 Publication and recovery
-
-A successful worker owns at most one fenced commit. The supervisor verifies
-branch attachment, clean state, envelope/HEAD consistency, and expected-old
-publication before a ref advance. Child integration and root publication are
+A successful worker owns at most one fenced commit. The supervisor validates
+branch attachment, clean state, envelope/HEAD agreement, and expected-old
+publication before advancing a ref. Child integration and root publication are
 serialized.
 
 On interruption, Cambium preserves bounded salvage and the latest valid
-checkpoint. Resume is legal only when workspace identity matches. Otherwise the
-worktree is fenced, salvaged, and recovered from the accepted base.
+checkpoint. Resume is legal only when workspace identity matches; otherwise the
+old worktree is fenced and recovery starts from accepted state.
 
-## 6. Control surfaces
+## 4. Control surfaces
 
 ### Human surface
 
-The persistent TUI and monitor reduce durable events into an operator view with
-agents, context, usage, quota, and recent activity. The frontend is not runtime
+The persistent TUI and monitor reduce durable events into operator views of
+agents, context, usage, quota, and recent activity. Frontends are not runtime
 authority.
-
-See [`interactive-tui.md`](interactive-tui.md) and
-[`terminal-interface.md`](terminal-interface.md).
 
 ### Model surface
 
-Current model context contains the coding-agent prompt, task, optional parent
-context, CAST summaries, recent observations, and tool schemas.
+Current model context contains the coding prompt, task, optional parent context,
+CAST entries, recent observations, and six tool schemas.
 
-Target model control adds a deterministic late `SituationFrame` and three
-separate read surfaces:
+Target model control adds a deterministic late SituationFrame and three
+orthogonal read surfaces:
 
 ```text
-inspect_state   current accepted branch state
-branch_history  prior branch/tool/transcript evidence
-repo_query      repository location and code navigation
+inspect_state    current accepted branch state
+branch_history   prior branch/tool/transcript evidence
+repo_query       repository location/navigation
 ```
 
-The model and TUI then share BranchState fields rather than learning different
-versions of the session.
+The target model and TUI project the same BranchState fields at one watermark.
+The existing history/index/LSP libraries are inputs to these future slices, not
+proof that the model surfaces already exist.
 
-## 7. Durable data and ownership
+## 5. Durable data and ownership
 
-| Data | Writer | Reader | Mutation rule |
+| Data | Writer | Readers | Mutation rule |
 | --- | --- | --- | --- |
 | event log | supervisor/worker through EventStore | replay, TUI, monitor, history, target BranchState | append only |
 | ordinary checkpoint | worker | restart/recovery/history | immutable file |
-| context epoch | worker, supervisor validates | fork/resume/CAST/history | immutable; successor epoch only |
+| context epoch | worker, supervisor validates | fork/resume/CAST/history | immutable; successor only |
 | interactive manifest | InteractiveSession single writer | reconnect/TUI | atomic replace after successful turn |
 | routing debt | usage-event fold | admission/doctor | transactional merge |
-| quota ledger | reservation owner | admission/operator | transactional reservation/reconcile |
+| quota ledger | reservation owner | admission/operator | transactional reserve/reconcile |
 | worker branch | fenced worker | supervisor/merge | one generation owner |
-| main/parent integration ref | merge sequencer/supervisor | all artifact consumers | expected-old atomic advance |
+| integration ref | merge sequencer/supervisor | artifact consumers | expected-old atomic advance |
 | semantic summary | model proposal, worker validates | active context/target WorkLedger | append only; invalidate/supersede by delta |
 
-## 8. Module map
+## 6. Module map
 
 ```text
 src/cambium/
-  cli.py                   command routing
-  interactive.py           persistent interactive branch ownership
-  tui.py                    terminal command/input loop
-  tui_screen.py             deterministic rendering
-  observability.py          current event-sourced operator projection
+  cli.py                    command routing
+  interactive.py            persistent interactive branch ownership
+  tui.py / tui_screen.py     terminal input and deterministic rendering
+  observability.py           current event-sourced operator projection
 
-  supervisor.py            task/worker/child lifecycle, admission, join, publication
-  worker.py                model/tool/context loop and checkpoints
-  tasktree.py              static/dynamic hierarchy bounds
-  merge.py                 ref-only serialized publication and recovery
-  fencing.py               generation authority
+  supervisor.py             task/worker/child lifecycle, admission, join, publication
+  worker.py                 model/tool/context loop and checkpoints
+  tasktree.py               hierarchy bounds and readiness
+  merge.py                  serialized ref-only publication and recovery
+  fencing.py                generation authority
 
-  prompts.py               current coding and summary prompt text
-  schemas.py               model action/tool schemas
-  tools.py                 active executable worker tools
-  branch_history.py        bounded history projection; wiring pending
-  code_index.py            bounded portable navigation; wiring pending
-  lsp_query.py             optional one-shot LSP boundary; wiring pending
+  prompts.py                coding and semantic-summary prompt text
+  schemas.py                model action/tool schemas
+  tools.py                  active effects and call-time validation
+  child_policy.py           context/placement values and parsing
+  branch_history.py         bounded history projection; model wiring pending
+  code_index.py             bounded portable navigation; model wiring pending
+  lsp_query.py              optional one-shot LSP boundary; model wiring pending
 
-  summary_trunk.py         semantic deltas and K0 projection
-  context_policy.py        hard CAST bounds
-  child_policy.py          child context/placement values
-  conversations.py         optional raw conversation rows
+  summary_trunk.py          semantic deltas and K0 projection
+  context_policy.py         hard CAST bounds
+  conversations.py          optional raw conversation rows
 
-  routing.py               provider/model admission and usage debt
-  provider_scheduler.py    leases, cache/quota values and reservations
-  provider_config.py       provider capability/auth/protocol configuration
-  diffundo.py              call-time execution and failure handling
-  oauth.py / auth.py       credential stores and safe worker handoff
+  routing.py                provider/model admission and usage debt
+  provider_scheduler.py     leases, quota/cache values and reservations
+  provider_config.py        provider capabilities/auth/protocol config
+  diffundo.py               call-time execution and typed failure
+  oauth.py / auth.py        credential stores and worker handoff
 
-  store.py                 durable events
-  results.py               canonical terminal result
-  modules/                 optimizable decision modules
+  store.py                  durable events
+  results.py                canonical terminal result
+  modules/                  optimizable deterministic decisions
 ```
 
-Target additions should remain small:
+Target additions remain small and require live consumers:
 
 ```text
-branch_state.py            pure canonical reducer/value objects
-situation.py               bounded SituationFrame projection
+branch_state.py             pure canonical reducer/value objects
+situation.py                bounded SituationFrame projection
+inspect_state wiring        current-state model tool
+branch_history wiring       existing history projection into active tools
+repo_query wiring           existing index/LSP boundaries into active tools
 ```
 
-Names may change, but ownership must not spread across another scheduler or
-frontend-local state machine.
-
-## 9. Invariants
+## 7. Invariants
 
 ### Authority
 
-- A worker may mutate only its assigned worktree under the current generation.
-- A child cannot widen parent credential/provider or filesystem authority.
+- A worker mutates only its assigned worktree under the current generation.
+- File effects cannot mutate parent paths or reserved Git/Cambium metadata.
+- A child cannot widen parent filesystem, tool, credential, or provider
+  authority.
 - A frontend or model response cannot mutate supervisor state directly.
 - Publication uses expected-old atomic ref advancement.
 
 ### Context
 
-- Raw history remains durable outside the active projection.
+- Raw history remains durable outside active projection.
 - Published summary/checkpoint bytes are immutable.
-- Exact fork compatibility is proven from all relevant identity fields.
+- Exact fork compatibility uses all relevant identity fields.
 - Provider cache hits come only from provider evidence.
-- Compaction never silently loses current obligations or required verification.
+- Compaction cannot silently lose current obligations or verification.
 
 ### Branching
 
-- Admission is validated and durable before spawn.
-- Parent lifetime bounds children through structured concurrency.
-- Child completion order does not determine join order.
+- Model child policy is explicit before proposal registration.
+- Admission is durable before spawn.
+- Parent lifetime bounds children.
+- Completion order does not determine join order.
 - Semantic result acceptance cannot imply artifact acceptance.
-- Parent resume after code changes requires the accepted integration head.
+- Parent write authority resumes only at accepted integration state.
 
-### Agent state
+### State and resources
 
-- Current accepted facts, model claims, unknowns, and stale values are distinct.
-- Model and operator projections agree at the same source watermark.
-- Every lossy current item can expose a stable evidence/source reference or an
-  explicit inferred/hypothesis label.
-- A verification is tied to the artifact state it tested.
-
-### Resources
-
-- Hard provider/task constraints precede scoring.
-- Request rate, concurrency, token windows, wall time, cash, and cache state are
-  separate dimensions.
+- Accepted facts, model claims, unknowns, and stale values remain distinct.
+- Model and operator projections agree at one watermark in the target design.
+- Verification is tied to the artifact/configuration tested.
+- Request rate, concurrency, tokens, wall time, cash, quota, and cache state
+  remain separate.
 - Missing evidence remains unknown.
-- Retries, children, summaries, and verification consume the parent/session
-  budget explicitly.
 
-## 10. Documentation and truth
+## 8. Current versus target
 
-Documentation types have different authority:
+Current runtime has durable execution, CAST, provider routing, recursive child
+branches, confined file mutations, persistent interactive sessions, six active
+model tools, and implemented but unwired history/navigation libraries.
 
-```text
-architecture  rationale, ownership, invariants, current/target boundary
-reference     exact public or target values and schemas
-how-to        recommended workflows
-research      hypotheses and evaluation protocols
-implementation-plan ordered open work only
-```
+Target work includes canonical BranchState, automatic SituationFrame,
+state/history/repository model-tool wiring, evidence-linked semantic identities,
+versioned ResultCapsule, model-visible ResourceEnvelope, and removal or explicit
+naming of the harness-only automatic child policy.
 
-A target document must say target. An implemented-contract document must point
-to executable source/tests. Historical branch status belongs in Git history,
-not the active plan.
+The ordered path is [`../../implementation-plan.md`](../../implementation-plan.md).
 
-## 11. Definition of architectural coherence
+## 9. Architectural coherence
 
 ```text
 one branch identity across process, context, artifacts, resources, and UI
-one durable record for replay
+one durable replay authority
 one derived branch state for model and operator
 one scheduler ownership path
 one explicit effect boundary per tool/process/ref update
 one bounded semantic accumulation path
-one deterministic child admission/join order
-one evidence-linked explanation of why an action and final result were valid
+one deterministic child admission and join order
+one evidence-linked explanation of accepted action and result
 ```
-
-The ordered path from the current runtime to that state is
-[`../../implementation-plan.md`](../../implementation-plan.md).
