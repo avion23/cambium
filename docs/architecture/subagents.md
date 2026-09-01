@@ -1,14 +1,18 @@
 # Subagents and workload delegation
 
-**Status:** current runtime contract with target control/capsule evolution clearly
-labelled. Source and tests remain authoritative.
+**Status:** current runtime contract with target control/result evolution labelled
+explicitly. Source, executable scenarios, durable events, and accepted Git state
+remain authoritative.
 
-Cambium children are normal supervised tasks. Provider-native tool calls may
-transport a typed `delegate` action, but providers never own child process,
-credential, filesystem, budget, or publication authority.
+Cambium children are normal supervised branches. A provider may transport a
+typed `delegate` action, but providers never own child process, credential,
+filesystem, budget, context, join, or publication authority.
 
 ```text
 model delegate action
+        |
+        v
+schema + call-time tool validation
         |
         v
 generation-local proposal buffer
@@ -25,66 +29,66 @@ bounded result + ordered artifact join
 
 ## 1. One branch abstraction
 
-The root and every child use the same conceptual branch:
+The root and every child use the same conceptual record:
 
 ```text
 task + authority + context + lease + resources + worktree
      + children + verification + result + artifact state
 ```
 
-There is no provider-native subagent runtime and no special “sub-main” class.
-A task's `kind` is structural task-tree metadata; current children use the same
-coding worker/prompt/tool roster and differ through their task, authority,
-context policy, placement, budgets, and parent result.
+There is no provider-native subagent runtime and no special research, review, or
+sub-main class. A task's `kind` is structural task-tree metadata; current
+children use the same worker/prompt/tool roster and differ through task,
+authority, context policy, placement, budgets, and parent relation.
 
 ## 2. Creation paths
 
 ### Static plan child
 
 A plan may contain `depends_on`. The supervisor validates one rooted task tree,
-dispatches deterministic ready waves, bounds width, and prevents descendants of
-a failed dependency from spawning.
+dispatches deterministic ready waves, bounds width/depth, and prevents
+descendants of a failed dependency from spawning.
 
 ### Model-requested child
 
-Current accepted explicit shape:
+Current model contract:
 
 ```json
 {
   "child_task_id": "review-routing",
   "kind": "investigation",
   "spec": {
-    "task": "Read-only review of routing. Return concrete defects, evidence refs, and reproductions. Own no production files.",
+    "task": "Read-only review of routing. Return concrete defects and reproductions.",
     "context_mode": "semantic",
     "placement": "spread"
   }
 }
 ```
 
-The call only proposes. Admission occurs at a permitted parent lifecycle
-boundary after validation of identity, task-tree bounds, paths, branch/worktree
-ownership, provider authority, policy, and budget.
+Both policy fields are required by the model schema and validated again at tool
+call and supervisor admission. The call only proposes. With context reuse, a
+successful proposal may suspend the parent until the child result is joined.
 
-Current compatibility note: the active schema still permits `context_mode` and
-`placement` to be omitted. The supervisor then performs automatic exact versus
-semantic compatibility resolution. The target public model contract makes both
-fields explicit; see `implementation-plan.md` Phase 0.
+Harness-originated static `proposed_children` may still omit both fields and use
+the internal automatic compatibility path. This is not a model default. The
+remaining target is to remove that path or expose an explicit internal
+schema/event value.
 
 ### Architectus child
 
 The optional Architectus port may propose children after a parent result. It is
-a decision source, not a second scheduler; every proposal crosses the normal
-admission boundary.
+a decision source, not a scheduler; every proposal crosses the normal admission
+boundary.
 
 ### Conflict-resolver child
 
 A structured merge conflict may create a bounded resolver branch with explicit
 write authority over one integration attempt. Its result still passes worker
-integrity and publication/join checks.
+integrity, join, and publication checks.
 
 ## 3. Child task contract
 
-A useful child task makes these facts explicit:
+A useful task states:
 
 ```text
 objective       result to produce
@@ -94,48 +98,30 @@ verification    commands or evidence required
 constraints     boundaries it must not cross
 context_mode    trunk | semantic | fresh
 placement       inherit | spread
-budget          turns/wall and normal task/provider constraints
+budget          turns/wall and provider/task constraints
 ```
 
-Current wire carries most of this inside `spec.task` plus policy/budget fields.
-The target evolves it into a typed task contract only after the versioned result
-capsule is stable; avoid adding parallel free-text and structured owners that
-can disagree.
+Current wire carries most of this inside `spec.task` plus policy and budget
+fields. Avoid parallel free-text and structured owners that can disagree.
 
-Bad:
+Parallel writers need disjoint ownership. Read-only investigations may overlap.
+When two branches must touch one semantic area, use one writer plus a reviewer
+or serialize the edits.
 
-```text
-Improve the code.
-```
-
-Good:
-
-```text
-Own src/cambium/routing.py and focused routing scenarios only.
-Reproduce the lane-release defect, repair the owning transition, and run the
-focused scenarios. Do not edit provider transports or documentation.
-```
-
-Parallel writers should have disjoint ownership. Read-only investigations may
-overlap. When two branches must touch one semantic area, use one writer plus a
-reviewer or serialize them.
-
-## 4. Context policy
-
-The model chooses context representation separately from provider placement.
+## 4. Context and placement
 
 | Context mode | Context supplied | Cache claim |
 | --- | --- | --- |
-| `trunk` | Exact immutable parent checkpoint prefix plus child task | May reuse provider prefix only when all compatibility checks pass |
-| `semantic` | Fresh provider-specific head plus immutable semantic trunk | Cold semantic continuity, not a cache hit |
-| `fresh` | New prompt with no parent checkpoint, semantic trunk, or parent envelope | No reuse |
+| `trunk` | exact immutable parent checkpoint prefix plus child task | exact provider prefix only after all compatibility checks pass |
+| `semantic` | fresh provider-specific head plus immutable semantic trunk | semantic continuity, not a provider cache hit |
+| `fresh` | task only, without parent checkpoint/trunk/result | no reuse |
 
 | Placement | Meaning |
 | --- | --- |
-| `inherit` | Preserve parent provider/model affinity when known and feasible |
-| `spread` | Remove inherited hard pinning, prefer another hard-feasible lane, then fall back to all feasible lanes |
+| `inherit` | preserve parent provider/model affinity when known and feasible |
+| `spread` | remove inherited hard pinning, prefer another hard-feasible lane, then use the full feasible set |
 
-Valid explicit combinations:
+Valid model pairs:
 
 ```text
 trunk + inherit
@@ -146,9 +132,9 @@ fresh + spread
 ```
 
 `trunk + spread` is contradictory and rejected. An explicit trunk request that
-cannot prove exact compatibility is rejected; it is not silently downgraded.
+cannot prove exact compatibility is rejected rather than downgraded.
 
-## 5. Prompt construction
+## 5. Prompt and tool authority
 
 Current branch context is composed from:
 
@@ -156,19 +142,23 @@ Current branch context is composed from:
 stable system/tool head
 + task user message
 + optional bounded parent-result context
-+ immutable CAST summary entries
-+ bounded raw working tail
++ immutable CAST entries
++ bounded raw tail
 + exact fork/resume suffix when applicable
 ```
 
-A child does not receive hidden reasoning or sibling context. Exact fork bytes
-remain byte-identical before the new child task. Semantic mode rebuilds a fresh
-provider-specific head and imports only semantic entries.
+A child receives no hidden reasoning or sibling context. Exact fork bytes remain
+byte-identical before the new child task. Semantic mode imports only immutable
+semantic state under a fresh provider head.
 
-Target integration adds a deterministic late SituationFrame derived from the
-canonical BranchState. It exposes current mission, accepted context/artifact,
-open obligations, children, resources, and evidence anchors without rewriting
-the stable prefix. See [`agent-operating-model.md`](agent-operating-model.md).
+Mutating file tools are confined to normal paths inside the assigned worktree.
+`write_file` and `edit_file` reject parent paths, `.git`, `.cambium`, and symlink
+escapes. This preserves branch ownership at the effect boundary rather than
+relying on prompt compliance.
+
+Target integration adds a deterministic late SituationFrame derived from
+canonical BranchState. See
+[`agent-operating-model.md`](agent-operating-model.md).
 
 ## 6. Lifecycle and structured concurrency
 
@@ -208,17 +198,18 @@ bounds child wait/resume. A future is registered before spawn so a fast child
 cannot finish in an unobservable gap.
 
 A parent owns child lifetime. Cancellation, failure, restart, or admission
-rollback must resolve that ownership exactly once. A child never escapes into a
-session-global background task by accident.
+rollback resolves ownership exactly once. A child does not escape into a
+session-global background task accidentally.
 
-## 7. Semantic result versus artifact result
+## 7. Semantic result, artifact, and verification
 
-A child produces two different things:
+A child may produce:
 
-- **semantic result:** bounded evidence/conclusions for parent reasoning;
-- **artifact result:** commits that may be integrated into the parent workspace.
+- a **semantic result** for parent reasoning;
+- an **artifact result** that may be integrated;
+- **verification evidence** tied to the child or combined tree.
 
-They require separate acceptance:
+These require separate acceptance:
 
 ```text
 child terminal result represented
@@ -227,36 +218,33 @@ AND parent worktree HEAD == accepted integration HEAD
 AND required combined-tree verification applies
 ```
 
-A summary cannot authorize publication. `files_changed` cannot prove the parent
-contains the changes. Verification performed on the child head is not
-necessarily sufficient for the combined parent tree.
+A summary cannot authorize publication. `files_changed` cannot prove parent
+integration. A check run on the child head may become stale after combination.
 
 ## 8. Current result and target ResultCapsule
 
 Current supervisor/worker exchange uses a strict bounded result envelope with
 status, summary, diff evidence, commits, files, metrics, and parent identity.
-Branch history remains available for drill-down.
+Raw events/checkpoints remain the drill-down authority for recovery and history.
 
-Target version 2 is a `ResultCapsule` containing:
+Target version 2 is a bounded `ResultCapsule` containing:
 
 ```text
 status and concise outcome
-claims and decisions with evidence refs
-changed artifact/head information
-verification and tested artifact head
+evidence-linked claims and decisions
+changed artifact and head
+verification and tested head
 open obligations and blockers
 resource usage
 recommended parent action
 ```
 
-The migration must be versioned and preserve current readers. A capsule remains
-much smaller than a transcript and never claims accepted parent integration.
-Exact target fields are in
-[`../reference/agent-state.md`](../reference/agent-state.md).
+The migration must be versioned and preserve current readers. A capsule never
+claims accepted parent integration.
 
 ## 9. Delegation control law
 
-A child is justified only when expected benefit exceeds coordination cost.
+Delegate only when expected benefit exceeds coordination cost.
 
 ```text
 benefit
@@ -273,96 +261,55 @@ cost
   + combined verification
 ```
 
-Delegate when:
+Continue locally when the edit is small, tightly coupled to the raw tail,
+contends on the same files, or can be resolved by one direct tool call.
 
-- work has an independent objective and ownership region;
-- a read-only audit can run concurrently;
-- another feasible provider/model is materially better or idle;
-- independent assumptions are valuable;
-- a conflict needs separate resolver authority;
-- exact compatible context makes a substantial child cheap.
+## 10. Historical inspection
 
-Continue locally when:
+`branch_history.py` already implements bounded projection over existing events
+and immutable checkpoints. It is not yet an active model tool. `code_index.py`
+and `lsp_query.py` are likewise implemented libraries awaiting `repo_query`
+wiring.
 
-- the edit is small and cohesive;
-- the next step depends on the unsummarized tail;
-- children would contend on the same files;
-- a direct tool call resolves the uncertainty;
-- the child cannot be given observable done criteria;
-- spawn/join/verification cost dominates the work.
-
-The target SituationFrame exposes critical-path child state and relative
-delegation overhead so this decision does not depend on prompt folklore.
-
-## 10. Progressive child inspection
-
-The normal parent path is:
+The target normal path is:
 
 ```text
 ResultCapsule
     -> inspect_state(children)
-    -> branch_history(branches/tools)
-    -> one exact historical tool ref
-    -> bounded transcript window only when necessary
+    -> branch_history branches/tools
+    -> one exact tool:<task>:<generation>:<turn>:<batch-index>
+    -> bounded transcript only when necessary
 ```
 
-Historical reads do not execute the tool again or rewrite the parent's CAST
-trunk. A durable correction discovered through history is appended later as a
-new fact/decision/invalidation delta.
-
-Current `branch_history.py` implements the read-only projection, but it is not
-yet in the active worker tool roster. Until wiring lands, do not describe the
-model as able to call it.
+History reads must never re-execute a tool. Schema, dispatch, prompt/tool hash,
+bounded output, durable observation, and public scenario land together.
 
 ## 11. Failures
 
 - Invalid, duplicate, cyclic, too-deep, too-wide, unauthorized, or
   path-conflicting proposals spawn nothing.
-- An explicit impossible context policy is rejected.
-- A child cannot widen credential/provider or filesystem authority.
-- A failed child produces a bounded failure result and remains visible to the
-  parent.
-- A critical child failure remains a blocking obligation unless the parent
-  changes the plan.
-- Parent timeout does not convert unfinished child work into success.
-- Cancellation is generation-fenced and acknowledged durably.
-- Merge conflict evidence is bounded and ordered through resolver authority.
-- Child completion order does not determine final integration order.
+- Missing model policy is rejected before proposal registration.
+- Explicit impossible policy is rejected without downgrade.
+- A child cannot widen filesystem, tool, credential, or provider authority.
+- A failed child remains visible and a critical failure remains blocking.
+- Parent timeout does not convert unfinished work into success.
+- Cancellation is generation-fenced and durably acknowledged.
+- Merge conflict evidence is bounded and ordered through one resolver owner.
+- Completion order does not determine final integration order.
 
-## 12. Observability
+## 12. Source map
 
-Current durable events expose task/child identity, lifecycle, context fork,
-provider usage, result, merge, recovery, and session end. The operator TUI
-projects child parentage, lifecycle, lineage, provider/model, usage, and quota.
-
-Target BranchState/SituationFrame adds shared semantics:
-
-```text
-admission index and critical-path flag
-objective/ownership/done criteria
-open obligations/blockers
-resolved context mode and placement
-semantic-result status
-artifact-integration status and accepted head
-verification status and tested head
-resource contribution
-```
-
-The model and operator must agree on shared fields at one event watermark.
-
-## 13. Source map
-
-- Tool schema and validation: `src/cambium/schemas.py`
-- Active tool dispatch: `src/cambium/tools.py`
-- Worker prompt and delegation suspension: `src/cambium/prompts.py`,
-  `src/cambium/worker.py`
-- Child policy: `src/cambium/child_policy.py`
-- Admission, policy materialization, lifetime, join, and publication:
+- Model schema: `src/cambium/schemas.py`
+- Active tool validation/effects: `src/cambium/tools.py`
+- Prompt and worker loop: `src/cambium/prompts.py`, `src/cambium/worker.py`
+- Child policy values: `src/cambium/child_policy.py`
+- Admission, lifetime, materialization, join, publication:
   `src/cambium/supervisor.py`
 - Task-tree bounds: `src/cambium/tasktree.py`
-- Provider admission: `src/cambium/routing.py`
-- Call-time provider execution: `src/cambium/diffundo.py`
+- History/navigation libraries: `src/cambium/branch_history.py`,
+  `src/cambium/code_index.py`, `src/cambium/lsp_query.py`
+- Provider admission/execution: `src/cambium/routing.py`,
+  `src/cambium/diffundo.py`
 - Current operator projection: `src/cambium/observability.py`
-- Historical branch projection: `src/cambium/branch_history.py`
 - Target system: [`agent-operating-model.md`](agent-operating-model.md)
 - Ordered work: [`../../implementation-plan.md`](../../implementation-plan.md)
