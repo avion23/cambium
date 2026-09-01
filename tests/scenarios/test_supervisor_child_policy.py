@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+from cambium.child_policy import parse_child_policy
 from cambium.supervisor import _Runtime
 from cambium.worker import _provider_task_tools_hash
 
@@ -110,3 +111,11 @@ def test_missing_parent_epoch_rejects_declared_semantic(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="requires an unredacted parent checkpoint"):
         asyncio.run(runtime._pin_fork_child(child_spec, "missing", "child", "investigation"))
+
+
+def test_parse_child_policy_rejects_trunk_spread_combination() -> None:
+    """trunk+spread is contradictory and must be rejected."""
+    with pytest.raises(ValueError, match="trunk requires placement=inherit"):
+        parse_child_policy({"context_mode": "trunk", "placement": "spread"})
+    parse_child_policy({"context_mode": "trunk", "placement": "inherit"})
+    parse_child_policy({"context_mode": "semantic", "placement": "spread"})

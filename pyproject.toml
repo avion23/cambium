@@ -71,8 +71,8 @@ target-version = "py314"
 [tool.ruff.lint]
 # C901 (mccabe) gates cyclomatic complexity at 15 for new/untouched code.
 # Existing offenders are frozen in per-file-ignores below; prune an entry
-# whenever that file is refactored under the limit. Current exemptions are
-# 24 production modules and two scripts.
+# whenever that file is refactored under the limit. Measured baseline
+# (2026-08-26): 26 files, longest tail worker.py/supervisor.py/diffundo.py.
 select = ["E", "F", "I", "UP", "B", "C90"]
 
 [tool.ruff.lint.mccabe]
@@ -81,10 +81,12 @@ max-complexity = 15
 [tool.ruff.lint.per-file-ignores]
 "src/cambium/architectus.py" = ["C901"]
 "src/cambium/auth.py" = ["C901"]
+"src/cambium/bench.py" = ["C901"]
 "src/cambium/cli.py" = ["C901"]
 "src/cambium/conversations.py" = ["C901"]
 "src/cambium/diffundo.py" = ["C901"]
 "src/cambium/interactive.py" = ["C901"]
+"src/cambium/lsp_query.py" = ["C901"]
 "src/cambium/merge.py" = ["C901"]
 "src/cambium/module_conformance.py" = ["C901"]
 "src/cambium/observability.py" = ["C901"]

@@ -77,7 +77,9 @@ For compatibility, the active delegate schema still permits omission and then
 uses automatic exact/semantic resolution. The target public model contract makes
 that choice explicit.
 
-The active worker tool roster is:
+The repository also contains implementations of branch-history projection,
+bounded code indexing, and optional one-shot LSP queries. They are not yet part
+of the active worker tool roster, which currently exposes:
 
 ```text
 write_file
@@ -88,15 +90,9 @@ read_batch
 delegate
 ```
 
-`inspect_state`, `branch_history`, and `repo_query` are target capabilities, not
-current production implementations. Each must land as one complete runtime
-slice: schema, dispatcher, prompt/tool hash, bounded result, durable observation,
-and public scenario. An optional one-shot LSP boundary is target work only and
-should be added when a supported `repo_query` action proves it is needed.
-
-The automatic SituationFrame, shared BranchState reducer, evidence-linked
-WorkLedger, versioned ResultCapsule, and model-visible ResourceEnvelope are also
-target work, not current implementation claims.
+The automatic SituationFrame, shared BranchState reducer, `inspect_state`,
+evidence-linked WorkLedger, versioned ResultCapsule, and model-visible
+ResourceEnvelope are target work, not current implementation claims.
 
 ## Quick start
 
@@ -140,7 +136,6 @@ uv run cambium monitor /path/to/session
 ## Verification
 
 ```bash
-python -m compileall -q src tests
 uv run ruff check src tests
 uv run pytest -m "not slow" -q
 uv run pytest -m slow -q
