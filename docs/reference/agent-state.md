@@ -1,32 +1,28 @@
 # Agent state reference
 
-**Status:** target interface reference. These values define the intended
-agent-facing control model. Current wire schemas remain authoritative until the
-corresponding implementation-plan phase lands.
+**Status:** target interface reference. Current source schemas remain
+ authoritative until the corresponding implementation-plan slice lands.
 
 Rationale is in
 [`../architecture/agent-operating-model.md`](../architecture/agent-operating-model.md).
 
 ## 1. Identity and authority
 
-Every state object is scoped by stable runtime identity:
+Every target state object is scoped by:
 
 ```text
 session_id
-branch_id       normally the task_id
+branch_id          normally task_id
 parent_branch_id
-generation      worker ownership/fencing generation
-turn            model decision turn within the generation
-context_epoch   immutable CAST epoch
-artifact_head   accepted Git commit
-source_watermark latest durable event sequence used by the projection
+generation         worker ownership/fencing generation
+turn               model decision turn within generation
+context_epoch      immutable CAST epoch
+artifact_head      accepted Git commit
+source_watermark   latest durable event sequence used
 projection_version
 ```
 
-`generation`, `context_epoch`, and `artifact_head` are independent. Equality of
-one does not imply equality of the others.
-
-Field ownership:
+`generation`, `context_epoch`, and `artifact_head` are independent.
 
 | Field class | Authority |
 | --- | --- |
@@ -34,23 +30,20 @@ Field ownership:
 | branch lifecycle, generation, child admission | supervisor |
 | tool observation | tool boundary and durable event |
 | provider usage/cache hit | provider response normalized by transport |
-| checkpoint identity | worker checkpoint writer, validated by supervisor |
-| accepted artifact head | Git plus supervisor publication/join invariant |
+| checkpoint identity | worker writer, validated by supervisor |
+| accepted artifact head | Git plus supervisor join/publication invariant |
 | claim or recommendation | model proposal, explicitly labelled |
 | SituationFrame | deterministic projection engine |
 | TUI row | renderer over canonical state |
 
 ## 2. Stable references
 
-A lossy state item should point back to one or more stable references.
-Recommended printable forms:
-
 ```text
 branch:<percent-encoded-task-id>
 tool:<percent-encoded-task-id>:<generation>:<turn>:<batch-index>
 event:<session-id>:<sequence>
 checkpoint:<percent-encoded-task-id>:<epoch>
-commit:<40-or-64-hex-object-id>
+commit:<object-id>
 file:<path>#L<start>-L<end>@<blob-or-worktree-hash>
 check:<percent-encoded-task-id>:<generation>:<name>
 claim:<percent-encoded-task-id>:<sequence>
@@ -59,24 +52,24 @@ obligation:<percent-encoded-task-id>:<sequence>
 verification:<percent-encoded-task-id>:<sequence>
 ```
 
-Tool batch index is zero-based. The current branch-history reader also accepts
-the legacy form without `:<batch-index>` and resolves it to index zero. New
-references should use the canonical five-part form.
+The tool batch index is zero-based and mandatory for new history tooling. An
+evidence reference grants no authority and never re-executes an effect. Missing
+or stale references fail explicitly.
 
-A reference identifies evidence; it does not grant authority or re-execute an
-effect. Missing or stale references fail explicitly.
+The existing `branch_history.py` library accepts a legacy tool form without the
+batch index for compatibility. The future active model tool should emit the
+canonical form and decide explicitly whether that library compatibility remains.
 
 ## 3. BranchState
 
-`BranchState` is a pure read model reconstructed from durable sources.
-Illustrative JSON shape:
+Target illustrative shape:
 
 ```json
 {
   "version": 1,
   "source_watermark": 481,
   "identity": {
-    "session_id": "/state/cambium/project/run-42",
+    "session_id": "/state/cambium/run-42",
     "branch_id": "root",
     "parent_branch_id": null,
     "generation": 2,
@@ -85,7 +78,7 @@ Illustrative JSON shape:
   "mission": {
     "objective": "Repair paging and prove the regression",
     "constraints": ["Do not edit provider transports"],
-    "done_when": ["focused regression passes", "existing parser suite passes"],
+    "done_when": ["focused regression passes", "parser suite passes"],
     "verification_contract": ["python -m pytest tests/test_parser.py -q"]
   },
   "authority": {
@@ -110,7 +103,7 @@ Illustrative JSON shape:
     "dirty": false
   },
   "control": {
-    "plan": ["locate paging boundary", "add regression", "repair", "verify"],
+    "plan": ["locate", "reproduce", "repair", "verify"],
     "current_step": 2,
     "last_meaningful_delta": "offset=500 truncates before slicing",
     "blockers": []
@@ -144,7 +137,7 @@ Illustrative JSON shape:
 }
 ```
 
-### Lifecycle values
+Public lifecycle values:
 
 ```text
 queued
@@ -160,13 +153,10 @@ cancelled
 rejected
 ```
 
-A reducer may preserve more detailed internal phases, but model and operator
-projections should use the same public vocabulary.
+Internal phases may be richer, but model and operator projections use one public
+vocabulary.
 
 ## 4. SituationFrame
-
-The SituationFrame is a bounded text rendering of `BranchState`, appended as a
-normal late request message.
 
 Canonical section order:
 
@@ -181,7 +171,7 @@ RESOURCES
 ANCHORS
 ```
 
-Every frame header carries:
+Frame metadata:
 
 ```text
 version
@@ -195,19 +185,17 @@ artifact_head
 
 Rules:
 
-1. Omit empty optional rows, never mandatory section headers.
-2. Sort obligations, children, and anchors by stable identity/admission order,
-   not completion time.
-3. Label unknown values `unknown`; do not invent defaults.
-4. Mark stale verification or evidence explicitly.
-5. Include at most the next few critical obligations and children. Supply an
-   `inspect_state` cursor when more exist.
-6. Do not include secrets, raw credentials, hidden reasoning, or the full
-   transcript.
-7. A frame is not persisted as another truth object. Persist its projection
-   version, source watermark, digest, byte count, and truncation metadata.
+1. Keep mandatory section headers even when values are empty.
+2. Sort children and obligations by stable identity/admission order.
+3. Render missing values as `unknown` rather than plausible defaults.
+4. Mark stale verification and evidence explicitly.
+5. Bound the whole frame and every section; expose `inspect_state` continuation
+   when items are omitted.
+6. Include no credentials, hidden reasoning, or full transcript.
+7. Persist only version, watermark, identity, digest, byte count, and
+   truncation metadata when the frame is reproducible.
 
-Suggested hard initial bounds, subject to measurement:
+Initial target bounds, subject to measurement:
 
 ```text
 whole frame             12 KiB
@@ -240,14 +228,10 @@ resources + anchors      2 KiB / 12 refs
 }
 ```
 
-`warm_estimate` is based on configured TTL and elapsed time, not a cache-hit
-claim. `provider_cache_hit` remains provider evidence after a request.
+`warm_estimate` is not a cache-hit claim. Pressure thresholds are versioned and
+inspectable. Missing inputs yield `unknown`.
 
-Pressure classes are harness-computed policy outputs. Their thresholds are
-versioned and inspectable. Unknown inputs produce `unknown`, not a low-pressure
-assumption.
-
-## 6. Epistemic items
+## 6. Knowledge items
 
 ### Observation
 
@@ -255,24 +239,21 @@ assumption.
 {
   "id": "observation:root:18",
   "kind": "tool|event|file|provider|artifact",
-  "summary": "test_parser_offset_500 failed before the repair",
-  "evidence_refs": ["tool:root:2:6:0", "check:root:2:parser-offset"],
+  "summary": "offset case failed before repair",
+  "evidence_refs": ["tool:root:2:6:0"],
   "source_watermark": 420
 }
 ```
-
-An Observation reports what a boundary returned. It should not contain a model
-conclusion disguised as a direct fact.
 
 ### Claim
 
 ```json
 {
   "id": "claim:root:7",
-  "text": "read_batch slices after applying the byte cap",
+  "text": "read_batch caps before offset slicing",
   "basis": "observed|inferred|hypothesis",
   "status": "proposed|accepted|invalidated",
-  "evidence_refs": ["file:src/pager.py#L80-L96@abc123", "tool:root:2:6:0"],
+  "evidence_refs": ["file:src/pager.py#L80-L96@abc123"],
   "supersedes": []
 }
 ```
@@ -282,7 +263,7 @@ conclusion disguised as a direct fact.
 ```json
 {
   "id": "decision:root:4",
-  "text": "slice lines before enforcing the response-byte cap",
+  "text": "slice lines before response-byte cap",
   "status": "active|superseded",
   "evidence_refs": ["claim:root:7"],
   "supersedes": []
@@ -294,9 +275,9 @@ conclusion disguised as a direct fact.
 ```json
 {
   "id": "obligation:root:9",
-  "text": "run the existing parser scenario suite",
+  "text": "run parser scenarios",
   "owner": "root",
-  "done_when": "command exits 0 at the accepted artifact head",
+  "done_when": "command exits 0 at accepted head",
   "status": "open|blocked|satisfied|cancelled",
   "evidence_refs": []
 }
@@ -315,32 +296,28 @@ conclusion disguised as a direct fact.
 }
 ```
 
-Verification is valid only for the artifact and relevant configuration it
-tested. A later overlapping artifact change marks it stale until rerun.
+Verification applies only to the artifact and configuration tested.
 
 ## 7. WorkLedger projection
 
-The first implementation should derive a ledger from existing `SummaryEntry`
-fields:
+The first implementation derives current items conservatively from existing
+`SummaryEntry` fields:
 
-| Existing field | Derived state |
+| Existing field | Derived item |
 | --- | --- |
-| `facts_added` | Claim with `basis=inferred` unless linked direct evidence exists |
-| `facts_invalidated` | append invalidation transition |
+| `facts_added` | Claim, inferred unless linked direct evidence exists |
+| `facts_invalidated` | invalidation transition |
 | `decisions_added` | active Decision |
 | `decisions_superseded` | supersession transition |
 | `open_items` | open Obligation |
-| `verification_results` | Verification, parsed conservatively |
-| `relevant_failed_approaches` | constraint/negative evidence |
-| `files_and_symbols_changed` | artifact-related observation, not accepted Git proof |
+| `verification_results` | Verification parsed conservatively |
+| `relevant_failed_approaches` | negative evidence/constraint |
+| `files_and_symbols_changed` | model-reported observation, not accepted Git proof |
 
-The harness assigns identities and preserves source-entry references. It must
-not guess that two similar strings are the same item. Explicit future IDs can
-replace conservative identity only through a versioned schema migration.
+The harness assigns identities and source-entry refs. It must not fuzzy-merge
+similar strings. A richer model schema requires a versioned migration.
 
 ## 8. ResultCapsule
-
-Target versioned shape:
 
 ```json
 {
@@ -366,17 +343,16 @@ Target versioned shape:
     "output_tokens": 2100,
     "estimated_cost_usd": 0.0
   },
-  "recommended_parent_action": "continue the root repair"
+  "recommended_parent_action": "continue root repair"
 }
 ```
 
-The capsule is bounded, immutable once admitted, and linked to branch history.
-It does not carry the complete child transcript. `artifacts.changed=true` does
-not mean the parent accepted the artifact; join state remains supervisor-owned.
+The capsule is bounded and immutable once admitted. Artifact fields do not prove
+parent integration; join state remains supervisor-owned.
 
-## 9. inspect_state tool
+## 9. Target tools
 
-Target model-facing schema:
+### `inspect_state`
 
 ```json
 {
@@ -390,13 +366,23 @@ Target model-facing schema:
 }
 ```
 
-The tool reads the current canonical projection only. It does not read raw
-transcripts, execute tools, or mutate state. Historical detail remains in
-`branch_history`.
+It reads BranchState only and never executes effects.
 
-## 10. repo_query tool
+### `branch_history`
 
-Target model-facing schema:
+Existing library actions:
+
+```text
+branches
+tools
+tool
+transcript
+```
+
+The library reads existing events/checkpoints only and never re-executes a tool.
+It is not yet wired into the active model schema/dispatcher/prompt/tool hash.
+
+### `repo_query`
 
 ```json
 {
@@ -412,14 +398,14 @@ Target model-facing schema:
 }
 ```
 
-Portable actions use the bounded `code_index.py` implementation. Rich
-definition/reference/diagnostic actions may use the optional one-shot LSP
-boundary. An unavailable LSP returns an explicit unsupported result and may
-fall back only to a semantically equivalent portable query.
+Portable actions can reuse `code_index.py`. Optional LSP actions can reuse
+`lsp_query.py`. Both remain repository-local and must not silently perform a
+different fallback operation.
 
-## 11. Projection events
+No target tool is current until schema, dispatcher, prompt/tool hash, bounded
+result, durable observation, scenario, and documentation land together.
 
-Planned event vocabulary:
+## 10. Planned projection events
 
 ```text
 branch_state_projected
@@ -434,19 +420,25 @@ provider_lease_migrated
 operator_steer_admitted
 ```
 
-Events should contain identifiers, versions, hashes, counts, and bounded
-summaries. Large frame or knowledge payloads should remain reconstructible from
-existing checkpoints/events rather than duplicated without need.
+Events contain identities, versions, counts, hashes, and bounded summaries.
+Large reconstructible payloads are not duplicated without need.
 
-## 12. Compatibility and migration
+## 11. Current migration state
 
-Current child-policy source accepts explicit `context_mode`/`placement`, while
-the model schema also permits omission and automatic compatibility resolution.
-The target interface removes that ambiguity: every model-originated child
-proposal declares both fields. A separate harness-originated compatibility mode,
-if retained, must have an explicit name and event value; omission must not carry
-hidden semantics.
+Current model-originated `delegate` calls require `task`, `context_mode`, and
+`placement` in the schema and are validated again at tool and supervisor
+boundaries.
 
-Current result envelopes remain valid during migration. Version 2 capsules are
-added behind an adapter that preserves the current strict envelope until all
-supervisor, worker, TUI, and history readers consume the new version.
+Harness-originated static `proposed_children` can still omit both policy fields
+and enter an internal automatic compatibility path. That mode must receive an
+explicit schema/event value or be removed; it is not a public model default.
+
+Current `write_file` and `edit_file` effects are confined to normal paths inside
+the assigned worktree. Parent paths, `.git`, `.cambium`, and symlink escapes are
+rejected.
+
+Current strict result envelopes remain the migration base for ResultCapsule.
+Current CAST `SummaryEntry` remains the migration base for WorkLedger.
+`branch_history.py`, `code_index.py`, and `lsp_query.py` are implemented library
+boundaries awaiting model-tool wiring. BranchState, SituationFrame, and
+`inspect_state` do not yet exist as production runtime surfaces.
