@@ -144,12 +144,12 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "write_file",
         "description": (
-            "Write UTF-8 text content to a file. Relative paths resolve against cwd; "
-            "absolute paths may refer anywhere on the system."
+            "Write UTF-8 text inside the assigned worktree. Relative paths resolve against "
+            "cwd; paths outside the worktree and reserved .git/.cambium metadata are rejected."
         ),
         "parameters": _parameters(
             {
-                "path": {"type": "string", "description": "Path to the file."},
+                "path": {"type": "string", "description": "Worktree-relative file path."},
                 "content": {"type": "string", "description": "Complete file contents."},
             },
             ["path", "content"],
@@ -158,12 +158,12 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "edit_file",
         "description": (
-            "Replace exactly one occurrence of old_string in a file. Relative paths resolve "
-            "against cwd; absolute paths may refer anywhere on the system."
+            "Replace exactly one occurrence of old_string inside the assigned worktree. "
+            "Paths outside the worktree and reserved .git/.cambium metadata are rejected."
         ),
         "parameters": _parameters(
             {
-                "path": {"type": "string", "description": "Path to the file."},
+                "path": {"type": "string", "description": "Worktree-relative file path."},
                 "old_string": {"type": "string", "description": "Text to replace."},
                 "new_string": {"type": "string", "description": "Replacement text."},
             },
@@ -242,17 +242,14 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "delegate",
         "description": (
-            "Propose one scoped child workload for work you should not do yourself — a "
-            "separable subproblem with its own files or investigation area. The child is a "
-            "full Cambium worker in an isolated git worktree. IMPORTANT: this call only "
-            "PROPOSES the child. With context reuse, a successful proposal suspends this "
-            "task; the supervisor may later resume it with a bounded child-result envelope. "
-            "Without context reuse, child admission waits for this task's terminal boundary. "
-            "Make spec.task self-contained. Declare context_mode and placement when you need "
-            "them: trunk+inherit reuses the exact checkpoint prefix on the same provider; "
-            "semantic imports only the immutable summaries; fresh drops parent context. "
-            "placement=spread prefers another feasible provider; inherit keeps the parent's. "
-            "The child never receives sibling context or hidden reasoning."
+            "Propose one scoped child workload for work you should not do yourself. The child "
+            "is a full Cambium worker in an isolated git worktree. This call only proposes; "
+            "the supervisor validates and durably admits or rejects the child. With context "
+            "reuse, a successful proposal may suspend this task until the child result is "
+            "joined. Make spec.task self-contained and always declare context_mode plus "
+            "placement. Valid pairs are trunk+inherit, semantic+inherit, semantic+spread, "
+            "fresh+inherit, and fresh+spread. trunk+spread is rejected. The child never "
+            "receives sibling context or hidden reasoning."
         ),
         "parameters": _parameters(
             {
@@ -272,8 +269,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "spec": {
                     "type": "object",
                     "description": (
-                        "Spawnable child task spec. task is the workload contract. Provider "
-                        "fields are constraints, never an instruction to bypass admission."
+                        "Spawnable child task spec. task is the workload contract; "
+                        "context_mode and placement are explicit architectural choices. "
+                        "Provider fields constrain admission and never bypass it."
                     ),
                     "properties": {
                         "task": {
@@ -290,21 +288,19 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                             "type": "string",
                             "enum": ["trunk", "semantic", "fresh"],
                             "description": (
-                                "Which parent context representation seeds the child. "
-                                "trunk = exact same-provider checkpoint prefix (requires "
-                                "placement=inherit); semantic = immutable summary trunk only; "
-                                "fresh = no parent context. Defaults to the supervisor's "
-                                "automatic compatibility resolution when omitted."
+                                "Required parent-context representation. trunk = exact "
+                                "same-provider checkpoint prefix and requires inherit; "
+                                "semantic = immutable summary trunk under a fresh head; "
+                                "fresh = task contract only."
                             ),
                         },
                         "placement": {
                             "type": "string",
                             "enum": ["inherit", "spread"],
                             "description": (
-                                "Provider-affinity preference. inherit keeps the parent "
-                                "provider/model; spread prefers another feasible provider lane "
-                                "and falls back to the full feasible set. Defaults to inherit "
-                                "when omitted."
+                                "Required provider-affinity choice. inherit preserves parent "
+                                "affinity; spread prefers another hard-feasible lane, then "
+                                "falls back to the complete feasible set."
                             ),
                         },
                         "requirements": {
@@ -345,7 +341,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                             ),
                         },
                     },
-                    "required": ["task"],
+                    "required": ["task", "context_mode", "placement"],
                     "additionalProperties": True,
                 },
             },

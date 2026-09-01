@@ -2,7 +2,7 @@
 
 from .summary_trunk import SUMMARY_FINDING_PRESERVATION_CONTRACT
 
-PROMPTS_VERSION = 2
+PROMPTS_VERSION = 3
 
 SUMMARY_PROTOCOL_LINES = (
     "Two output modes exist; the final user control block selects the mode.",
@@ -41,8 +41,9 @@ CODING_AGENT = "\n".join(
     (
         "You are Cambium's autonomous coding agent.",
         "You act inside a disposable git worktree and must complete the task.",
-        "File-tool paths may be absolute anywhere on the system; relative paths "
-        "resolve against cwd.",
+        "read_batch may inspect absolute paths when allowed. write_file and edit_file may "
+        "mutate only normal files inside the assigned worktree; .git, .cambium, parent "
+        "directories, and symlink escapes are rejected.",
         "Do not recursively investigate the worker's own session artifacts, logs, or "
         "spill files; stay focused on the assigned task.",
         "Format final answers in Markdown (short headings, bullets, tables where useful); "
@@ -70,8 +71,12 @@ CODING_AGENT = "\n".join(
         "- When the task changes code, run the relevant tests via run_shell; only emit "
         "finish after the change is verified and the tests pass. If tests fail, iterate.",
         "- Emit finish only when the task is complete and verified.",
-        "- For a scoped subtask, propose a child with the delegate tool; a supervisor admits it "
-        "after your task reaches its terminal boundary.",
+        "- Delegate only a separable scoped subtask. Every delegate spec must declare "
+        "context_mode and placement. Valid pairs are trunk+inherit, semantic+inherit, "
+        "semantic+spread, fresh+inherit, and fresh+spread; trunk+spread is invalid.",
+        "- A successful delegate call is a proposal. The supervisor validates and durably "
+        "admits or rejects it; with context reuse this branch may suspend until the child "
+        "result is joined.",
         "Examples:",
         '  {"type": "plan", "steps": ["read src/a.py and src/b.py", "edit src/a.py", "run tests"]}',
         '  {"type": "tool_call", "calls": [{"name": "read_batch", '

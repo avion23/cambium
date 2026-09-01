@@ -14,17 +14,37 @@ def _delegate_schema() -> dict[str, Any]:
     )
 
 
+def _policy() -> dict[str, str]:
+    return {"context_mode": "fresh", "placement": "spread"}
+
+
 def test_delegate_schema_requires_a_scoped_workload() -> None:
     errors = validate_tool_call(
         _delegate_schema(),
         {
             "child_task_id": "child-review",
             "kind": "investigation",
-            "spec": {},
+            "spec": _policy(),
         },
     )
 
     assert errors == ["validation failed: missing 'spec.task' (string)"]
+
+
+def test_delegate_schema_requires_explicit_context_and_placement() -> None:
+    errors = validate_tool_call(
+        _delegate_schema(),
+        {
+            "child_task_id": "child-review",
+            "kind": "investigation",
+            "spec": {"task": "inspect provider routing"},
+        },
+    )
+
+    assert errors == [
+        "validation failed: missing 'spec.context_mode' (string)",
+        "validation failed: missing 'spec.placement' (string)",
+    ]
 
 
 def test_delegate_schema_accepts_explicit_provider_constraints() -> None:
@@ -38,6 +58,7 @@ def test_delegate_schema_accepts_explicit_provider_constraints() -> None:
                     "Inspect provider routing only; own no files; report concrete "
                     "violations and the tests that reproduce them."
                 ),
+                **_policy(),
                 "requirements": {
                     "quality": "strong",
                     "needs_native_tools": True,
@@ -72,7 +93,7 @@ def test_delegate_schema_rejects_invalid_budget_values(
         {
             "child_task_id": "child-review",
             "kind": "investigation",
-            "spec": {"task": "inspect the routing", field: value},
+            "spec": {"task": "inspect the routing", **_policy(), field: value},
         },
     )
 
