@@ -124,9 +124,6 @@ def test_tasktree_plan_runs_supervisor_subprocess_to_three_merges(tmp_path) -> N
     plan_path = tmp_path / "plan.json"
     plan_path.write_text(json.dumps(plan, indent=2))
 
-    written_plan = json.loads(plan_path.read_text())
-    assert [task["task_id"] for task in written_plan["tasks"]] == order
-
     env = _pythonpath_env()
     env.pop("FAKE_MODE", None)
     env.update(

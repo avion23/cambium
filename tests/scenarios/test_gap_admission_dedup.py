@@ -5,9 +5,10 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
-import subprocess
 from pathlib import Path
 from typing import Any
+
+from _helpers_g11 import init_repo  # type: ignore[reportMissingImports]
 
 from cambium.routing import DebtStore
 from cambium.supervisor import (
@@ -26,28 +27,6 @@ class _RunningTaskGroup:
 
     def create_task(self, coroutine: Any) -> None:
         self.tasks.append(asyncio.create_task(coroutine))
-
-
-def _repo(tmp_path: Path) -> tuple[Path, str]:
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
-    subprocess.run(["git", "-C", str(repo), "config", "user.name", "admission-test"], check=True)
-    subprocess.run(
-        ["git", "-C", str(repo), "config", "user.email", "admission@test"], check=True
-    )
-    (repo / "a.txt").write_text("base\n", encoding="utf-8")
-    subprocess.run(["git", "-C", str(repo), "add", "a.txt"], check=True, capture_output=True)
-    subprocess.run(
-        ["git", "-C", str(repo), "commit", "-m", "initial"], check=True, capture_output=True
-    )
-    base = subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    return repo, base
 
 
 def _provider_config(path: Path, providers: list[dict[str, Any]]) -> Path:
@@ -113,7 +92,7 @@ def _parent_envelope() -> dict[str, Any]:
 
 def test_same_task_generation_deduplicates_while_child_is_running(tmp_path: Path) -> None:
     session_dir = tmp_path / "session"
-    repo, base = _repo(tmp_path)
+    repo, base = init_repo(tmp_path, "admission-test", "admission@test")
     provider_name = "ready-provider"
     provider_key = "CAMBIUM_PROVIDER_READY_PROVIDER_API_KEY"
     config = _provider_config(tmp_path / "providers.json", [_provider(provider_name)])
@@ -214,7 +193,7 @@ def test_different_child_tasks_are_admitted_with_distinct_request_ids(
     tmp_path: Path,
 ) -> None:
     session_dir = tmp_path / "session"
-    repo, base = _repo(tmp_path)
+    repo, base = init_repo(tmp_path, "admission-test", "admission@test")
     parent = _parent(session_dir, repo, base)
     runtime = _Runtime(session_dir, None)
     runtime.set_session_tasks([parent])
@@ -266,7 +245,7 @@ def test_new_generation_request_is_not_lost_to_stale_generation_filter(
     tmp_path: Path,
 ) -> None:
     session_dir = tmp_path / "session"
-    repo, base = _repo(tmp_path)
+    repo, base = init_repo(tmp_path, "admission-test", "admission@test")
     parent = _parent(session_dir, repo, base)
     runtime = _Runtime(session_dir, None)
     runtime.set_session_tasks([parent])
@@ -341,7 +320,7 @@ def test_empty_credential_feasible_set_fails_before_worker_spawn(
     tmp_path: Path,
 ) -> None:
     provider_name = "missing-provider"
-    repo, base = _repo(tmp_path)
+    repo, base = init_repo(tmp_path, "admission-test", "admission@test")
     config = _provider_config(
         tmp_path / "providers.json", [_provider(provider_name) | {"api_key": ""}]
     )

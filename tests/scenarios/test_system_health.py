@@ -2,20 +2,24 @@
 
 from __future__ import annotations
 
+import pytest
+
 from cambium.system_health import can_run_heavy
 
 
-def test_can_run_heavy_passes_with_generous_thresholds() -> None:
-    allowed, reasons = can_run_heavy(
-        {"mem_available_frac": 0.0, "load1_per_cpu": 1_000_000.0, "disk_free": 0}
-    )
+@pytest.mark.parametrize(
+    ("thresholds", "expected", "reason"),
+    [
+        ({"mem_available_frac": 0.0, "load1_per_cpu": 1_000_000.0, "disk_free": 0}, True, ""),
+        ({"mem_available_frac": 1.0}, False, "mem_available_frac"),
+    ],
+    ids=["generous-thresholds", "impossible-memory"],
+)
+def test_can_run_heavy_respects_thresholds(
+    thresholds: dict[str, float], expected: bool, reason: str
+) -> None:
+    allowed, reasons = can_run_heavy(thresholds)
 
-    assert allowed is True, reasons
-    assert reasons == []
-
-
-def test_can_run_heavy_reports_impossible_memory_threshold() -> None:
-    allowed, reasons = can_run_heavy({"mem_available_frac": 1.0})
-
-    assert allowed is False
-    assert any("mem_available_frac" in reason for reason in reasons)
+    assert allowed is expected
+    assert (not reasons) is expected
+    assert not reason or any(reason in item for item in reasons)

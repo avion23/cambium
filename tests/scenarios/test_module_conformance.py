@@ -459,7 +459,6 @@ def test_module_deletion_leaves_shared_scenarios_green(tmp_path: Path) -> None:
             "pytest",
             "-q",
             "tests/scenarios/test_module_conformance.py",
-            "tests/scenarios/test_bench.py",
             "tests/scenarios/test_tooling.py",
         ],
         cwd=copy,

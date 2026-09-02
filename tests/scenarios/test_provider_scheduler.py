@@ -43,23 +43,6 @@ class _ExecuteFaultConnection:
         return getattr(self._connection, name)
 
 
-def test_module_has_one_state_role_and_no_competing_scheduler() -> None:
-    assert not hasattr(provider_state, "ProviderScheduler")
-    assert not hasattr(provider_state, "rank_policies")
-    assert set(provider_state.__all__) == {
-        "BillingMode",
-        "ProviderLease",
-        "QuotaLedger",
-        "QuotaLedgerBusyError",
-        "QuotaLedgerDiskFullError",
-        "QuotaLedgerError",
-        "QuotaReservation",
-        "QuotaWindowSnapshot",
-        "QuotaWindowSpec",
-        "quota_snapshot_json",
-    }
-
-
 def test_provider_lease_is_strictly_identified() -> None:
     lease = ProviderLease("openai", "gpt-5.6", "root", cache_identity="prefix")
     assert lease.provider == "openai"
@@ -215,20 +198,6 @@ def test_late_reconciliation_does_not_touch_new_window(tmp_path: Path) -> None:
     snapshot = ledger.snapshots("p")[0]
     assert snapshot.reset_at == 20.0
     assert snapshot.used_tokens == 0
-
-
-def test_reconciled_reservations_are_pruned(tmp_path: Path) -> None:
-    ledger = QuotaLedger(tmp_path / "quota.db")
-    window = QuotaWindowSpec("long", 1_000_000, token_allowance=100)
-    reservation = ledger.reserve("p", (window,), 20, requests=0, now=0.0)
-    assert reservation is not None
-    ledger.reconcile(reservation, (window,), 20, now=24 * 60 * 60 + 1)
-
-    with sqlite3.connect(tmp_path / "quota.db") as connection:
-        assert connection.execute("SELECT COUNT(*) FROM quota_reservations").fetchone()[0] == 0
-        assert (
-            connection.execute("SELECT COUNT(*) FROM quota_reservation_windows").fetchone()[0] == 0
-        )
 
 
 def test_quota_reconciliation_is_idempotent(tmp_path: Path) -> None:

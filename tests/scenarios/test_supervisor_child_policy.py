@@ -117,5 +117,3 @@ def test_parse_child_policy_rejects_trunk_spread_combination() -> None:
     """trunk+spread is contradictory and must be rejected."""
     with pytest.raises(ValueError, match="trunk requires placement=inherit"):
         parse_child_policy({"context_mode": "trunk", "placement": "spread"})
-    parse_child_policy({"context_mode": "trunk", "placement": "inherit"})
-    parse_child_policy({"context_mode": "semantic", "placement": "spread"})

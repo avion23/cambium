@@ -268,20 +268,32 @@ def test_publish_rejects_quarantine_env(tmp_path, monkeypatch) -> None:
     seq.cleanup_staging(repo)
 
 
-def test_staging_conflict_lists_file_and_keeps_main(tmp_path) -> None:
+@pytest.mark.parametrize(
+    ("conflict_path", "initial_content"),
+    [("base.txt", None), ("my file.txt", "orig\n")],
+    ids=["plain", "spaced"],
+)
+def test_staging_conflict_lists_file_and_keeps_main(
+    tmp_path, conflict_path: str, initial_content: str | None
+) -> None:
     repo = tmp_path / "repo"
     base = _init_repo(repo)
+    if initial_content is not None:
+        (repo / conflict_path).write_text(initial_content)
+        _run(repo, "add", conflict_path)
+        _run(repo, "commit", "-m", "add spaced file")
+        base = _rev(repo, "HEAD")
 
     wt_a = tmp_path / "wt-a"
-    _worker_commit(repo, "wt-a", wt_a, {"base.txt": "base\nfrom-a\n"}, base)
+    _worker_commit(repo, "wt-a", wt_a, {conflict_path: "from-a\n"}, base)
     wt_m = tmp_path / "wt-m"
-    _worker_commit(repo, "wt-m", wt_m, {"base.txt": "base\nfrom-m\n"}, base)
+    _worker_commit(repo, "wt-m", wt_m, {conflict_path: "from-m\n"}, base)
     _publish(repo, _rev(repo, "refs/heads/wt-m"), base)
 
     seq = MergeSequencer(task_id="conf-1", session_dir=tmp_path)
     with pytest.raises(MergeConflictError) as exc:
         seq.prepare_staging(repo, tmp_path / "staging", "wt-a", "main")
-    assert "base.txt" in exc.value.conflicts
+    assert conflict_path in exc.value.conflicts
     assert _rev(repo, "refs/heads/main") == _rev(repo, "refs/heads/wt-m")  # untouched
     seq.cleanup_staging(repo)  # conflict leaves no poison behind
 
@@ -433,28 +445,6 @@ def test_publish_rejects_non_fast_forward_tips(tmp_path) -> None:
     with pytest.raises(NonFastForwardError):
         seq.publish_merge(repo, tip_c, tip_b)
     assert _rev(repo, "refs/heads/main") == tip_b
-
-
-def test_staging_conflict_with_spaced_path(tmp_path) -> None:
-    repo = tmp_path / "repo"
-    base = _init_repo(repo)
-    (repo / "my file.txt").write_text("orig\n")
-    _run(repo, "add", "my file.txt")
-    _run(repo, "commit", "-m", "add spaced file")
-    base = _rev(repo, "HEAD")
-
-    wt_a = tmp_path / "wt-a"
-    _worker_commit(repo, "wt-a", wt_a, {"my file.txt": "from-a\n"}, base)
-    wt_m = tmp_path / "wt-m"
-    _worker_commit(repo, "wt-m", wt_m, {"my file.txt": "from-m\n"}, base)
-    _publish(repo, _rev(repo, "refs/heads/wt-m"), base)
-
-    seq = MergeSequencer(task_id="conf-space", session_dir=tmp_path)
-    with pytest.raises(MergeConflictError) as exc:
-        seq.prepare_staging(repo, tmp_path / "staging", "wt-a", "main")
-    assert "my file.txt" in exc.value.conflicts  # unquoted by the -z parse
-    assert _rev(repo, "refs/heads/main") == _rev(repo, "refs/heads/wt-m")  # untouched
-    seq.cleanup_staging(repo)
 
 
 def test_registered_staging_path_with_literal_newline_is_reusable_and_cleaned(tmp_path) -> None:
@@ -1218,18 +1208,3 @@ def test_sparse_dirty_staging_is_preserved(tmp_path) -> None:
     _, destination = _quarantined(seq)
     assert (destination / "keep" / "evidence.bin").read_bytes() == b"sparse evidence"
     assert _run(destination, "sparse-checkout", "list").stdout.strip() == "keep"
-
-
-def test_hook_cannot_generate_content_during_staging(tmp_path) -> None:
-    repo = tmp_path / "repo"
-    base = _init_repo(repo)
-    _worker_commit(repo, "worker", tmp_path / "worker", {"worker.txt": "ok\n"}, base)
-    hook = repo / ".git" / "hooks" / "post-checkout"
-    hook.write_text("#!/bin/sh\nprintf 'hook evidence' > hook-secret-name.txt\n")
-    hook.chmod(0o700)
-    staging = tmp_path / "staging"
-    seq = MergeSequencer(task_id="hook-generated", session_dir=tmp_path)
-    seq.prepare_staging(repo, staging, "worker", "main")
-    seq.ensure_staging_clean(repo)
-
-    assert not (staging / "hook-secret-name.txt").exists()

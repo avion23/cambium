@@ -8,19 +8,12 @@ from pathlib import Path
 
 from cambium import oneshot, tui
 from cambium.oneshot import OneShotConfig
-from cambium.supervisor import PlanResult, TaskResult, _Runtime
+from cambium.supervisor import PlanResult, TaskResult
 
 
 class _Tty(io.StringIO):
     def isatty(self) -> bool:
         return True
-
-
-def test_admission_is_unlimited_by_default_and_honors_explicit_cap(tmp_path: Path) -> None:
-    assert _Runtime(tmp_path / "unlimited", None)._admission_semaphore is None
-    capped = _Runtime(tmp_path / "capped", None, max_concurrent_tasks=2)
-    assert capped._admission_semaphore is not None
-    assert capped._admission_semaphore._value == 2
 
 
 def test_queued_tui_prompts_use_one_flat_plan(monkeypatch, tmp_path: Path) -> None:

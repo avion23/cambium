@@ -41,8 +41,7 @@ def test_idle_cancel_does_not_wait_for_a_blocked_input_reader(
                 error_stream=io.StringIO(),
             )
         )
-        while not started.is_set():
-            await asyncio.sleep(0.01)
+        await asyncio.to_thread(started.wait)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, timeout=1.0)

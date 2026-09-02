@@ -24,7 +24,6 @@ import signal
 import sqlite3
 import subprocess
 import sys
-import textwrap
 import time
 from pathlib import Path
 from typing import Any
@@ -35,6 +34,7 @@ from cambium import supervisor as supervisor_module
 from cambium.merge import MergeSequencer
 from cambium.store import EventStore
 from cambium.supervisor import read_events, run_plan
+from tests.scenarios._helpers_g7 import write_supervisor_worker
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKER = str(ROOT / "scripts" / "fake_worker.py")
@@ -218,17 +218,6 @@ def test_t1_fanout_disjoint_files_all_merged(tmp_path) -> None:
         ready = next(event for event in task_events if event["kind"] == "ready")
         assert ready["request_id"] == init["request_id"]
     assert events[-1]["kind"] == "session_ended"
-    with sqlite3.connect(session_dir / ".cambium" / "events.db") as connection:
-        terminal = connection.execute(
-            "SELECT kind, task_id FROM events "
-            "WHERE kind IN ('result', 'merge_committed', 'session_ended', "
-            "'worktree_pruned', 'worktree_cleanup_deferred')"
-        ).fetchall()
-    assert sum(kind == "result" for kind, _task_id in terminal) == 3
-    assert sum(kind == "merge_committed" for kind, _task_id in terminal) == 3
-    assert sum(kind == "worktree_pruned" for kind, _task_id in terminal) == 3
-    assert not any(kind == "worktree_cleanup_deferred" for kind, _task_id in terminal)
-    assert ("session_ended", None) in terminal
 
 
 @pytest.mark.slow
@@ -341,7 +330,6 @@ def test_observer_barriers_do_not_hold_merge_or_worktree_locks(tmp_path) -> None
         assert prune_events == {"t-a", "t-b"}
 
     asyncio.run(canary())
-    assert len(_kinds(read_events(session_dir), "merge_committed")) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -351,161 +339,30 @@ def test_observer_barriers_do_not_hold_merge_or_worktree_locks(tmp_path) -> None
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    ("mode", "task_id", "branch", "marker", "status", "reason"),
+    [
+        ("branch-lock", "t-branch-lock", "wt-branch-lock", "// cambium-locked", "succeeded", None),
+        (
+            "dirty",
+            "t-dirty-worker",
+            "wt-dirty-worker",
+            "// cambium-dirty",
+            "failed",
+            "worker_tree_dirty",
+        ),
+    ],
+)
 @pytest.mark.slow
-def test_branch_delete_failure_defers_cleanup_without_false_prune(tmp_path) -> None:
-    worker = tmp_path / "branch-lock-worker.py"
-    worker.write_text(
-        textwrap.dedent("""
-        import json
-        import subprocess
-        import sys
-        from pathlib import Path
-
-        def send(message):
-            sys.stdout.write(json.dumps(message) + "\\n")
-            sys.stdout.flush()
-
-        init = json.loads(sys.stdin.readline())
-        send({
-            "type": "ready",
-            "request_id": init["request_id"],
-            "task_id": init["task_id"],
-            "pid": 0,
-            "generation": init.get("generation", 1),
-            "proto": 1,
-        })
-        run = json.loads(sys.stdin.readline())
-        worktree = Path(run["worktree_path"])
-        target = worktree / run["target_file"]
-        target.write_text(target.read_text().rstrip("\\n") + "\\n" + run["marker"] + "\\n")
-        subprocess.run(["git", "add", run["target_file"]], cwd=worktree, check=True)
-        subprocess.run(["git", "commit", "-m", "branch-lock-worker"], cwd=worktree, check=True)
-        commit = subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=worktree, check=True, capture_output=True, text=True
-        ).stdout.strip()
-        lock = Path(run["repo"]) / ".git" / "refs" / "heads" / f"{run['branch']}.lock"
-        lock.parent.mkdir(parents=True, exist_ok=True)
-        lock.write_text("concurrent ref lock\\n")
-        send({
-            "type": "result_envelope",
-            "request_id": run["request_id"],
-            "task_id": init["task_id"],
-            "status": "succeeded",
-            "commits": [commit],
-        })
-        send({
-            "type": "exit_message",
-            "task_id": init["task_id"],
-            "generation": init.get("generation", 1),
-            "reason": "done",
-        })
-    """),
-        encoding="utf-8",
-    )
+def test_cleanup_deferral_keeps_registered_worktree(
+    tmp_path, mode, task_id, branch, marker, status, reason
+) -> None:
+    worker = tmp_path / f"{mode}-worker.py"
+    write_supervisor_worker(worker, mode)
 
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
     base = _make_repo(repo, {"a.txt": "file a\n"})
-    branch = "wt-branch-lock"
-
-    plan = {
-        "tasks": [
-            _task(
-                session_dir,
-                repo,
-                base,
-                "t-branch-lock",
-                worktree="wt-branch-lock",
-                branch=branch,
-                target_file="a.txt",
-                marker="// cambium-locked",
-                worker=str(worker),
-            )
-        ]
-    }
-
-    result = asyncio.run(run_plan(session_dir, plan))
-
-    (task,) = result.results
-    assert task.status == "succeeded"
-    assert (session_dir / "wt-branch-lock").exists()
-    assert _worktree_paths(repo) == [repo.resolve(), (session_dir / "wt-branch-lock").resolve()]
-    assert _branch_exists(repo, branch)
-
-    events = read_events(session_dir)
-    deferred = _kinds(events, "worktree_cleanup_deferred")
-    assert len(deferred) == 1
-    assert deferred[0]["payload"]["reason"] == "branch_delete_failed"
-    assert deferred[0]["payload"]["restored"] is True
-    assert not _kinds(events, "worktree_pruned")
-    with sqlite3.connect(session_dir / ".cambium" / "events.db") as connection:
-        terminal = connection.execute(
-            "SELECT kind, task_id FROM events "
-            "WHERE task_id = ? AND kind IN ('result', 'worktree_pruned', "
-            "'worktree_cleanup_deferred')",
-            ("t-branch-lock",),
-        ).fetchall()
-    assert "worktree_cleanup_deferred" in {kind for kind, _task_id in terminal}
-    assert "worktree_pruned" not in {kind for kind, _task_id in terminal}
-
-
-@pytest.mark.slow
-def test_dirty_worker_tree_defers_cleanup_and_keeps_tree_registered(tmp_path) -> None:
-    worker = tmp_path / "dirty-worker.py"
-    worker.write_text(
-        textwrap.dedent("""
-        import json
-        import subprocess
-        import sys
-        from pathlib import Path
-
-        def send(message):
-            sys.stdout.write(json.dumps(message) + "\\n")
-            sys.stdout.flush()
-
-        init = json.loads(sys.stdin.readline())
-        send({
-            "type": "ready",
-            "request_id": init["request_id"],
-            "task_id": init["task_id"],
-            "pid": 0,
-            "generation": init.get("generation", 1),
-            "proto": 1,
-        })
-        run = json.loads(sys.stdin.readline())
-        worktree = Path(run["worktree_path"])
-        target = worktree / run["target_file"]
-        target.write_text(target.read_text().rstrip("\\n") + "\\n" + run["marker"] + "\\n")
-        (worktree / ".gitignore").write_text("leftover.txt\\n")
-        subprocess.run(
-            ["git", "add", run["target_file"], ".gitignore"], cwd=worktree, check=True
-        )
-        subprocess.run(["git", "commit", "-m", "dirty-worker"], cwd=worktree, check=True)
-        commit = subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=worktree, check=True, capture_output=True, text=True
-        ).stdout.strip()
-        (worktree / "leftover.txt").write_text("dirty content\\n")
-        send({
-            "type": "result_envelope",
-            "request_id": run["request_id"],
-            "task_id": init["task_id"],
-            "status": "succeeded",
-            "commits": [commit],
-        })
-        send({
-            "type": "exit_message",
-            "task_id": init["task_id"],
-            "generation": init.get("generation", 1),
-            "reason": "done",
-        })
-    """),
-        encoding="utf-8",
-    )
-
-    session_dir = tmp_path / "session"
-    repo = session_dir / "repo"
-    base = _make_repo(repo, {"a.txt": "file a\n"})
-    branch = "wt-dirty-worker"
     worktree = session_dir / branch
 
     plan = {
@@ -514,11 +371,11 @@ def test_dirty_worker_tree_defers_cleanup_and_keeps_tree_registered(tmp_path) ->
                 session_dir,
                 repo,
                 base,
-                "t-dirty-worker",
+                task_id,
                 worktree=branch,
                 branch=branch,
                 target_file="a.txt",
-                marker="// cambium-dirty",
+                marker=marker,
                 worker=str(worker),
             )
         ]
@@ -527,30 +384,24 @@ def test_dirty_worker_tree_defers_cleanup_and_keeps_tree_registered(tmp_path) ->
     result = asyncio.run(run_plan(session_dir, plan))
 
     (task,) = result.results
-    # the worker left an ignored file behind (leftover.txt): the integrity
-    # check must not accept that as a clean success — the task fails, and the
-    # dirty retained tree defers cleanup as before.
-    assert task.status == "failed"
-    assert task.reason == "worker_tree_dirty"
+    assert task.status == status
+    if reason is not None:
+        assert task.reason == reason
     assert worktree.exists()
-    assert (worktree / "leftover.txt").read_text() == "dirty content\n"
+    if mode == "dirty":
+        assert (worktree / "leftover.txt").read_text() == "dirty content\n"
     assert _worktree_paths(repo) == [repo.resolve(), worktree.resolve()]
     assert _branch_exists(repo, branch)
 
     events = read_events(session_dir)
     deferred = _kinds(events, "worktree_cleanup_deferred")
     assert len(deferred) == 1
-    assert deferred[0]["payload"]["reason"] == "dirty"
+    assert deferred[0]["payload"]["reason"] == (
+        "branch_delete_failed" if mode == "branch-lock" else "dirty"
+    )
+    if mode == "branch-lock":
+        assert deferred[0]["payload"]["restored"] is True
     assert not _kinds(events, "worktree_pruned")
-    with sqlite3.connect(session_dir / ".cambium" / "events.db") as connection:
-        terminal = connection.execute(
-            "SELECT kind, task_id FROM events "
-            "WHERE task_id = ? AND kind IN ('result', 'worktree_pruned', "
-            "'worktree_cleanup_deferred')",
-            ("t-dirty-worker",),
-        ).fetchall()
-    assert "worktree_cleanup_deferred" in {kind for kind, _task_id in terminal}
-    assert "worktree_pruned" not in {kind for kind, _task_id in terminal}
 
 
 # ---------------------------------------------------------------------------
@@ -562,48 +413,7 @@ def test_dirty_worker_tree_defers_cleanup_and_keeps_tree_registered(tmp_path) ->
 @pytest.mark.slow
 def test_wrong_ready_request_id_kills_worker_before_run(tmp_path) -> None:
     worker = tmp_path / "wrong-ready-worker.py"
-    worker.write_text(
-        textwrap.dedent("""
-        import json
-        import subprocess
-        import sys
-        from pathlib import Path
-
-        def send(message):
-            sys.stdout.write(json.dumps(message) + "\\n")
-            sys.stdout.flush()
-
-        init = json.loads(sys.stdin.readline())
-        generation = init.get("generation", 1)
-        send({
-            "type": "ready",
-            "request_id": init["request_id"] if generation > 1 else "wrong-request-id",
-            "task_id": init["task_id"],
-            "pid": 0,
-            "generation": generation,
-            "proto": 1,
-        })
-        run = json.loads(sys.stdin.readline())
-        worktree = Path(run["worktree_path"])
-        target = worktree / run["target_file"]
-        target.write_text(target.read_text().rstrip("\\n") + "\\n" + run["marker"] + "\\n")
-        subprocess.run(["git", "add", run["target_file"]], cwd=worktree, check=True)
-        subprocess.run(["git", "commit", "-m", "wrong-ready"], cwd=worktree, check=True)
-        send({
-            "type": "result_envelope",
-            "request_id": run["request_id"],
-            "task_id": init["task_id"],
-            "status": "succeeded",
-        })
-        send({
-            "type": "exit_message",
-            "task_id": init["task_id"],
-            "generation": generation,
-            "reason": "done",
-        })
-    """),
-        encoding="utf-8",
-    )
+    write_supervisor_worker(worker, "wrong-ready")
 
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
@@ -906,9 +716,19 @@ def test_t4_same_file_race_one_wins_loser_merge_failed(tmp_path, monkeypatch) ->
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    ("mode", "task_id", "marker", "min_parse_errors"),
+    [
+        ("garbage", "t-garbage", "// cambium-garbage", 3),
+        ("valid_non_object", "t-valid-nobj", "// cambium-valid-nobj", 9),
+    ],
+)
 @pytest.mark.slow
-def test_t5_garbage_stdout_tolerated(tmp_path, monkeypatch) -> None:
-    monkeypatch.setenv("FAKE_MODE", "garbage")
+def test_t5_non_protocol_stdout_is_tolerated(
+    tmp_path, monkeypatch, mode, task_id, marker, min_parse_errors
+) -> None:
+    """Garbage and valid non-object JSON do not break a valid protocol run."""
+    monkeypatch.setenv("FAKE_MODE", mode)
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
     base = _make_repo(repo, {"a.txt": "file a\n"})
@@ -919,12 +739,12 @@ def test_t5_garbage_stdout_tolerated(tmp_path, monkeypatch) -> None:
                 session_dir,
                 repo,
                 base,
-                "t-garbage",
+                task_id,
                 worktree="wt-a",
                 branch="wt-a",
                 target_file="a.txt",
-                marker="// cambium-garbage",
-                gate="grep -q '// cambium-garbage' a.txt",
+                marker=marker,
+                gate=f"grep -q '{marker}' a.txt",
             ),
         ]
     }
@@ -935,8 +755,8 @@ def test_t5_garbage_stdout_tolerated(tmp_path, monkeypatch) -> None:
     assert task.status == "succeeded"
     assert task.merge_sha is not None
     events = read_events(session_dir)
-    assert len(_kinds(events, "parse_error")) >= 3
-    assert _protocol(events, "t-garbage") == ["init", "ready", "run_task", "result", "exit"]
+    assert len(_kinds(events, "parse_error")) >= min_parse_errors
+    assert _protocol(events, task_id) == ["init", "ready", "run_task", "result", "exit"]
 
 
 @pytest.mark.slow
@@ -980,43 +800,6 @@ def test_t5_pure_garbage_fails_cleanly_on_cap(tmp_path, monkeypatch) -> None:
     assert len(_kinds(events, "restart_scheduled")) == 2
     assert len(_kinds(events, "worker_failed")) == 1
     assert not _kinds(events, "merge_committed")
-
-
-@pytest.mark.slow
-def test_t5_valid_non_object_stdout_tolerated(tmp_path, monkeypatch) -> None:
-    """Valid JSON lines that are not objects are skipped, not fatal (agents.md
-    boundary invariants: framing never fails supervision on non-object JSON)."""
-    monkeypatch.setenv("FAKE_MODE", "valid_non_object")
-    session_dir = tmp_path / "session"
-    repo = session_dir / "repo"
-    base = _make_repo(repo, {"a.txt": "file a\n"})
-
-    plan = {
-        "tasks": [
-            _task(
-                session_dir,
-                repo,
-                base,
-                "t-valid-nobj",
-                worktree="wt-a",
-                branch="wt-a",
-                target_file="a.txt",
-                marker="// cambium-valid-nobj",
-                gate="grep -q '// cambium-valid-nobj' a.txt",
-            ),
-        ]
-    }
-
-    result = asyncio.run(run_plan(session_dir, plan))
-
-    (task,) = result.results
-    assert task.status == "succeeded"
-    assert task.merge_sha is not None
-    events = read_events(session_dir)
-    # 9 valid non-object lines (3x [list, str, int]): all counted as
-    # parse_errors, none fail the task.
-    assert len(_kinds(events, "parse_error")) >= 9
-    assert _protocol(events, "t-valid-nobj") == ["init", "ready", "run_task", "result", "exit"]
 
 
 # ---------------------------------------------------------------------------

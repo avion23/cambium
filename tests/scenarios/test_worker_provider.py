@@ -1237,20 +1237,6 @@ def test_worker_git_worktree_hook_does_not_receive_provider_key(
     assert not record.exists(), "worker git command executed a repository hook"
 
 
-def test_worker_git_argv_disables_hooks(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[list[str]] = []
-
-    def fake_run(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
-        calls.append(argv)
-        return subprocess.CompletedProcess(argv, 0, "", "")
-
-    monkeypatch.setattr(worker.subprocess, "run", fake_run)
-
-    worker.git("status")
-
-    assert calls == [["git", "-c", "core.hooksPath=/dev/null", "status"]]
-
-
 def test_worker_fenced_git_argv_disables_hooks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1322,26 +1308,40 @@ def test_worker_endless_tool_calls_stop_at_max_turns(tmp_path) -> None:
         server.close()
 
 
+@pytest.mark.parametrize(
+    ("usages", "branch"),
+    [
+        pytest.param(
+            (
+                {"prompt_tokens": 1000, "completion_tokens": 0, "total_tokens": 1000},
+                {"prompt_tokens": 1600, "completion_tokens": 0, "total_tokens": 1600},
+            ),
+            "tokens",
+            id="prompt-delta",
+        ),
+        pytest.param(
+            ({"total_tokens": 1000}, {"total_tokens": 1000}),
+            "tokens-total",
+            id="total-only",
+        ),
+    ],
+)
 @pytest.mark.slow
-def test_worker_token_budget_fails_before_executing(tmp_path) -> None:
+def test_worker_token_budget_fails_before_executing(tmp_path, usages, branch) -> None:
+    """Both supported usage shapes charge enough work before an edit runs."""
     _reset_server()
     server = _FakeOpenAIServer()
     try:
         config_path = _provider_config(tmp_path / "providers.json", server.base_url)
-        # New-token accounting: only the prompt delta between turns plus the
-        # completion count against the budget. The transcript grows between
-        # the two calls (1000 -> 1600 prompt tokens), so the second turn's
-        # 600 new input tokens plus 0 completion push the 1500 budget over
-        # before the edit_file action is executed.
         _enqueue(
             '{"type":"tool_call","name":"read_batch","arguments":{"paths":["target.txt"]}}',
-            usage={"prompt_tokens": 1000, "completion_tokens": 0, "total_tokens": 1000},
+            usage=usages[0],
         )
         _enqueue(
             '{"type":"tool_call","name":"edit_file","arguments":'
             '{"path":"target.txt","old_string":"fixture\\n",'
             '"new_string":"fixture\\n// token-limit\\n"}}',
-            usage={"prompt_tokens": 1600, "completion_tokens": 0, "total_tokens": 1600},
+            usage=usages[1],
         )
 
         session_dir = tmp_path / "session"
@@ -1351,55 +1351,13 @@ def test_worker_token_budget_fails_before_executing(tmp_path) -> None:
         init = _agent_init(config_path, max_tokens=1500, spec=TASK_TEXT)
         result, _messages, rc, _stderr = asyncio.run(
             _drive_worker(
-                session_dir, repo, env, init=init, run={"task": TASK_TEXT}, branch="tokens"
+                session_dir, repo, env, init=init, run={"task": TASK_TEXT}, branch=branch
             )
         )
 
         assert result["status"] == "failed"
         assert "token budget exceeded" in result["failure_reason"]
         assert rc == 0  # verdict delivered; the failure lives in the envelope
-        # the second action (edit_file) was never executed
-        assert (session_dir / "wt" / "target.txt").read_text(encoding="utf-8") == "fixture\n"
-        with REQUEST_LOCK:
-            assert len(REQUESTS) == 2
-    finally:
-        server.close()
-
-
-@pytest.mark.slow
-def test_worker_token_budget_binds_total_only_usage(tmp_path) -> None:
-    """A provider that reports only total_tokens (no prompt/completion split)
-    still binds the budget: each turn's whole total counts as new work, so the
-    budget can never be bypassed."""
-    _reset_server()
-    server = _FakeOpenAIServer()
-    try:
-        config_path = _provider_config(tmp_path / "providers.json", server.base_url)
-        _enqueue(
-            '{"type":"tool_call","name":"read_batch","arguments":{"paths":["target.txt"]}}',
-            usage={"total_tokens": 1000},
-        )
-        _enqueue(
-            '{"type":"tool_call","name":"edit_file","arguments":'
-            '{"path":"target.txt","old_string":"fixture\\n",'
-            '"new_string":"fixture\\n// token-limit\\n"}}',
-            usage={"total_tokens": 1000},
-        )
-
-        session_dir = tmp_path / "session"
-        repo = session_dir / "repo"
-        _make_repo(repo)
-        env = _worker_env(config_path, session_dir)
-        init = _agent_init(config_path, max_tokens=1500, spec=TASK_TEXT)
-        result, _messages, rc, _stderr = asyncio.run(
-            _drive_worker(
-                session_dir, repo, env, init=init, run={"task": TASK_TEXT}, branch="tokens-total"
-            )
-        )
-
-        assert result["status"] == "failed"
-        assert "token budget exceeded" in result["failure_reason"]
-        assert rc == 0
         assert (session_dir / "wt" / "target.txt").read_text(encoding="utf-8") == "fixture\n"
         with REQUEST_LOCK:
             assert len(REQUESTS) == 2

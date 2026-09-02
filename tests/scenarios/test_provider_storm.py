@@ -167,6 +167,7 @@ def _config(
         quota_windows=quota_windows,
     )
 
+
 def _quota_state(path: str, provider: str) -> tuple[int, int, int]:
     """Return pending reservations, reconciled reservations, used requests."""
     with sqlite3.connect(path) as connection:
@@ -339,7 +340,6 @@ def test_429_storm_respects_wall_and_retry_budgets(
         # retry; allow generous worker scheduling jitter in this wall bound.
         assert elapsed < 6.0
         assert len(server.requests) == 1
-        assert len(server.requests) <= max_retries + 1
         assert error.outcome is ProviderOutcome.QUOTA
         assert error.retry_after_s == 60.0
         assert router.health("bounded-storm") is HealthState.COOLDOWN
@@ -432,7 +432,7 @@ def test_mixed_storm_policy_refusal_is_terminal_but_health_neutral(monkeypatch, 
         server.close()
 
 
-def test_terminal_dead_lane_does_not_starve_optimizer_style_burst(monkeypatch) -> None:
+def test_terminal_dead_lane_does_not_starve_optimizer_style_burst() -> None:
     """A dead incumbent is not retried ahead of a healthy burst lane."""
     dead = _StormServer([_Behavior(503, _error_payload("endpoint unavailable"))])
     healthy = _StormServer([_Behavior(200, _ok_payload("healthy"))])

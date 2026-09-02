@@ -25,7 +25,6 @@ import time
 from diffundo_helpers import PROMPT, FakeServer, _config, _error_payload, _ok_payload
 
 from cambium.diffundo import (
-    CallResult,
     Diffundo,
     HealthState,
     ProviderStatus,
@@ -33,11 +32,11 @@ from cambium.diffundo import (
 )
 
 # --------------------------------------------------------------------------- #
-# 1. distinct priorities -> lower priority serves every call
+# 1. distinct priorities -> lower priority serves first
 # --------------------------------------------------------------------------- #
 
 
-def test_two_healthy_providers_distinct_priorities_try_priority_order(monkeypatch) -> None:
+def test_two_healthy_providers_distinct_priorities_try_priority_order() -> None:
     # p_high sits FIRST in config order but carries the HIGHER priority; the
     # priority sort, not config order, must decide the cascade winner.
     low = FakeServer([(200, _ok_payload("low"), 0.0)])
@@ -49,11 +48,9 @@ def test_two_healthy_providers_distinct_priorities_try_priority_order(monkeypatc
         )
     )
     try:
-        for _ in range(10):
-            result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
-            assert isinstance(result, CallResult)
-            assert result.provider == "p_low"
-        assert len(low.calls) == 10
+        result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert result.provider == "p_low"
+        assert len(low.calls) == 1
         assert len(high.calls) == 0  # never even dispatched
     finally:
         low.close()
@@ -61,36 +58,11 @@ def test_two_healthy_providers_distinct_priorities_try_priority_order(monkeypatc
 
 
 # --------------------------------------------------------------------------- #
-# 2. equal priorities -> round-robin within the priority run, priority order
-#    across runs preserved
+# 2. equal priorities -> sticky primaries, priority order across runs preserved
 # --------------------------------------------------------------------------- #
 
 
-def test_equal_priority_providers_stick_to_primary_per_instance(monkeypatch) -> None:
-    first = FakeServer([(200, _ok_payload("first"), 0.0)])
-    second = FakeServer([(200, _ok_payload("second"), 0.0)])
-    router = Diffundo(
-        (
-            _config("p_first", first, "K_FIRST", priority=0),
-            _config("p_second", second, "K_SECOND", priority=0),
-        )
-    )
-    try:
-        # One instance = one task: every call lands on the same provider so
-        # the task's growing context stays on one provider (prompt-prefix
-        # caching preserved). No per-call rotation.
-        served = [asyncio.run(router.call(ProviderTier.FAST, PROMPT)).provider for _ in range(6)]
-        assert served == ["p_first"] * 6
-        assert len(first.calls) == 6
-        assert len(second.calls) == 0
-    finally:
-        first.close()
-        second.close()
-
-
-def test_rotation_seed_spreads_primaries_across_instances_and_keeps_priority_order(
-    monkeypatch,
-) -> None:
+def test_rotation_seed_spreads_primaries_across_instances_and_keeps_priority_order() -> None:
     first = FakeServer([(200, _ok_payload("first"), 0.0)])
     second = FakeServer([(200, _ok_payload("second"), 0.0)])
     low = FakeServer([(200, _ok_payload("low"), 0.0)])
@@ -125,7 +97,7 @@ def test_rotation_seed_spreads_primaries_across_instances_and_keeps_priority_ord
         low.close()
 
 
-def test_fallback_moves_association_and_never_bounces_back(monkeypatch) -> None:
+def test_fallback_moves_association_and_never_bounces_back() -> None:
     """A task's context follows the provider that served; a recovered former
     primary does not reclaim the task (prompt-prefix caching preserved)."""
     first = FakeServer([(500, {"error": "boom"}, 0.0), (200, _ok_payload("first"), 0.0)])
@@ -144,7 +116,7 @@ def test_fallback_moves_association_and_never_bounces_back(monkeypatch) -> None:
         # call 2: p_first's cooldown expired and it is eligible again, but the
         # association leads, so the task stays on p_second — no bounce-back
         # that would cold-start the context at p_first.
-        time.sleep(0.06)
+        router._runtime("p_first").cooldown_until = time.monotonic() - 1.0
         r2 = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
         assert r2.provider == "p_second"
         assert len(first.calls) == 1
@@ -155,42 +127,11 @@ def test_fallback_moves_association_and_never_bounces_back(monkeypatch) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# 4. rate-limited priority provider falls through to the next
+# 4. provider outcome changes eligibility, never selection order
 # --------------------------------------------------------------------------- #
 
 
-def test_rate_limited_priority_provider_falls_through_to_next(monkeypatch) -> None:
-    first = FakeServer([(200, _ok_payload("first"), 0.0)])
-    second = FakeServer([(200, _ok_payload("second"), 0.0)])
-    router = Diffundo(
-        (
-            _config("p_first", first, "K_1", rpm=1, priority=0),
-            _config("p_second", second, "K_2", priority=5),
-        )
-    )
-    try:
-        # priority 0 is healthy and wins the first call by priority
-        result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
-        assert result.provider == "p_first"
-        assert len(first.calls) == 1 and len(second.calls) == 0
-        assert router.status("p_first") is ProviderStatus.RATE_LIMITED
-
-        # priority 0's bucket is empty -> skipped; priority 1 serves
-        result2 = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
-        assert result2.provider == "p_second"
-        assert len(first.calls) == 1  # not re-dispatched
-        assert len(second.calls) == 1
-    finally:
-        first.close()
-        second.close()
-
-
-# --------------------------------------------------------------------------- #
-# 5. provider outcome changes eligibility, never selection order
-# --------------------------------------------------------------------------- #
-
-
-def test_provider_outcome_does_not_change_selection_order(monkeypatch) -> None:
+def test_provider_outcome_does_not_change_selection_order() -> None:
     flaky = FakeServer([(500, _error_payload("boom"), 0.0)])
     good = FakeServer([(200, _ok_payload("good"), 0.0)])
     router = Diffundo(

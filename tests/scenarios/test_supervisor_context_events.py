@@ -170,38 +170,26 @@ def _drive_checkpoint_generation(
     return runtime, store, outcome
 
 
-def test_incomplete_context_checkpoint_is_rejected_without_epoch_update(
-    tmp_path: Path,
-) -> None:
-    for missing in ("system_sha256", "tools_sha256", "provider_boundary"):
-        case_dir = tmp_path / missing
+def test_invalid_context_checkpoint_is_rejected_without_epoch_update(tmp_path: Path) -> None:
+    for invalid in ("system_sha256", "tools_sha256", "provider_boundary", "generation"):
+        case_dir = tmp_path / invalid
         case_dir.mkdir()
-        event = _checkpoint_message()
-        del event["cache_key"][missing]
+        event = _checkpoint_message(generation=2 if invalid == "generation" else 1)
+        if invalid != "generation":
+            del event["cache_key"][invalid]
         runtime, store, outcome = _drive_checkpoint_generation(case_dir, event)
 
         assert outcome.clean is True
         assert "task" not in runtime._task_epochs
-        rejected = [
-            record
+        expected = (
+            "context_checkpoint rejected: identity mismatch"
+            if invalid == "generation"
+            else "context_checkpoint rejected: invalid field(s)"
+        )
+        assert any(
+            record["kind"] == "protocol" and record["payload"].get("note") == expected
             for record in store.records
-            if record["kind"] == "protocol"
-            and record["payload"].get("note") == "context_checkpoint rejected: invalid field(s)"
-        ]
-        assert rejected
-
-
-def test_context_checkpoint_generation_mismatch_is_rejected(tmp_path: Path) -> None:
-    event = _checkpoint_message(generation=2)
-    runtime, store, outcome = _drive_checkpoint_generation(tmp_path, event)
-
-    assert outcome.clean is True
-    assert "task" not in runtime._task_epochs
-    assert any(
-        record["kind"] == "protocol"
-        and record["payload"].get("note") == "context_checkpoint rejected: identity mismatch"
-        for record in store.records
-    )
+        )
 
 
 class _Clock:

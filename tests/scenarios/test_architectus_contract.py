@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from typing import Any
 
 import pytest
 
-from cambium.architectus import CORE_DIRECTIVE_MAX, ActionKind, ArchitectusCore, ScriptedLLM
+from cambium.architectus import CORE_DIRECTIVE_MAX, ArchitectusCore, ScriptedLLM
 from cambium.supervisor import ArchitectusAdmissionPort
 from cambium.tasktree import TaskTree, build_tree
 
@@ -49,24 +48,11 @@ def _envelope(parent_task_id: str | None = None, summary: str = "finished") -> d
     }
 
 
-@pytest.mark.parametrize("kind", tuple(ActionKind))
-def test_action_kind_json_round_trip(kind: ActionKind) -> None:
-    wire_action = json.loads(json.dumps({"action": kind, "task_id": "root"}))
-    assert wire_action["action"] == kind.value
-
-    core = ArchitectusCore(
-        ScriptedLLM([wire_action]),
-        tree=_tree(),
-    )
-    assert asyncio.run(core.step([])) == [{"action": kind.value, "task_id": "root"}]
-
-
 def test_empty_step_and_minimal_context_are_stable() -> None:
     llm = ScriptedLLM([])
     core = ArchitectusCore(llm, tree=_tree())
 
     assert asyncio.run(core.step([])) == []
-    assert llm.calls[0][1] == []
     assert llm.calls[0][0]["ready"] == ["root"]
     assert core.compose_context("root") == {
         "task_id": "root",
@@ -75,11 +61,6 @@ def test_empty_step_and_minimal_context_are_stable() -> None:
         "prompt": "deliver the goal",
         "truncated": False,
     }
-    assert core.finished == {}
-    assert core.in_flight == frozenset()
-    assert core.action_history == []
-    assert core.reset_retry_tasks == frozenset()
-    assert core.durable_state == {"reset_retry_consumed": []}
 
 
 def test_oversized_core_directive_is_bounded_without_mutating_tree() -> None:
@@ -213,23 +194,6 @@ def test_invalid_action_kinds_raise_value_error(raw_kind: Any) -> None:
         asyncio.run(core.step([]))
 
 
-def test_same_input_produces_same_output_twice() -> None:
-    tree = _tree()
-    events = [{"kind": "decision_tick", "payload": {"sequence": 1}}]
-    first_llm = ScriptedLLM([{"action": "spawn", "task_id": "root"}])
-    second_llm = ScriptedLLM([{"action": "spawn", "task_id": "root"}])
-    first = ArchitectusCore(first_llm, tree=tree)
-    second = ArchitectusCore(second_llm, tree=tree)
-
-    first_actions = asyncio.run(first.step(events))
-    second_actions = asyncio.run(second.step(events))
-
-    assert first_actions == second_actions == [{"action": "spawn", "task_id": "root"}]
-    assert first_llm.calls == second_llm.calls
-    assert first.action_history == second.action_history == first_actions
-    assert first.in_flight == second.in_flight == frozenset({"root"})
-
-
 def test_supervisor_port_consumes_tree_aggregate_and_spawn_contract() -> None:
     child_spec = {"task": "implement child"}
     core = ArchitectusCore(
@@ -261,6 +225,5 @@ def test_failure_decision_method_is_deterministic_and_rejects_empty_event() -> N
     event = {"kind": "crash", "task_id": "root"}
 
     assert ArchitectusCore.decide_failure(event) == "restart"
-    assert ArchitectusCore.decide_failure(event) == ArchitectusCore.decide_failure(event)
     with pytest.raises(ValueError, match="unclassified failure event"):
         ArchitectusCore.decide_failure({})

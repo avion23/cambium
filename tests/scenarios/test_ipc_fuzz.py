@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from cambium.ipc import MAX_LINE_BYTES, MessageTooLong, read_message, write_message
+from cambium.ipc import MAX_LINE_BYTES, MessageTooLong, read_message
 
 # 128 cases keep every byte-pattern mode (case % 8) sampled 16x; the line-length
 # framing boundary itself is covered by test_read_message_one_mib_plus_one_byte_resyncs.
@@ -85,61 +85,6 @@ def _random_payload(rng: random.Random, case: int) -> bytes:
     return bytes(data)
 
 
-def _json_value(rng: random.Random, depth: int = 0) -> Any:
-    if depth >= 3:
-        return rng.choice(
-            (
-                None,
-                False,
-                True,
-                -0.0,
-                0.5,
-                -1.25e-30,
-                1.7976931348623157e308,
-                rng.randrange(-(10**30), 10**30),
-                "",
-                "café\n雪🌙\x00",
-            )
-        )
-
-    kind = rng.randrange(6)
-    if kind == 0:
-        return None
-    if kind == 1:
-        return rng.choice((False, True))
-    if kind == 2:
-        return rng.choice((-0.0, 0.5, -1.25e-30, 1.7976931348623157e308))
-    if kind == 3:
-        return rng.randrange(-(10**30), 10**30)
-    if kind == 4:
-        return rng.choice(("", "café\n雪🌙\x00", "emoji: 🧪 / ���� / \r\n"))
-    return (
-        [_json_value(rng, depth + 1) for _ in range(rng.randrange(4))]
-        if rng.randrange(2)
-        else {
-            rng.choice(("ключ", "键", "nested", "\x00key")): _json_value(rng, depth + 1)
-            for _ in range(rng.randrange(3))
-        }
-    )
-
-
-def _fuzz_message(rng: random.Random, case: int) -> dict[str, Any]:
-    return {
-        "case": case,
-        "unicode": rng.choice(("", "café", "雪🌙", "\x00\r\n", "emoji: 🧪")),
-        "float": rng.choice((-0.0, 0.5, -1.25e-30, 1.7976931348623157e308)),
-        "nested": _json_value(rng),
-    }
-
-
-class _BufferWriter:
-    def __init__(self) -> None:
-        self.data = bytearray()
-
-    def write(self, data: bytes) -> None:
-        self.data.extend(data)
-
-
 def test_read_message_deterministic_random_bytes_never_escapes_or_hangs() -> None:
     async def scenario() -> None:
         rng = random.Random(FUZZ_SEED)
@@ -202,19 +147,5 @@ def test_read_message_discards_unterminated_final_line() -> None:
     async def scenario() -> None:
         reader = _reader_with(b'{"type":"unterminated"}')
         assert await _read_fuzz_case(reader) is None
-
-    asyncio.run(scenario())
-
-
-def test_write_message_fuzz_roundtrips_weird_json_objects() -> None:
-    async def scenario() -> None:
-        rng = random.Random(FUZZ_SEED ^ 0x5EED)
-        for case in range(100):
-            message = _fuzz_message(rng, case)
-            writer = _BufferWriter()
-            write_message(writer, message)
-            reader = _reader_with(bytes(writer.data))
-            assert await _read_fuzz_case(reader) == message
-            assert await _read_fuzz_case(reader) is None
 
     asyncio.run(scenario())

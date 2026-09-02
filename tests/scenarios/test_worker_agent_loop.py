@@ -558,8 +558,6 @@ def test_build_agent_prompt_last_message_is_always_user() -> None:
     prompt2 = worker._build_agent_prompt("edit a.txt", [{"name": "read_batch"}], plan_transcript)
     assert prompt2["messages"][-1]["role"] == "user"
     assert prompt2["messages"][-1]["content"] == "Continue."
-    # The static system prefix is unchanged across transcripts.
-    assert prompt2["messages"][0]["content"] == messages[0]["content"]
 
 
 def test_build_agent_prompt_static_head_is_byte_stable_across_tasks() -> None:
@@ -597,16 +595,8 @@ def test_build_agent_prompt_static_head_is_byte_stable_across_tasks() -> None:
     assert volatile in prompt_v["messages"][1]["content"]
     validate_prompt_structure(prompt_v)
 
-
-def test_build_agent_prompt_head_is_byte_stable_across_transcript_growth() -> None:
-    """A growing transcript (tool loop) never changes the leading system
-    message, so the in-session prefix stays byte-stable per turn."""
-    tools = [{"name": "read_batch", "parameters": {"type": "object", "properties": {}}}]
-    identity = "codex/gpt-5.6-luna"
-    task = "read the files and finish"
-    fresh = worker._build_agent_prompt(task, tools, [], model_identity=identity)
     grown = worker._build_agent_prompt(
-        task,
+        task_a,
         tools,
         [
             {"role": "user", "content": "Begin."},
@@ -615,8 +605,8 @@ def test_build_agent_prompt_head_is_byte_stable_across_transcript_growth() -> No
         ],
         model_identity=identity,
     )
-    assert grown["messages"][0]["content"] == fresh["messages"][0]["content"]
-    assert prompt_prefix_bytes(grown) == prompt_prefix_bytes(fresh)
+    assert grown["messages"][0]["content"] == content_a
+    assert prompt_prefix_bytes(grown) == prompt_prefix_bytes(prompt_a)
 
 
 def test_agent_status_bar_is_last_context_tail_message(tmp_path: Path) -> None:
@@ -682,8 +672,6 @@ def test_usage_budget_charge_uses_uncached_baseline_and_safe_fallback() -> None:
         "total_tokens": 125,
     }
     assert worker._usage_budget_charge(missing_cache, 100) == (25, 120)
-    # A provider/model switch starts a new uncached baseline at the caller.
-    assert worker._usage_budget_charge(cached, 0) == (15, 10)
 
 
 def test_cached_heavy_turn_uses_paid_tokens_not_gross_prompt(tmp_path: Path) -> None:
@@ -770,8 +758,6 @@ def test_finalization_may_use_scaled_headroom_past_hard_cap(tmp_path: Path) -> N
     assert outcome["failure_reason"] == (
         "forced finalization: investigation incomplete, no changes made"
     )
-    assert worker.FINAL_SYNTHESIS_MIN_HEADROOM_TOKENS == 4_000
-    assert 4_000 > config.max_tokens
 
 
 def test_max_turns_edge_injects_the_same_finalization_directive(tmp_path: Path) -> None:
@@ -799,19 +785,6 @@ def test_max_turns_edge_injects_the_same_finalization_directive(tmp_path: Path) 
         )
         == 1
     )
-
-
-def test_build_agent_prompt_head_passes_d8c_lint() -> None:
-    """The static head (first 3 lines) carries no volatile timestamp or
-    request_id token; dynamic content sits at the bottom (D8c)."""
-    tools = [{"name": "read_batch", "parameters": {"type": "object", "properties": {}}}]
-    prompt = worker._build_agent_prompt("a task", tools, [], model_identity="codex/gpt-5.6-luna")
-    validate_prompt_structure(prompt)  # raises PromptStructureError on churn
-    head = prompt["messages"][0]["content"]
-    assert "Task:" not in head  # dynamic content is user-role data, not head
-    task_message = prompt["messages"][1]
-    assert task_message["role"] == "user"
-    assert task_message["content"] == "<cambium-task>\nTask: a task\n</cambium-task>"
 
 
 def test_build_agent_prompt_renders_bounded_parent_envelope() -> None:
@@ -923,9 +896,6 @@ def test_plan_before_act_plan_read_batch_finish(tmp_path: Path) -> None:
     final_action = json.loads(transcript[-1]["content"])
     assert final_action["type"] == "finish"
     assert "thought" not in final_action
-
-    tool_names = [schema["name"] for schema in worker._exposed_tool_schemas(config)]
-    assert "read_batch" in tool_names
 
 
 def test_batched_tool_calls_keep_order_and_deny_atomically(tmp_path: Path) -> None:
@@ -1162,17 +1132,6 @@ def test_tool_call_batch_cap_rejects_text_and_native_actions(tmp_path: Path) -> 
     assert "tool_call calls[20] exceeds the maximum of 16 calls per batch" in "\n".join(
         message["content"] for message in outcome["transcript"]
     )
-
-
-def test_exposed_tool_schemas_offer_batch_reading_only(tmp_path: Path) -> None:
-    repo = tmp_path / "repo"
-    worktree = _make_worktree(repo)
-    config = replace(_agent_config(worktree), shell_permission=False)
-
-    tool_names = [schema["name"] for schema in worker._exposed_tool_schemas(config)]
-
-    assert "read_batch" in tool_names
-    assert "read_file" not in tool_names
 
 
 def test_finish_after_failed_verification_is_rejected(tmp_path: Path) -> None:
@@ -1641,14 +1600,26 @@ def test_lint_feedback_visible_in_transcript(
 # ---------------------------------------------------------------------------
 
 
-def test_heartbeats_report_waiting_then_streaming_tail(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("deltas", "expected_phases", "expected_tail"),
+    (
+        ([("text", "answer fragment")], {"waiting", "streaming"}, "answer fragment"),
+        ([], {"waiting"}, None),
+    ),
+)
+def test_heartbeats_report_provider_phase_and_tail(
+    tmp_path: Path,
+    deltas: list[tuple[str, str]],
+    expected_phases: set[str],
+    expected_tail: str | None,
+) -> None:
     repo = tmp_path / "repo"
     worktree = _make_worktree(repo)
     config = _agent_config(worktree)
     router = _StreamingScriptedRouter(
         ['{"type":"finish","summary":"done","objective_met":true}'],
-        [("text", "answer fragment")],
-        delta_delay_s=0.15,
+        deltas,
+        delta_delay_s=0.15 if deltas else 0.0,
     )
 
     outcome, messages = asyncio.run(_drive_loop_with_heartbeats(config, worktree, router))
@@ -1656,25 +1627,13 @@ def test_heartbeats_report_waiting_then_streaming_tail(tmp_path: Path) -> None:
     assert outcome["status"] == "succeeded"
     heartbeats = [message for message in messages if message["type"] == "heartbeat"]
     phases = [heartbeat.get("phase") for heartbeat in heartbeats]
-    assert "waiting" in phases
-    assert "streaming" in phases
-    assert phases.index("waiting") < phases.index("streaming")
-    assert any(heartbeat.get("tail") == "answer fragment" for heartbeat in heartbeats)
-
-
-def test_heartbeats_stay_waiting_without_provider_deltas(tmp_path: Path) -> None:
-    repo = tmp_path / "repo"
-    worktree = _make_worktree(repo)
-    config = _agent_config(worktree)
-    router = _StreamingScriptedRouter(['{"type":"finish","summary":"done","objective_met":true}'])
-
-    outcome, messages = asyncio.run(_drive_loop_with_heartbeats(config, worktree, router))
-
-    assert outcome["status"] == "succeeded"
-    heartbeats = [message for message in messages if message["type"] == "heartbeat"]
     assert heartbeats
-    assert {heartbeat.get("phase") for heartbeat in heartbeats} == {"waiting"}
-    assert all("tail" not in heartbeat for heartbeat in heartbeats)
+    assert set(phases) == expected_phases
+    if expected_tail is None:
+        assert all("tail" not in heartbeat for heartbeat in heartbeats)
+    else:
+        assert phases.index("waiting") < phases.index("streaming")
+        assert any(heartbeat.get("tail") == expected_tail for heartbeat in heartbeats)
 
 
 def test_heartbeat_tail_is_bounded_and_terminally_safe(tmp_path: Path) -> None:

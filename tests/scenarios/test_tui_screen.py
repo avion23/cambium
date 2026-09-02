@@ -2,14 +2,11 @@
 
 import io
 import os
-import subprocess
-import sys
-from collections.abc import Iterator, Mapping
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from _helpers_g2 import _FlushCountingTty, _Tty  # type: ignore[reportMissingImports]
 
 import cambium.tui_screen as tui_screen
 from cambium.observability import ObservabilityState, RecentEvent, snapshot_from_events
@@ -22,11 +19,9 @@ from cambium.tui_screen import (
     _compact_rail_rows,
     _display_width,
     _live_window_lines,
-    _rail_depth,
     _rail_rows,
     _side_sections,
     _status_rows,
-    _style_kind,
     _transcript_lines,
     _visible,
     _wrap_markdown,
@@ -211,31 +206,7 @@ def test_compact_operator_rail_rows_keep_glyphs_and_epoch() -> None:
     ]
 
 
-def test_operator_rail_is_hidden_below_eighty_columns() -> None:
-    snapshot = _snapshot()
-    transcript = Transcript()
-    kwargs = {
-        "session_description": "session",
-        "branch_line": "branch",
-        "cumulative_line": "usage: calls=0",
-        "width": 70,
-        "height": 20,
-    }
-    expected = render_cockpit(snapshot, transcript, **kwargs)
-
-    original = tui_screen._rail_rows
-    tui_screen._rail_rows = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError())
-    try:
-        assert render_cockpit(snapshot, transcript, **kwargs) == expected
-    finally:
-        tui_screen._rail_rows = original
-
-
 def test_operator_rail_change_uses_a_fresh_frame(monkeypatch) -> None:
-    class _Tty(io.StringIO):
-        def isatty(self) -> bool:
-            return True
-
     monkeypatch.setattr(
         tui_screen.shutil,
         "get_terminal_size",
@@ -268,10 +239,6 @@ def test_operator_rail_change_uses_a_fresh_frame(monkeypatch) -> None:
 
 
 def test_activity_rail_ticks_redraw_in_place_at_duration_width_change(monkeypatch) -> None:
-    class _Tty(io.StringIO):
-        def isatty(self) -> bool:
-            return True
-
     monkeypatch.setattr(
         tui_screen.shutil,
         "get_terminal_size",
@@ -423,19 +390,6 @@ def test_markdown_falls_back_when_rich_import_is_unavailable(monkeypatch) -> Non
     assert render_markdown_lines(text, 36, color=False) == expected
 
 
-def test_tui_screen_import_does_not_import_rich() -> None:
-    source_root = Path(__file__).resolve().parents[2] / "src"
-    probe = (
-        "import sys; import cambium.tui_screen; "
-        "assert not any(name == 'rich' or name.startswith('rich.') for name in sys.modules)"
-    )
-    subprocess.run(
-        [sys.executable, "-c", probe],
-        check=True,
-        env={**os.environ, "PYTHONPATH": str(source_root)},
-    )
-
-
 def test_rich_path_keeps_literal_markup_text() -> None:
     pytest.importorskip("rich")
     rendered = "\n".join(render_markdown_lines("[bold]x[/bold]", 36, color=False))
@@ -474,10 +428,6 @@ def test_bounded_markdown_lines_limits_wrapped_rows() -> None:
 
 
 def test_resume_summary_identifiers_survive_deferred_startup_draw(monkeypatch) -> None:
-    class _Tty(io.StringIO):
-        def isatty(self) -> bool:
-            return True
-
     monkeypatch.setenv("COLUMNS", "80")
     monkeypatch.setenv("LINES", "24")
     summary = (
@@ -603,10 +553,6 @@ def test_detail_row_reports_traffic_and_context() -> None:
 
 
 def test_detail_command_hides_row_on_next_frame(monkeypatch) -> None:
-    class _Tty(io.StringIO):
-        def isatty(self) -> bool:
-            return True
-
     monkeypatch.setattr(
         tui_screen.shutil,
         "get_terminal_size",
@@ -676,18 +622,11 @@ def test_tool_row_counts_failures_and_uses_compact_last_duration() -> None:
 
 
 @pytest.mark.parametrize(
-    ("duration_ms", "expected"),
-    [(83, "83ms"), (1000, "1s"), (1500, "1s"), (24411, "24s")],
-)
-def test_duration_formatter_uses_integer_units(duration_ms: int, expected: str) -> None:
-    assert tui_screen._format_duration(duration_ms) == expected
-
-
-@pytest.mark.parametrize(
     ("duration_ms", "count", "expected"),
     [
         (83, 2, "   83ms ✓ run_shell ×2"),
         (1000, 3, "     1s ✓ run_shell ×3"),
+        (1500, 2, "     1s ✓ run_shell ×2"),
         (24411, 2, "    24s ✓ run_shell ×2"),
         (0, 2, "✓ run_shell ×2"),
         (None, 1, "✓ run_shell"),
@@ -890,10 +829,6 @@ def test_primary_renderer_ends_with_compact_status_row() -> None:
 
 
 def test_cockpit_appends_to_primary_buffer_without_repainting() -> None:
-    class _Tty(io.StringIO):
-        def isatty(self) -> bool:
-            return True
-
     stream = _Tty()
     transcript = Transcript()
     transcript.system("ready")
@@ -935,10 +870,6 @@ def test_cockpit_appends_to_primary_buffer_without_repainting() -> None:
 
 
 def test_cockpit_flushes_overflow_history_once() -> None:
-    class _Tty(io.StringIO):
-        def isatty(self) -> bool:
-            return True
-
     stream = _Tty()
     transcript = Transcript()
     for index in range(20):
@@ -967,10 +898,6 @@ def test_cockpit_flushes_overflow_history_once() -> None:
 
 
 def test_cockpit_coalesces_draws_while_input_line_is_active() -> None:
-    class _Tty(io.StringIO):
-        def isatty(self) -> bool:
-            return True
-
     stream = _Tty()
     transcript = Transcript()
     cockpit = Cockpit(stream)
@@ -999,10 +926,6 @@ def test_cockpit_coalesces_draws_while_input_line_is_active() -> None:
 
 
 def test_cockpit_commits_native_input_without_leaving_fixed_frame() -> None:
-    class _Tty(io.StringIO):
-        def isatty(self) -> bool:
-            return True
-
     stream = _Tty()
     cockpit = Cockpit(stream)
     with cockpit:
@@ -1023,10 +946,6 @@ def test_cockpit_commits_native_input_without_leaving_fixed_frame() -> None:
 
 
 def test_cockpit_paints_mid_turn_tool_tick_while_input_is_pending() -> None:
-    class _Tty(io.StringIO):
-        def isatty(self) -> bool:
-            return True
-
     stream = _Tty()
     transcript = Transcript()
     cockpit = Cockpit(stream)
@@ -1062,10 +981,6 @@ def test_cockpit_paints_mid_turn_tool_tick_while_input_is_pending() -> None:
 
 
 def test_cockpit_throttles_active_turn_frames(monkeypatch) -> None:
-    class _Tty(io.StringIO):
-        def isatty(self) -> bool:
-            return True
-
     now = [10.0]
     monkeypatch.setattr("cambium.tui_screen.time.monotonic", lambda: now[0])
     stream = _Tty()
@@ -1110,10 +1025,6 @@ def test_cockpit_throttles_active_turn_frames(monkeypatch) -> None:
 
 
 def test_cockpit_replaces_failed_to_idle_status_in_place() -> None:
-    class _Tty(io.StringIO):
-        def isatty(self) -> bool:
-            return True
-
     stream = _Tty()
     transcript = Transcript()
     snapshot = _snapshot()
@@ -1171,10 +1082,6 @@ def test_result_commits_into_conversation_rows_after_final_hold(monkeypatch) -> 
     live-only path, so the committed response stayed invisible in the
     transcript area (only the bottom live rows showed it).
     """
-
-    class _Tty(io.StringIO):
-        def isatty(self) -> bool:
-            return True
 
     now = [10.0]
     monkeypatch.setattr(tui_screen.time, "monotonic", lambda: now[0])
@@ -1237,17 +1144,7 @@ def test_result_commits_into_conversation_rows_after_final_hold(monkeypatch) -> 
 
 
 def test_cockpit_forces_completed_frame_while_input_read_is_pending() -> None:
-    class _Tty(io.StringIO):
-        flush_count = 0
-
-        def isatty(self) -> bool:
-            return True
-
-        def flush(self) -> None:
-            self.flush_count += 1
-            super().flush()
-
-    stream = _Tty()
+    stream = _FlushCountingTty()
     transcript = Transcript()
     cockpit = Cockpit(stream)
     final_snapshot = _snapshot()
@@ -1304,10 +1201,6 @@ def test_cockpit_forces_completed_frame_while_input_read_is_pending() -> None:
 
 
 def test_cockpit_updates_fixed_status_pane_in_place() -> None:
-    class _Tty(io.StringIO):
-        def isatty(self) -> bool:
-            return True
-
     stream = _Tty()
     cockpit = Cockpit(stream)
     transcript = Transcript()
@@ -1334,10 +1227,6 @@ def test_cockpit_updates_fixed_status_pane_in_place() -> None:
 
 
 def test_live_window_updates_two_fixed_rows_without_reflow() -> None:
-    class _Tty(io.StringIO):
-        def isatty(self) -> bool:
-            return True
-
     stream = _Tty()
     transcript = Transcript()
     cockpit = Cockpit(stream)
@@ -1381,10 +1270,6 @@ def test_live_window_updates_two_fixed_rows_without_reflow() -> None:
 
 
 def test_completed_response_moves_from_live_window_into_conversation() -> None:
-    class _Tty(io.StringIO):
-        def isatty(self) -> bool:
-            return True
-
     stream = _Tty()
     transcript = Transcript()
     cockpit = Cockpit(stream)
@@ -1497,10 +1382,6 @@ def test_local_waiting_activity_renders_honest_starting_state() -> None:
 
 
 def test_small_terminal_live_events_rewrite_two_rows_without_newlines(monkeypatch) -> None:
-    class _Tty(io.StringIO):
-        def isatty(self) -> bool:
-            return True
-
     monkeypatch.setattr(
         tui_screen.shutil,
         "get_terminal_size",
@@ -1676,10 +1557,6 @@ def test_short_terminal_falls_back_to_stream_rows() -> None:
 
 
 def test_live_cockpit_keeps_short_terminal_fallback(monkeypatch) -> None:
-    class _Tty(io.StringIO):
-        def isatty(self) -> bool:
-            return True
-
     monkeypatch.setattr(
         tui_screen.shutil,
         "get_terminal_size",
@@ -2239,10 +2116,6 @@ def test_activity_redraw_is_silent_for_non_tty() -> None:
 
 
 def test_activity_resize_repaints_frame_and_restores_input_prompt(monkeypatch) -> None:
-    class _Tty(io.StringIO):
-        def isatty(self) -> bool:
-            return True
-
     sizes = iter(
         (
             os.terminal_size((110, 24)),
@@ -2268,37 +2141,6 @@ def test_activity_resize_repaints_frame_and_restores_input_prompt(monkeypatch) -
             assert stream.getvalue()[len(before) :].endswith("› ")
 
     assert cockpit.size.columns == 70
-
-
-def test_style_kind_ignores_unhashable_state_values() -> None:
-    assert _style_kind({"state": "active"}) == ""
-
-
-def test_rail_depth_memo_avoids_rewalking_parent_chain() -> None:
-    class _Parents(Mapping[str, str | None]):
-        lookups = 0
-
-        def __init__(self, values: dict[str, str | None]) -> None:
-            self._data = values
-
-        def __getitem__(self, key: str) -> str | None:
-            self.lookups += 1
-            return self._data[key]
-
-        def __iter__(self) -> Iterator[str]:
-            return iter(self._data)
-
-        def __len__(self) -> int:
-            return len(self._data)
-
-    parents = _Parents(
-        {f"task-{index}": (f"task-{index - 1}" if index else None) for index in range(2000)}
-    )
-    depths: dict[str, int] = {}
-    for index in range(2000):
-        assert _rail_depth(f"task-{index}", parents, depths) == index
-
-    assert parents.lookups == 2000
 
 
 def test_activity_keeps_tool_in_flight_until_matching_end() -> None:

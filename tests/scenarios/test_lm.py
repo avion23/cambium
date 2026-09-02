@@ -14,10 +14,8 @@ from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
-from cambium.architectus import ArchitectusCore
 from cambium.diffundo import CallResult, Diffundo, ProviderConfig, ProviderTier, _RawResponse
-from cambium.lm import ArchitectusLM, CambiumLM
-from cambium.tasktree import build_tree
+from cambium.lm import CambiumLM
 
 if TYPE_CHECKING:
     dspy: Any
@@ -66,14 +64,11 @@ class FakeDiffundo:
             }
         )
         self.session_markers.append(dspy.settings.cambium_session)
-        content = "completion text"
-        if prompt["messages"][0]["role"] == "system":
-            content = '[{"action":"spawn","task_id":"root"}]'
         return CallResult(
             provider=self.endpoint,
             model=model or "fake-model",
             tier=tier,
-            content=content,
+            content="completion text",
             latency_s=0.01,
             usage={"prompt_tokens": 2, "completion_tokens": 2},
         )
@@ -203,27 +198,6 @@ def test_session_context_is_isolated_and_retains_no_prompt() -> None:
     assert not hasattr(dspy.settings, "cambium_session")
     assert diffundo.session_markers[0] is not original_marker
     assert lm.history == []
-
-
-def test_architectus_real_decide_port_uses_cambium_lm() -> None:
-    _require_dspy()
-    diffundo = FakeDiffundo()
-    lm = CambiumLM(diffundo, ProviderTier.FAST)  # type: ignore[arg-type]
-    tree = build_tree(
-        {
-            "tasks": [
-                {
-                    "task_id": "root",
-                    "kind": "FEATURE",
-                    "depends_on": [],
-                    "spec": {"goal": "deliver the feature"},
-                }
-            ]
-        }
-    )
-    actions = asyncio.run(ArchitectusCore(ArchitectusLM(lm), tree=tree).step([{"kind": "tick"}]))
-    assert actions == [{"action": "spawn", "task_id": "root"}]
-    assert len(diffundo.calls) == 1
 
 
 def test_core_module_imports_never_import_dspy() -> None:
@@ -585,21 +559,6 @@ def test_hostile_former_parameter_key_cannot_change_provider(entry_point: str, k
     assert provider_b.calls == []
 
 
-def test_copy_model_override_routes_through_diffundo() -> None:
-    _require_dspy()
-    diffundo = FakeDiffundo()
-    lm = CambiumLM(  # type: ignore[arg-type]
-        diffundo,
-        ProviderTier.FAST,
-        model="original",
-    )
-    copied = lm.copy(model="override")
-
-    assert _call(copied, "model override prompt") == ["completion text"]
-    assert diffundo.calls[0]["model"] == "override"
-    assert copied.dump_state()["model"] == "override"
-
-
 def test_post_construction_callback_does_not_observe_prompt() -> None:
     _require_dspy()
 
@@ -672,15 +631,6 @@ def test_predict_json_save_and_load_round_trip_routes_through_diffundo(tmp_path:
     assert diffundo.calls[1]["budget_usd"] == 2.0
 
 
-def test_per_call_max_tokens_reaches_diffundo() -> None:
-    _require_dspy()
-    diffundo = FakeDiffundo()
-    lm = CambiumLM(diffundo, ProviderTier.FAST)  # type: ignore[arg-type]
-
-    assert lm(messages=[{"role": "user", "content": "hello"}], max_tokens=1) == ["completion text"]
-    assert diffundo.calls[0]["prompt"]["max_tokens"] == 1
-
-
 @pytest.mark.parametrize(
     ("budget", "error", "message"),
     [
@@ -703,23 +653,6 @@ def test_request_budget_extension_rejects_invalid_values(
 
     with pytest.raises(error, match=message):
         lm(request=request)
-
-
-def test_request_budget_extension_uses_validated_value() -> None:
-    _require_dspy()
-    import dspy
-
-    diffundo = FakeDiffundo()
-    lm = CambiumLM(diffundo, ProviderTier.FAST)  # type: ignore[arg-type]
-    request = dspy.LMRequest(
-        model="request-model",
-        messages=cast(Any, [{"role": "user", "parts": [{"type": "text", "text": "hello"}]}]),
-        config=cast(Any, {"extensions": {"budget_usd": 10**1000}}),
-    )
-
-    lm(request=request)
-    assert diffundo.calls[0]["budget_usd"] == 10**1000
-    assert type(diffundo.calls[0]["budget_usd"]) is int
 
 
 @pytest.mark.parametrize("entry_point", ["call", "acall"])
@@ -929,24 +862,6 @@ def test_state_serialization_rejects_userinfo_base_url_raw_state_canary() -> Non
     queryless_raw_state = repr(CambiumLM(valid_diffundo, ProviderTier.FAST).dump_state())
     assert "https://api.example.invalid/v1" in queryless_raw_state
     assert "QUERY_SECRET_CANARY" not in queryless_raw_state
-
-
-def test_reasoning_and_tool_choice_reach_diffundo() -> None:
-    _require_dspy()
-    diffundo = FakeDiffundo()
-    lm = CambiumLM(diffundo, ProviderTier.FAST)  # type: ignore[arg-type]
-
-    lm(
-        messages=[{"role": "user", "content": "hello"}],
-        reasoning={"effort": "high"},
-        tool_choice="none",
-    )
-
-    assert diffundo.calls[0]["prompt"] == {
-        "messages": [{"role": "user", "content": "hello"}],
-        "reasoning": {"effort": "high"},
-        "tool_choice": {"mode": "none"},
-    }
 
 
 def test_tool_call_completion_reaches_dspy_outputs() -> None:

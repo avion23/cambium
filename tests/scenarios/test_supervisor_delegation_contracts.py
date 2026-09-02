@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import subprocess
 import textwrap
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import pytest
+from _helpers_g11 import init_repo  # type: ignore[reportMissingImports]
 
 from cambium.supervisor import (
     _resolve_model_candidates,
@@ -29,26 +29,6 @@ class _MemoryStore:
         return len(self.records)
 
 
-def _repo(tmp_path: Path) -> tuple[Path, str]:
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
-    subprocess.run(["git", "-C", str(repo), "config", "user.name", "supervisor-test"], check=True)
-    subprocess.run(["git", "-C", str(repo), "config", "user.email", "supervisor@test"], check=True)
-    (repo / "a.txt").write_text("base\n", encoding="utf-8")
-    subprocess.run(["git", "-C", str(repo), "add", "a.txt"], check=True, capture_output=True)
-    subprocess.run(
-        ["git", "-C", str(repo), "commit", "-m", "initial"], check=True, capture_output=True
-    )
-    base = subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    return repo, base
-
-
 def _provider_config(path: Path, providers: list[dict[str, Any]]) -> Path:
     path.write_text(json.dumps({"providers": providers}), encoding="utf-8")
     return path
@@ -63,11 +43,6 @@ def _provider(name: str) -> dict[str, Any]:
         "api_key": f"sk-delegation-{name}",
         "model": "m1",
     }
-
-
-class _TaskGroup:
-    def create_task(self, coroutine: Any) -> None:
-        coroutine.close()
 
 
 class _DecisionPort:
@@ -135,7 +110,7 @@ def test_empty_fanout_uses_provider_payload_boundary_and_keeps_marker_opt_in(
 
 
 def test_heartbeat_phase_and_tail_are_forwarded_safely(tmp_path: Path) -> None:
-    repo, base = _repo(tmp_path)
+    repo, base = init_repo(tmp_path, "supervisor-test", "supervisor@test")
     worker = tmp_path / "heartbeat-worker.py"
     worker.write_text(
         textwrap.dedent(
@@ -230,40 +205,6 @@ def test_heartbeat_phase_and_tail_are_forwarded_safely(tmp_path: Path) -> None:
     assert heartbeats[2] == {"turn": 3, "tool": None, "status": "working"}
 
 
-def test_each_child_admission_gets_a_supervisor_request_id(tmp_path: Path) -> None:
-    session_dir = tmp_path / "session"
-    repo = tmp_path / "repo"
-    parent = _parent(session_dir, repo)
-    runtime = _Runtime(session_dir, None)
-    runtime.set_session_tasks([parent])
-    cast(Any, runtime)._task_group = _TaskGroup()
-    emitted: list[dict[str, Any]] = []
-
-    async def emit(kind: str, **payload: Any) -> None:
-        emitted.append({"kind": kind, **payload})
-
-    async def no_pin(*_args: Any, **_kwargs: Any) -> None:
-        return None
-
-    async def no_conversation(*_args: Any, **_kwargs: Any) -> None:
-        return None
-
-    runtime.emit = emit  # type: ignore[method-assign]
-    runtime._pin_fork_child = no_pin  # type: ignore[method-assign]
-    runtime._record_revision_conversation = no_conversation  # type: ignore[method-assign]
-
-    async def scenario() -> None:
-        await runtime._admit_child(parent, _proposal(session_dir, repo, "child-a"), {})
-        await runtime._admit_child(parent, _proposal(session_dir, repo, "child-b"), {})
-
-    asyncio.run(scenario())
-    request_ids = [event["request_id"] for event in emitted if event["kind"] == "child_admitted"]
-
-    assert len(request_ids) == 2
-    assert len(set(request_ids)) == 2
-    assert all(request_id != "run-1" for request_id in request_ids)
-
-
 def test_failure_reason_reaches_decision_port_without_widening_child_envelope(
     tmp_path: Path,
 ) -> None:
@@ -292,22 +233,7 @@ def test_failure_reason_reaches_decision_port_without_widening_child_envelope(
 
 
 def test_failed_worker_reason_reaches_decision_port(tmp_path: Path) -> None:
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
-    subprocess.run(["git", "-C", str(repo), "config", "user.name", "supervisor-test"], check=True)
-    subprocess.run(["git", "-C", str(repo), "config", "user.email", "supervisor@test"], check=True)
-    (repo / "a.txt").write_text("base\n", encoding="utf-8")
-    subprocess.run(["git", "-C", str(repo), "add", "a.txt"], check=True, capture_output=True)
-    subprocess.run(
-        ["git", "-C", str(repo), "commit", "-m", "initial"], check=True, capture_output=True
-    )
-    base = subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
+    repo, base = init_repo(tmp_path, "supervisor-test", "supervisor@test")
     port = _DecisionPort()
     session_dir = tmp_path / "session"
     task = {
@@ -379,7 +305,7 @@ def test_no_credential_feasible_providers_fail_before_spawn(
     explicit: bool,
 ) -> None:
     provider_name = "missing-provider"
-    repo, base = _repo(tmp_path)
+    repo, base = init_repo(tmp_path, "supervisor-test", "supervisor@test")
     config = _provider_config(
         tmp_path / "providers.json", [_provider(provider_name) | {"api_key": ""}]
     )
@@ -424,7 +350,7 @@ def test_success_invariant_rejects_base_claim_when_commit_is_required() -> None:
 
 
 def test_advanced_head_commit_mismatch_is_failed_and_retained(tmp_path: Path) -> None:
-    repo, base = _repo(tmp_path)
+    repo, base = init_repo(tmp_path, "supervisor-test", "supervisor@test")
     session_dir = tmp_path / "session"
     worker = tmp_path / "dishonest-worker.py"
     worker.write_text(

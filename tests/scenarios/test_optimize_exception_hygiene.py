@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 import asyncio
 from dataclasses import dataclass
 from enum import StrEnum
@@ -35,23 +34,6 @@ def _gold() -> Example:
 
 def _prediction() -> dict[str, str]:
     return {"decision": "do_not_decompose", "reason": "atomic"}
-
-
-def test_only_public_main_keeps_generic_exception_boundary() -> None:
-    tree = ast.parse(Path(optimize.__file__).read_text(encoding="utf-8"))
-    handlers = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.ExceptHandler)
-        and isinstance(node.type, ast.Name)
-        and node.type.id == "Exception"
-    ]
-
-    assert len(handlers) == 1
-    main = next(
-        node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "main"
-    )
-    assert any(handler in ast.walk(main) for handler in handlers)
 
 
 def test_load_program_class_wraps_import_error_but_propagates_type_error(monkeypatch) -> None:

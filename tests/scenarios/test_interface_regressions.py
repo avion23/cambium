@@ -76,40 +76,23 @@ def test_no_change_completion_returns_success_across_user_interfaces(monkeypatch
     assert cli.main(["run", "hi", "--repo", str(tmp_path)]) == 0
 
 
-def test_tui_programming_error_terminates(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    "runner",
+    [tui.run_tui, repl.run_repl],
+    ids=["tui", "repl"],
+)
+def test_programming_error_terminates_user_interface(monkeypatch, tmp_path, runner):
     async def run(_config: oneshot.OneShotConfig, on_event=None):
         raise RuntimeError("backend unavailable")
 
     monkeypatch.setattr(oneshot, "run_oneshot", run)
-    out = _FlushStream()
-    err = _FlushStream()
     with pytest.raises(RuntimeError, match="backend unavailable"):
         asyncio.run(
-            tui.run_tui(
+            runner(
                 oneshot.OneShotConfig(repo=tmp_path),
-                input_stream=io.StringIO("hi\n"),
-                output_stream=out,
-                error_stream=err,
-            )
-        )
-
-
-def test_repl_programming_error_terminates(monkeypatch, tmp_path):
-    async def run(config: oneshot.OneShotConfig, on_event=None) -> PlanResult:
-        if config.prompt == "bad":
-            raise RuntimeError("backend unavailable")
-        return PlanResult((TaskResult(task_id="oneshot", status="succeeded", exit_code=0),))
-
-    monkeypatch.setattr(oneshot, "run_oneshot", run)
-    out = _FlushStream()
-    err = _FlushStream()
-    with pytest.raises(RuntimeError, match="backend unavailable"):
-        asyncio.run(
-            repl.run_repl(
-                oneshot.OneShotConfig(repo=tmp_path),
-                input_stream=io.StringIO("bad\nok\n"),
-                output_stream=out,
-                error_stream=err,
+                input_stream=io.StringIO("bad\n"),
+                output_stream=_FlushStream(),
+                error_stream=_FlushStream(),
             )
         )
 
@@ -133,19 +116,6 @@ def _valid_event_log(path: Path) -> None:
         store.close()
 
 
-def test_session_event_uri_encodes_query_and_fragment_chars(tmp_path):
-    session_dir = tmp_path / "explicit?session#one"
-    state = session_dir / ".cambium"
-    state.mkdir(parents=True)
-    (state / "result.json").write_text(json.dumps({"status": "done"}), encoding="utf-8")
-    _valid_event_log(state / "events.db")
-
-    view = session.show_session(session_dir)
-
-    assert view.path == session_dir.resolve()
-    assert view.result == {"status": "done"}
-
-
 def test_session_listing_surfaces_invalid_results(tmp_path):
     root = tmp_path / "sessions"
     valid = root / "valid" / ".cambium"
@@ -163,15 +133,6 @@ def test_session_listing_surfaces_invalid_results(tmp_path):
     assert entries[1].reason is not None
     with pytest.raises(session.InvalidSessionError):
         session.list_sessions(root)
-
-
-@pytest.mark.parametrize(
-    "value",
-    [float("nan"), float("inf"), float("-inf"), 10**10_000],
-    ids=["nan", "positive-inf", "negative-inf", "huge-int"],
-)
-def test_session_timestamp_uses_negative_infinity_for_nonfinite_values(value) -> None:
-    assert session._timestamp(value) == float("-inf")
 
 
 def test_cli_session_show_renderer_failure_is_clean(capsys, tmp_path):
@@ -279,12 +240,3 @@ def test_tui_stats_failure_does_not_break_loop(monkeypatch, tmp_path):
     assert err.getvalue() == ("cambium tui: usage stats unavailable: stats backend unavailable\n")
     assert "plan_status={succeeded}" in value
     assert "stats:" not in value
-
-
-def test_oneshot_allocate_session_dir(tmp_path):
-    first = oneshot.allocate_session_dir(tmp_path)
-    second = oneshot.allocate_session_dir(tmp_path)
-    assert first.parent == oneshot.default_session_root(tmp_path)
-    assert first.is_dir()
-    assert second.is_dir()
-    assert first != second

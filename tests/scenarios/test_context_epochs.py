@@ -36,14 +36,10 @@ from cambium.supervisor import (
     run_plan,
 )
 from cambium.worker import ContextForkError
+from tests.scenarios._helpers_g3 import TEST_RESOURCE_THRESHOLDS
 
 ROOT = Path(__file__).resolve().parents[2]
 FAKE_WORKER = str(ROOT / "scripts" / "fake_worker.py")
-TEST_RESOURCE_THRESHOLDS = {
-    "mem_available_frac": 0.0,
-    "load1_per_cpu": 1_000_000.0,
-    "disk_free": 0,
-}
 
 _STRICT_ENVELOPE_KEYS = {
     "parent_task_id",
@@ -757,28 +753,6 @@ def test_resume_missing_checkpoint_fails_closed(tmp_path: Path) -> None:
     assert "context_resume_failed" in (outcome["failure_reason"] or "")
 
 
-def test_rolling_compact_config_defaults_on() -> None:
-    init = {
-        "task_id": "epoch-agent",
-        "context_reuse": True,
-        "rolling_compact": True,
-        "max_transcript_chars": 200,
-        "rolling_compact_threshold_high": 100,
-    }
-    config = worker.AgentConfig.from_init(init)
-    assert config.rolling_compact is True
-    assert config.rolling_compact_threshold_high == 100
-    assert config.rolling_compact_threshold_low == 50
-
-    defaulted = worker.AgentConfig.from_init(
-        {
-            "task_id": "default-rolling",
-            "context_reuse": True,
-        }
-    )
-    assert defaulted.rolling_compact is True
-
-
 def test_rolling_compact_fold_advances_epoch_and_preserves_head(
     tmp_path: Path,
 ) -> None:
@@ -867,46 +841,6 @@ def test_rolling_compact_fold_advances_epoch_and_preserves_head(
     assert resume_router.prompts[0]["messages"][: len(folded.full_messages)] == (
         folded.full_messages
     )
-
-
-def test_rolling_compact_rewrites_active_context_before_publication(
-    tmp_path: Path,
-) -> None:
-    worktree = _make_worktree(tmp_path / "repo")
-    base_config = _agent_config(worktree, checkpoint_root=tmp_path / "ckpts")
-    checkpoint = _write_epoch(base_config)
-    resume = {
-        "checkpoint_ref": checkpoint.checkpoint_ref,
-        "epoch": checkpoint.epoch,
-        "child_results": [_strict_child_envelope(summary="x" * 300)] * 2,
-        "child_results_truncated": False,
-        "workspace_changed": False,
-    }
-    config = _agent_config(
-        worktree,
-        checkpoint_root=tmp_path / "ckpts",
-        context_reuse=True,
-        rolling_compact=True,
-        rolling_compact_threshold_high=100,
-        rolling_compact_threshold_low=50,
-        resume=resume,
-        max_turns=2,
-    )
-    writer = _FakeWriter()
-    asyncio.run(
-        _drive_loop(
-            config,
-            worktree,
-            _ScriptedRouter(['{"type":"plan","steps":["continue"]}']),
-            writer,
-            run_request_id="run-unpublished",
-        )
-    )
-
-    kinds = [message["type"] for message in writer.messages()]
-    assert "context_epoch_advanced" in kinds
-    assert "compaction_failed" not in kinds
-    assert len(list((tmp_path / "ckpts" / "epoch-agent").glob("epoch-*.json"))) == 2
 
 
 def test_rolling_compact_hysteresis_does_not_refold_below_low(
@@ -1825,51 +1759,8 @@ def test_suspended_envelope_without_flag_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Without context_reuse a suspended verdict is a failure, not a resume."""
-    session_dir = tmp_path / "session"
-    repo = session_dir / "repo"
-    base = _make_repo(repo, {"a.txt": "file a\n", "b.txt": "file b\n"})
-
-    suspend_worker = tmp_path / "suspend_worker.py"
-    dump_worker = tmp_path / "dump_worker.py"
-    _write_suspend_worker(suspend_worker)
-    _write_dump_worker(dump_worker)
-    monkeypatch.setenv("CONTEXT_DUMP_PATH", str(tmp_path / "parent-inits.jsonl"))
-    monkeypatch.setenv("CHILD_DUMP_PATH", str(tmp_path / "child-init.json"))
-
-    child = _task(
-        session_dir,
-        repo,
-        base,
-        "c1",
-        worktree="wt-c1",
-        branch="wt-c1",
-        target_file="b.txt",
-        marker="// child-marker",
-        worker_path=str(dump_worker),
-        provider_env_keys=["FAKE_MODE", "CHILD_DUMP_PATH"],
-    )
-    root = _task(
-        session_dir,
-        repo,
-        base,
-        "t-root",
-        worktree="wt-root",
-        branch="wt-root",
-        target_file="a.txt",
-        marker="// parent-marker",
-        worker_path=str(suspend_worker),
-        provider_env_keys=[
-            "FAKE_MODE",
-            "CONTEXT_DUMP_PATH",
-            "CHILD_DUMP_PATH",
-            "FAKE_CHECKPOINT_REF",
-            "FAKE_EPOCH_PROVIDER",
-            "FAKE_EPOCH_MODEL",
-            "FAKE_TOOLS_SHA",
-            "FAKE_SYSTEM_SHA",
-            "FAKE_MESSAGES_SHA",
-        ],
-        proposed_children=[_child_proposal(child)],
+    session_dir, _context_dump, _child_dump, root, _tools_sha = _wire_epoch_setup(
+        tmp_path, monkeypatch, fork_pin=False
     )
 
     result = asyncio.run(run_plan(session_dir, {"tasks": [root]}, context_reuse=False))

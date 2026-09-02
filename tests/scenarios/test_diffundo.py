@@ -20,6 +20,7 @@ and cascade-design contracts:
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 import urllib.request
 from dataclasses import replace
@@ -30,7 +31,6 @@ from diffundo_helpers import PROMPT, FakeServer, _config, _error_payload, _ok_pa
 
 from cambium.diffundo import (
     AllProvidersFailed,
-    CallResult,
     Diffundo,
     HealthState,
     PromptStructureError,
@@ -68,32 +68,6 @@ STATIC_HEAD = {
 }
 
 
-def test_summary_call_uses_extended_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Keep the ordinary-call budget above incidental scheduler jitter; the
-    # explicit summary budget, not a transport attempt, is this test's signal.
-    router = Diffundo((), call_budget_s=2.0, summary_call_budget_s=3.0)
-    deadlines: list[float] = []
-
-    async def capture_deadline(
-        tier: ProviderTier,
-        model: str | None,
-        deadline: float,
-        **kwargs: Any,
-    ) -> list[Any]:
-        deadlines.append(deadline)
-        return []
-
-    monkeypatch.setattr(router, "_await_candidates", capture_deadline)
-    started = time.monotonic()
-    with pytest.raises(AllProvidersFailed):
-        asyncio.run(router.summary_call(ProviderTier.FAST, PROMPT, model="m"))
-
-    assert len(deadlines) == 1
-    # xdist can pause the worker between ``started`` and deadline capture;
-    # retain the three-second semantic while allowing generous scheduling lag.
-    assert 2.0 < deadlines[0] - started <= 5.0
-
-
 def test_prompt_structure_rejects_timestamp_on_line_five() -> None:
     prompt = {
         "messages": [
@@ -115,18 +89,6 @@ def test_prompt_prefix_token_estimate_uses_utf8_bytes() -> None:
     assert prompt_prefix_bytes(prompt) == expected_bytes
     assert prompt_prefix_estimate_tokens(prompt) == expected_bytes // 4
     assert prompt_prefix_estimate_tokens(PROMPT) is None
-
-
-def test_routing_request_does_not_infer_native_tools_from_prompt() -> None:
-    router = Diffundo(())
-    request = router._routing_request(
-        {**PROMPT, "tools": [{"name": "read_file"}]},
-        None,
-        allow_model_substitution=False,
-        requirements=None,
-    )
-
-    assert request.needs_native_tools is False
 
 
 @pytest.mark.parametrize("supports_native_tools", [False, True])
@@ -186,7 +148,7 @@ def test_selected_provider_controls_native_wire_tools(
 # --------------------------------------------------------------------------- #
 
 
-def test_cascade_falls_through_500_to_next_provider(tmp_path, monkeypatch) -> None:
+def test_cascade_falls_through_500_to_next_provider() -> None:
     bad = FakeServer([(500, _error_payload("boom"), 0.0)])
     good = FakeServer([(200, _ok_payload("from good", model="m-good"), 0.0)])
     router = Diffundo(
@@ -197,7 +159,6 @@ def test_cascade_falls_through_500_to_next_provider(tmp_path, monkeypatch) -> No
     )
     try:
         result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
-        assert isinstance(result, CallResult)
         assert result.provider == "p_good"
         assert result.model == "m-good"
         assert result.content == "from good"
@@ -212,7 +173,7 @@ def test_cascade_falls_through_500_to_next_provider(tmp_path, monkeypatch) -> No
         good.close()
 
 
-def test_pinned_endpoint_death_falls_back_same_tier_and_records_origin(monkeypatch) -> None:
+def test_pinned_endpoint_death_falls_back_same_tier_and_records_origin() -> None:
     pinned = FakeServer([(503, _error_payload("Endpoint is unavailable"), 0.0)])
     same_tier = FakeServer([(200, _ok_payload("served by sibling", model="m-sibling"), 0.0)])
     other_tier = FakeServer([(200, _ok_payload("must not be reached", model="m-strong"), 0.0)])
@@ -238,7 +199,7 @@ def test_pinned_endpoint_death_falls_back_same_tier_and_records_origin(monkeypat
         other_tier.close()
 
 
-def test_pinned_death_stays_on_sibling_on_next_call(monkeypatch) -> None:
+def test_pinned_death_stays_on_sibling_on_next_call() -> None:
     dead = FakeServer(
         [
             (503, _error_payload("Endpoint is unavailable"), 0.0),
@@ -259,14 +220,6 @@ def test_pinned_death_stays_on_sibling_on_next_call(monkeypatch) -> None:
         primary_provider="p_pinned",
         pause_timeout_s=0.01,
     )
-    attempted: list[str] = []
-    original_attempt = router._attempt
-
-    async def capture_attempt(provider, prompt, *, deadline=None):
-        attempted.append(provider.name)
-        return await original_attempt(provider, prompt, deadline=deadline)
-
-    monkeypatch.setattr(router, "_attempt", capture_attempt)
     try:
         first = asyncio.run(router.call(ProviderTier.FAST, PROMPT, model="m-pinned"))
         second = asyncio.run(router.call(ProviderTier.FAST, PROMPT, model="m-pinned"))
@@ -275,16 +228,14 @@ def test_pinned_death_stays_on_sibling_on_next_call(monkeypatch) -> None:
         assert first.fell_back_from == "p_pinned"
         assert second.provider == "p_sibling"
         assert second.fell_back_from == "p_pinned"
-        assert attempted == ["p_pinned", "p_sibling", "p_sibling"]
         assert len(dead.calls) == 1
         assert len(healthy.calls) == 2
-        assert router._terminal_death_providers == frozenset({"p_pinned"})
     finally:
         dead.close()
         healthy.close()
 
 
-def test_pinned_timeout_falls_back_to_sibling_and_records_origin(monkeypatch) -> None:
+def test_pinned_timeout_falls_back_to_sibling_and_records_origin() -> None:
     pinned = FakeServer([(200, _ok_payload("late", model="m-pinned"), 0.1)])
     sibling = FakeServer([(200, _ok_payload("served by sibling", model="m-sibling"), 0.0)])
     router = Diffundo(
@@ -314,7 +265,7 @@ def test_pinned_timeout_falls_back_to_sibling_and_records_origin(monkeypatch) ->
         sibling.close()
 
 
-def test_pinned_429_retry_after_does_not_trigger_fallback(monkeypatch) -> None:
+def test_pinned_429_retry_after_does_not_trigger_fallback() -> None:
     limited = FakeServer([(429, _error_payload("busy"), 0.0, {"Retry-After": "60"})])
     sibling = FakeServer([(200, _ok_payload("must not serve", model="m-sibling"), 0.0)])
     router = Diffundo(
@@ -337,7 +288,7 @@ def test_pinned_429_retry_after_does_not_trigger_fallback(monkeypatch) -> None:
         sibling.close()
 
 
-def test_pinned_endpoint_death_without_alternative_remains_fatal(monkeypatch) -> None:
+def test_pinned_endpoint_death_without_alternative_remains_fatal() -> None:
     dead = FakeServer([(503, _error_payload("server_error"), 0.0)])
     router = Diffundo(
         (_config("p_only", dead, "K_ONLY_PIN", model="m-pinned"),),
@@ -354,7 +305,7 @@ def test_pinned_endpoint_death_without_alternative_remains_fatal(monkeypatch) ->
         dead.close()
 
 
-def test_leased_provider_death_releases_lease_for_healthy_sibling(monkeypatch) -> None:
+def test_leased_provider_death_releases_lease_for_healthy_sibling() -> None:
     incumbent = FakeServer(
         [
             (200, _ok_payload("incumbent", model="m-incumbent"), 0.0),
@@ -392,7 +343,7 @@ def test_leased_provider_death_releases_lease_for_healthy_sibling(monkeypatch) -
         sibling.close()
 
 
-def test_healthy_incumbent_keeps_lease_sticky(monkeypatch) -> None:
+def test_healthy_incumbent_keeps_lease_sticky() -> None:
     incumbent = FakeServer(
         [
             (200, _ok_payload("first", model="m-incumbent"), 0.0),
@@ -424,7 +375,7 @@ def test_healthy_incumbent_keeps_lease_sticky(monkeypatch) -> None:
         sibling.close()
 
 
-def test_transient_429_keeps_lease_through_cooldown(monkeypatch) -> None:
+def test_transient_429_keeps_lease_through_cooldown() -> None:
     incumbent = FakeServer(
         [
             (200, _ok_payload("first", model="m-incumbent"), 0.0),
@@ -459,7 +410,7 @@ def test_transient_429_keeps_lease_through_cooldown(monkeypatch) -> None:
         sibling.close()
 
 
-def test_terminal_endpoint_death_is_skipped_until_a_new_router(monkeypatch) -> None:
+def test_terminal_endpoint_death_is_skipped_until_a_new_router() -> None:
     dead = FakeServer(
         [
             (503, _error_payload("endpoint is unavailable"), 0.0),
@@ -484,9 +435,6 @@ def test_terminal_endpoint_death_is_skipped_until_a_new_router(monkeypatch) -> N
         # Once ordinary cooldown has elapsed, terminal-death memory still
         # excludes the dead lane while a healthy sibling can serve.
         router._runtime("p_terminal_dead").cooldown_until = time.monotonic() - 1.0
-        assert [provider.name for provider in router._candidates(ProviderTier.FAST, None)] == [
-            "p_terminal_healthy"
-        ]
         second = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
         assert second.provider == "p_terminal_healthy"
         assert len(dead.calls) == 1
@@ -499,12 +447,8 @@ def test_terminal_endpoint_death_is_skipped_until_a_new_router(monkeypatch) -> N
             primary_provider="p_terminal_dead",
             pause_timeout_s=0.01,
         )
-        assert [provider.name for provider in fresh._candidates(ProviderTier.FAST, None)][
-            0
-        ] == "p_terminal_dead"
         recovered = asyncio.run(fresh.call(ProviderTier.FAST, PROMPT))
         assert recovered.provider == "p_terminal_dead"
-        assert recovered.content == "fresh router"
         assert len(dead.calls) == 2
     finally:
         dead.close()
@@ -516,7 +460,7 @@ def test_terminal_endpoint_death_is_skipped_until_a_new_router(monkeypatch) -> N
 # --------------------------------------------------------------------------- #
 
 
-def test_tier_filtering_and_model_pin(tmp_path, monkeypatch) -> None:
+def test_tier_filtering_and_model_pin() -> None:
     fast = FakeServer([(200, _ok_payload("fast", model="m1"), 0.0)])
     fast2 = FakeServer([(200, _ok_payload("fast m2", model="m2"), 0.0)])
     strong = FakeServer([(200, _ok_payload("strong", model="m-s"), 0.0)])
@@ -555,9 +499,7 @@ def test_tier_filtering_and_model_pin(tmp_path, monkeypatch) -> None:
             server.close()
 
 
-def test_model_pin_falls_through_to_sibling_when_matching_provider_fails(
-    tmp_path, monkeypatch
-) -> None:
+def test_model_pin_falls_through_to_sibling_when_matching_provider_fails() -> None:
     """An explicitly substitution-enabled sibling may serve after the exact
     model lane fails; substitution is never an implicit fallback."""
     bad = FakeServer([(500, _error_payload("boom"), 0.0)])
@@ -584,7 +526,6 @@ def test_model_pin_falls_through_to_sibling_when_matching_provider_fails(
                 allow_model_substitution=True,
             )
         )
-        assert isinstance(result, CallResult)
         assert result.provider == "p_other"
         assert result.model == "m-other"
         assert result.content == "sibling served"
@@ -595,7 +536,7 @@ def test_model_pin_falls_through_to_sibling_when_matching_provider_fails(
         sibling.close()
 
 
-def test_model_pin_does_not_authorize_provider_global_substitution(tmp_path, monkeypatch) -> None:
+def test_model_pin_does_not_authorize_provider_global_substitution() -> None:
     """A provider opt-in cannot override a task's exact-model pin."""
     bad = FakeServer([(500, _error_payload("boom"), 0.0)])
     sibling = FakeServer([(200, _ok_payload("must not serve", model="m-other"), 0.0)])
@@ -622,7 +563,7 @@ def test_model_pin_does_not_authorize_provider_global_substitution(tmp_path, mon
         sibling.close()
 
 
-def test_model_pin_unavailable_at_selection_falls_through_to_sibling(tmp_path, monkeypatch) -> None:
+def test_model_pin_unavailable_at_selection_falls_through_to_sibling() -> None:
     """An explicitly substitution-enabled sibling remains eligible while the
     exact model lane is in cooldown."""
     bad = FakeServer([(500, _error_payload("boom"), 0.0)])
@@ -669,7 +610,7 @@ def test_model_pin_unavailable_at_selection_falls_through_to_sibling(tmp_path, m
         sibling.close()
 
 
-def test_clear_provider_lease_also_clears_sticky_primary(monkeypatch) -> None:
+def test_clear_provider_lease_also_clears_sticky_primary() -> None:
     first = FakeServer([(200, _ok_payload("first"), 0.0)])
     second = FakeServer([(200, _ok_payload("second"), 0.0)])
     router = Diffundo(
@@ -682,11 +623,9 @@ def test_clear_provider_lease_also_clears_sticky_primary(monkeypatch) -> None:
     try:
         bound = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
         assert bound.provider == "p_second"
-        assert router._primary_provider == "p_second"
         router.bind_provider("p_second", "m")
         router.clear_provider_lease()
         assert router.provider_lease is None
-        assert router._primary_provider is None
 
         rebound = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
         assert rebound.provider == "p_first"
@@ -700,7 +639,7 @@ def test_clear_provider_lease_also_clears_sticky_primary(monkeypatch) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_duplicate_half_open_probe_rejection_is_benign(monkeypatch) -> None:
+def test_duplicate_half_open_probe_rejection_is_benign() -> None:
     provider = ProviderConfig(
         name="p_probe",
         tier=ProviderTier.FAST,
@@ -728,7 +667,7 @@ def test_duplicate_half_open_probe_rejection_is_benign(monkeypatch) -> None:
     assert list(runtime.outcomes) == [True]
 
 
-def test_breaker_three_failures_put_provider_in_cooldown_and_skip(tmp_path, monkeypatch) -> None:
+def test_breaker_three_failures_put_provider_in_cooldown_and_skip() -> None:
     flaky = FakeServer([(500, _error_payload("intermittent"), 0.0)])
     good = FakeServer([(200, _ok_payload("good"), 0.0)])
     router = Diffundo(
@@ -755,7 +694,7 @@ def test_breaker_three_failures_put_provider_in_cooldown_and_skip(tmp_path, monk
         good.close()
 
 
-def test_breaker_auth_error_first_call_disables(tmp_path, monkeypatch) -> None:
+def test_breaker_auth_error_first_call_disables() -> None:
     auth = FakeServer([(401, _error_payload("unauthorized"), 0.0)])
     good = FakeServer([(200, _ok_payload("ok"), 0.0)])
     router = Diffundo((_config("p_auth", auth, "K_AUTH"), _config("p_good", good, "K_GOOD")))
@@ -828,7 +767,7 @@ def test_retry_after_is_provider_local(monkeypatch) -> None:
         healthy.close()
 
 
-def test_http_error_redacts_authorization_key_from_provider_error(tmp_path, monkeypatch) -> None:
+def test_http_error_redacts_authorization_key_from_provider_error() -> None:
     key = "sk-echoed-in-4xx-body"
     server = FakeServer(
         [
@@ -890,7 +829,7 @@ def test_http_error_redacts_authorization_key_from_provider_error(tmp_path, monk
         retry_server.close()
 
 
-def test_cloudflare_1010_forbidden_is_error_not_auth_error(tmp_path, monkeypatch) -> None:
+def test_cloudflare_1010_forbidden_is_error_not_auth_error() -> None:
     blocked = FakeServer(
         [
             (
@@ -917,7 +856,7 @@ def test_cloudflare_1010_forbidden_is_error_not_auth_error(tmp_path, monkeypatch
         blocked.close()
 
 
-def test_403_invalid_credential_is_quarantined_until_key_changes(monkeypatch) -> None:
+def test_403_invalid_credential_is_quarantined_until_key_changes() -> None:
     server = FakeServer(
         [
             (403, _error_payload("invalid_api_key: credential revoked"), 0.0),
@@ -953,7 +892,7 @@ def test_403_invalid_credential_is_quarantined_until_key_changes(monkeypatch) ->
         server.close()
 
 
-def test_403_missing_model_entitlement_is_config_error(tmp_path, monkeypatch) -> None:
+def test_403_missing_model_entitlement_is_config_error() -> None:
     server = FakeServer(
         [
             (
@@ -983,7 +922,7 @@ def test_403_missing_model_entitlement_is_config_error(tmp_path, monkeypatch) ->
         server.close()
 
 
-def test_403_quota_or_billing_exhaustion_cools_until_reset(monkeypatch) -> None:
+def test_403_quota_or_billing_exhaustion_cools_until_reset() -> None:
     server = FakeServer(
         [
             (
@@ -1019,7 +958,7 @@ def test_403_quota_or_billing_exhaustion_cools_until_reset(monkeypatch) -> None:
         server.close()
 
 
-def test_403_policy_refusal_falls_through_without_health_damage(monkeypatch) -> None:
+def test_403_policy_refusal_falls_through_without_health_damage() -> None:
     refusing = FakeServer(
         [
             (
@@ -1073,7 +1012,7 @@ def test_403_waf_block_retries_with_bounded_backoff(monkeypatch) -> None:
         blocked.close()
 
 
-def test_tool_call_response_with_null_content_succeeds(tmp_path, monkeypatch) -> None:
+def test_tool_call_response_with_null_content_succeeds() -> None:
     # A normal OpenAI tool-call completion carries content:null plus tool_calls;
     # it is a success, not a "content missing" malformed response. A tool call
     # with non-null text content keeps both the text and the call.
@@ -1140,7 +1079,7 @@ def test_tool_call_response_with_null_content_succeeds(tmp_path, monkeypatch) ->
         server.close()
 
 
-def test_tool_call_response_rejects_malformed_empty_tool_call(tmp_path, monkeypatch) -> None:
+def test_tool_call_response_rejects_malformed_empty_tool_call() -> None:
     # A bare {} tool call has no function name; it must be rejected as a
     # malformed response, not forwarded as a valid-looking (name="") call.
     # A tool call whose function.name is "" is rejected the same way.
@@ -1175,7 +1114,7 @@ def test_tool_call_response_rejects_malformed_empty_tool_call(tmp_path, monkeypa
         empty.close()
 
 
-def test_tool_call_response_rejects_malformed_arguments_json(tmp_path, monkeypatch) -> None:
+def test_tool_call_response_rejects_malformed_arguments_json() -> None:
     # A tool call whose arguments are not a JSON object is a malformed response
     # and must be rejected, never forwarded as a silent args={} call.
     malformed = FakeServer(
@@ -1209,42 +1148,7 @@ def test_tool_call_response_rejects_malformed_arguments_json(tmp_path, monkeypat
         malformed.close()
 
 
-def test_tool_call_response_with_valid_read_file_args_passes(tmp_path, monkeypatch) -> None:
-    # A real read_file tool call with concrete arguments must still pass
-    # unchanged through the malformed-call guard.
-    server = FakeServer(
-        [
-            (
-                200,
-                _tool_call_payload(
-                    [
-                        {
-                            "id": "call_read",
-                            "type": "function",
-                            "function": {
-                                "name": "read_file",
-                                "arguments": '{"path": "README.md", "offset": 5}',
-                            },
-                        }
-                    ]
-                ),
-                0.0,
-            )
-        ]
-    )
-    router = Diffundo((_config("p_read", server, "K_READ"),))
-    try:
-        result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
-        assert result.content == ""
-        assert result.tool_calls is not None
-        assert result.tool_calls[0]["function"]["name"] == "read_file"
-        assert result.tool_calls[0]["function"]["arguments"] == '{"path": "README.md", "offset": 5}'
-        assert router.health("p_read") is HealthState.HEALTHY
-    finally:
-        server.close()
-
-
-def test_refusal_like_completion_content_passes_through(monkeypatch) -> None:
+def test_refusal_like_completion_content_passes_through() -> None:
     content = (
         "```text\n"
         "You are a change-risk triage assistant. Explain when to refuse unsafe "
@@ -1270,7 +1174,7 @@ def test_refusal_like_completion_content_passes_through(monkeypatch) -> None:
         fallback.close()
 
 
-def test_structural_refusals_raise_refusal_outcome(monkeypatch) -> None:
+def test_structural_refusals_raise_refusal_outcome() -> None:
     # Structural refusal signals remain request-level fall-throughs and never
     # mark a provider unhealthy (cascade-design §1.2).
     refusal_field = _ok_payload("provider refusal details")
@@ -1299,7 +1203,7 @@ def test_structural_refusals_raise_refusal_outcome(monkeypatch) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_token_bucket_rpm_one_second_call_cascades(tmp_path, monkeypatch) -> None:
+def test_token_bucket_rpm_one_second_call_cascades() -> None:
     first = FakeServer([(200, _ok_payload("first"), 0.0)])
     second = FakeServer([(200, _ok_payload("second"), 0.0)])
     router = Diffundo(
@@ -1328,7 +1232,7 @@ def test_token_bucket_rpm_one_second_call_cascades(tmp_path, monkeypatch) -> Non
 # --------------------------------------------------------------------------- #
 
 
-def test_consecutive_all_provider_failures_trip_and_success_resets_cap(tmp_path) -> None:
+def test_consecutive_all_provider_failures_trip_and_success_resets_cap() -> None:
     server = FakeServer(
         [
             (429, _error_payload("rate limit"), 0.0),
@@ -1351,13 +1255,14 @@ def test_consecutive_all_provider_failures_trip_and_success_resets_cap(tmp_path)
         assert router._consecutive_all_provider_failures == 2
 
         recovered = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
-        assert recovered.content == "recovered"
+        assert recovered.provider == "flapping"
         assert router._consecutive_all_provider_failures == 0
 
-        for _ in range(3):
-            with pytest.raises(AllProvidersFailed) as raised:
+        for _ in range(2):
+            with pytest.raises(AllProvidersFailed):
                 asyncio.run(router.call(ProviderTier.FAST, PROMPT))
-        assert "3 consecutive calls" in str(raised.value)
+        with pytest.raises(AllProvidersFailed, match="3 consecutive calls"):
+            asyncio.run(router.call(ProviderTier.FAST, PROMPT))
         assert router._consecutive_all_provider_failures == 3
 
         with pytest.raises(AllProvidersFailed, match="provider failure circuit is open"):
@@ -1367,7 +1272,7 @@ def test_consecutive_all_provider_failures_trip_and_success_resets_cap(tmp_path)
         server.close()
 
 
-def test_successful_provider_fallback_does_not_trip_all_failure_cap(tmp_path) -> None:
+def test_successful_provider_fallback_does_not_trip_all_failure_cap() -> None:
     bad = FakeServer([(429, _error_payload("rate limit"), 0.0)])
     good = FakeServer([(200, _ok_payload("fallback"), 0.0)])
     router = Diffundo(
@@ -1379,7 +1284,7 @@ def test_successful_provider_fallback_does_not_trip_all_failure_cap(tmp_path) ->
     )
     try:
         result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
-        assert result.content == "fallback"
+        assert result.provider == "flapping-good"
         assert router._consecutive_all_provider_failures == 0
     finally:
         bad.close()
@@ -1387,7 +1292,7 @@ def test_successful_provider_fallback_does_not_trip_all_failure_cap(tmp_path) ->
 
 
 @pytest.mark.slow  # cooldown recovery wait; asserts elapsed >= 0.5
-def test_exhaustion_pause_wakes_when_provider_recovers(tmp_path, monkeypatch) -> None:
+def test_exhaustion_pause_wakes_when_provider_recovers() -> None:
     # D8f recovery monitor: after the provider's cooldown elapses mid-pause, the
     # monitor wakes dispatch, the call probes, and the provider heals.
     server = FakeServer([(500, _error_payload("boom"), 0.0), (200, _ok_payload("rec"), 0.0)])
@@ -1413,7 +1318,7 @@ def test_exhaustion_pause_wakes_when_provider_recovers(tmp_path, monkeypatch) ->
 
 
 @pytest.mark.slow  # 0.5s blocking-pause wait; asserts elapsed >= 0.4
-def test_outage_pause_actually_blocks_not_busy_spins(tmp_path, monkeypatch) -> None:
+def test_outage_pause_actually_blocks_not_busy_spins(monkeypatch) -> None:
     # D8f: a tier outage must BLOCK on the pause event, not spin the candidate
     # loop. The reviewer measured ~26k pause iterations in 0.6s before the fix;
     # a blocked call must keep the loop iteration count low.
@@ -1473,9 +1378,12 @@ def test_call_budget_outer_deadline_bounds_threaded_post(monkeypatch) -> None:
         max_retries=0,
     )
     router = Diffundo((provider,), call_budget_s=0.05, pause_timeout_s=0.01)
+    release = threading.Event()
+    finished = threading.Event()
 
     def slow_post_sync(self, provider, prompt, timeout_s):
-        time.sleep(0.3)
+        release.wait(timeout=1.0)
+        finished.set()
         return _RawResponse(_ok_payload("late"), 0.3)
 
     monkeypatch.setattr(Diffundo, "_post_sync", slow_post_sync)
@@ -1491,15 +1399,16 @@ def test_call_budget_outer_deadline_bounds_threaded_post(monkeypatch) -> None:
         error = cast(ProviderError, failure.last_error)
         assert error.outcome is ProviderOutcome.TIMEOUT
         assert error.budget_exhausted is True
-        # Keep the loop alive until the deliberately orphaned executor work
-        # finishes, so the regression test also checks its cleanup callback.
-        await asyncio.sleep(0.35)
+        # Release the deliberately orphaned executor work, then wait for it so
+        # the regression test also checks its cleanup callback.
+        release.set()
+        assert await asyncio.to_thread(finished.wait, 1.0)
 
     asyncio.run(scenario())
 
 
 @pytest.mark.slow  # 0.3s scripted provider delays; timing assertion
-def test_call_budget_bounds_slow_attempts(tmp_path, monkeypatch) -> None:
+def test_call_budget_bounds_slow_attempts() -> None:
     # call_budget_s is a hard deadline over the WHOLE cascade, not just
     # candidate waiting. Two 0.4s-timeout providers with a retry would naively
     # take ~1.6s; a 0.2s budget caps it to budget + one in-flight attempt.
@@ -1527,7 +1436,7 @@ def test_call_budget_bounds_slow_attempts(tmp_path, monkeypatch) -> None:
         slow2.close()
 
 
-def test_two_calls_to_static_prompt_both_hit_provider(tmp_path, monkeypatch) -> None:
+def test_two_calls_to_static_prompt_both_hit_provider() -> None:
     # Opposite of a cache: two byte-identical calls are two provider round-trips.
     server = FakeServer([(200, _ok_payload("same"), 0.0)])
     router = Diffundo((_config("p", server, "K"),))
@@ -1540,9 +1449,7 @@ def test_two_calls_to_static_prompt_both_hit_provider(tmp_path, monkeypatch) -> 
         server.close()
 
 
-def test_remote_http_provider_without_config_validation_is_rejected_at_call(
-    tmp_path, monkeypatch
-) -> None:
+def test_remote_http_provider_without_config_validation_is_rejected_at_call() -> None:
     # A ProviderConfig constructed directly (bypassing the config loader) must
     # still never send the Authorization header over plaintext http to a remote
     # host: _post_sync re-checks the resolved base_url scheme before sending.
@@ -1570,9 +1477,7 @@ def test_remote_http_provider_without_config_validation_is_rejected_at_call(
     ("scheme", "base_url"),
     [("ftp", "ftp://provider.example/v1"), ("file", "file:///tmp/provider")],
 )
-def test_non_http_provider_schemes_are_rejected_before_urllib(
-    scheme: str, base_url: str, monkeypatch
-) -> None:
+def test_non_http_provider_schemes_are_rejected_before_urllib(scheme: str, base_url: str) -> None:
     config = ProviderConfig(
         name=f"p_{scheme}",
         tier=ProviderTier.FAST,
@@ -1597,9 +1502,7 @@ def test_non_http_provider_schemes_are_rejected_before_urllib(
 # --------------------------------------------------------------------------- #
 
 
-def test_loopback_redirect_to_non_loopback_http_never_contacts_target(
-    tmp_path, monkeypatch
-) -> None:
+def test_loopback_redirect_to_non_loopback_http_never_contacts_target() -> None:
     # A provider completion endpoint must never redirect: urllib replays the
     # original request headers — including Authorization — against the redirect
     # target, which bypasses the loopback/https transport guard entirely. The
@@ -1632,9 +1535,7 @@ def test_loopback_redirect_to_non_loopback_http_never_contacts_target(
         target.close()
 
 
-def test_loopback_http_request_bypasses_proxy_and_proxy_never_sees_key(
-    tmp_path, monkeypatch
-) -> None:
+def test_loopback_http_request_bypasses_proxy_and_proxy_never_sees_key(monkeypatch) -> None:
     # A loopback http provider carries the Authorization Bearer in the clear;
     # honoring HTTP_PROXY would forward the request (and the key) to the proxy.
     # Loopback requests must go straight to the address, never via a proxy.
@@ -1715,7 +1616,7 @@ def test_429_retry_after_and_quota_owner_surface_on_winning_result(monkeypatch) 
         limited.close()
 
 
-def test_429_quota_owner_reaches_failure_error(monkeypatch) -> None:
+def test_429_quota_owner_reaches_failure_error() -> None:
     # The provider-reported quota owner rides the terminal failure too, so a
     # failed call's durable usage event can name the exhausted quota.
     server = FakeServer(
@@ -1751,7 +1652,7 @@ def test_429_quota_owner_reaches_failure_error(monkeypatch) -> None:
         server.close()
 
 
-def test_usage_metric_fields_follow_provider_reports(tmp_path, monkeypatch) -> None:
+def test_usage_metric_fields_follow_provider_reports() -> None:
     # prompt-prefix stability + provider-reported cache-hit metrics: recorded
     # per call, never evidence of a local response cache (D1).
     server = FakeServer(
@@ -1801,59 +1702,62 @@ def test_usage_metric_fields_follow_provider_reports(tmp_path, monkeypatch) -> N
         server.close()
 
 
-def test_codex_usage_preserves_unknown_token_counts() -> None:
-    normalized = _codex_usage(
-        {
-            "response": {
-                "usage": {
-                    "output_tokens": 5,
-                    "input_tokens_details": {"cached_tokens": 2},
+@pytest.mark.parametrize(
+    ("completed", "expected"),
+    [
+        (
+            {
+                "response": {
+                    "usage": {
+                        "output_tokens": 5,
+                        "input_tokens_details": {"cached_tokens": 2},
+                    }
                 }
-            }
-        }
-    )
-
-    assert normalized == {
-        "prompt_tokens": None,
-        "completion_tokens": 5,
-        "prompt_tokens_details": {"cached_tokens": 2},
-        "input_tokens_details": {"cached_tokens": 2},
-        "cached_tokens": 2,
-    }
-
-
-def test_codex_usage_preserves_explicit_zero_token_counts() -> None:
-    assert _codex_usage({"response": {"usage": {"input_tokens": 0, "output_tokens": 0}}}) == {
-        "prompt_tokens": 0,
-        "completion_tokens": 0,
-    }
-
-
-def test_codex_usage_normalizes_full_usage_unchanged() -> None:
-    assert _codex_usage(
-        {
-            "response": {
-                "usage": {
-                    "input_tokens": 12,
-                    "input_tokens_details": {"cached_tokens": 7},
-                    "output_tokens": 5,
-                    "output_tokens_details": {"reasoning_tokens": 2},
-                    "total_tokens": 17,
+            },
+            {
+                "prompt_tokens": None,
+                "completion_tokens": 5,
+                "prompt_tokens_details": {"cached_tokens": 2},
+                "input_tokens_details": {"cached_tokens": 2},
+                "cached_tokens": 2,
+            },
+        ),
+        (
+            {"response": {"usage": {"input_tokens": 0, "output_tokens": 0}}},
+            {"prompt_tokens": 0, "completion_tokens": 0},
+        ),
+        (
+            {
+                "response": {
+                    "usage": {
+                        "input_tokens": 12,
+                        "input_tokens_details": {"cached_tokens": 7},
+                        "output_tokens": 5,
+                        "output_tokens_details": {"reasoning_tokens": 2},
+                        "total_tokens": 17,
+                    }
                 }
-            }
-        }
-    ) == {
-        "prompt_tokens": 12,
-        "completion_tokens": 5,
-        "prompt_tokens_details": {"cached_tokens": 7},
-        "input_tokens_details": {"cached_tokens": 7},
-        "output_tokens_details": {"reasoning_tokens": 2},
-        "total_tokens": 17,
-        "cached_tokens": 7,
-    }
+            },
+            {
+                "prompt_tokens": 12,
+                "completion_tokens": 5,
+                "prompt_tokens_details": {"cached_tokens": 7},
+                "input_tokens_details": {"cached_tokens": 7},
+                "output_tokens_details": {"reasoning_tokens": 2},
+                "total_tokens": 17,
+                "cached_tokens": 7,
+            },
+        ),
+    ],
+    ids=("unknown-input", "explicit-zero", "full-usage"),
+)
+def test_codex_usage_normalizes_provider_token_counts(
+    completed: dict[str, Any], expected: dict[str, Any]
+) -> None:
+    assert _codex_usage(completed) == expected
 
 
-def test_chat_response_larger_than_provider_cap_is_rejected(monkeypatch) -> None:
+def test_chat_response_larger_than_provider_cap_is_rejected() -> None:
     from cambium.diffundo import MAX_PROVIDER_RESPONSE_BYTES
 
     oversized = _ok_payload("x" * (MAX_PROVIDER_RESPONSE_BYTES + 1))

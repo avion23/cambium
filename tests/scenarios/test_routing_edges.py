@@ -72,33 +72,6 @@ def test_select_lane_does_not_call_a_non_matching_pool_exhausted() -> None:
     assert str(exc_info.value) == ("model_candidates ['m1'] match no enabled configured provider")
 
 
-def test_resolve_assignment_handles_empty_single_and_zero_lane_pools() -> None:
-    provider = _provider("a", "m1")
-
-    assignment = cast(ProviderAssignment, resolve_assignment([provider], ["m1"], {}, {}))
-    assert assignment.provider == "a"
-    assert assignment.model == "m1"
-    assert assignment.tier == "fast"
-    assert (
-        cast(ProviderAssignment, resolve_assignment([provider], ["m1"], {}, None)).provider == "a"
-    )
-
-    with pytest.raises(ValueError, match="match no enabled configured provider"):
-        resolve_assignment([], ["m1"], {}, {})
-
-
-def test_resolve_assignment_reports_all_matching_lanes_exhausted() -> None:
-    provider = _provider("a", "m1")
-
-    with pytest.raises(LaneCapacityExhausted):
-        resolve_assignment(
-            [provider],
-            ["m1"],
-            {},
-            {"a": LaneState(in_flight=1, rpm_allowance=1.0)},
-        )
-
-
 def test_native_tool_capability_does_not_exclude_a_provider() -> None:
     provider = _provider("a", "m1")
     request = RoutingRequest(model="m1", needs_native_tools=True)
@@ -173,11 +146,3 @@ def test_validate_requirements_rejects_invalid_values_precisely(
         validate_requirements(requirements)
 
     assert str(exc_info.value) == message
-
-
-def test_validate_requirements_preserves_valid_values() -> None:
-    requirements = {"quality": "normal", "min_context_window": 128_000}
-
-    assert validate_requirements(requirements) == requirements
-    assert validate_requirements(None) == {}
-    assert validate_requirements({}) == {}

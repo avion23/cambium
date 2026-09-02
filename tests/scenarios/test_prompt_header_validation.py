@@ -39,24 +39,25 @@ def test_volatile_tokens_in_later_header_messages_are_aggregated() -> None:
     assert "message indexes [1, 2]" in str(raised.value)
 
 
-def test_clean_static_header_passes() -> None:
-    validate_prompt_structure(
-        _prompt(
+@pytest.mark.parametrize(
+    "messages",
+    (
+        (
             ("system", "You are a coding assistant."),
             ("developer", "Use deterministic output."),
             ("assistant", "The immutable header ends before user data."),
-        )
-    )
-
-
-def test_dynamic_user_tail_is_not_flagged() -> None:
-    validate_prompt_structure(
-        _prompt(
+        ),
+        (
             ("system", "You are a coding assistant."),
             (
                 "user",
                 "task timestamp 2026-08-20T12:34:56Z "
                 "uuid 550e8400-e29b-41d4-a716-446655440000 request_id=req-123",
             ),
-        )
-    )
+        ),
+    ),
+)
+def test_static_headers_and_dynamic_user_tail_pass(
+    messages: tuple[tuple[str, str], ...],
+) -> None:
+    validate_prompt_structure(_prompt(*messages))

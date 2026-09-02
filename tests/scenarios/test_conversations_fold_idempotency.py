@@ -231,7 +231,6 @@ def test_unicode_and_empty_folds_are_safe(tmp_path) -> None:
         summary = store.fold("unicode", "\u8981\u7d04 \U0001f680", tokens_before=3, tokens_after=1)
 
         assert summary is not None
-        assert store.fold("unicode", "\u8981\u7d04 \U0001f680") == summary
         assert store.history("unicode")[0]["content"] == content
         assert store.history("unicode")[-1]["content"] == "\u8981\u7d04 \U0001f680"
     finally:

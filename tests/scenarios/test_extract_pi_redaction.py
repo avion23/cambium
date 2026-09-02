@@ -6,6 +6,8 @@ import base64
 import random
 from collections.abc import Callable, Iterator
 
+import pytest
+
 from cambium.redact import Redactor
 from scripts.extract_pi import _redact_text
 
@@ -90,21 +92,17 @@ def _assert_zero_survival(
     assert survivors == 0
 
 
-def test_zero_width_key_fuzz_corpus_has_zero_survival() -> None:
-    _assert_zero_survival("zero_width", _zero_width)
-
-
-def test_homoglyph_key_fuzz_corpus_has_zero_survival() -> None:
-    _assert_zero_survival("homoglyph", _homoglyph)
-
-
-def test_html_entity_key_fuzz_corpus_has_zero_survival() -> None:
-    _assert_zero_survival("html_entities", _html_entities)
-
-
-def test_newline_split_key_fuzz_corpus_has_zero_survival() -> None:
-    _assert_zero_survival("split_lines", _split_lines)
-
-
-def test_base64_key_fuzz_corpus_has_zero_survival() -> None:
-    _assert_zero_survival("base64", _base64, require_base64_marker=True)
+@pytest.mark.parametrize(
+    ("kind", "transform", "require_base64_marker"),
+    [
+        ("zero_width", _zero_width, False),
+        ("homoglyph", _homoglyph, False),
+        ("html_entities", _html_entities, False),
+        ("split_lines", _split_lines, False),
+        ("base64", _base64, True),
+    ],
+)
+def test_key_fuzz_corpus_has_zero_survival(
+    kind: str, transform: Callable[[str], str], require_base64_marker: bool
+) -> None:
+    _assert_zero_survival(kind, transform, require_base64_marker=require_base64_marker)

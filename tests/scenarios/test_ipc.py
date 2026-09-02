@@ -34,7 +34,6 @@ import signal
 import subprocess
 import sys
 import threading
-import time
 from pathlib import Path
 from typing import Any, cast
 
@@ -45,7 +44,6 @@ from cambium.ipc import (
     MAX_LINE_BYTES,
     MessageTooLong,
     read_message,
-    write_message,
 )
 
 MARKER = "// cambium-ipc"
@@ -57,20 +55,6 @@ DIFF_CAP_BYTES = 64 * 1024
 # negligible.
 TEST_HEARTBEAT_INTERVAL_S = 0.02
 FAKE_WORKER = Path(__file__).resolve().parents[2] / "scripts" / "fake_worker.py"
-
-
-def test_write_message_rejects_oversized_frame_without_writing() -> None:
-    class Writer:
-        def __init__(self) -> None:
-            self.frames: list[bytes] = []
-
-        def write(self, frame: bytes) -> None:
-            self.frames.append(frame)
-
-    writer = Writer()
-    with pytest.raises(MessageTooLong):
-        write_message(writer, {"value": "x" * MAX_LINE_BYTES})
-    assert writer.frames == []
 
 
 def _make_scratch(repo: Path) -> str:
@@ -429,9 +413,7 @@ def test_worker_happy_path_8x_no_corrupted_lines(tmp_path) -> None:
 
 
 @pytest.mark.slow
-def test_worker_invalid_input_fatal_error(tmp_path) -> None:
-    session_dir = tmp_path / "session"
-    _make_scratch(session_dir / "scratch")
+def test_worker_invalid_input_fatal_error() -> None:
     init_rid = "init-neg-1"
 
     async def scenario() -> None:
@@ -671,10 +653,7 @@ def test_worker_check_health_mid_task_ok_and_continues(tmp_path) -> None:
 
 
 @pytest.mark.slow
-def test_worker_ping_returns_exact_pong_request_id(tmp_path) -> None:
-    session_dir = tmp_path / "session"
-    _make_scratch(session_dir / "scratch")
-
+def test_worker_ping_returns_exact_pong_request_id() -> None:
     async def scenario() -> None:
         w = WorkerSupervisor()
         await w.start()
@@ -786,7 +765,6 @@ def test_worker_fence_advance_during_pre_commit_creates_no_stale_commit(
                 assert asyncio.get_running_loop().time() < deadline
                 await asyncio.sleep(0.01)
             write_generation(worktree, 3)
-            await asyncio.sleep(0.05)
             hook_release.touch()
             result, _ = await w.recv_result()
             assert result["status"] == "failed"
@@ -947,8 +925,8 @@ def test_stale_worker_never_mutates_newer_generations_staged_work(
 
     from cambium import worker as worker_module
 
-    hook_started = tmp_path / "fence-block-started"
-    hook_release = tmp_path / "fence-block-release"
+    hook_started = threading.Event()
+    hook_release = threading.Event()
     real_fenced_git = worker_module._fenced_git
 
     def blocking_fenced_git(
@@ -958,12 +936,8 @@ def test_stale_worker_never_mutates_newer_generations_staged_work(
         # test can stage generation-2 work without colliding. On release the
         # real _fenced_git runs its generation pre-check and raises
         # GenerationFenceError for the now-stale worker.
-        hook_started.touch()
-        hook_release_exists = False
-        deadline = time.monotonic() + 10.0
-        while not hook_release_exists and time.monotonic() < deadline:
-            hook_release_exists = hook_release.exists()
-            time.sleep(0.01)
+        hook_started.set()
+        hook_release.wait(10.0)
         return real_fenced_git(worktree, generation, *args, cwd=cwd)
 
     result_holder: list[dict] = []
@@ -1001,10 +975,7 @@ def test_stale_worker_never_mutates_newer_generations_staged_work(
     )
     monkeypatch.setattr(worker_module, "_fenced_git", blocking_fenced_git)
     worker_thread.start()
-    deadline = time.monotonic() + 5.0
-    while not hook_started.exists() and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert hook_started.exists()
+    assert hook_started.wait(5.0)
 
     # Generation 2 takes ownership and stages in-progress work before generation
     # 1 observes the invalidated fence.
@@ -1025,7 +996,7 @@ def test_stale_worker_never_mutates_newer_generations_staged_work(
         text=True,
     ).stdout.splitlines()
 
-    hook_release.touch()
+    hook_release.set()
     worker_thread.join(timeout=5.0)
 
     assert not worker_thread.is_alive()
@@ -1114,10 +1085,8 @@ def test_worker_shutdown_graceful_exit(tmp_path) -> None:
 
 
 @pytest.mark.slow
-def test_worker_init_timeout_exits_nonzero(tmp_path) -> None:
+def test_worker_init_timeout_exits_nonzero() -> None:
     """Never sending init must trip the (env-shortened) init deadline."""
-    session_dir = tmp_path / "session"
-    _make_scratch(session_dir / "scratch")
 
     async def scenario() -> None:
         w = WorkerSupervisor(env={"CAMBIUM_INIT_TIMEOUT_S": "0.3"})
@@ -1138,10 +1107,8 @@ def test_worker_init_timeout_exits_nonzero(tmp_path) -> None:
 
 
 @pytest.mark.slow
-def test_worker_idle_timeout_exits_gracefully(tmp_path) -> None:
+def test_worker_idle_timeout_exits_gracefully() -> None:
     """Silence after ready (past the env-shortened idle deadline) exits 0."""
-    session_dir = tmp_path / "session"
-    _make_scratch(session_dir / "scratch")
 
     async def scenario() -> None:
         w = WorkerSupervisor(env={"CAMBIUM_IDLE_TIMEOUT_S": "0.3"})

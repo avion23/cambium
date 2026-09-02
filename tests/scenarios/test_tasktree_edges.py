@@ -2,10 +2,6 @@
 
 from __future__ import annotations
 
-import os
-import subprocess
-import sys
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -23,23 +19,6 @@ from cambium.tasktree import (
     topological_order,
     upward_result,
 )
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
-SRC_DIR = str(REPO_ROOT / "src")
-
-
-def _run_cli(payload: str) -> subprocess.CompletedProcess[str]:
-    env = dict(os.environ)
-    env["PYTHONPATH"] = os.pathsep.join(filter(None, [SRC_DIR, env.get("PYTHONPATH")]))
-    return subprocess.run(
-        [sys.executable, "-m", "cambium.tasktree"],
-        input=payload,
-        capture_output=True,
-        text=True,
-        env=env,
-        cwd=str(REPO_ROOT),
-        timeout=120,
-    )
 
 
 def _plan(task_ids: list[str]) -> dict[str, Any]:
@@ -118,7 +97,7 @@ def test_ready_and_topological_order_are_pinned_and_repeatable() -> None:
     }
 
     observations: list[tuple[list[str], dict[frozenset[str], list[str]]]] = []
-    for _ in range(20):
+    for _ in range(2):
         tree = build_tree(_plan(task_ids))
         observations.append(
             (

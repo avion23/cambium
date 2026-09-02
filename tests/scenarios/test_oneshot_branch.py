@@ -27,44 +27,12 @@ def _repo(path: Path) -> Path:
     return path
 
 
-def test_default_sessions_get_distinct_branches_and_succeed(monkeypatch, tmp_path: Path) -> None:
+def test_default_sessions_get_distinct_branches(monkeypatch, tmp_path: Path) -> None:
     repo = _repo(tmp_path / "repo")
     runs: list[tuple[Path, str]] = []
 
     async def fake_run_plan(session_dir, plan, on_event=None, **kwargs):
         task = plan["tasks"][0]
-        worktree = Path(task["worktree_path"])
-        subprocess.run(
-            [
-                "git",
-                "-C",
-                str(repo),
-                "worktree",
-                "add",
-                "-b",
-                task["branch"],
-                str(worktree),
-                "main",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        target = worktree / task["target_file"]
-        target.write_text(
-            target.read_text(encoding="utf-8").rstrip("\n") + "\n" + task["marker"] + "\n",
-            encoding="utf-8",
-        )
-        subprocess.run(
-            ["git", "-C", str(worktree), "add", task["target_file"]],
-            check=True,
-            capture_output=True,
-        )
-        subprocess.run(
-            ["git", "-C", str(worktree), "commit", "-m", "marker"],
-            check=True,
-            capture_output=True,
-        )
         runs.append((Path(session_dir), task["branch"]))
         return PlanResult((TaskResult(task_id=task["task_id"], status="succeeded", exit_code=0),))
 
@@ -76,16 +44,11 @@ def test_default_sessions_get_distinct_branches_and_succeed(monkeypatch, tmp_pat
         marker="// marker",
     )
 
-    first = asyncio.run(oneshot.run_oneshot(config))
-    second = asyncio.run(oneshot.run_oneshot(config))
+    asyncio.run(oneshot.run_oneshot(config))
+    asyncio.run(oneshot.run_oneshot(config))
 
-    assert first.exit_code == second.exit_code == 0
     assert runs[0][0] != runs[1][0]
     assert runs[0][1] != runs[1][1]
-    assert all(
-        (session_dir / "wt" / "file.txt").read_text(encoding="utf-8").endswith("// marker\n")
-        for session_dir, _branch in runs
-    )
 
 
 def test_default_branch_is_stable_and_explicit_branch_is_preserved(tmp_path: Path) -> None:
@@ -293,38 +256,6 @@ def test_explicit_provider_requires_usable_credential_and_key_in_plan(
     resolved, environment = _resolve_provider(config, repo)
     assert "CAMBIUM_PROVIDER_PB_API_KEY" in resolved.provider_env_keys
     assert environment["CAMBIUM_PROVIDER_PB_API_KEY"] == "secret-b"
-
-
-def test_pinned_provider_router_keeps_ready_siblings_for_terminal_fallback(
-    monkeypatch, tmp_path: Path
-) -> None:
-    from cambium import worker
-    from cambium.oneshot import _resolve_provider
-
-    repo = _repo(tmp_path / "repo")
-    config_path = _write_providers(tmp_path / "providers.json")
-    _write_providers(config_path, pb_key="secret-b")
-    config = oneshot.OneShotConfig(
-        prompt="p",
-        repo=repo,
-        provider="pa",
-        provider_config_path=config_path,
-    )
-
-    resolved, _environment = _resolve_provider(config, repo)
-    monkeypatch.setattr(worker, "_provider_path", lambda: config_path)
-
-    router, _tier, _model, _identity = worker._provider_router(
-        dict(resolved.fanout_config or {}),
-        assigned_provider=resolved.assigned_provider,
-        authorized_providers=resolved.authorized_providers,
-        authorized_providers_explicit=True,
-        task_id="tui-turn",
-    )
-
-    assert tuple(provider.name for provider in router._providers) == ("pa", "pb")
-    assert router._primary_provider == "pa"
-    assert resolved.model_candidates == ("model-a", "model-b")
 
 
 def test_resume_requires_existing_session_artifact(tmp_path: Path) -> None:

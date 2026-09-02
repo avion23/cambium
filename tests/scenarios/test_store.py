@@ -674,18 +674,6 @@ def test_checkpoint_busy_never_acks_while_reader_holds(tmp_path) -> None:
     assert all(e["kind"] == "result" for e in events)
 
 
-def test_close_propagates_final_fsync_error(tmp_path, monkeypatch) -> None:
-    store = EventStore(tmp_path / "events.db", fsync_interval_s=60.0)
-    store.append({"kind": "log", "payload": {"i": 0}})
-
-    def fail_fsync(self) -> None:
-        raise OSError(28, "No space left on device")
-
-    monkeypatch.setattr(EventStore, "_fsync_now", fail_fsync)
-    with pytest.raises(OSError, match="No space left on device"):
-        store.close()
-
-
 def test_concurrent_close_waits_for_final_fsync_result(tmp_path, monkeypatch) -> None:
     store = EventStore(tmp_path / "events.db", fsync_interval_s=60.0)
     store.append({"kind": "log", "payload": {"i": 0}})

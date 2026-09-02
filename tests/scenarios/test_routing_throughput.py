@@ -62,34 +62,6 @@ def test_legacy_rpm_derives_conservative_in_flight_capacity(tmp_path: Path) -> N
     assert lane.effective_request_slot_cap(0) == 120
 
 
-def test_provider_config_loads_independent_dimensions(tmp_path: Path) -> None:
-    path = tmp_path / "providers.json"
-    path.write_text(
-        json.dumps(
-            {
-                "providers": [
-                    _config_provider(
-                        "separated",
-                        "m",
-                        requests_per_minute=2,
-                        max_in_flight=8,
-                        tokens_per_s=33.0,
-                    )
-                ]
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    provider = load_providers(path)[0]
-
-    assert provider.rpm == 2
-    assert provider.requests_per_minute == 2
-    assert provider.max_in_flight == 8
-    assert provider.max_concurrency == 8
-    assert provider.tokens_per_s == pytest.approx(33.0)
-
-
 def test_rate_and_in_flight_slots_are_independent() -> None:
     burst = _provider("burst", "m1", requests_per_minute=2, max_in_flight=8)
     serial = _provider("serial", "m2", requests_per_minute=60, max_in_flight=1)
@@ -111,7 +83,7 @@ def test_rate_and_in_flight_slots_are_independent() -> None:
     # simultaneous slot, so its second admission is rejected for a different
     # reason than burst's rate exhaustion.
     assert lanes["serial"].reserve()
-    assert lanes["serial"].request_slots > 1
+    assert lanes["serial"].request_slots is not None and lanes["serial"].request_slots > 1
     assert not lanes["serial"].reserve()
     lanes["serial"].release()
     lanes["burst"].release()

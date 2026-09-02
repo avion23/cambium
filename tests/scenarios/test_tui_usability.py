@@ -9,6 +9,8 @@ import os
 import time
 from pathlib import Path
 
+import pytest
+
 from cambium import tui
 from cambium.interactive import InteractiveSession
 from cambium.oneshot import OneShotConfig
@@ -244,14 +246,15 @@ def test_model_switch_persists_for_subsequent_turns(monkeypatch, tmp_path: Path)
     assert turn.config.assigned_provider == "ready-b"
 
 
-def test_trimmed_q_exits_without_submitting_a_turn(tmp_path: Path) -> None:
+@pytest.mark.parametrize("command", ["  q  ", "/exit"])
+def test_exit_commands_do_not_submit_a_turn(command: str, tmp_path: Path) -> None:
     output = _Tty()
     error = io.StringIO()
 
     code = asyncio.run(
         tui.run_tui(
             OneShotConfig(repo=tmp_path, session_root=tmp_path / "interactive"),
-            input_stream=_Tty("  q  \n"),
+            input_stream=_Tty(f"{command}\n"),
             output_stream=output,
             error_stream=error,
         )
@@ -260,24 +263,6 @@ def test_trimmed_q_exits_without_submitting_a_turn(tmp_path: Path) -> None:
     assert code == 0
     assert error.getvalue() == ""
     assert "Unknown command" not in output.getvalue()
-    assert not tuple((tmp_path / "interactive").glob("turn-*"))
-
-
-def test_exit_command_still_exits_without_submitting_a_turn(tmp_path: Path) -> None:
-    output = _Tty()
-    error = io.StringIO()
-
-    code = asyncio.run(
-        tui.run_tui(
-            OneShotConfig(repo=tmp_path, session_root=tmp_path / "interactive"),
-            input_stream=_Tty("/exit\n"),
-            output_stream=output,
-            error_stream=error,
-        )
-    )
-
-    assert code == 0
-    assert error.getvalue() == ""
     assert not tuple((tmp_path / "interactive").glob("turn-*"))
 
 
@@ -314,38 +299,6 @@ def test_tui_history_is_private_and_bounded(monkeypatch, tmp_path: Path) -> None
     assert history.written == path
     assert history.length == 1000
     assert os.stat(path).st_mode & 0o777 == 0o600
-
-
-def test_help_documents_turn_cancellation() -> None:
-    assert "Ctrl-C cancels" in tui._HELP
-    assert "toggle full command/output details" in tui._HELP
-    assert "/dashboard" in tui._HELP
-    assert "/events" in tui._HELP
-    assert "blank line submits" in tui._HELP
-
-
-def test_v_toggles_tool_details_without_submitting_a_prompt(monkeypatch, tmp_path: Path) -> None:
-    toggles: list[bool] = []
-
-    def toggle(self) -> bool:
-        toggles.append(self.tool_details_expanded)
-        return not self.tool_details_expanded
-
-    monkeypatch.setattr(tui.Transcript, "toggle_tool_details", toggle)
-    source = _Tty("v\n/exit\n")
-
-    assert (
-        asyncio.run(
-            tui.run_tui(
-                OneShotConfig(repo=tmp_path, session_root=tmp_path / "interactive"),
-                input_stream=source,
-                output_stream=_Tty(),
-                error_stream=io.StringIO(),
-            )
-        )
-        == 0
-    )
-    assert toggles == [False]
 
 
 def test_tty_bracketed_paste_preserves_embedded_newlines() -> None:

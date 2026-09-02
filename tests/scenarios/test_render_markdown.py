@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 from io import StringIO
 
+import pytest
+
 from cambium import repl
 from cambium.oneshot import OneShotConfig
 from cambium.render_markdown import render_markdown, render_markdown_if_tty
@@ -44,44 +46,48 @@ def test_inline_code_bold_and_italic_styles() -> None:
     assert render_markdown("2 * 3 + 4 * 5\n") == "2 * 3 + 4 * 5\n"
 
 
-def test_lists_preserve_layout_verbatim() -> None:
-    unordered = "- alpha\n* beta\n  - nested\n    - deeper\n"
-    ordered = "1. one\n2. two\n  3. indented three\n"
-    assert render_markdown(unordered) == unordered
-    assert render_markdown(ordered) == ordered
+@pytest.mark.parametrize(
+    "text",
+    [
+        "- alpha\n* beta\n  - nested\n    - deeper\n",
+        "1. one\n2. two\n  3. indented three\n",
+        "plain paragraph line\n\nanother one, with punctuation!\n",
+    ],
+    ids=("unordered-list", "ordered-list", "paragraph"),
+)
+def test_unstyled_markdown_preserves_layout_verbatim(text: str) -> None:
+    assert render_markdown(text) == text
 
 
 def test_blockquote_gets_dim_italic_prefix_and_inline_body() -> None:
     assert render_markdown("> quoted **b**\n") == ("\x1b[2;3m>\x1b[0m quoted \x1b[1mb\x1b[0m\n")
 
 
-def test_paragraphs_and_blank_lines_pass_through_verbatim() -> None:
-    text = "plain paragraph line\n\nanother one, with punctuation!\n"
-    assert render_markdown(text) == text
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("a\x1b[31mesc\x07b\tc\x00d\ne\r\f\n", "a[31mescb\tcd\ne\n"),
+        ("café 中\x80between\x9bend\n", "café 中betweenend\n"),
+    ],
+    ids=("c0", "c1"),
+)
+def test_control_characters_are_stripped_without_losing_text(raw: str, expected: str) -> None:
+    assert render_markdown(raw) == expected
 
 
-def test_c0_controls_are_stripped_before_processing() -> None:
-    raw = "a\x1b[31mesc\x07b\tc\x00d\ne\r\f\n"
-    rendered = render_markdown(raw)
-    assert rendered == "a[31mescb\tcd\ne\n"
-    assert "\x1b" not in rendered
-
-
-def test_c1_controls_are_stripped_without_touching_utf8_text() -> None:
-    raw = "café 中\x80between\x9bend\n"
-
-    assert render_markdown(raw) == "café 中betweenend\n"
-
-
-def test_gated_markdown_paths_sanitize_controls(monkeypatch) -> None:
-    text = "safe\x1b[31m\x9b31m\nnext"
-    monkeypatch.setenv("NO_COLOR", "1")
-    monkeypatch.setenv("TERM", "xterm-256color")
-    assert render_markdown_if_tty(text, _Tty()) == "safe[31m31m\nnext"
-
-    monkeypatch.delenv("NO_COLOR")
-    monkeypatch.setenv("TERM", "dumb")
-    assert render_markdown_if_tty(text, _Tty()) == "safe[31m31m\nnext"
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [("NO_COLOR", "1"), ("TERM", "dumb")],
+    ids=("no-color", "dumb-term"),
+)
+def test_disabled_color_gates_strip_controls_without_styling(
+    monkeypatch, name: str, value: str
+) -> None:
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("TERM", raising=False)
+    monkeypatch.setenv(name, value)
+    text = "safe\x1b[31m\x9b31m\n# Title\n"
+    assert render_markdown_if_tty(text, _Tty()) == "safe[31m31m\n# Title\n"
 
 
 def test_non_tty_stream_returns_input_unchanged(monkeypatch) -> None:
@@ -89,16 +95,6 @@ def test_non_tty_stream_returns_input_unchanged(monkeypatch) -> None:
     monkeypatch.setenv("TERM", "xterm-256color")
     text = "# Title\n**bold**\n"
     assert render_markdown_if_tty(text, StringIO()) == text
-
-
-def test_no_color_and_dumb_term_gates_return_input_unchanged(monkeypatch) -> None:
-    text = "# Title\n`code`\n"
-    monkeypatch.setenv("NO_COLOR", "1")
-    monkeypatch.setenv("TERM", "xterm-256color")
-    assert render_markdown_if_tty(text, _Tty()) == text
-    monkeypatch.delenv("NO_COLOR")
-    monkeypatch.setenv("TERM", "dumb")
-    assert render_markdown_if_tty(text, _Tty()) == text
 
 
 def test_empty_no_color_on_real_term_renders(monkeypatch) -> None:

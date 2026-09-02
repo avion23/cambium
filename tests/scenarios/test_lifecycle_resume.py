@@ -11,12 +11,7 @@ from pathlib import Path
 import pytest
 
 from cambium.supervisor import read_events, run_plan
-
-TEST_RESOURCE_THRESHOLDS = {
-    "mem_available_frac": 0.0,
-    "load1_per_cpu": 1_000_000.0,
-    "disk_free": 0,
-}
+from tests.scenarios._helpers_g3 import TEST_RESOURCE_THRESHOLDS
 
 
 def _make_repo(repo: Path) -> str:
@@ -133,54 +128,42 @@ def _task(session: Path, repo: Path, base: str, worker: Path, task_id: str = "ta
 
 
 @pytest.mark.slow
-def test_stall_respawn_matching_hash_resumes_without_reset(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize("mismatch", [False, True], ids=["matching-hash", "mismatched-hash"])
+def test_stall_respawn_hash_handling(tmp_path: Path, monkeypatch, mismatch: bool) -> None:
     session = tmp_path / "session"
     repo = session / "repo"
     base = _make_repo(repo)
-    worker = tmp_path / "restart_worker.py"
-    _restart_worker(worker)
+    task_id = "mismatch" if mismatch else "matching"
+    worker = tmp_path / f"{task_id}_worker.py"
+    _restart_worker(worker, mismatch=mismatch)
     monkeypatch.setattr("cambium.supervisor.RESTART_BASE_DELAY_S", 0.01)
-    task = _task(session, repo, base, worker, "matching")
+    task = _task(session, repo, base, worker, task_id)
 
     result = asyncio.run(run_plan(session, {"tasks": [task]}))
 
     assert result.exit_code == 0
     assert result.results[0].restarts == 1
-    assert result.results[0].salvage_ref is None
     events = read_events(session)
     inits = [event for event in events if event["kind"] == "init"]
     assert len(inits) == 2
     assert inits[1]["generation"] == 2
-    resume = json.loads((session / "resume.json").read_text(encoding="utf-8"))
-    assert resume["checkpoint_ref"] == "matching/turn-001.json"
-    assert resume["child_results"] == []
-    assert not any(event["kind"] == "worktree_salvaged" for event in events)
-
-
-@pytest.mark.slow
-def test_stall_respawn_mismatched_hash_salvages_then_resets(tmp_path: Path, monkeypatch) -> None:
-    session = tmp_path / "session"
-    repo = session / "repo"
-    base = _make_repo(repo)
-    worker = tmp_path / "mismatch_worker.py"
-    _restart_worker(worker, mismatch=True)
-    monkeypatch.setattr("cambium.supervisor.RESTART_BASE_DELAY_S", 0.01)
-    task = _task(session, repo, base, worker, "mismatch")
-
-    result = asyncio.run(run_plan(session, {"tasks": [task]}))
-
-    assert result.exit_code == 0
-    salvage_ref = result.results[0].salvage_ref
-    assert salvage_ref == "salvage/mismatch/1/workspace.diff"
-    salvage_dir = session / salvage_ref.removesuffix("/workspace.diff")
-    assert "mismatch" in (salvage_dir / "workspace.diff").read_text(encoding="utf-8")
-    metadata = json.loads((salvage_dir / "salvage.json").read_text(encoding="utf-8"))
-    assert metadata["task_id"] == "mismatch"
-    assert metadata["generation"] == 1
-    assert metadata["base_commit"] == base
-    events = read_events(session)
-    assert any(event["kind"] == "worktree_salvaged" for event in events)
-    assert any(event["kind"] == "recover" and event["generation"] == 2 for event in events)
+    if mismatch:
+        salvage_ref = result.results[0].salvage_ref
+        assert salvage_ref == "salvage/mismatch/1/workspace.diff"
+        salvage_dir = session / salvage_ref.removesuffix("/workspace.diff")
+        assert "mismatch" in (salvage_dir / "workspace.diff").read_text(encoding="utf-8")
+        metadata = json.loads((salvage_dir / "salvage.json").read_text(encoding="utf-8"))
+        assert metadata["task_id"] == "mismatch"
+        assert metadata["generation"] == 1
+        assert metadata["base_commit"] == base
+        assert any(event["kind"] == "worktree_salvaged" for event in events)
+        assert any(event["kind"] == "recover" and event["generation"] == 2 for event in events)
+    else:
+        assert result.results[0].salvage_ref is None
+        resume = json.loads((session / "resume.json").read_text(encoding="utf-8"))
+        assert resume["checkpoint_ref"] == "matching/turn-001.json"
+        assert resume["child_results"] == []
+        assert not any(event["kind"] == "worktree_salvaged" for event in events)
 
 
 @pytest.mark.slow

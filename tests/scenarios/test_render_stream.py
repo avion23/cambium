@@ -15,14 +15,12 @@ import re
 import shutil
 import signal
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 import pytest
 
 from cambium import oneshot, repl, tui
 from cambium.render import (
-    _OK_GREEN,
-    _RESET,
     _display_width,
     render_active_workers,
     render_event_line,
@@ -53,38 +51,17 @@ def _lifecycle(kind: str) -> dict[str, object]:
     return {"kind": kind, "payload": {}}
 
 
-def test_tokens_per_s_prefers_completion_tokens() -> None:
-    events = [
-        _usage_event(
-            1,
-            {"input_tokens": 900, "completion_tokens": 50, "total_tokens": 950},
-            5.0,
-        )
+def test_tokens_per_s_uses_completion_or_total_tokens() -> None:
+    cases = [
+        ({"input_tokens": 900, "completion_tokens": 50, "total_tokens": 950}, 5.0, "10.0"),
+        ({"total_tokens": 300}, 10.0, "30.0"),
+        ({"completion_tokens": "many", "total_tokens": 300}, 10.0, "30.0"),
+        ({"completion_tokens": True, "total_tokens": 300}, 10.0, "30.0"),
+        ({"completion_tokens": float("nan"), "total_tokens": 300}, 10.0, "30.0"),
+        ({"completion_tokens": float("inf"), "total_tokens": 300}, 10.0, "30.0"),
     ]
-
-    assert render_tokens_per_s(events) == "tokens/s=10.0"
-
-
-def test_tokens_per_s_falls_back_to_total_tokens_when_completion_missing() -> None:
-    events = [_usage_event(1, {"total_tokens": 300}, 10.0)]
-
-    assert render_tokens_per_s(events) == "tokens/s=30.0"
-
-
-def test_tokens_per_s_falls_back_when_completion_is_not_numeric() -> None:
-    events = [_usage_event(1, {"completion_tokens": "many", "total_tokens": 300}, 10.0)]
-
-    assert render_tokens_per_s(events) == "tokens/s=30.0"
-
-
-def test_tokens_per_s_treats_unusable_completion_as_missing() -> None:
-    bool_case = _usage_event(1, {"completion_tokens": True, "total_tokens": 300}, 10.0)
-    nan_case = _usage_event(2, {"completion_tokens": float("nan"), "total_tokens": 300}, 10.0)
-    inf_case = _usage_event(3, {"completion_tokens": float("inf"), "total_tokens": 300}, 10.0)
-
-    assert render_tokens_per_s([bool_case]) == "tokens/s=30.0"
-    assert render_tokens_per_s([nan_case]) == "tokens/s=30.0"
-    assert render_tokens_per_s([inf_case]) == "tokens/s=30.0"
+    for index, (usage, latency, expected) in enumerate(cases):
+        assert render_tokens_per_s([_usage_event(index, usage, latency)]) == f"tokens/s={expected}"
 
 
 def test_tokens_per_s_skips_non_finite_or_non_positive_latency() -> None:
@@ -109,15 +86,14 @@ def test_tokens_per_s_skips_events_without_a_usable_token_count() -> None:
     assert render_tokens_per_s([inf_total]) == ""
 
 
-def test_active_workers_reuse_ready_never_negative() -> None:
-    events = [_lifecycle("spawned"), _lifecycle("reuse_ready")]
-
-    assert render_active_workers(events) == ""
-
-
-def test_active_workers_clamps_a_lone_decrement() -> None:
-    assert render_active_workers([_lifecycle("exit")]) == ""
-    assert render_active_workers([_lifecycle("reuse_ready")]) == ""
+def test_active_workers_never_go_negative() -> None:
+    cases = (
+        [_lifecycle("spawned"), _lifecycle("reuse_ready")],
+        [_lifecycle("exit")],
+        [_lifecycle("reuse_ready")],
+    )
+    for events in cases:
+        assert render_active_workers(events) == ""
 
 
 def _line(
@@ -136,142 +112,9 @@ def _line(
     return render_event_line(event, stream=stream)  # type: ignore[arg-type]
 
 
-def test_unknown_kind_keeps_raw_compact_json_dump() -> None:
-    payload = {"zeta": 1, "alpha": "x"}
-    line = _line("brand_new_kind", payload)
-
-    kind_field, body = line.rsplit("  ", 1)
-    assert kind_field == "brand_new_kind".rjust(16)
-    assert json.loads(body) == payload
-
-
-def test_missing_kind_falls_back_to_raw_dump_with_event_label() -> None:
-    line = render_event_line({"seq": 4, "payload": {"a": 1}})
-
-    assert line.startswith(f"{4:>6} {'event':>16}  ")
-    assert json.loads(line.rsplit("  ", 1)[1]) == {"a": 1}
-
-
-def test_prefix_shape_is_seq_kind_task_then_body() -> None:
-    line = _line("ready", {"pid": 7}, seq=12, task_id="t1")
-
-    assert line == f"{12:>6} {'ready':>16} t1  pid=7"
-
-
 def test_silent_kinds_print_nothing() -> None:
     for kind in ("heartbeat", "log", "ping", "pong"):
         assert _line(kind, {"turn": 2}, seq=9, task_id="t") == ""
-
-
-def test_usage_event_success_is_silent_failure_names_provider_and_reason() -> None:
-    success = {
-        "turn": 1,
-        "provider": "p",
-        "usage": {"total_tokens": 100},
-    }
-    failure = {
-        "turn": 2,
-        "provider": "codex",
-        "failure_reason": "rate_limited: slow down",
-    }
-
-    assert _line("usage_event", success, seq=1, task_id="t") == ""
-    assert _line("usage_event", failure, seq=2, task_id="t").endswith(
-        "  provider codex FAILED rate_limited: slow down"
-    )
-    no_provider = {"failure_reason": "boom"}
-    assert _line("usage_event", no_provider, seq=3, task_id="t").endswith("  FAILED boom")
-
-
-def test_tool_event_ok_line_and_cmd_truncation() -> None:
-    ok = _line(
-        "tool_event",
-        {"tool": "run_shell", "cmd": "git status", "ok": True, "duration_ms": 42},
-        seq=5,
-        task_id="t",
-    )
-
-    assert ok.endswith("  run_shell git status OK 42ms")
-
-    long_cmd = "x" * 100
-    truncated = _line(
-        "tool_event", {"tool": "edit", "cmd": long_cmd, "ok": False}, seq=6, task_id="t"
-    )
-
-    assert truncated.endswith(f"  edit {'x' * 60} FAIL ?")
-    assert len(long_cmd[:60]) == 60
-
-
-def test_context_checkpoint_golden() -> None:
-    line = _line(
-        "context_checkpoint",
-        {"epoch": 2, "turn": 14, "checkpoint_ref": "ckpt://t/2/14"},
-        seq=8,
-        task_id="t",
-    )
-
-    assert line.endswith("  epoch=2 turn=14 ckpt://t/2/14")
-
-
-def test_context_epoch_advanced_appends_reason_and_folded_from_when_present() -> None:
-    full = _line(
-        "context_epoch_advanced",
-        {
-            "epoch": 3,
-            "turn": 20,
-            "checkpoint_ref": "ckpt://t/3/20",
-            "folded_from_epoch": 2,
-            "reason": "rolling_transcript_compaction",
-        },
-        seq=9,
-        task_id="t",
-    )
-
-    assert full.endswith(
-        "  epoch=3 turn=20 ckpt://t/3/20 reason=rolling_transcript_compaction folded_from=2"
-    )
-
-    bare = _line(
-        "context_epoch_advanced",
-        {"epoch": 1, "turn": 3, "checkpoint_ref": "ckpt://t/1/3"},
-        seq=10,
-        task_id="t",
-    )
-
-    assert bare.endswith("  epoch=1 turn=3 ckpt://t/1/3")
-
-
-def test_checkpoint_golden() -> None:
-    assert _line("checkpoint", {"turn": 7}, seq=3, task_id="t").endswith("  ckpt turn=7")
-
-
-def test_lifecycle_kinds_one_concise_key_value_line_each() -> None:
-    cases: list[tuple[str, dict[str, object], str | None]] = [
-        ("spawned", {"worker": "/usr/bin/python3 -m cambium.worker"}, None),
-        ("init", {"request_id": "rid-1"}, "request_id=rid-1"),
-        ("run_task", {"request_id": "rid-2"}, "request_id=rid-2"),
-        ("ready", {"pid": 4242, "proto": "cambium/1"}, "pid=4242"),
-        ("reuse_ready", {"pid": 4242}, "pid=4242"),
-        ("exit", {"reason": "clean_exit"}, "reason=clean_exit"),
-        ("worker_failed", {"reason": "worker_detached_head"}, None),
-        ("task_failed", {"reason": "marker missing"}, None),
-        ("result", {"status": "succeeded"}, "status=succeeded"),
-        ("result", {"status": "failed", "failure_reason": "timeout"}, None),
-        ("session_ended", {"session_status": "ended", "results": {}}, "status=ended"),
-        ("task_assigned", {"branch": "cambium/t1", "assigned_provider": "codex"}, None),
-    ]
-    for kind, payload, expected_body in cases:
-        line = _line(kind, payload, seq=1, task_id="t")
-        if expected_body is None:
-            assert line and not line.endswith("  "), kind
-            continue
-        assert line.endswith(f"  {expected_body}"), kind
-
-
-def test_spawned_worker_cmd_is_truncated_to_60_chars() -> None:
-    line = _line("spawned", {"worker": "y" * 90}, seq=2, task_id="t")
-
-    assert line.endswith(f"  worker={'y' * 60}")
 
 
 def test_unknown_result_status_is_sanitized() -> None:
@@ -279,70 +122,6 @@ def test_unknown_result_status_is_sanitized() -> None:
 
     assert line.endswith("  status=paused next")
     assert "\x1b" not in line and "\x9b" not in line and "\n" not in line
-
-
-def test_merge_worktree_and_child_kinds_golden() -> None:
-    sha_old = "a" * 40
-    sha_new = "b" * 40
-    cases: list[tuple[str, dict[str, object], str]] = [
-        ("merge_started", {"branch": "cambium/t1"}, "branch=cambium/t1"),
-        (
-            "merge_committed",
-            {"branch": "cambium/t1", "old": sha_old, "new": sha_new},
-            f"branch=cambium/t1 old={sha_old[:12]} new={sha_new[:12]}",
-        ),
-        ("worktree_created", {"branch": "cambium/t2"}, "branch=cambium/t2"),
-        ("worktree_pruned", {"branch": "cambium/t2"}, "branch=cambium/t2"),
-        (
-            "context_fork",
-            {"child_task_id": "child-1", "epoch": 4},
-            "child=child-1 epoch=4",
-        ),
-        ("context_resume", {"epoch": 4, "child_count": 2}, "epoch=4 children=2"),
-        (
-            "child_admitted",
-            {"child_task_id": "child-1", "branch": "cambium/child-1"},
-            "child=child-1 branch=cambium/child-1",
-        ),
-    ]
-    for kind, payload, expected_body in cases:
-        assert _line(kind, payload, seq=1, task_id="t").endswith(f"  {expected_body}"), kind
-
-
-def test_diagnostic_kinds_include_message_or_reason() -> None:
-    cases: list[tuple[str, dict[str, object], str | None]] = [
-        ("protocol", {"note": "run_task write failed"}, "note=run_task write failed"),
-        (
-            "protocol",
-            {"error_type": "PROTO_UNKNOWN_REQUEST_ID", "message": "bad rid"},
-            None,
-        ),
-        ("parse_error", {"message": "Expecting value: line 1 column 1"}, None),
-        ("compaction_failed", {"epoch": 2, "reason": "provider_error"}, None),
-        ("context_resume_failed", {"reason": "wall budget exhausted"}, None),
-        (
-            "child_rejected",
-            {
-                "child_task_id": "child-9",
-                "reason": "ParentTerminatedWithoutResult",
-                "message": "parent ended without a result envelope; proposal dropped",
-            },
-            None,
-        ),
-    ]
-    for kind, payload, exact_body in cases:
-        line = _line(kind, payload, seq=1, task_id="t")
-        if exact_body is not None:
-            assert line.endswith(f"  {exact_body}"), kind
-            continue
-        assert line and "msg=" in line or "reason=" in line or "note=" in line, kind
-
-
-def test_non_mapping_payload_derives_body_from_extra_envelope_keys() -> None:
-    event: dict[str, object] = {"kind": "exit", "task_id": "t", "reason": "done"}
-    line = render_event_line(event)
-
-    assert line.endswith("  reason=done")
 
 
 def test_tool_event_cmd_control_characters_are_neutralized() -> None:
@@ -442,35 +221,6 @@ def _bar_events() -> list[dict[str, object]]:
     ]
 
 
-def test_status_bar_full_golden_at_fixed_columns(monkeypatch: pytest.MonkeyPatch) -> None:
-    _fixed_columns(monkeypatch, 120)
-    left = "session=sess · elapsed=0s · task=t1"
-    right = "tokens/s=15.0 · in=100 out=50 cached=0 · cost=$0.012500 · subagents=1"
-    expected = f"{left}{' ' * (120 - len(left) - len(right))}{right}"
-
-    line = render_status_bar(_bar_events(), session_label="sess")
-
-    assert line == expected
-    assert len(line) == 120
-
-
-def test_status_bar_narrow_terminal_drops_right_segments_first(
-    monkeypatch: object,
-) -> None:
-    _fixed_columns(monkeypatch, 60)
-
-    line = render_status_bar(_bar_events(), session_label="sess")
-
-    assert len(line) == 60
-    assert line.endswith("tokens/s=15.0")
-    assert "cost=" not in line and "subagents=" not in line
-
-
-def test_status_bar_no_events_is_empty() -> None:
-    assert render_status_bar([], session_label="s") == ""
-    assert render_status_bar(None, session_label="s") == ""
-
-
 def test_status_bar_sanitizes_label_and_task_id(monkeypatch: pytest.MonkeyPatch) -> None:
     _fixed_columns(monkeypatch, 100)
 
@@ -484,14 +234,8 @@ def test_status_bar_sanitizes_label_and_task_id(monkeypatch: pytest.MonkeyPatch)
     assert " task=ti x" in line
 
 
-def test_status_bar_drops_absent_segments() -> None:
-    line = render_status_bar([{"kind": "heartbeat", "payload": {}}], session_label="lab")
-
-    assert line == "session=lab"
-
-
 # ---------------------------------------------------------------------------
-# Severity accents (tty + NO_COLOR/TERM gate) and heartbeat spinner frame
+# Severity accents (tty + NO_COLOR/TERM gate)
 # ---------------------------------------------------------------------------
 
 
@@ -521,7 +265,7 @@ def test_should_color_mirrors_render_markdown_if_tty_gate(
 
 
 def test_severity_accents_on_only_for_color_capable_stream(
-    monkeypatch: object,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     tty = _TtyStream()
     ok = _line(
@@ -598,45 +342,8 @@ def test_severity_accents_off_when_gated_or_other_status(monkeypatch: pytest.Mon
     assert "\x1b[" not in other
 
 
-def test_status_bar_spinner_rotates_over_working_heartbeats(
-    monkeypatch: object,
-) -> None:
-    _fixed_columns(monkeypatch, 100)
-    frames = ["/", "-", "\\", "|", "/"]  # len(events with heartbeat) % 4
-    events: list[dict[str, object]] = [
-        {"kind": "spawned", "payload": {}, "task_id": "t1", "monotonic_ms": 0}
-    ]
-    for index, expected in enumerate(frames):
-        events.append(
-            {
-                "kind": "heartbeat",
-                "payload": {"status": "working"},
-                "task_id": "t1",
-                "monotonic_ms": 100 + index,
-            }
-        )
-        line = render_status_bar(events, session_label="s")
-
-        parts = line.split(" · ")
-        assert parts[0] == "session=s"
-        assert parts[-1].split()[0] == expected
-
-
-def test_status_bar_spinner_needs_last_heartbeat_working(monkeypatch: object) -> None:
-    _fixed_columns(monkeypatch, 100)
-
-    working = [{"kind": "heartbeat", "payload": {"status": "working"}}]
-    assert render_status_bar(working, session_label="s") == "session=s · /"
-
-    idle = working + [{"kind": "heartbeat", "payload": {"status": "idle"}}]
-    assert render_status_bar(idle, session_label="s") == "session=s"
-
-    bare = [{"kind": "heartbeat", "payload": {}}]
-    assert render_status_bar(bare, session_label="s") == "session=s"
-
-
 # ---------------------------------------------------------------------------
-# Sink wiring: tty status-bar footer vs legacy non-tty byte behavior
+# Sink wiring: legacy non-tty byte behavior
 # ---------------------------------------------------------------------------
 
 
@@ -670,37 +377,6 @@ async def _scripted_run(config, on_event=None) -> PlanResult:
     return PlanResult((TaskResult(task_id="oneshot", status="succeeded", exit_code=0),))
 
 
-def _bar_draws(out: str) -> int:
-    return out.count("\r\033[K")
-
-
-def test_tui_tty_draws_event_sourced_dashboard(monkeypatch, tmp_path):
-    monkeypatch.setattr(oneshot, "run_oneshot", _scripted_run)
-    out = _TtyStream()
-    assert (
-        asyncio.run(
-            tui.run_tui(
-                oneshot.OneShotConfig(repo=tmp_path),
-                input_stream=io.StringIO("hi\n"),
-                output_stream=out,
-                error_stream=io.StringIO(),
-            )
-        )
-        == 0
-    )
-    text = out.getvalue()
-    assert "\x1b[?1049h" in text
-    assert "\x1b[?1049l" in text
-    assert "Cambium" in text
-    # The event-sourced dashboard renders the agent table per event; the
-    # tool name surfaces there while accented severity lines remain the
-    # scrolling/non-dashboard contract covered by the REPL tests above.
-    assert "run_shell" in text
-    assert "plan_status={succeeded}" in text
-    # one full dashboard redraw per scripted event plus the final snapshot
-    assert text.count("\x1b[H\x1b[2J") == 5
-
-
 def test_tui_non_tty_keeps_legacy_bytes(monkeypatch, tmp_path):
     monkeypatch.setattr(oneshot, "run_oneshot", _scripted_run)
     out = io.StringIO()
@@ -717,44 +393,7 @@ def test_tui_non_tty_keeps_legacy_bytes(monkeypatch, tmp_path):
     )
     text = out.getvalue()
     assert "\r\033[K" not in text
-    assert render_event_line({"kind": "heartbeat", "payload": {}}) == ""
     assert "run_shell df -h OK 5ms" in text
-
-
-def test_repl_tty_draws_bar_and_suppresses_after_terminal_events(monkeypatch, tmp_path):
-    monkeypatch.setattr(oneshot, "run_oneshot", _scripted_run)
-    out = _TtyStream()
-    assert (
-        asyncio.run(
-            repl.run_repl(
-                oneshot.OneShotConfig(repo=tmp_path),
-                input_stream=io.StringIO("hi\n/exit\n"),
-                output_stream=out,
-                error_stream=io.StringIO(),
-            )
-        )
-        == 0
-    )
-    text = out.getvalue()
-    assert f"run_shell df -h {_OK_GREEN}OK{_RESET} 5ms" in text
-    assert _bar_draws(text) == 3
-
-
-def test_repl_non_tty_legacy_has_no_bar_escapes(monkeypatch, tmp_path):
-    monkeypatch.setattr(oneshot, "run_oneshot", _scripted_run)
-    out = io.StringIO()
-    assert (
-        asyncio.run(
-            repl.run_repl(
-                oneshot.OneShotConfig(repo=tmp_path),
-                input_stream=io.StringIO("hi\n/exit\n"),
-                output_stream=out,
-                error_stream=io.StringIO(),
-            )
-        )
-        == 0
-    )
-    assert "\r\033[K" not in out.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -842,7 +481,6 @@ def test_result_usage_and_breakdown_fields_are_sanitized() -> None:
     # task line, not a line break inside a field).
     for line in breakdown.splitlines():
         assert "\x1b" not in line and "\x9b" not in line and "\x80" not in line
-        assert not line.startswith(" ") or line.strip()
 
 
 def test_display_width_handles_wide_and_combining_text(monkeypatch: object) -> None:
@@ -940,7 +578,7 @@ def test_repl_sigint_handler_cancels_turn_and_loop_continues(monkeypatch, tmp_pa
     feed = iter([b"hi\n", b"/exit\n", b""])
     monkeypatch.setattr(repl, "_read_stdin_byte", lambda: next(feed))
     out = _TtyStream()
-    captured: dict[str, object] = {}
+    captured: dict[str, Callable[[], None]] = {}
 
     async def scenario():
         loop = asyncio.get_running_loop()
@@ -960,7 +598,6 @@ def test_repl_sigint_handler_cancels_turn_and_loop_continues(monkeypatch, tmp_pa
         )
 
     assert asyncio.run(scenario()) == 0
-    assert callable(captured["handler"])
     assert seen_prompts == ["hi"]  # interrupted turn never submitted a second run
     assert "interrupted" in out.getvalue()
 

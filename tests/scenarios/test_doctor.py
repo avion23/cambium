@@ -19,6 +19,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
+import pytest
+
 from cambium import doctor, routing
 from cambium.process_env import build_subprocess_env
 from cambium.routing import DebtStore
@@ -62,29 +64,27 @@ def _run_doctor(cwd: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(DOCTOR, cwd=cwd, env=env, capture_output=True, text=True, timeout=300)
 
 
-def test_doctor_fails_on_empty_required_provider_key(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("required", "returncode", "detail", "summary"),
+    [
+        (True, 1, "required provider credential missing", r"Summary: .* [1-9]\d* fail"),
+        (False, 0, "missing provider credential is WARN", r"Summary: .* [0-9]+ fail"),
+    ],
+    ids=["required-fails", "optional-warns"],
+)
+def test_doctor_empty_provider_key_respects_requiredness(
+    tmp_path, monkeypatch, required: bool, returncode: int, detail: str, summary: str
+) -> None:
     monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
-    config = _write_config(tmp_path, required=True)
+    config = _write_config(tmp_path, required=required)
     monkeypatch.setenv("CAMBIUM_PROVIDERS", str(config))
 
     result = _run_doctor(tmp_path)
 
-    assert result.returncode == 1, result.stdout + result.stderr
+    assert result.returncode == returncode, result.stdout + result.stderr
     assert "Provider env" in result.stdout
-    assert "required provider credential missing" in result.stdout
-    assert re.search(r"Summary: .* [1-9]\d* fail", result.stdout)
-
-
-def test_doctor_warns_on_empty_optional_provider_key(tmp_path, monkeypatch) -> None:
-    monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
-    config = _write_config(tmp_path, required=False)
-    monkeypatch.setenv("CAMBIUM_PROVIDERS", str(config))
-
-    result = _run_doctor(tmp_path)
-
-    assert "Provider env" in result.stdout
-    assert "missing provider credential is WARN" in result.stdout
-    assert re.search(r"Summary: .* [0-9]+ fail", result.stdout)
+    assert detail in result.stdout
+    assert re.search(summary, result.stdout)
 
 
 def test_doctor_provider_row_shows_configured_model(tmp_path, monkeypatch) -> None:

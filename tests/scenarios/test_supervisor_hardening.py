@@ -122,18 +122,19 @@ def _kinds(events: list[dict], kind: str) -> list[dict]:
     return [event for event in events if event["kind"] == kind]
 
 
-@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
-def test_cfg_float_nonfinite_value_is_rejected(value: float) -> None:
-    with pytest.raises(ValueError, match="must be finite"):
+@pytest.mark.parametrize(
+    ("value", "error"),
+    [
+        (float("nan"), "must be finite"),
+        (float("inf"), "must be finite"),
+        (float("-inf"), "must be finite"),
+        ("abc", "invalid max_wall_s: 'abc'"),
+    ],
+)
+def test_cfg_float_rejects_invalid_values(value: object, error: str) -> None:
+    with pytest.raises(ValueError, match=error):
         supervisor_module._cfg_float(
             {"max_wall_s": value}, "max_wall_s", "CAMBIUM_WALL_BUDGET_S", 42.0
-        )
-
-
-def test_cfg_float_malformed_value_names_key() -> None:
-    with pytest.raises(ValueError, match="invalid max_wall_s: 'abc'"):
-        supervisor_module._cfg_float(
-            {"max_wall_s": "abc"}, "max_wall_s", "CAMBIUM_WALL_BUDGET_S", 42.0
         )
 
 
