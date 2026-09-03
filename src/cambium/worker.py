@@ -2064,11 +2064,20 @@ def _normalize_tool_calls(action: Mapping[str, Any]) -> list[dict[str, Any]]:
     return [{"name": name, "arguments": arguments}]
 
 
+_FENCED_ACTION_RE = re.compile(r"^```[A-Za-z0-9_-]*\r?\n(.*)\r?\n?```\s*$", re.DOTALL)
+
+
 def _parse_agent_action(content: str) -> dict[str, Any]:
     """Strictly parse ONE agent action; the response must be exactly one
     top-level JSON object.  Any prose, trailing JSON, or concatenated
     actions are rejected (the owner overrode trailing-prose tolerance).
     Raises ``ValueError`` on any deviation.
+
+    Exactly one well-formed markdown fence wrapping the object is unwrapped
+    first (```` ```json ... ``` ```` or a bare ```` ``` ... ``` ```` fence);
+    the body must still be exactly one JSON object.  Anything that does not
+    match that full fenced shape (prose outside the fence, two fences, an
+    unclosed fence) is rejected unchanged.
 
     Accepted shapes (each may optionally carry a ``thought`` field for
     reasoning; the action fields themselves must be exact):
@@ -2084,6 +2093,9 @@ def _parse_agent_action(content: str) -> dict[str, Any]:
         raise ValueError("empty agent action")
     if len(text.encode("utf-8")) > MAX_ACTION_CONTENT_BYTES:
         raise ValueError("agent action exceeds the field cap")
+    fence = _FENCED_ACTION_RE.match(text)
+    if fence:
+        text = fence.group(1)
     try:
         parsed, _end = _decode_action_json(text)
     except (json.JSONDecodeError, UnicodeDecodeError, RecursionError) as exc:
