@@ -136,7 +136,7 @@ def _cache_rows(
     if not cache_stats:
         return [" no provider cache evidence yet"]
     return [
-        f" {_clip(provider, 22):<22} "
+        f" {clip_terminal_text(provider, 22):<22} "
         f"{cache_provider_status(stats).value.upper():<5} {_cache_dashboard_detail(stats)}"
         for provider, stats in sorted(cache_stats.items())
     ]
