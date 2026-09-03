@@ -23,7 +23,7 @@ from typing import Any, cast
 
 import pytest
 
-from cambium import worker
+from cambium import tools, worker
 from cambium.diffundo import ProviderTier, prompt_prefix_bytes, validate_prompt_structure
 from cambium.fencing import write_generation
 
@@ -2218,7 +2218,18 @@ class _BackpressuredWriter(_FakeWriter):
         await self._blocked.wait()
 
 
-def test_tool_progress_callback_delivers_pending_tail_before_completion() -> None:
+def test_tool_progress_callback_delivers_pending_tail_before_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        worker,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: 1_000.0,
+            monotonic_ns=lambda: 1_000_000_000_000,
+            time=lambda: 1_000.0,
+        ),
+    )
     writer = _BackpressuredWriter()
     config = SimpleNamespace(task_id="t", generation=1)
     sink = worker._tool_progress_callback(
@@ -2240,20 +2251,27 @@ def test_tool_progress_callback_delivers_pending_tail_before_completion() -> Non
     assert [m["delta"] for m in deltas] == ["first", "FINAL ERROR"]
 
 
+class _FrozenClockEventLoop(asyncio.SelectorEventLoop):
+    """Keep asyncio timeout scheduling off the real clock for this scenario."""
+
+    def time(self) -> float:
+        return 1_000.0
+
+
 def test_run_shell_delivery_survives_backpressure_and_reports_final_tail(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Keep the process output callbacks inside the worker's throttle window
-    # without changing the event loop clock used by asyncio.
+    fixed_clock = SimpleNamespace(
+        monotonic=lambda: 1_000.0,
+        monotonic_ns=lambda: 1_000_000_000_000,
+        time=lambda: 1_000.0,
+    )
     monkeypatch.setattr(
         worker,
         "time",
-        SimpleNamespace(
-            monotonic=lambda: 1_000.0,
-            monotonic_ns=lambda: 1_000_000_000_000,
-            time=time.time,
-        ),
+        fixed_clock,
     )
+    monkeypatch.setattr(tools, "time", fixed_clock)
     repo = tmp_path / "repo"
     worktree = _make_worktree(repo)
     config = _agent_config(worktree)
@@ -2261,8 +2279,7 @@ def test_run_shell_delivery_survives_backpressure_and_reports_final_tail(
         sys.executable,
         "-u",
         "-c",
-        "import sys,time; print('first', flush=True); time.sleep(0.02); "
-        "print('FINAL ERROR', flush=True)",
+        "import os; os.write(1, b'first\\n'); os.write(1, b'FINAL ERROR')",
     ]
     router = _ScriptedRouter(
         [
@@ -2289,7 +2306,7 @@ def test_run_shell_delivery_survives_backpressure_and_reports_final_tail(
             timeout=30.0,
         )
 
-    outcome = asyncio.run(_run())
+    outcome = asyncio.run(_run(), loop_factory=_FrozenClockEventLoop)
 
     assert outcome["status"] == "succeeded"
     deltas = [m for m in writer.messages() if m["type"] == "tool_output_delta"]
