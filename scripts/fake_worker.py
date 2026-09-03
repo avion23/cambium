@@ -549,25 +549,35 @@ def _init_problem(init: object) -> str | None:
 
 def _read_run_or_control(
     idle_timeout: float,
+    task_id: str,
+    generation: int,
 ) -> tuple[str, dict | None, str]:
-    """Return (control, validated dict when control is "run"/"init", detail)."""
-    try:
-        message = _read_with_timeout(idle_timeout)
-    except (TypeError, ValueError, json.JSONDecodeError) as exc:
-        return "invalid", None, f"invalid message: {exc}"
-    if message is _TIMEOUT:
-        return "idle", None, "idle"
-    if message is None:
-        return "closed", None, "closed"
-    if isinstance(message, dict):
-        message_type = message.get("type")
-        if message_type == "shutdown":
-            return "shutdown", None, "shutdown"
-        if message_type == "init":
-            return "init", message, "rebind"
-        if message_type == "run_task":
-            return "run", message, "run"
-    return "invalid", None, f"invalid message: {message!r}"
+    """Read a task/rebind message and handle controls valid while ready."""
+    while True:
+        try:
+            message = _read_with_timeout(idle_timeout)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            return "invalid", None, f"invalid message: {exc}"
+        if message is _TIMEOUT:
+            return "idle", None, "idle"
+        if message is None:
+            return "closed", None, "closed"
+        if isinstance(message, dict):
+            message_type = message.get("type")
+            if message_type == "init":
+                return "init", message, "rebind"
+            if message_type == "run_task":
+                return "run", message, "run"
+            control = _handle_ready_message(message, task_id, generation)
+            if control == "continue":
+                continue
+            if control == "shutdown":
+                return "shutdown", None, "shutdown"
+        return (
+            "invalid",
+            message if isinstance(message, dict) else None,
+            f"invalid message: {message!r}",
+        )
 
 
 def _exit_message(task_id: str, generation: int, reason: str) -> None:
@@ -591,7 +601,7 @@ def _run_one_task(
     init: dict, idle_timeout: float, task_id: str, generation: int
 ) -> tuple[dict | None, int | None]:
     """Execute one task cycle. Returns (rebind-init, exit-code); exactly one is set."""
-    control, run, detail = _read_run_or_control(idle_timeout)
+    control, run, detail = _read_run_or_control(idle_timeout, task_id, generation)
     if control == "idle":
         _exit_message(task_id, generation, "idle")
         return None, 0
@@ -602,7 +612,7 @@ def _run_one_task(
     if control != "run" or run is None:
         return None, _fatal(
             f"invalid message while awaiting run_task: {detail}",
-            None,
+            run,
             task_id=task_id,
             generation=generation,
         )
@@ -629,7 +639,7 @@ def _run_one_task(
     ) is not None:
         return None, finish_exit
 
-    control, rebind, detail = _read_run_or_control(idle_timeout)
+    control, rebind, detail = _read_run_or_control(idle_timeout, task_id, generation)
     if control == "idle":
         _exit_message(task_id, generation, "idle")
         return None, 0
@@ -638,7 +648,7 @@ def _run_one_task(
     if control != "init" or rebind is None:
         return None, _fatal(
             f"expected init when rebinding worker: {detail}",
-            None,
+            rebind,
             task_id=task_id,
             generation=generation,
         )

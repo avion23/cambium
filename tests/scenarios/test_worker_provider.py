@@ -815,6 +815,8 @@ def test_worker_delegate_tool_proposes_and_admits_child(tmp_path, monkeypatch) -
                 "marker": "// provider-child",
                 "write_marker": True,
                 "base_commit": base,
+                "context_mode": "fresh",
+                "placement": "spread",
             },
         }
         _enqueue(
@@ -894,6 +896,8 @@ def test_worker_context_reuse_fork_resume_is_byte_exact(tmp_path, monkeypatch) -
             "marker": "// provider-cache-child",
             "write_marker": True,
             "base_commit": base,
+            "context_mode": "trunk",
+            "placement": "inherit",
             "provider_env_keys": [PROVIDER_KEY, "NO_PROXY", "no_proxy"],
             "authorized_providers": ["loopback-provider"],
             "fanout_config": {
