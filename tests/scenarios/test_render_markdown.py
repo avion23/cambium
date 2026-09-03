@@ -18,11 +18,11 @@ class _Tty(StringIO):
         return True
 
 
-def test_atx_headings_render_bold_with_falling_brightness() -> None:
-    assert render_markdown("# Title\n") == "\x1b[1;97mTitle\x1b[0m\n"
-    assert render_markdown("## Mid\n") == "\x1b[1;37mMid\x1b[0m\n"
-    assert render_markdown("### Low\n") == "\x1b[1;90mLow\x1b[0m\n"
-    assert render_markdown("#### Deep\n") == "\x1b[1;30mDeep\x1b[0m\n"
+def test_atx_headings_render_bold_with_level_colors() -> None:
+    assert render_markdown("# Title\n") == "\x1b[1;96mTitle\x1b[0m\n"
+    assert render_markdown("## Mid\n") == "\x1b[1;94mMid\x1b[0m\n"
+    assert render_markdown("### Low\n") == "\x1b[1;95mLow\x1b[0m\n"
+    assert render_markdown("#### Deep\n") == "\x1b[1;93mDeep\x1b[0m\n"
     assert render_markdown("##### five hashes\n") == "##### five hashes\n"
     assert render_markdown("#NoSpace\n") == "#NoSpace\n"
 
@@ -33,34 +33,52 @@ def test_fenced_block_is_verbatim_dim_cyan_and_suppresses_inline() -> None:
         "\x1b[2;36m```py\x1b[0m\n"
         "\x1b[2;36mcode **not bold** `not code`\x1b[0m\n"
         "\x1b[2;36m```\x1b[0m\n"
-        "after \x1b[2msoft\x1b[0m\n"
+        "after \x1b[3;35msoft\x1b[0m\n"
     )
     assert render_markdown(text) == expected
 
 
 def test_inline_code_bold_and_italic_styles() -> None:
-    assert render_markdown("run `make test` now\n") == ("run \x1b[33mmake test\x1b[0m now\n")
+    assert render_markdown("run `make test` now\n") == ("run \x1b[2;33mmake test\x1b[0m now\n")
     assert render_markdown("**big** deal *soft*\n") == (
-        "\x1b[1mbig\x1b[0m deal \x1b[2msoft\x1b[0m\n"
+        "\x1b[1;97mbig\x1b[0m deal \x1b[3;35msoft\x1b[0m\n"
     )
     assert render_markdown("2 * 3 + 4 * 5\n") == "2 * 3 + 4 * 5\n"
 
 
 @pytest.mark.parametrize(
-    "text",
+    ("text", "expected"),
     [
-        "- alpha\n* beta\n  - nested\n    - deeper\n",
-        "1. one\n2. two\n  3. indented three\n",
-        "plain paragraph line\n\nanother one, with punctuation!\n",
+        (
+            "- alpha\n* beta\n  - nested\n    - deeper\n",
+            "\x1b[32m-\x1b[0m alpha\n"
+            "\x1b[32m*\x1b[0m beta\n"
+            "  \x1b[32m-\x1b[0m nested\n"
+            "    \x1b[32m-\x1b[0m deeper\n",
+        ),
+        (
+            "1. one\n2. two\n  3. indented three\n",
+            "\x1b[32m1.\x1b[0m one\n\x1b[32m2.\x1b[0m two\n  \x1b[32m3.\x1b[0m indented three\n",
+        ),
+        (
+            "plain paragraph line\n\nanother one, with punctuation!\n",
+            "plain paragraph line\n\nanother one, with punctuation!\n",
+        ),
     ],
     ids=("unordered-list", "ordered-list", "paragraph"),
 )
-def test_unstyled_markdown_preserves_layout_verbatim(text: str) -> None:
-    assert render_markdown(text) == text
+def test_markdown_preserves_list_layout_with_colored_markers(text: str, expected: str) -> None:
+    assert render_markdown(text) == expected
 
 
-def test_blockquote_gets_dim_italic_prefix_and_inline_body() -> None:
-    assert render_markdown("> quoted **b**\n") == ("\x1b[2;3m>\x1b[0m quoted \x1b[1mb\x1b[0m\n")
+def test_inline_links_are_underlined_without_changing_visible_text() -> None:
+    assert render_markdown("read [the docs](https://example.test/docs)\n") == (
+        "read \x1b[4;34m[the docs](https://example.test/docs)\x1b[0m\n"
+    )
+
+
+def test_blockquote_gets_dim_colored_prefix_and_inline_body() -> None:
+    assert render_markdown("> quoted **b**\n") == ("\x1b[2;34m>\x1b[0m quoted \x1b[1;97mb\x1b[0m\n")
 
 
 @pytest.mark.parametrize(
@@ -110,7 +128,7 @@ def test_non_tty_stream_returns_sanitized_plain_text(monkeypatch) -> None:
 def test_empty_no_color_on_real_term_renders(monkeypatch) -> None:
     monkeypatch.setenv("NO_COLOR", "")
     monkeypatch.setenv("TERM", "xterm-256color")
-    assert render_markdown_if_tty("# T\n", _Tty()) == "\x1b[1;97mT\x1b[0m\n"
+    assert render_markdown_if_tty("# T\n", _Tty()) == "\x1b[1;96mT\x1b[0m\n"
 
 
 def test_repl_emits_rendered_summaries_only_when_output_stream_is_a_tty(
@@ -161,9 +179,9 @@ def test_repl_emits_rendered_summaries_only_when_output_stream_is_a_tty(
     )
 
     value = tty_out.getvalue()
-    assert "\x1b[1;97mDone\x1b[0m" in value
-    assert "\x1b[33mmake\x1b[0m" in value
-    assert "\x1b[1mwon\x1b[0m" in value
+    assert "\x1b[1;96mDone\x1b[0m" in value
+    assert "\x1b[2;33mmake\x1b[0m" in value
+    assert "\x1b[1;97mwon\x1b[0m" in value
     plain = plain_out.getvalue()
     assert "\x1b[1;97m" not in plain
     assert "used `make` and **won**" in plain
