@@ -50,8 +50,8 @@ Current coherence gaps:
 - the model does not receive a canonical current-state projection;
 - `observability.py` serves the human surface but is not the shared branch-state
   owner;
-- child policy can still be omitted and silently enter the automatic
-  compatibility path, while normative docs describe explicit policy;
+- child policy omission is now rejected by the model schema, but the
+  normative explicit-policy contract still needs a public decision record;
 - `branch_history.py`, `code_index.py`, and `lsp_query.py` are not in the active
   six-tool worker roster;
 - docs claim named branch-decision/history prompt components that
@@ -101,7 +101,8 @@ prompt, and event must use one vocabulary for current behavior and target work.
 1. Decide the public child-policy contract:
    - preferred target: every model-originated `delegate` proposal explicitly
      declares `context_mode` and `placement`;
-   - remove omission from the model schema and prompt;
+   - DONE (schemas.py, child_policy.py): omission is rejected by the model
+     schema; remaining: record the public decision and align prompts/events;
    - if harness-originated automatic compatibility remains necessary, give it
      an explicit internal policy name and event value rather than overloading
      missing fields.

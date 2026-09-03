@@ -52,7 +52,7 @@ effort-aware deadline; `reasoning_effort: max` multiplies the base by `2.0`.
 (src/cambium/diffundo.py:164,695-697,2007-2057)
 
 One-shot plans materialize `max_restarts: 1` when unset; explicit values, including zero,
-remain explicit. (src/cambium/oneshot.py:800-821)
+remain explicit. (src/cambium/oneshot.py:920-922)
 
 A restart-eligible failed generation consumes restart budget, emits `restart_scheduled`,
 sleeps with bounded jitter, starts a fresh process, and receives a fresh wall window.

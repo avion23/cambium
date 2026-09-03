@@ -247,9 +247,9 @@ scenario path are wired.
 - Exact cache reuse requires byte/identity compatibility; provider cache hits
   come only from provider evidence.
 - Current supervisor source consumes declared child `context_mode` and
-  `placement`. The model schema still permits omission and automatic
-  exact/semantic resolution; treat this as a current compatibility gap, not an
-  implicit normative default.
+  `placement`, and the model schema requires both fields (omission is
+  rejected before admission); treat any remaining automatic resolution as
+  a current compatibility gap, not an implicit normative default.
 - A child cannot widen parent filesystem, tool, credential, or provider
   authority.
 - Admission is durable before spawn. Child completion order does not determine
@@ -298,7 +298,9 @@ Focused references:
   or merge is created.
 - A dirty, detached, wrong-branch, stale-base, conflicted, quarantined, or
   envelope-inconsistent worker result is not published.
-- Publication is expected-old and ref-only. Do not reset a caller-owned primary
+- Publication is expected-old and ref-only, except the one-shot CLI path,
+  which owns the ordinary clean primary checkout and may fast-forward it
+  to the published head after publication. Do not reset a caller-owned primary
   checkout to make it visually match.
 - Recovery preserves salvage and the last safe checkpoint; resume requires a
   matching workspace identity.

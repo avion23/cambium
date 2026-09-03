@@ -30,8 +30,8 @@ result for a complex change. The system failure without it: results that
 cannot be completed, are unfinished, or touch sensitive/destructive paths are
 accepted without review, so defects and policy violations reach the main
 branch. `Architectus` is a future caller; the current consumer is the neutral
-JSON CLI invoked by the bench harness, the conformance gate, and the colocated
-tests.
+JSON CLI invoked by the conformance gate and the colocated
+tests (the former bench harness was removed with `src/cambium/bench.py`).
 
 ## 3. Interfaces
 
@@ -70,20 +70,20 @@ Closed domain alternatives use the `Decision` enum (`REVIEW` /
 `DO_NOT_REVIEW`); the enum stays in the domain model and the wire boolean at
 the boundary is `review`, never `decompose`. The JSON wire object is
 `{"confidence": float, "review": bool, "reason": str}`. Consumers are the
-JSON CLI probe, the bench harness (`operation: evaluate` reads the
-prediction), and the colocated tests.
+JSON CLI probe (`operation: evaluate` reads the
+prediction) and the colocated tests.
 
-The v1 class-balance contract stays generic. The bench harness and the
-committed baseline schema carry `label_true` / `label_false` as the
-generic v1 class-balance field names (a bench contract, not a domain claim).
+The v1 class-balance contract stays generic. The
+committed baseline schema carries `label_true` / `label_false` as the
+generic v1 class-balance field names (a bench-era contract, not a domain claim).
 `module.json` therefore declares `label_field: "review"`; the conformance gate
 counts class balance from `expected.review` and checks it against the
-baseline's `dataset.label_true` / `dataset.label_false`. The bench harness
-reads the manifest's `label_field` (`review`) for class balance;
+baseline's `dataset.label_true` / `dataset.label_false`. Consumers read
+the manifest's `label_field` (`review`) for class balance;
 `expected.decompose` remains a v1-compat mirror in each record, and the loader
 still enforces `expected.decompose == expected.review`.
 The same `label_field` mechanism is applied to `scripts/check_dataset_v1.py`,
-the one remaining harness consumer that hardcodes the generic name.
+which reads the generic name from the manifest instead of hardcoding it.
 
 ### 3.3 Errors
 
@@ -97,8 +97,8 @@ class DatasetError(ValueError): ...           # cambium.modules.base, loader bou
 process boundary; it never escapes to the supervisor event loop).  A
 schema-invalid dataset record (bad `review`/`reason`/`canary`, malformed
 `input`) raises `SchemaInvalidError`; `__main__._write_error` marks those
-errors with the explicit `"code": "SCHEMA_INVALID"` split marker so the bench
-harness can fall back to the combined file without guessing from the error
+errors with the explicit `"code": "SCHEMA_INVALID"` split marker so callers
+can fall back to the combined file without guessing from the error
 type.
 `DatasetError` is raised by `ExampleDatasetLoader` for unreadable files,
 malformed JSON, schema-invalid records, version drift, duplicate ids, and
@@ -189,9 +189,9 @@ fallback for backward compat and it is exercised by tests).
 - Canary markers: `canary: true` plus `canary_info` with `kind`,
   `anti_expected`, `anti_expected_confidence_range`, `failure_mode`, and
   description. Kinds: `trivially_atomic`, `must_review` (the must-decompose
-  analogue renamed for review semantics), `keyword_hack`, `format_only_hack`,
-  `ambiguous_calibration`; four of the five are taxonomy kinds, so
-  `bench.canary_stats` reports non-zero coverage (0.8).
+   analogue renamed for review semantics), `keyword_hack`, `format_only_hack`,
+   `ambiguous_calibration`; four of the five are taxonomy kinds, so
+   canary coverage is non-zero (0.8).
 - Sibling versions: `sibling_pins` is empty; no sibling stubs exist.
 - Who may add records: the module owner hand-authors additions; a second
   reviewer approves frozen eval changes and canary additions; refresh cadence
@@ -204,11 +204,11 @@ fallback for backward compat and it is exercised by tests).
 |---|---|---|---|
 | Malformed JSON / non-object / duplicate keys at the CLI | exit 1, error object on stdout, diagnostic on stderr | `InputValidationError` / `json.JSONDecodeError` caught in `__main__.main` | caller resubmits a valid object; the boundary never defaults |
 | Invalid `input.task`/`input.context` (missing, empty, wrong type) | exit 1 with typed error | `_parse_input` at the CLI boundary | caller fixes the record |
-| Schema-invalid dataset record at the CLI (`evaluate` on a bad record) | exit 1, error object with `"code": "SCHEMA_INVALID"` | `SchemaInvalidError` in `__main__._evaluate`/`_write_error` | record owner fixes the JSONL and bumps `dataset_version`; the bench harness falls back to the combined file |
+| Schema-invalid dataset record at the CLI (`evaluate` on a bad record) | exit 1, error object with `"code": "SCHEMA_INVALID"` | `SchemaInvalidError` in `__main__._evaluate`/`_write_error` | record owner fixes the JSONL and bumps `dataset_version`; callers fall back to the combined file |
 | Schema-invalid dataset record at the loader (bad `review`/`reason`, mirror drift) | `DatasetError` with file:line | `ExampleDatasetLoader._validate` | record owner fixes the JSONL and bumps `dataset_version` |
 | Version drift (record vs meta.json) | `DatasetError` | `_validate_record_versions` | bump `dataset_version` deliberately; never silently re-anchor |
 | Duplicate id / cross-split `(task, context)` | `DatasetError` | loader + conformance gate | deduplicate and re-run digests |
-| Over-review: keyword-dense atomic canaries | metric < 1.0 on `trivially_atomic`/`keyword_hack` | canary gate (`bench.canary_stats.failed`) | tune evidence weights; do not drop the canary |
+| Over-review: keyword-dense atomic canaries | metric < 1.0 on `trivially_atomic`/`keyword_hack` | canary gate (failed-canary count) | tune evidence weights; do not drop the canary |
 | Under-review: keyword-free/well-formatted untested canaries | metric < 1.0 on `must_review`/`format_only_hack` | canary gate | restore file/test signals; do not drop the canary |
 | Reward hacking: dropping canaries | `dataset.canaries` count mismatch | baseline + gate integrity checks | restore the frozen records |
 
@@ -255,7 +255,8 @@ imports and reverse imports are static failures.
 ### 9.4 Baseline and removal
 
 Baseline: `src/cambium/modules/should_review/tests/baselines/baseline.json`,
-generated by `pytest -p cambium.bench --bench=report` (never hand-written).
+generated by the former `cambium.bench` harness (removed; never hand-written).
+Sync counts by hand when the suite changes.
 It contains `schema_version`, logical `module` (`should_review`),
 `dataset_version`, `split_digests`, `git_sha`, `date`, `python`, `pytest`,
 `metric`, `canaries`, `dataset`, `tests`, and `drift_thresholds`. Its digests
@@ -289,14 +290,14 @@ steps as configured) would require human approval for promotion, replace
 ## Appendix A. Required evidence and boundary notes
 
 The module is traced from its live entry point: the neutral JSON CLI
-(`cambium.modules.should_review.__main__`) is invoked by the bench harness
-(`src/cambium/bench.py::build_module_report` through `run_module_cli`), the
+(`cambium.modules.should_review.__main__`) was invoked by the former bench harness
+(`src/cambium/bench.py`, removed); live invokers are the
 conformance probe (`src/cambium/module_conformance.py::probe_module_cli`), and
 `scripts/check_dataset_v1.py`. No production orchestrator caller exists yet;
 `Architectus` is a future target, stated as a target, not a live caller.
 
 Shared surfaces used: the module ABC and examples (`cambium.modules.base`,
-`cambium.modules.example`), the benchmark/conformance harness (`bench.py`,
+`cambium.modules.example`), the conformance harness (
 `module_conformance.py`), and the CLI (`cli.py`). No module-specific schema
 registry, dispatch path, cache, or resource-budget abstraction is added.
 
@@ -311,7 +312,7 @@ registry, dispatch path, cache, or resource-budget abstraction is added.
 - Which exception is raised and where it is caught: `InputValidationError` in
   `__main__.py` (caught in `main()`), `DatasetError` in `dataset.py` (raised to
   callers; never hidden behind a catch-all).
-- Which consumer reads each output: the bench harness reads `evaluate`
+- Which consumer reads each output: the conformance gate reads `evaluate`
   predictions and scores; the CLI probe reads the direct decision; tests read
   `ReviewOutput` directly.
 - Which fields are retained at the wire boundary: `review` (boolean label),
@@ -321,8 +322,8 @@ registry, dispatch path, cache, or resource-budget abstraction is added.
   `label_field: "review"`, the conformance gate counts class balance from
   `expected.review`, and the baseline carries `label_true`/`label_false`
   as generic v1 class-balance names. `expected.decompose` in each dataset record
-  is a v1-compat mirror of `expected.review` enforced by the loader; the bench
-  harness reads `manifest.label_field` for class balance. `scripts/check_dataset_v1.py`
+   is a v1-compat mirror of `expected.review` enforced by the loader; consumers read
+   `manifest.label_field` for class balance. `scripts/check_dataset_v1.py`
   reads the same `label_field` instead of hardcoding the generic name.
 - The JSON adapter is a process boundary: it rejects duplicate object keys,
   rejects unknown fields, emits no logs on stdout, and avoids importing
