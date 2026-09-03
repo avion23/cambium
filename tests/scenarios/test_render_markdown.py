@@ -66,13 +66,23 @@ def test_blockquote_gets_dim_italic_prefix_and_inline_body() -> None:
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
-        ("a\x1b[31mesc\x07b\tc\x00d\ne\r\f\n", "a[31mescb\tcd\ne\n"),
-        ("café 中\x80between\x9bend\n", "café 中betweenend\n"),
+        ("a\x1b[31mesc\x07b\tc\x00d\ne\r\f\n", "aescb\tcd\ne\n"),
+        ("café 中\x80between\x9b31mend\n", "café 中betweenend\n"),
+        (
+            "left\x1b]2;secret\x07right\u202eabc\u202c\n",
+            "leftright\\u202Eabc\\u202C\n",
+        ),
     ],
-    ids=("c0", "c1"),
+    ids=("c0-and-csi", "c1-and-8-bit-csi", "osc-and-bidi"),
 )
-def test_control_characters_are_stripped_without_losing_text(raw: str, expected: str) -> None:
+def test_terminal_controls_are_removed_without_losing_readable_text(
+    raw: str, expected: str
+) -> None:
     assert render_markdown(raw) == expected
+
+
+def test_unicode_line_separators_are_normalized() -> None:
+    assert render_markdown("a\u0085b\u2028c\u2029d") == "a\nb\nc\nd"
 
 
 @pytest.mark.parametrize(
@@ -87,10 +97,10 @@ def test_disabled_color_gates_strip_controls_without_styling(
     monkeypatch.delenv("TERM", raising=False)
     monkeypatch.setenv(name, value)
     text = "safe\x1b[31m\x9b31m\n# Title\n"
-    assert render_markdown_if_tty(text, _Tty()) == "safe[31m31m\n# Title\n"
+    assert render_markdown_if_tty(text, _Tty()) == "safe\n# Title\n"
 
 
-def test_non_tty_stream_returns_input_unchanged(monkeypatch) -> None:
+def test_non_tty_stream_returns_sanitized_plain_text(monkeypatch) -> None:
     monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.setenv("TERM", "xterm-256color")
     text = "# Title\n**bold**\n"
