@@ -15,10 +15,12 @@ import os
 import shutil
 import signal
 import sys
+from collections.abc import Mapping
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, TextIO
 
+from .doctor import CacheProviderStats, cache_provider_status, record_cache_event
 from .observability import (
     AgentSnapshot,
     ObservabilityState,
@@ -108,6 +110,38 @@ def _bottom(width: int) -> str:
     return "└" + "─" * max(0, width - 2) + "┘"
 
 
+def _cache_percentage(numerator: float, denominator: int | float) -> str:
+    if denominator <= 0:
+        return "n/a"
+    return f"{100.0 * numerator / denominator:.1f}%"
+
+
+def _cache_dashboard_detail(stats: CacheProviderStats) -> str:
+    unknown = stats.calls - stats.cache_known
+    share = (
+        _cache_percentage(stats.cached_token_total, stats.input_token_total)
+        if stats.token_pairs and stats.input_token_total > 0
+        else "n/a"
+    )
+    hit_rate = _cache_percentage(stats.cache_hits, stats.cache_known)
+    return (
+        f"calls={stats.calls} cache-hits={stats.cache_hits} unknown={unknown} "
+        f"hit={hit_rate} cached={share}"
+    )
+
+
+def _cache_rows(
+    cache_stats: Mapping[str, CacheProviderStats] | None,
+) -> list[str]:
+    if not cache_stats:
+        return [" no provider cache evidence yet"]
+    return [
+        f" {_clip(provider, 22):<22} "
+        f"{cache_provider_status(stats).value.upper():<5} {_cache_dashboard_detail(stats)}"
+        for provider, stats in sorted(cache_stats.items())
+    ]
+
+
 def render_agent_lines(snapshot: SessionSnapshot) -> list[str]:
     """Stable non-boxed agent report used by CLI status and tests."""
 
@@ -146,6 +180,7 @@ def render_dashboard(
     session_dir: str | Path,
     width: int = 120,
     height: int = 40,
+    cache_stats: Mapping[str, CacheProviderStats] | None = None,
 ) -> list[str]:
     """Render one full dashboard frame without terminal control sequences."""
 
@@ -196,6 +231,10 @@ def render_dashboard(
         )
     )
 
+    cache_lines = _cache_rows(cache_stats)
+    lines.append(_rule("provider cache", width))
+    lines.extend(_inside(line, width) for line in cache_lines)
+
     lines.append(_rule("agents", width))
     compact = width < 105
     if compact:
@@ -209,9 +248,9 @@ def render_dashboard(
         )
     lines.append(_inside(header, width))
 
-    reserved = 6  # top/bottom/rules
     event_rows = min(8, max(3, height // 4))
-    agent_capacity = max(3, height - reserved - event_rows - 3)
+    cache_section_rows = 1 + len(cache_lines)
+    agent_capacity = max(3, height - 9 - event_rows - cache_section_rows)
     agents = snapshot.agents[-agent_capacity:]
     for agent in agents:
         role = "M" if agent.role == "main" else "S"
@@ -332,7 +371,12 @@ class AnsiDashboard:
                 raise
         return self
 
-    def draw(self, snapshot: SessionSnapshot) -> None:
+    def draw(
+        self,
+        snapshot: SessionSnapshot,
+        *,
+        cache_stats: Mapping[str, CacheProviderStats] | None = None,
+    ) -> None:
         if not self.enabled:
             return
         size = shutil.get_terminal_size((120, 40))
@@ -341,6 +385,7 @@ class AnsiDashboard:
             session_dir=self.session_dir,
             width=size.columns,
             height=size.lines,
+            cache_stats=cache_stats,
         )
         self.stream.write(_HOME_CLEAR)
         self.stream.write("\n".join(lines))
@@ -416,24 +461,32 @@ async def monitor_session_async(
     out = sys.stdout if output_stream is None else output_stream
     state = ObservabilityState()
     event_cursor = EventCursor()
+    cache_stats: dict[str, CacheProviderStats] = {}
     dashboard = AnsiDashboard(session, stream=out, enabled=not once and not json_output)
     try:
         with dashboard:
             while True:
                 events, event_cursor = read_events_with_cursor(session, event_cursor)
+                for event in events:
+                    record_cache_event(cache_stats, event)
                 state.extend(events)
                 snapshot = state.snapshot(session_dir=session)
                 if json_output:
                     out.write(snapshot_json(snapshot) + "\n")
                     out.flush()
                     return 0
-                frame = "\n".join(render_dashboard(snapshot, session_dir=session)) + "\n"
+                frame = (
+                    "\n".join(
+                        render_dashboard(snapshot, session_dir=session, cache_stats=cache_stats)
+                    )
+                    + "\n"
+                )
                 if once:
                     out.write(frame)
                     out.flush()
                     return 0
                 if dashboard.enabled:
-                    dashboard.draw(snapshot)
+                    dashboard.draw(snapshot, cache_stats=cache_stats)
                 else:
                     out.write(frame)
                     out.flush()

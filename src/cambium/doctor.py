@@ -13,6 +13,7 @@ any check fails.
 Run::
 
     python -m cambium.doctor [--session-dir <dir>]
+    python -m cambium.doctor --cache-report <session-dir>
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from __future__ import annotations
 import argparse
 import enum
 import json
+import math
 import os
 import re
 import shutil
@@ -31,7 +33,7 @@ import tomllib
 import urllib.error
 import urllib.request
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, metadata
 from pathlib import Path
@@ -124,6 +126,115 @@ class Status(enum.StrEnum):
 
 class DatasetIntegrityError(Exception):
     """Raised when a module-owned dataset cannot be discovered or validated."""
+
+
+@dataclass(slots=True)
+class CacheProviderStats:
+    """Provider cache evidence accumulated from usage events."""
+
+    calls: int = 0
+    cache_hits: int = 0
+    cache_known: int = 0
+    cached_token_total: float = 0.0
+    input_token_total: float = 0.0
+    token_pairs: int = 0
+
+
+def _cache_number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) and number >= 0 else None
+
+
+def _usage_input_tokens(usage: Mapping[str, Any]) -> float | None:
+    for key in ("input_tokens", "prompt_tokens"):
+        value = _cache_number(usage.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _usage_cached_tokens(usage: Mapping[str, Any]) -> float | None:
+    for details_key in ("input_tokens_details", "prompt_tokens_details"):
+        details = usage.get(details_key)
+        if isinstance(details, Mapping) and "cached_tokens" in details:
+            return _cache_number(details.get("cached_tokens"))
+    for key in ("cache_read_input_tokens", "cached_tokens"):
+        if key in usage:
+            return _cache_number(usage.get(key))
+    return None
+
+
+def _cache_provider_name(payload: Mapping[str, Any]) -> str:
+    provider = payload.get("provider")
+    return provider if isinstance(provider, str) and provider else "<unknown>"
+
+
+def record_cache_event(
+    providers: dict[str, CacheProviderStats], event: Mapping[str, Any]
+) -> None:
+    """Fold one usage event into per-provider cache evidence."""
+    if event.get("kind") != "usage_event":
+        return
+    raw_payload = event.get("payload")
+    payload = raw_payload if isinstance(raw_payload, Mapping) else {}
+    stats = providers.setdefault(_cache_provider_name(payload), CacheProviderStats())
+    stats.calls += 1
+
+    cache_hit = payload.get("provider_cache_hit")
+    if type(cache_hit) is bool:
+        stats.cache_known += 1
+        stats.cache_hits += int(cache_hit)
+
+    usage = payload.get("usage")
+    if not isinstance(usage, Mapping):
+        return
+    input_tokens = _usage_input_tokens(usage)
+    cached_tokens = _usage_cached_tokens(usage)
+    if input_tokens is None or cached_tokens is None:
+        return
+    stats.input_token_total += input_tokens
+    stats.cached_token_total += cached_tokens
+    stats.token_pairs += 1
+
+
+def cache_provider_status(stats: CacheProviderStats) -> Status:
+    """Return WARN when one or more calls lack provider cache evidence."""
+    return Status.PASS if stats.cache_known == stats.calls else Status.WARN
+
+
+def _cache_percentage(numerator: float, denominator: float) -> str:
+    if denominator <= 0:
+        return "n/a"
+    return f"{100.0 * numerator / denominator:.1f}%"
+
+
+def _cache_token_number(value: float) -> str:
+    return f"{value:g}"
+
+
+def format_cache_provider_detail(stats: CacheProviderStats) -> str:
+    """Format the operator-facing metrics for one provider."""
+    unknown = stats.calls - stats.cache_known
+    hit_detail = _cache_percentage(stats.cache_hits, stats.cache_known)
+    hit_detail += f" ({stats.cache_hits}/{stats.cache_known} known)"
+    if stats.token_pairs and stats.input_token_total > 0:
+        share = _cache_percentage(stats.cached_token_total, stats.input_token_total)
+        token_detail = (
+            f"{share} ({_cache_token_number(stats.cached_token_total)} cached/"
+            f"{_cache_token_number(stats.input_token_total)} input)"
+        )
+    else:
+        token_detail = "n/a"
+    return (
+        f"total calls: {stats.calls}; cache-hit calls: {stats.cache_hits}; "
+        f"unknown cache fields: {unknown}; hit %: {hit_detail}; "
+        f"cached-token share: {token_detail}"
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,6 +364,88 @@ def check_event_store(session_dir: Path | None) -> tuple[Status, str]:
     if problems:
         return Status.FAIL, f"{db}: integrity_check: {problems[:3]}"
     return Status.PASS, f"{db}: integrity ok, {count} events"
+
+
+def _cache_report_event_dbs(session_dir: Path) -> list[Path]:
+    """Return session event stores without following event-store symlinks."""
+    databases: list[Path] = []
+    root_db = session_dir / EVENTS_DB_REL
+    if root_db.is_file() and not root_db.is_symlink():
+        databases.append(root_db)
+    databases.extend(
+        path
+        for path in sorted(session_dir.glob("turn-*/.cambium/events.db"))
+        if path.is_file() and not path.is_symlink()
+    )
+    return databases
+
+
+def _read_cache_report_db(db: Path, providers: dict[str, CacheProviderStats]) -> int:
+    """Fold usage rows from one event store, using a read-only connection."""
+    calls = 0
+    connection = sqlite3.connect(_sqlite_read_only_uri(db), uri=True)
+    try:
+        rows = connection.execute(
+            "SELECT payload FROM events WHERE kind = ? ORDER BY seq", ("usage_event",)
+        )
+        for row in rows:
+            try:
+                payload = json.loads(row[0])
+            except (TypeError, ValueError, UnicodeDecodeError) as exc:
+                raise ValueError(f"{db}: invalid usage_event payload") from exc
+            record_cache_event(
+                providers,
+                {"kind": "usage_event", "payload": payload if isinstance(payload, Mapping) else {}},
+            )
+            calls += 1
+    finally:
+        connection.close()
+    return calls
+
+
+def _scan_cache_report(
+    session_dir: Path,
+) -> tuple[Status, str, dict[str, CacheProviderStats]]:
+    """Read cache evidence from a session without modifying any artifact."""
+    databases = _cache_report_event_dbs(session_dir)
+    if not databases:
+        return (
+            Status.SKIP,
+            f"{session_dir}: no event database found (expected .cambium/events.db "
+            "or turn-*/.cambium/events.db)",
+            {},
+        )
+
+    providers: dict[str, CacheProviderStats] = {}
+    calls = 0
+    for db in databases:
+        try:
+            calls += _read_cache_report_db(db, providers)
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            return Status.FAIL, f"{db}: cache report unavailable: {exc}", providers
+
+    if calls == 0:
+        return (
+            Status.SKIP,
+            f"{session_dir}: {len(databases)} event database(s), no usage_event rows",
+            providers,
+        )
+    status = (
+        Status.WARN
+        if any(cache_provider_status(stats) is Status.WARN for stats in providers.values())
+        else Status.PASS
+    )
+    return (
+        status,
+        f"{session_dir}: {len(databases)} event database(s), {calls} usage_event call(s)",
+        providers,
+    )
+
+
+def check_cache_report(session_dir: Path) -> tuple[Status, str]:
+    """Return the overall status for a provider cache report."""
+    status, detail, _providers = _scan_cache_report(Path(session_dir))
+    return status, detail
 
 
 def _provider_config_path(cwd: Path) -> tuple[Path, bool]:
@@ -869,8 +1062,10 @@ def run_checks(session_dir: Path | None, cwd: Path, *, oauth_live: bool = False)
     ]
 
 
-def format_report(checks: list[Check]) -> str:
-    lines = ["cambium doctor — Cambium harness diagnostics"]
+def format_report(
+    checks: list[Check], *, title: str = "cambium doctor — Cambium harness diagnostics"
+) -> str:
+    lines = [title]
     ordered_checks = sorted(checks, key=lambda check: check.number)
     for check in ordered_checks:
         lines.append(
@@ -884,6 +1079,27 @@ def format_report(checks: list[Check]) -> str:
         f"{counts[Status.FAIL]} fail"
     )
     return "\n".join(lines)
+
+
+def format_cache_report(
+    session_dir: Path,
+    status: Status,
+    detail: str,
+    providers: Mapping[str, CacheProviderStats],
+) -> str:
+    """Format a cache report using the standard doctor status lines."""
+    checks = [Check(1, "Cache report", status, detail)]
+    checks.extend(
+        Check(
+            number=index,
+            name=f"Provider cache ({provider})",
+            status=cache_provider_status(stats),
+            detail=format_cache_provider_detail(stats),
+        )
+        for index, (provider, stats) in enumerate(sorted(providers.items()), start=2)
+    )
+    del session_dir
+    return format_report(checks, title="cambium doctor — provider cache report")
 
 
 def _redact_report_detail(detail: str) -> str:
@@ -917,12 +1133,22 @@ def main(argv: list[str] | None = None) -> int:
         help="session dir whose Cambium artifacts are checked (optional)",
     )
     parser.add_argument(
+        "--cache-report",
+        type=Path,
+        metavar="DIR",
+        help="report provider cache hits from usage events in a session (read-only)",
+    )
+    parser.add_argument(
         "--oauth-live",
         action="store_true",
         help="opt-in live oauth probe for codex_chatgpt providers (consumes "
         "quota; never makes a model call)",
     )
     args = parser.parse_args(argv)
+    if args.cache_report is not None:
+        status, detail, providers = _scan_cache_report(args.cache_report)
+        print(format_cache_report(args.cache_report, status, detail, providers))
+        return 1 if status is Status.FAIL else 0
     checks = run_checks(args.session_dir, Path.cwd(), oauth_live=args.oauth_live)
     print(format_report(checks))
     return exit_code(checks)

@@ -435,6 +435,7 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Run Cambium harness diagnostics.",
     )
     doctor.add_argument("--session-dir", type=Path, metavar="DIR")
+    doctor.add_argument("--cache-report", type=Path, metavar="DIR")
     doctor.add_argument(
         "--oauth-live",
         action="store_true",
@@ -708,6 +709,11 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Run the isolated conformance gate for one Cambium module.",
     )
     module_test.add_argument("name", metavar="NAME")
+    module_test.add_argument(
+        "--regen-baseline",
+        action="store_true",
+        help="rewrite the module baseline test count and timings after a passing run",
+    )
     commands.add_parser("version", help="print the Cambium version")
     return parser
 
@@ -741,6 +747,8 @@ def _run_doctor(args: argparse.Namespace) -> int:
     delegated = []
     if args.session_dir is not None:
         delegated.extend(["--session-dir", str(args.session_dir)])
+    if args.cache_report is not None:
+        delegated.extend(["--cache-report", str(args.cache_report)])
     if getattr(args, "oauth_live", False):
         delegated.append("--oauth-live")
     return doctor.main(delegated)
@@ -991,8 +999,10 @@ def _run_module_test(args: argparse.Namespace) -> int:
         "-q",
         "-o",
         "addopts=",
-        str(tests_dir.resolve()),
     ]
+    if args.regen_baseline:
+        command.append("--cambium-regen-baseline")
+    command.append(str(tests_dir.resolve()))
     with module_conformance.module_offline_environment() as env:
         env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
         env.pop("PYTEST_ADDOPTS", None)

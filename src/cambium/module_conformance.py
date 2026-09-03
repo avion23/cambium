@@ -508,6 +508,84 @@ def _valid_baseline_date(value: object) -> bool:
     return parsed.tzinfo is not None
 
 
+def _current_git_sha() -> str:
+    """Return the checkout's current commit for a regenerated baseline."""
+    if not _repository_available():
+        raise ModuleConformanceError("baseline regeneration requires a git checkout")
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ModuleConformanceError(f"could not read current git commit: {exc}") from exc
+    sha = result.stdout.strip()
+    if result.returncode != 0 or GIT_SHA_RE.fullmatch(sha) is None:
+        detail = result.stderr.strip() or "invalid commit output"
+        raise ModuleConformanceError(f"could not read current git commit: {detail}")
+    return sha
+
+
+def _regenerate_baseline(spec: ModuleSpec, timings: dict[str, float]) -> Path:
+    """Rewrite only the live test timing fields and regen provenance."""
+    baseline_file = next(
+        (REPO_ROOT / path for path in spec.baseline_files if path.suffix.lower() == ".json"),
+        None,
+    )
+    if baseline_file is None:
+        raise ModuleConformanceError(f"{spec.name}: baseline is required for regeneration")
+    try:
+        baseline = _load_json(baseline_file)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise ModuleConformanceError(
+            f"{spec.name}: cannot read baseline for regeneration: {exc}"
+        ) from exc
+    if not isinstance(baseline, dict):
+        raise ModuleConformanceError(f"{spec.name}: baseline must be an object for regeneration")
+    tests = baseline.get("tests")
+    if not isinstance(tests, dict):
+        raise ModuleConformanceError(
+            f"{spec.name}: baseline tests must be an object for regeneration"
+        )
+
+    refreshed: dict[str, float] = {}
+    for nodeid in sorted(timings):
+        duration = timings[nodeid]
+        if (
+            not isinstance(nodeid, str)
+            or not nodeid
+            or isinstance(duration, bool)
+            or not isinstance(duration, int | float)
+            or not math.isfinite(duration)
+            or duration < 0
+        ):
+            raise ModuleConformanceError(
+                f"{spec.name}: invalid collected test timing for {nodeid!r}"
+            )
+        refreshed[nodeid] = round(float(duration), 6)
+
+    tests["count"] = len(refreshed)
+    tests["by_nodeid"] = refreshed
+    baseline["git_sha"] = _current_git_sha()
+    baseline["date"] = (
+        _dt.datetime.now(_dt.UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+    )
+    try:
+        baseline_file.write_text(
+            json.dumps(baseline, indent=2, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        raise ModuleConformanceError(
+            f"{spec.name}: could not write regenerated baseline: {exc}"
+        ) from exc
+    return baseline_file
+
+
 def _finite_non_negative(value: object) -> bool:
     return (
         not isinstance(value, bool)
@@ -2505,10 +2583,13 @@ class ModuleConformancePlugin:
     def __init__(self, config: pytest.Config) -> None:
         self.config = config
         self.name = config.getoption("cambium_isolated_module")
+        self.regen_baseline = config.getoption("cambium_regen_baseline")
         self.spec: ModuleSpec | None = None
         self.reports: dict[str, str] = {}
+        self.timings: dict[str, float] = {}
         self.failures: list[str] = []
         self.siblings_before: list[str] = []
+        self.regenerated_baseline: Path | None = None
 
     @pytest.hookimpl(tryfirst=True)
     def pytest_sessionstart(self, session: pytest.Session) -> None:
@@ -2576,6 +2657,8 @@ class ModuleConformancePlugin:
     def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
         if report.when == "call":
             self.reports[report.nodeid] = report.outcome
+            if self.regen_baseline:
+                self.timings[report.nodeid] = report.duration
 
     def pytest_sessionfinish(
         self, session: pytest.Session, exitstatus: pytest.ExitCode | int
@@ -2585,36 +2668,56 @@ class ModuleConformancePlugin:
         passed = sum(outcome == "passed" for outcome in self.reports.values())
         skipped = sum(outcome == "skipped" for outcome in self.reports.values())
         failed = sum(outcome == "failed" for outcome in self.reports.values())
-        expected_count: int | None = None
-        for baseline_path in self.spec.baseline_files:
-            if baseline_path.suffix.lower() != ".json":
-                continue
-            try:
-                baseline = _load_json(REPO_ROOT / baseline_path)
-            except (OSError, ValueError, json.JSONDecodeError):
-                continue
-            tests = baseline.get("tests") if isinstance(baseline, dict) else None
-            count = tests.get("count") if isinstance(tests, dict) else None
-            if isinstance(count, int) and not isinstance(count, bool) and count >= 1:
-                expected_count = count
-                break
-        if expected_count is None:
-            self.failures.append("baseline test count is unavailable; refusing partial gate")
-        elif len(self.reports) != expected_count or passed != expected_count:
-            self.failures.append(
-                f"module test session is incomplete: passed={passed} skipped={skipped} "
-                f"failed={failed} reported={len(self.reports)} expected={expected_count}"
-            )
-        elif skipped or failed:
-            self.failures.append(
-                f"module test session has non-passing tests: passed={passed} "
-                f"skipped={skipped} failed={failed}"
-            )
+        if self.regen_baseline:
+            if (
+                exitstatus != pytest.ExitCode.OK
+                or not self.reports
+                or len(self.reports) != len(self.timings)
+                or passed != len(self.reports)
+                or skipped
+                or failed
+            ):
+                self.failures.append(
+                    "baseline regeneration requires a complete passing test session: "
+                    f"passed={passed} skipped={skipped} failed={failed} "
+                    f"reported={len(self.reports)} timed={len(self.timings)}"
+                )
+        else:
+            expected_count: int | None = None
+            for baseline_path in self.spec.baseline_files:
+                if baseline_path.suffix.lower() != ".json":
+                    continue
+                try:
+                    baseline = _load_json(REPO_ROOT / baseline_path)
+                except (OSError, ValueError, json.JSONDecodeError):
+                    continue
+                tests = baseline.get("tests") if isinstance(baseline, dict) else None
+                count = tests.get("count") if isinstance(tests, dict) else None
+                if isinstance(count, int) and not isinstance(count, bool) and count >= 1:
+                    expected_count = count
+                    break
+            if expected_count is None:
+                self.failures.append("baseline test count is unavailable; refusing partial gate")
+            elif len(self.reports) != expected_count or passed != expected_count:
+                self.failures.append(
+                    f"module test session is incomplete: passed={passed} skipped={skipped} "
+                    f"failed={failed} reported={len(self.reports)} expected={expected_count}"
+                )
+            elif skipped or failed:
+                self.failures.append(
+                    f"module test session has non-passing tests: passed={passed} "
+                    f"skipped={skipped} failed={failed}"
+                )
         siblings_after = _loaded_siblings(cast(str, self.name))
         if siblings_after:
             self.failures.append(
                 "sibling modules loaded during isolated tests: " + ", ".join(siblings_after)
             )
+        if self.regen_baseline and not self.failures:
+            try:
+                self.regenerated_baseline = _regenerate_baseline(self.spec, self.timings)
+            except ModuleConformanceError as exc:
+                self.failures.append(str(exc))
         if self.failures:
             session.exitstatus = 1
 
@@ -2636,6 +2739,8 @@ class ModuleConformancePlugin:
             f"{self.name}: passed={counts['passed']} failed={counts['failed']} "
             f"skipped={counts['skipped']}"
         )
+        if self.regenerated_baseline is not None:
+            terminalreporter.write_line(f"baseline regenerated: {self.regenerated_baseline}")
         for failure in self.failures:
             terminalreporter.write_line(f"FAIL: {failure}", red=True)
 
@@ -2651,6 +2756,11 @@ def pytest_addoption(parser: Any) -> None:
         default=None,
         metavar="NAME",
         help="run the complete conformance gate for one module",
+    )
+    group.addoption(
+        "--cambium-regen-baseline",
+        action="store_true",
+        help="regenerate the isolated module's baseline after a passing run",
     )
 
 

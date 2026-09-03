@@ -350,9 +350,7 @@ def test_implicit_provider_selection_uses_stored_credential_without_plan_leak(
         trusted_home / ".config" / "cambium" / "providers.json",
         [
             _provider_entry("disabled", priority=0, enabled=False),
-            _provider_entry(
-                "selected", tier="balanced", model="selected-model", priority=1
-            )
+            _provider_entry("selected", tier="balanced", model="selected-model", priority=1)
             | {"api_key": secret},
             _provider_entry("later", priority=2) | {"api_key": ""},
         ],
@@ -699,9 +697,7 @@ def test_stored_auth_is_handed_to_provider_worker_without_plan_leak(
     assert env_name not in os.environ
 
 
-def test_environment_only_provider_key_is_rejected(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_environment_only_provider_key_is_rejected(monkeypatch, tmp_path: Path) -> None:
     repo = _repo(tmp_path / "repo")
     env_name = derived_env_name("environment-only")
     monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
