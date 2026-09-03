@@ -355,7 +355,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     commands = parser.add_subparsers(
         dest="command",
-        metavar="{auth,supervisor,doctor,module-test,version,run,repl,tui,monitor,quota,optimize,session,architectus}",
+        metavar="{auth,supervisor,doctor,module-test,version,run,repl,tui,monitor,quota,optimize,session,inspect-state,architectus}",
         required=True,
         parser_class=_SafeArgumentParser,
     )
@@ -693,6 +693,13 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="SESSION",
         help="session id whose usage to aggregate",
     )
+
+    inspect_state = commands.add_parser(
+        "inspect-state",
+        help="replay and print one session's canonical branch state",
+        description="Read one session's durable event stores and print BranchState JSON.",
+    )
+    inspect_state.add_argument("session_dir", type=Path, metavar="DIR")
 
     architectus = commands.add_parser(
         "architectus",
@@ -1378,6 +1385,28 @@ def _run_session(args: argparse.Namespace) -> int:
     raise AssertionError(f"unhandled session command: {args.session_command!r}")
 
 
+def _run_inspect_state(args: argparse.Namespace) -> int:
+    from .branch_state import inspect_state
+    from .store import StoreError, read_events_file
+
+    session_dir = args.session_dir.expanduser().resolve()
+    event_dbs = [session_dir / ".cambium" / "events.db"]
+    event_dbs.extend(sorted(session_dir.glob("turn-*/.cambium/events.db")))
+    event_dbs = [path for path in event_dbs if path.is_file()]
+    if not event_dbs:
+        print(f"cambium inspect-state: no event stores under {session_dir}", file=sys.stderr)
+        return ExitCode.FAILURE
+    try:
+        events = [event for path in event_dbs for event in read_events_file(path)]
+        events.sort(key=lambda event: event["seq"])
+        state = inspect_state(events)
+    except (OSError, StoreError, ValueError, sqlite3.Error) as exc:
+        print(f"cambium inspect-state: {exc}", file=sys.stderr)
+        return ExitCode.FAILURE
+    print(state.to_json())
+    return ExitCode.SUCCESS
+
+
 def _architectus_provider_config_path() -> Path:
     from .oneshot import OneShotConfig, _provider_config_path
 
@@ -1545,6 +1574,8 @@ async def async_main(argv: list[str] | None = None) -> int:
             return await asyncio.to_thread(_run_module_test, args)
         case "session":
             return await asyncio.to_thread(_run_session, args)
+        case "inspect-state":
+            return await asyncio.to_thread(_run_inspect_state, args)
         case "version":
             print(__version__)
             return ExitCode.SUCCESS
