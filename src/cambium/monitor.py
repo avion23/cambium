@@ -26,29 +26,17 @@ from .observability import (
 )
 from .store import StoreError
 from .supervisor import EventCursor, read_events_with_cursor
-from .terminal import sanitize_terminal_text
+from .terminal import (
+    clip_terminal_text,
+    pad_terminal_text,
+    sanitize_terminal_text,
+    supports_cursor_controls,
+    terminal_display_width,
+)
 
 _ALT_ENTER = "\x1b[?1049h\x1b[?25l"
 _ALT_EXIT = "\x1b[?25h\x1b[?1049l"
 _HOME_CLEAR = "\x1b[H\x1b[2J"
-
-
-def _is_tty(stream: Any) -> bool:
-    try:
-        return bool(getattr(stream, "isatty", lambda: False)())
-    except (AttributeError, OSError):
-        return False
-
-
-def _clip(value: str, width: int) -> str:
-    value = sanitize_terminal_text(value, single_line=True)
-    if width <= 0:
-        return ""
-    if len(value) <= width:
-        return value
-    if width == 1:
-        return "…"
-    return value[: width - 1] + "…"
 
 
 def _human_count(value: int) -> str:
@@ -102,23 +90,18 @@ def _rate(agent: AgentSnapshot) -> str:
 
 def _border(title: str, width: int) -> str:
     inner = max(0, width - 2)
-    label = f" {title} "
-    if len(label) > inner:
-        label = _clip(label, inner)
-    return "┌" + label + "─" * max(0, inner - len(label)) + "┐"
+    label = clip_terminal_text(f" {title} ", inner)
+    return "┌" + label + "─" * max(0, inner - terminal_display_width(label)) + "┐"
 
 
 def _rule(title: str, width: int) -> str:
     inner = max(0, width - 2)
-    label = f" {title} "
-    if len(label) > inner:
-        label = _clip(label, inner)
-    return "├" + label + "─" * max(0, inner - len(label)) + "┤"
+    label = clip_terminal_text(f" {title} ", inner)
+    return "├" + label + "─" * max(0, inner - terminal_display_width(label)) + "┤"
 
 
 def _inside(content: str, width: int) -> str:
-    inner = max(0, width - 2)
-    return "│" + _clip(content, inner).ljust(inner) + "│"
+    return "│" + pad_terminal_text(content, max(0, width - 2)) + "│"
 
 
 def _bottom(width: int) -> str:
@@ -137,7 +120,8 @@ def render_agent_lines(snapshot: SessionSnapshot) -> list[str]:
         }.get(agent.state, agent.state)
         lines.append(
             sanitize_terminal_text(
-                f"{agent.task_id:<24} {state:<9} role={agent.role} "
+                f"{pad_terminal_text(agent.task_id, 24)} "
+                f"{pad_terminal_text(state, 9)} role={agent.role} "
                 f"parent={parent} gen={agent.generation} turn={agent.turn} "
                 f"epoch={agent.epoch} model={_model(agent)} calls={agent.calls} "
                 f"tokens={agent.total_tokens} in={agent.input_tokens} "
@@ -171,7 +155,7 @@ def render_dashboard(
     lines = [_border("Cambium", width)]
     lines.append(
         _inside(
-            f"session {_clip(session, max(10, width - 45))}  "
+            f"session {clip_terminal_text(session, max(10, width - 45))}  "
             f"status={snapshot.session_status}  elapsed={_duration(snapshot.elapsed_s)}  "
             f"seq={snapshot.last_seq}",
             width,
@@ -234,21 +218,23 @@ def render_dashboard(
         tool = agent.tool or "-"
         if compact:
             row = (
-                f" {role}  {_clip(agent.task_id, 20):<20} "
-                f"{agent.state:<10} {_clip(_model(agent), 24):<24} "
+                f" {role}  {pad_terminal_text(agent.task_id, 20)} "
+                f"{pad_terminal_text(agent.state, 10)} "
+                f"{pad_terminal_text(_model(agent), 24)} "
                 f"{agent.turn:>4} {_human_count(agent.total_tokens):>7} "
-                f"{_rate(agent):>7} {_clip(tool, 14)}"
+                f"{_rate(agent):>7} {clip_terminal_text(tool, 14)}"
             )
         else:
             row = (
-                f" {role}  {_clip(agent.task_id, 24):<24} "
-                f"{agent.state:<10} {_clip(_model(agent), 34):<34} "
+                f" {role}  {pad_terminal_text(agent.task_id, 24)} "
+                f"{pad_terminal_text(agent.state, 10)} "
+                f"{pad_terminal_text(_model(agent), 34)} "
                 f"{agent.generation:>3} {agent.turn:>4} {agent.epoch:>2} "
                 f"{_human_count(agent.input_tokens):>7} "
                 f"{_human_count(agent.output_tokens):>7} "
                 f"{_human_count(agent.cached_tokens):>7} "
                 f"{_human_count(agent.total_tokens):>7} "
-                f"{_rate(agent):>6} {_clip(tool, 16)}"
+                f"{_rate(agent):>6} {clip_terminal_text(tool, 16)}"
             )
         lines.append(_inside(row, width))
     if not agents:
@@ -261,7 +247,8 @@ def render_dashboard(
         detail = f"  {event.detail}" if event.detail else ""
         lines.append(
             _inside(
-                f" #{event.seq:<6} {_clip(event.kind, 24):<24} {_clip(task, 24):<24}{detail}",
+                f" #{event.seq:<6} {pad_terminal_text(event.kind, 24)} "
+                f"{pad_terminal_text(task, 24)}{detail}",
                 width,
             )
         )
@@ -295,7 +282,7 @@ class AnsiDashboard:
     ) -> None:
         self.session_dir = Path(session_dir)
         self.stream = sys.stdout if stream is None else stream
-        self.enabled = enabled and _is_tty(self.stream)
+        self.enabled = enabled and supports_cursor_controls(self.stream)
         self._entered = False
         self._previous_sigterm_handler: Any = None
         self._sigterm_handler_installed = False
