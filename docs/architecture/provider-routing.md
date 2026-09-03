@@ -144,7 +144,9 @@ constraints.
 
 ### Migration
 
-A permanently infeasible root lease uses an explicit transition:
+Target transition, not current source: a permanently infeasible root lease
+moves through an explicit transition (the `provider_lease_migrated` event and
+protocol are not implemented; see §12):
 
 ```text
 latest safe checkpoint

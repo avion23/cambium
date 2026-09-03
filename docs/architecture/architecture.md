@@ -192,9 +192,11 @@ verify parent HEAD == accepted integration HEAD
 parent resume
 ```
 
-Current supervisor source consumes declared context/placement policy. For
-compatibility, omitted policy still enters automatic exact/semantic resolution;
-the target public contract removes or explicitly names that ambiguity.
+Current supervisor source consumes declared context/placement policy. The model
+contract requires explicit policy; only harness-originated children with omitted
+policy still enter automatic exact/semantic resolution
+(`_declared_child_policy`), which the target contract must remove or explicitly
+name.
 
 See [`context-branches.md`](context-branches.md),
 [`context-branch-requirements.md`](context-branch-requirements.md), and

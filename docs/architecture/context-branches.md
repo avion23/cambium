@@ -332,7 +332,10 @@ provider/model.
 
 ## 9. Historical context interface
 
-The LM receives one small read-only tool, `branch_history`, with four actions:
+The target LM surface is one small read-only tool, `branch_history`, with four
+actions. `branch_history.py` implements the read-only projection and these
+actions, but the tool is not yet wired into the active worker tool roster
+(`subagents.md` §10); do not describe the model as able to call it today.
 
 ```text
 branches    list task branches and their context/placement/provider state
@@ -457,10 +460,10 @@ src/cambium/branch_history.py
     read-only event/checkpoint projection and stable refs
 
 src/cambium/schemas.py
-    delegate and branch_history model-facing contracts
+    delegate model-facing contract
 
 src/cambium/tools.py
-    executable history read and policy validation
+    executable worker tool dispatch and policy validation
 
 src/cambium/prompts.py
     separately named branch-decision and history-recall policies

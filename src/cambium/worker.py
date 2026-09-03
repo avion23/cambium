@@ -4086,11 +4086,10 @@ def _write_epoch_checkpoint(
     try:
         _create_epoch_checkpoint(path, content)
     except ContextForkError:
-        try:
-            info = path.lstat()
-            existing = path.read_text(encoding="utf-8")
-        except (FileNotFoundError, OSError, UnicodeDecodeError):
-            raise
+        # Accept an already-persisted byte-identical checkpoint; any read
+        # failure or content mismatch keeps failing the checkpoint write.
+        info = path.lstat()
+        existing = path.read_text(encoding="utf-8")
         if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode) or existing != content:
             raise
     return replace(

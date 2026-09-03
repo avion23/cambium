@@ -6441,6 +6441,17 @@ class _Runtime:
         if mtype == "log":
             await self._handle_log_message(state, msg)
             return False
+        if mtype == "invalid_action":
+            # The worker reports agent-loop strikes diagnostically; the
+            # turn outcome itself arrives via the result envelope.
+            await self.emit(
+                "log",
+                task_id=state.task_id,
+                generation=state.generation,
+                message=f"invalid_action: {str(msg.get('error', ''))[:384]} "
+                f"(strike {msg.get('consecutive_invalid_actions')})",
+            )
+            return False
         return None
 
     async def _handle_generation_message(
@@ -6472,7 +6483,7 @@ class _Runtime:
             "protocol",
             task_id=state.task_id,
             type=mtype,
-            note="unhandled message",
+            note=f"unhandled message type {mtype!r}",
             generation=state.generation,
         )
         return False

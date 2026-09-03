@@ -440,8 +440,10 @@ existing checkpoints/events rather than duplicated without need.
 
 ## 12. Compatibility and migration
 
-Current child-policy source accepts explicit `context_mode`/`placement`, while
-the model schema also permits omission and automatic compatibility resolution.
+Current child-policy source accepts explicit `context_mode`/`placement`, and
+the model schema rejects omission at the proposal boundary; only specs that
+reach the supervisor without a declared policy — harness-originated — still
+fall through to automatic compatibility resolution.
 The target interface removes that ambiguity: every model-originated child
 proposal declares both fields. A separate harness-originated compatibility mode,
 if retained, must have an explicit name and event value; omission must not carry

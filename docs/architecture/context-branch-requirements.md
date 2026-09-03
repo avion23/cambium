@@ -264,10 +264,12 @@ These concepts MUST remain distinct in source, events, documentation, and UI.
 
 These are current-source facts, not exceptions to the target requirements:
 
-- The active `delegate` schema currently permits `context_mode` and `placement`
-  to be omitted. The supervisor then performs automatic exact/semantic
-  compatibility resolution. Phase 0 must remove this ambiguity from the public
-  model contract or give the compatibility path an explicit name.
+- The model-facing `delegate` schema requires `context_mode` and `placement`
+  and rejects omission before admission. The remaining ambiguity is internal:
+  a harness-originated `proposed_children` spec may omit both, and the
+  supervisor's `_declared_child_policy` then falls back to automatic
+  exact/semantic compatibility resolution. Phase 0 must remove or explicitly
+  name that internal path.
 - `branch_history.py`, `code_index.py`, and `lsp_query.py` exist, but the active
   worker tool schema/dispatch roster currently contains only `write_file`,
   `edit_file`, `git_op`, `run_shell`, `read_batch`, and `delegate`.

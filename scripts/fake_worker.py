@@ -321,7 +321,7 @@ def _run_task(
                         "request_id": message.get("request_id"),
                         "task_id": task_id,
                         "generation": generation,
-                        "monotonic_ms": time.time_ns() // 1_000_000,
+                        "monotonic_ms": time.monotonic_ns() // 1_000_000,
                     }
                 )
                 stop.set()
@@ -345,7 +345,7 @@ def _run_task(
                         "request_id": message.get("request_id"),
                         "task_id": task_id,
                         "generation": generation,
-                        "monotonic_ms": time.time_ns() // 1_000_000,
+                        "monotonic_ms": time.monotonic_ns() // 1_000_000,
                     }
                 )
             elif message_type == "shutdown":
@@ -414,7 +414,7 @@ def _handle_ready_message(message: object, task_id: str, generation: int) -> str
                 "request_id": message.get("request_id"),
                 "task_id": task_id,
                 "generation": generation,
-                "monotonic_ms": time.time_ns() // 1_000_000,
+                "monotonic_ms": time.monotonic_ns() // 1_000_000,
             }
         )
         return "continue"

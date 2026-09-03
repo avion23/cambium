@@ -328,6 +328,6 @@ checkpoints, CAST, and Git.
 
 ### Relying on omitted policy fields
 
-Current source has an automatic compatibility path, but omission is not an
-agent-intuitive decision. Declare policy explicitly; the target contract will
-require it.
+The model schema already rejects omission at the delegate proposal boundary; a
+supervisor-side automatic compatibility path remains only for harness-originated
+specs. Declare policy explicitly either way.

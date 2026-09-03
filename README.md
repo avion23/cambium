@@ -72,10 +72,11 @@ and the ordered [`implementation-plan.md`](implementation-plan.md).
 
 ## Current truth and target gaps
 
-Current source already consumes declared child `context_mode` and `placement`.
-For compatibility, the active delegate schema still permits omission and then
-uses automatic exact/semantic resolution. The target public model contract makes
-that choice explicit.
+Current source consumes declared child `context_mode` and `placement`: the
+model schema rejects omission before admission. A supervisor-side automatic
+exact/semantic resolution remains only for harness-originated specs that reach
+it without a declared policy; it is a current compatibility gap, not a public
+contract.
 
 The repository also contains implementations of branch-history projection,
 bounded code indexing, and optional one-shot LSP queries. They are not yet part

@@ -88,15 +88,16 @@ which reads the generic name from the manifest instead of hardcoding it.
 ### 3.3 Errors
 
 ```python
-class InputValidationError(ValueError): ...   # JSON CLI boundary, __main__.py
-class SchemaInvalidError(ValueError): ...     # dataset-record schema, __main__.py
+class InputValidationError(ValueError): ...   # cambium.modules.base; JSON CLI boundary
+class SchemaInvalidError(ValueError): ...     # cambium.modules.base; dataset-record schema at the CLI
 class DatasetError(ValueError): ...           # cambium.modules.base, loader boundary
 ```
 
-`InputValidationError` is raised and caught inside `__main__.main()` (the
+`InputValidationError` is raised and caught inside the shared
+`run_module_entrypoint` that `__main__.main()` delegates to (the
 process boundary; it never escapes to the supervisor event loop).  A
 schema-invalid dataset record (bad `review`/`reason`/`canary`, malformed
-`input`) raises `SchemaInvalidError`; `__main__._write_error` marks those
+`input`) raises `SchemaInvalidError`; the entrypoint's `write_error` marks those
 errors with the explicit `"code": "SCHEMA_INVALID"` split marker so callers
 can fall back to the combined file without guessing from the error
 type.
@@ -116,13 +117,14 @@ non-empty `input.task`, allows optional string `input.context`, rejects
 unknown fields, duplicate keys, malformed JSON, and bad input with exit 1, and
 writes exactly one JSON object plus newline to stdout (`json.dumps(..., sort_keys=True) + "\n"`).
 Diagnostics go to stderr. The adapter preserves stable wire fields (`review`,
-`reason`, `confidence`), avoids providers and network access, and works without
-the checkout on `sys.path`.
+`reason`, `confidence`), avoids providers and network access, and runs from the
+source tree with the invoking harness setting `PYTHONPATH` (no editable
+install required).
 
 ```console
 $ printf '%s\n' '{"task":"I cannot complete the payment migration.","context":""}' \
     | python -m cambium.modules.should_review
-{"confidence":0.9,"reason":"worker refusal marker","review":true}
+{"confidence": 0.8, "reason": "worker refusal marker", "review": true}
 ```
 
 ## 4. State
@@ -131,9 +133,9 @@ $ printf '%s\n' '{"task":"I cannot complete the payment migration.","context":""
 |---|---|---|
 | Decision calls | none | none |
 
-This module is stateless across calls; only the primary implementation is held
-on the instance. No LLM-derived state is owned; no state is mutated from a
-worker process.
+This module is stateless across calls; the rule engine is a module-level
+function and the module holds no instance state. No LLM-derived state is owned;
+no state is mutated from a worker process.
 
 ## 5. DSPy program
 
@@ -169,10 +171,9 @@ either side is not a `Decision`. The `reason` and `confidence` fields are not
 scored. Signal weights and gameability: the rules weight refusal (+3) and
 markers (+2) above keyword density (+1/+2), so a keyword-greedy reviewer that
 ignores completion markers under-reviews large untested diffs. The canaries
-detect each unwanted behavior: `trivially_atomic` and `keyword_hack` detect
-over-review from surface keywords, `must_review` and `format_only_hack` detect
-under-review of keyword-free or well-formatted-but-untested results, and
-`ambiguous_calibration` guards over-confidence on a single low-risk signal.
+detect the dataset's unwanted behaviors: `must_review` canaries detect
+under-review of keyword-free results, and `ambiguous_calibration` canaries
+guard over-confidence on a single low-risk signal.
 
 ## 7. Dataset
 
@@ -180,18 +181,19 @@ Paths and layout: `datasets/{train,eval,canaries}.jsonl` plus `datasets/meta.jso
 no legacy `<name>_pairs.jsonl` is shipped (the loader keeps the explicit
 fallback for backward compat and it is exercised by tests).
 
-- train: 40 records; frozen eval: 10 records; canaries: 5 records.
-- Hand-authored provenance, schema_version 1, dataset_version `1.0.0`,
-  `eval_frozen_at`/`canary_frozen_at` `2026-08-11`, license `internal`.
-- Deterministic split: fixed hand-assigned ids (`should_review-0001..0040`,
-  `should_review-0201..0210`, `should_review-canary-01..05`); records sorted by
+- train: 40 records; frozen eval: 11 records; canaries: 6 records.
+- Transcript-derived provenance (`script:extract_cambium_week`, source
+  `cambium-session`, `redacted: true`), schema_version 1, dataset_version
+  `2.0.0`, `eval_frozen_at`/`canary_frozen_at` `2026-08-25`, license `internal`.
+- Deterministic split: stable hash-suffixed ids
+  (`should_review-<16 hex chars>`, e.g. `should_review-05c6083ab14888e9`);
+  records sorted by
   `id` within each split; no canonical `(task, context)` occurs in two splits.
-- Canary markers: `canary: true` plus `canary_info` with `kind`,
+- Canary markers: `canary: true` plus `canary_info` with `kind`, `name`,
   `anti_expected`, `anti_expected_confidence_range`, `failure_mode`, and
-  description. Kinds: `trivially_atomic`, `must_review` (the must-decompose
-   analogue renamed for review semantics), `keyword_hack`, `format_only_hack`,
-   `ambiguous_calibration`; four of the five are taxonomy kinds, so
-   canary coverage is non-zero (0.8).
+  description. Kinds present: `must_review` (3 records) and
+  `ambiguous_calibration` (3 records); the baseline records
+  `taxonomy_coverage` 0.2.
 - Sibling versions: `sibling_pins` is empty; no sibling stubs exist.
 - Who may add records: the module owner hand-authors additions; a second
   reviewer approves frozen eval changes and canary additions; refresh cadence
@@ -208,8 +210,8 @@ fallback for backward compat and it is exercised by tests).
 | Schema-invalid dataset record at the loader (bad `review`/`reason`, mirror drift) | `DatasetError` with file:line | `ExampleDatasetLoader._validate` | record owner fixes the JSONL and bumps `dataset_version` |
 | Version drift (record vs meta.json) | `DatasetError` | `_validate_record_versions` | bump `dataset_version` deliberately; never silently re-anchor |
 | Duplicate id / cross-split `(task, context)` | `DatasetError` | loader + conformance gate | deduplicate and re-run digests |
-| Over-review: keyword-dense atomic canaries | metric < 1.0 on `trivially_atomic`/`keyword_hack` | canary gate (failed-canary count) | tune evidence weights; do not drop the canary |
-| Under-review: keyword-free/well-formatted untested canaries | metric < 1.0 on `must_review`/`format_only_hack` | canary gate | restore file/test signals; do not drop the canary |
+| Under-review: keyword-free untested results | metric < 1.0 on `must_review` canaries | canary gate (failed-canary count) | restore file/test signals; do not drop the canary |
+| Over-confidence: single low-risk signal | metric < 1.0 on `ambiguous_calibration` canaries | canary gate | tune evidence weights; do not drop the canary |
 | Reward hacking: dropping canaries | `dataset.canaries` count mismatch | baseline + gate integrity checks | restore the frozen records |
 
 ## 9. Test strategy
@@ -221,11 +223,11 @@ complete directory; shared scenarios stay.
 
 ### 9.1 Unit and integration tests
 
-`test_review_module.py` and `test_dataset_splits.py` load the real dataset,
+`test_review_module.py` and `test_review_dataset_splits.py` load the real dataset,
 check the schema plus negative `DatasetError` paths, run every record
-(including canaries), assert the declared aggregate threshold
-(`eval` mean ≥ 0.95), and anchor the committed baseline to `meta.json` and the
-exact split bytes. `test_review_cli.py` covers the direct, `decide`, and
+(including canaries), and anchor the committed baseline to `meta.json` and the
+exact split bytes (`canaries.failed == 3` is pinned).
+`test_review_cli.py` covers the direct, `decide`, and
 `evaluate` operations, strict JSON errors, duplicate keys, unknown fields,
 empty/max/unicode input, and deterministic output. More than three happy paths
 and every failure mode in §8 are covered.
@@ -235,7 +237,8 @@ and every failure mode in §8 are covered.
 In v2, colocated tests are the eval-harness substitute. A v2.1 target may add
 `python -m cambium.modules.should_review.eval` and `--suite canaries`; any
 canary failure exits non-zero and canary pass rate gates promotion. The
-committed baseline records `canaries.failed == 0` and `taxonomy_coverage` > 0.
+committed baseline records `canaries.failed == 3` (the v2 rule engine misses
+three canaries; pinned by test) and `taxonomy_coverage` > 0.
 
 ### 9.3 Module conformance
 
@@ -271,14 +274,14 @@ The v2 rule engine is deterministic and needs no state optimizer. A v2.1
 DSPy replacement (state optimizer `dspy.SIMBA` or `dspy.GEPA`, train 40, max
 steps as configured) would require human approval for promotion, replace
 `optimized/<name>/{program.json,lm.json,report.json}` in place, hold out the
-10-record eval set, gate at ≥ 0.95 aggregate, and pass 100% of canaries at
+11-record eval set, gate at ≥ 0.95 aggregate, and pass 100% of canaries at
 `temperature=0.0`.
 
 ## 11. Open questions
 
 | Question | Owner | Decision needed |
 |---|---|---|
-| Should the refusal/high-stakes keyword sets be registry-driven (like `CANARY_TAXONOMY`) instead of module constants? | module owner | orchestrator: keep module-local sets or centralize |
+| Should the refusal/high-stakes keyword sets be registry-driven (a shared canary-kind registry) instead of module constants? | module owner | orchestrator: keep module-local sets or centralize |
 | Is an `Architectus.should_review` caller planned in the orchestrator? | orchestrator owner | route decision after worker completion |
 
 ## 12. Changelog
@@ -286,6 +289,7 @@ steps as configured) would require human approval for promotion, replace
 | Version | Date | Change |
 |---|---|---|
 | 1.0.0 | 2026-08-11 | Initial module: rule engine, JSONL dataset (40/10/5), metric, CLI, conformance, baseline |
+| dataset 2.0.0 | 2026-08-25 | Dataset rebuilt from transcripts: 40 train / 11 eval / 6 canaries, hash ids; baseline re-anchored (`canaries.failed` = 3) |
 
 ## Appendix A. Required evidence and boundary notes
 
@@ -334,10 +338,11 @@ registry, dispatch path, cache, or resource-budget abstraction is added.
 
 ### A.2 Dataset and baseline evidence
 
-Counts: 40 train / 10 eval / 5 canaries = 55 records. Source and license:
-hand-authored, `internal`. Schema/dataset versions: 1 / `1.0.0`. Split rule:
-hand-assigned ids, sorted within each split, unique `(task, context)` across
-splits. Freeze dates: `eval_frozen_at` and `canary_frozen_at` `2026-08-11`.
+Counts: 40 train / 11 eval / 6 canaries = 57 records. Source and license:
+transcript-derived (`script:extract_cambium_week`, redacted), `internal`.
+Schema/dataset versions: 1 / `2.0.0`. Split rule:
+stable hash-suffixed ids, sorted within each split, unique `(task, context)` across
+splits. Freeze dates: `eval_frozen_at` and `canary_frozen_at` `2026-08-25`.
 Digest source: exact split bytes (SHA-256), recorded in `meta.json` and the
 baseline. Sibling pins: none. Refresh authority: module owner; a second
 reviewer for frozen changes. The baseline `git_sha` identifies the worktree

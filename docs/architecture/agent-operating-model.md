@@ -576,7 +576,8 @@ At the time this design was written, current `main` provides:
 - provider leases, usage debt, quota/cache capability values, and routing;
 - persistent interactive sessions and an event-sourced operator projection;
 - explicit child context/placement behavior when those fields are declared;
-- automatic exact/semantic compatibility behavior when a child omits them;
+- automatic exact/semantic compatibility behavior when a harness-originated
+  child omits them (the model contract requires both fields);
 - implementations of branch-history projection, bounded code indexing, and
   optional LSP queries.
 

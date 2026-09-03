@@ -2019,7 +2019,7 @@ def _is_harness_target(target: str, spec: ModuleSpec) -> bool:
 
     A decision module may import the shared module base, its own package, and
     the enclosing package markers; importing any other ``cambium.*`` module
-    (``cambium.supervisor``, ``cambium.bench``, ...) crosses the module
+    (``cambium.supervisor``, ``cambium.routing``, ...) crosses the module
     boundary and is a static gate failure.
     """
     if not target.startswith("cambium."):

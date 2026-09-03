@@ -99,6 +99,7 @@ Operator commands include:
 /status     compact session status
 /dashboard  repaint the dashboard
 /events     recent durable events
+/usage      cumulative usage
 /agents     main/subagent lifecycle
 /context    checkpoint, epoch, trunk, and raw tail
 /session    interactive root and branch lease
