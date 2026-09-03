@@ -49,7 +49,7 @@ no-progress threshold and returns an `agent made no progress` failure.
 
 Each Diffundo provider attempt gets the smaller of the call deadline and its
 effort-aware deadline; `reasoning_effort: max` multiplies the base by `2.0`.
-(src/cambium/diffundo.py:164,695-697,2007-2057)
+(src/cambium/diffundo.py:167,784-786,2469-2474)
 
 One-shot plans materialize `max_restarts: 1` when unset; explicit values, including zero,
 remain explicit. (src/cambium/oneshot.py:920-922)
@@ -94,7 +94,7 @@ src/cambium/supervisor.py:1891-1912,4741-4765)
 
 `CONTENT_FLAGGED` is request-level fall-through: Diffundo moves to the normal
 cascade without changing provider health or spending retry backoff.
-(src/cambium/diffundo.py:311-329,1994-2005,2058-2107,2676-2763)
+(src/cambium/diffundo.py:314-332,2400-2412,2475-2524,3137-3217)
 
 A moderation/content-flagged summary gets one retry with a transformed tail; the second flag fails summary compaction. (src/cambium/worker.py:4751-4809)
 

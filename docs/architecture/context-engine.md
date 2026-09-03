@@ -61,7 +61,7 @@ semantic checkpoint correctness even when its cache is cold.
 Cambium has no local response cache: `Diffundo` is a stateless router
 (`src/cambium/diffundo.py:8-10`). A cache hit and a miss for the same request
 must produce the same request bytes; only provider-reported usage supplies hit
-evidence (`src/cambium/diffundo.py:1226-1237`).
+evidence (`src/cambium/diffundo.py:1237-1245,1262,1322-1333`).
 
 ## 3. State model
 
@@ -141,7 +141,8 @@ retry remains valid and receives the same request content. Matching a
 infer provider-cache eligibility or a hit. Only
 `usage_event.provider_cache_hit`, copied from
 provider-reported usage, is cache evidence
-(`src/cambium/diffundo.py:1226-1237`, `src/cambium/worker.py:3153-3192`).
+(`src/cambium/diffundo.py:1237-1245,1262,1322-1333`,
+`src/cambium/worker.py:3496-3497`).
 
 ### C2. Immutable replay prefix
 
@@ -330,12 +331,12 @@ cache_write_price
 
 This is provider capability and tariff metadata, not cache evidence
 (`src/cambium/provider_scheduler.py:56-124`,
-`src/cambium/provider_config.py:215`, `src/cambium/diffundo.py:624`). Cache
+`src/cambium/provider_config.py:215`, `src/cambium/diffundo.py:646-711`). Cache
 namespace and isolation are not modeled.
 
 `provider_cache_hit` is true only for a positive normalized cached-token count,
 false for present usage with no positive count, and absent when usage is absent;
-prefix equality never fills this field (`src/cambium/diffundo.py:1226-1237`).
+prefix equality never fills this field (`src/cambium/diffundo.py:1262,1322-1333`).
 
 ## 7. Routing interaction
 
@@ -352,14 +353,14 @@ Each provider attempt gets the smaller of the call deadline and
 2x).
 `CONTENT_FLAGGED` lets the caller transform context once before normal cascade
 recovery; it leaves provider health unchanged and consumes no retry backoff
-(`src/cambium/diffundo.py:161-164`, `src/cambium/diffundo.py:695-697`,
-`src/cambium/diffundo.py:2683-2690`, `src/cambium/diffundo.py:2759-2763`).
+(`src/cambium/diffundo.py:167`, `src/cambium/diffundo.py:784-786`,
+`src/cambium/diffundo.py:3137-3144`, `src/cambium/diffundo.py:3213-3217`).
 
 The first successful provider binds a `ProviderLease`; child/context binding can
 inherit its root and cache identity. A pinned incumbent timeout or real-death
 result clears that lease before fallback; a successful fallback becomes the new
-lease (`src/cambium/diffundo.py:2062-2115`,
-`src/cambium/diffundo.py:2193-2255`).
+lease (`src/cambium/diffundo.py:2479-2534`,
+`src/cambium/diffundo.py:2640-2701`).
 
 See [`provider-routing.md`](provider-routing.md).
 

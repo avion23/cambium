@@ -1770,11 +1770,17 @@ def _install_codex_progress_observer(router: Any, progress: AgentProgress) -> No
     """Observe buffered Codex SSE reads without changing Diffundo's API."""
     if not isinstance(router, Diffundo):
         return
-    codex_post = getattr(router, "_codex_post_sync", None)
-    if not callable(codex_post):
+    transports = getattr(router, "_transports", None)
+    if transports is None:
+        return
+    codex_protocol = _diffundo_module.Protocol.CODEX_RESPONSES
+    transport = transports.get(codex_protocol)
+    if transport is None:
         return
 
-    def _observed_codex_post(provider: Any, prompt: dict[str, Any], timeout_s: float) -> Any:
+    def _observed_post_sync(
+        router_arg: Any, provider: Any, prompt: dict[str, Any], timeout_s: float
+    ) -> Any:
         original_reader = _diffundo_module._read_provider_response
 
         def _read(response: Any, provider_name: str) -> bytes:
@@ -1784,11 +1790,23 @@ def _install_codex_progress_observer(router: Any, progress: AgentProgress) -> No
 
         cast(Any, _diffundo_module)._read_provider_response = _read
         try:
-            return codex_post(provider, prompt, timeout_s)
+            return transport.post_sync(router_arg, provider, prompt, timeout_s)
         finally:
             _diffundo_module._read_provider_response = original_reader
 
-    cast(Any, router)._codex_post_sync = _observed_codex_post
+    class _ObservedCodexTransport:
+        def post_sync(
+            self, router_arg: Any, provider: Any, prompt: dict[str, Any], timeout_s: float
+        ) -> Any:
+            return _observed_post_sync(router_arg, provider, prompt, timeout_s)
+
+        def classify_error(self, status: int, message: str) -> Any:
+            return transport.classify_error(status, message)
+
+    cast(Any, router)._transports = {
+        **transports,
+        codex_protocol: _ObservedCodexTransport(),
+    }
 
 
 def _cap_utf8(text: str, limit: int) -> str:

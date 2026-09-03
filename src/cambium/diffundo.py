@@ -121,6 +121,7 @@ from datetime import UTC
 from email.utils import parsedate_to_datetime
 from enum import Enum
 from typing import Any, cast
+from typing import Protocol as TypingProtocol
 from urllib.parse import urlparse
 
 from . import __version__
@@ -1959,6 +1960,307 @@ def _classify_http_403(
 
 
 # --------------------------------------------------------------------------- #
+# Provider transports
+# --------------------------------------------------------------------------- #
+
+
+class _ProviderTransport(TypingProtocol):
+    """Synchronous protocol transport used by the router's I/O boundary."""
+
+    def post_sync(
+        self,
+        router: Diffundo,
+        provider: ProviderConfig,
+        prompt: dict[str, Any],
+        timeout_s: float,
+    ) -> _RawResponse:
+        ...
+
+    def classify_error(self, status: int, message: str) -> ProviderOutcome | None:
+        ...
+
+
+class _ChatCompletionsTransport:
+    """OpenAI-compatible chat-completions transport."""
+
+    def classify_error(self, status: int, message: str) -> ProviderOutcome | None:
+        return None
+
+    def post_sync(
+        self,
+        router: Diffundo,
+        provider: ProviderConfig,
+        prompt: dict[str, Any],
+        timeout_s: float,
+    ) -> _RawResponse:
+        # Defensive transport guard: a ProviderConfig constructed without going
+        # through the config loader must still never send the Authorization
+        # header over plaintext http to a non-loopback host (security audit).
+        parsed = urlparse(provider.base_url)
+        scheme = parsed.scheme.lower()
+        if scheme not in ("http", "https"):
+            raise ProviderError(
+                provider.name,
+                ProviderOutcome.AUTH_ERROR,
+                "provider URL scheme must be http or https",
+            )
+        if scheme == "http" and not is_loopback_host(parsed.hostname or ""):
+            raise ProviderError(
+                provider.name,
+                ProviderOutcome.AUTH_ERROR,
+                "http transport is allowed only for loopback hosts; remote providers require https",
+            )
+        api_key = (
+            provider.api_key
+            if provider.api_key is not None
+            else os.environ.get(provider.api_key_env, "")
+        )
+        if provider.auth is not AuthMode.NONE and not api_key:
+            raise ProviderError(
+                provider.name,
+                ProviderOutcome.AUTH_ERROR,
+                f"env var {provider.api_key_env!r} not set",
+            )
+        url = f"{provider.base_url.rstrip('/')}/chat/completions"
+        body = {**prompt, "model": provider.model}
+        if provider.supports_native_tools and isinstance(body.get("tools"), list):
+            # Internal tool schemas carry {name, description, parameters}; the
+            # chat-completions wire format requires the function wrapper. The
+            # codex responses path has its own converter (_codex_tools); this
+            # is its chat counterpart.
+            wire_tools: list[dict[str, Any]] = []
+            for tool in body["tools"]:
+                if not isinstance(tool, dict) or not isinstance(tool.get("name"), str):
+                    continue
+                wire_tools.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": tool["name"],
+                            "description": tool.get("description", ""),
+                            "parameters": tool.get(
+                                "parameters", {"type": "object", "properties": {}}
+                            ),
+                        },
+                    }
+                )
+            body["tools"] = wire_tools
+        elif not provider.supports_native_tools:
+            # The textual JSON action protocol is provider-neutral. Keep the
+            # messages byte-identical while omitting native-only wire fields.
+            body.pop("tools", None)
+            body.pop("tool_choice", None)
+        data = json.dumps(body).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": provider.user_agent or USER_AGENT,
+            "x-opencode-session": router._task_id,
+        }
+        if provider.auth is not AuthMode.NONE:
+            headers["Authorization"] = f"Bearer {api_key}"
+        request = urllib.request.Request(url, data=data, method="POST", headers=headers)
+        # Fail-closed transport: never follow a provider redirect (urllib would
+        # replay the Authorization header against the redirect target), and
+        # never route loopback http through a proxy (HTTP_PROXY would capture
+        # the Authorization Bearer). https remote providers keep normal proxy
+        # behavior.
+        handlers: list[urllib.request.BaseHandler] = [_NoRedirectHandler()]
+        if scheme == "http":
+            handlers.append(urllib.request.ProxyHandler({}))
+        opener = urllib.request.build_opener(*handlers)
+        start = time.monotonic()
+        http_error: ProviderError | None = None
+        http_cause: _SanitizedHTTPError | None = None
+        payload: Any = None
+        try:
+            with opener.open(request, timeout=timeout_s) as response:
+                response_body = _read_provider_response(response, provider.name)
+                payload = json.loads(response_body.decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            try:
+                error_body = _read_provider_response(exc, provider.name).decode(
+                    "utf-8", errors="replace"
+                )
+            except ProviderError:
+                raise
+            except Exception:
+                error_body = ""
+            safe_body = _redact_error_text(error_body, api_key)[:500]
+            http_cause = _SanitizedHTTPError(status, _redact_error_text(str(exc.reason), api_key))
+            http_error = router._classify_http(
+                provider,
+                status,
+                safe_body,
+                cause=http_cause,
+                retry_after_s=(_parse_retry_after(exc.headers) if status in (403, 429) else None),
+                account_quota_owner=_account_quota_owner(error_body, api_key),
+            )
+        except urllib.error.URLError as exc:
+            reason = exc.reason
+            if isinstance(reason, TimeoutError):
+                outcome = ProviderOutcome.TIMEOUT
+            else:
+                outcome = ProviderOutcome.ERROR
+            raise ProviderError(provider.name, outcome, f"transport error: {reason}", exc) from exc
+        except TimeoutError as exc:
+            raise ProviderError(
+                provider.name,
+                ProviderOutcome.TIMEOUT,
+                f"timeout after {timeout_s}s",
+                exc,
+            ) from exc
+        except (OSError, ValueError) as exc:
+            raise ProviderError(
+                provider.name, ProviderOutcome.ERROR, f"request failed: {exc}", exc
+            ) from exc
+        if http_error is not None:
+            assert http_cause is not None
+            raise http_error from http_cause
+        if not isinstance(payload, dict):
+            raise ProviderError(
+                provider.name, ProviderOutcome.ERROR, "malformed response: not a JSON object"
+            )
+        return _RawResponse(payload, time.monotonic() - start)
+
+
+class _CodexResponsesTransport:
+    """Codex-ChatGPT Responses-API transport, including SSE decoding."""
+
+    def classify_error(self, status: int, message: str) -> ProviderOutcome | None:
+        if status == 400 and _codex_config_400(message):
+            return ProviderOutcome.CONFIG_ERROR
+        return None
+
+    def post_sync(
+        self,
+        router: Diffundo,
+        provider: ProviderConfig,
+        prompt: dict[str, Any],
+        timeout_s: float,
+    ) -> _RawResponse:
+        """Codex-ChatGPT ``/backend-api/codex/responses`` transport (SSE).
+
+        The endpoint is pinned to ``CODEX_CHATGPT_PROFILE`` (constructor-
+        injectable for tests only; providers.json can never set it). The bearer
+        token and optional account id come from the injected
+        ``CredentialSource`` only — without one a codex provider fails closed
+        with ``AUTH_ERROR``. The same fail-closed transport guards apply as on
+        the chat path: no redirects, no plaintext http off loopback, no proxy
+        on loopback.
+        """
+        profile = router._codex_profile
+        origin = str(profile.get("api_origin") or "").rstrip("/")
+        path = str(profile.get("api_path") or "")
+        parsed = urlparse(origin)
+        scheme = parsed.scheme.lower()
+        if scheme not in ("https", "http"):
+            raise ProviderError(
+                provider.name,
+                ProviderOutcome.AUTH_ERROR,
+                "codex responses endpoint origin must be an absolute http(s) URL",
+            )
+        if scheme == "http" and not is_loopback_host(parsed.hostname or ""):
+            raise ProviderError(
+                provider.name,
+                ProviderOutcome.AUTH_ERROR,
+                "http transport is allowed only for loopback hosts; remote providers require https",
+            )
+        credential = router._credential_source
+        if credential is None:
+            raise ProviderError(
+                provider.name,
+                ProviderOutcome.AUTH_ERROR,
+                "provider requires auth 'codex_chatgpt' but no credential source is injected",
+            )
+        if not credential.access_token:
+            raise ProviderError(
+                provider.name,
+                ProviderOutcome.AUTH_ERROR,
+                "injected credential source carries an empty access token",
+            )
+        access_token = credential.access_token
+        url = f"{origin}{path}"
+        body = _codex_request_body(provider, prompt)
+        data = json.dumps(body).encode("utf-8")
+        headers: dict[str, str] = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {access_token}",
+            "User-Agent": CODEX_USER_AGENT,
+            "originator": CODEX_ORIGINATOR,
+            "session-id": router._codex_session_id,
+        }
+        if credential.account_id:
+            headers["ChatGPT-Account-Id"] = credential.account_id
+        request = urllib.request.Request(url, data=data, method="POST", headers=headers)
+        # Fail-closed transport, same rationale as the chat path.
+        handlers: list[urllib.request.BaseHandler] = [_NoRedirectHandler()]
+        if scheme == "http":
+            handlers.append(urllib.request.ProxyHandler({}))
+        opener = urllib.request.build_opener(*handlers)
+        start = time.monotonic()
+        http_error: ProviderError | None = None
+        http_cause: _SanitizedHTTPError | None = None
+        stream = ""
+        try:
+            with opener.open(request, timeout=timeout_s) as response:
+                stream = _read_provider_response(response, provider.name).decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            try:
+                error_body = _read_provider_response(exc, provider.name).decode(
+                    "utf-8", errors="replace"
+                )
+            except ProviderError:
+                raise
+            except Exception:
+                error_body = ""
+            safe_body = _redact_error_text(error_body, access_token)[:500]
+            http_cause = _SanitizedHTTPError(
+                status, _redact_error_text(str(exc.reason), access_token)
+            )
+            http_error = router._classify_http(
+                provider,
+                status,
+                safe_body,
+                cause=http_cause,
+                retry_after_s=(_parse_retry_after(exc.headers) if status in (403, 429) else None),
+                account_quota_owner=_account_quota_owner(error_body, access_token),
+            )
+        except urllib.error.URLError as exc:
+            reason = exc.reason
+            if isinstance(reason, TimeoutError):
+                outcome = ProviderOutcome.TIMEOUT
+            else:
+                outcome = ProviderOutcome.ERROR
+            raise ProviderError(provider.name, outcome, f"transport error: {reason}", exc) from exc
+        except TimeoutError as exc:
+            raise ProviderError(
+                provider.name,
+                ProviderOutcome.TIMEOUT,
+                f"timeout after {timeout_s}s",
+                exc,
+            ) from exc
+        except (OSError, ValueError) as exc:
+            raise ProviderError(
+                provider.name, ProviderOutcome.ERROR, f"request failed: {exc}", exc
+            ) from exc
+        if http_error is not None:
+            assert http_cause is not None
+            raise http_error from http_cause
+        payload, text, stream_error = _parse_codex_sse(provider, stream, access_token)
+        if stream_error is not None:
+            raise stream_error
+        return _CodexRawResponse(payload, time.monotonic() - start, text)
+
+
+_PROVIDER_TRANSPORTS: Mapping[Protocol, _ProviderTransport] = {
+    Protocol.CHAT_COMPLETIONS: _ChatCompletionsTransport(),
+    Protocol.CODEX_RESPONSES: _CodexResponsesTransport(),
+}
+
+
+# --------------------------------------------------------------------------- #
 # Diffundo router
 # --------------------------------------------------------------------------- #
 
@@ -1997,6 +2299,10 @@ class Diffundo:
     ) -> None:
         self._providers = tuple(providers)
         self._task_id = task_id
+        # Per-router transport table (defaults to the shared registry) so
+        # callers can observe or substitute one protocol's transport without
+        # touching global state.
+        self._transports: Mapping[Protocol, _ProviderTransport] = _PROVIDER_TRANSPORTS
         # Keep task requirements immutable on the router. Validation happens
         # at the routing boundary so malformed requirements fail before any
         # provider transport is attempted.
@@ -3064,254 +3370,9 @@ class Diffundo:
     def _post_sync(
         self, provider: ProviderConfig, prompt: dict[str, Any], timeout_s: float
     ) -> _RawResponse:
-        if provider.protocol is Protocol.CODEX_RESPONSES:
-            return self._codex_post_sync(provider, prompt, timeout_s)
-        # Defensive transport guard: a ProviderConfig constructed without going
-        # through the config loader must still never send the Authorization
-        # header over plaintext http to a non-loopback host (security audit).
-        parsed = urlparse(provider.base_url)
-        scheme = parsed.scheme.lower()
-        if scheme not in ("http", "https"):
-            raise ProviderError(
-                provider.name,
-                ProviderOutcome.AUTH_ERROR,
-                "provider URL scheme must be http or https",
-            )
-        if scheme == "http" and not is_loopback_host(parsed.hostname or ""):
-            raise ProviderError(
-                provider.name,
-                ProviderOutcome.AUTH_ERROR,
-                "http transport is allowed only for loopback hosts; remote providers require https",
-            )
-        api_key = (
-            provider.api_key
-            if provider.api_key is not None
-            else os.environ.get(provider.api_key_env, "")
+        return self._transports[provider.protocol].post_sync(
+            self, provider, prompt, timeout_s
         )
-        if provider.auth is not AuthMode.NONE and not api_key:
-            raise ProviderError(
-                provider.name,
-                ProviderOutcome.AUTH_ERROR,
-                f"env var {provider.api_key_env!r} not set",
-            )
-        url = f"{provider.base_url.rstrip('/')}/chat/completions"
-        body = {**prompt, "model": provider.model}
-        if provider.supports_native_tools and isinstance(body.get("tools"), list):
-            # Internal tool schemas carry {name, description, parameters}; the
-            # chat-completions wire format requires the function wrapper. The
-            # codex responses path has its own converter (_codex_tools); this
-            # is its chat counterpart.
-            wire_tools: list[dict[str, Any]] = []
-            for tool in body["tools"]:
-                if not isinstance(tool, dict) or not isinstance(tool.get("name"), str):
-                    continue
-                wire_tools.append(
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": tool["name"],
-                            "description": tool.get("description", ""),
-                            "parameters": tool.get(
-                                "parameters", {"type": "object", "properties": {}}
-                            ),
-                        },
-                    }
-                )
-            body["tools"] = wire_tools
-        elif not provider.supports_native_tools:
-            # The textual JSON action protocol is provider-neutral. Keep the
-            # messages byte-identical while omitting native-only wire fields.
-            body.pop("tools", None)
-            body.pop("tool_choice", None)
-        data = json.dumps(body).encode("utf-8")
-        headers = {
-            "Content-Type": "application/json",
-            "User-Agent": provider.user_agent or USER_AGENT,
-            "x-opencode-session": self._task_id,
-        }
-        if provider.auth is not AuthMode.NONE:
-            headers["Authorization"] = f"Bearer {api_key}"
-        request = urllib.request.Request(url, data=data, method="POST", headers=headers)
-        # Fail-closed transport: never follow a provider redirect (urllib would
-        # replay the Authorization header against the redirect target), and
-        # never route loopback http through a proxy (HTTP_PROXY would capture
-        # the Authorization Bearer). https remote providers keep normal proxy
-        # behavior.
-        handlers: list[urllib.request.BaseHandler] = [_NoRedirectHandler()]
-        if scheme == "http":
-            handlers.append(urllib.request.ProxyHandler({}))
-        opener = urllib.request.build_opener(*handlers)
-        start = time.monotonic()
-        http_error: ProviderError | None = None
-        http_cause: _SanitizedHTTPError | None = None
-        payload: Any = None
-        try:
-            with opener.open(request, timeout=timeout_s) as response:
-                response_body = _read_provider_response(response, provider.name)
-                payload = json.loads(response_body.decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            status = exc.code
-            try:
-                error_body = _read_provider_response(exc, provider.name).decode(
-                    "utf-8", errors="replace"
-                )
-            except ProviderError:
-                raise
-            except Exception:
-                error_body = ""
-            safe_body = _redact_error_text(error_body, api_key)[:500]
-            http_cause = _SanitizedHTTPError(status, _redact_error_text(str(exc.reason), api_key))
-            http_error = self._classify_http(
-                provider,
-                status,
-                safe_body,
-                cause=http_cause,
-                retry_after_s=(_parse_retry_after(exc.headers) if status in (403, 429) else None),
-                account_quota_owner=_account_quota_owner(error_body, api_key),
-            )
-        except urllib.error.URLError as exc:
-            reason = exc.reason
-            if isinstance(reason, TimeoutError):
-                outcome = ProviderOutcome.TIMEOUT
-            else:
-                outcome = ProviderOutcome.ERROR
-            raise ProviderError(provider.name, outcome, f"transport error: {reason}", exc) from exc
-        except TimeoutError as exc:
-            raise ProviderError(
-                provider.name,
-                ProviderOutcome.TIMEOUT,
-                f"timeout after {timeout_s}s",
-                exc,
-            ) from exc
-        except (OSError, ValueError) as exc:
-            raise ProviderError(
-                provider.name, ProviderOutcome.ERROR, f"request failed: {exc}", exc
-            ) from exc
-        if http_error is not None:
-            assert http_cause is not None
-            raise http_error from http_cause
-        if not isinstance(payload, dict):
-            raise ProviderError(
-                provider.name, ProviderOutcome.ERROR, "malformed response: not a JSON object"
-            )
-        return _RawResponse(payload, time.monotonic() - start)
-
-    def _codex_post_sync(
-        self, provider: ProviderConfig, prompt: dict[str, Any], timeout_s: float
-    ) -> _RawResponse:
-        """Codex-ChatGPT ``/backend-api/codex/responses`` transport (SSE).
-
-        The endpoint is pinned to ``CODEX_CHATGPT_PROFILE`` (constructor-
-        injectable for tests only; providers.json can never set it). The bearer
-        token and optional account id come from the injected
-        ``CredentialSource`` only — without one a codex provider fails closed
-        with ``AUTH_ERROR``. The same fail-closed transport guards apply as on
-        the chat path: no redirects, no plaintext http off loopback, no proxy
-        on loopback.
-        """
-        profile = self._codex_profile
-        origin = str(profile.get("api_origin") or "").rstrip("/")
-        path = str(profile.get("api_path") or "")
-        parsed = urlparse(origin)
-        scheme = parsed.scheme.lower()
-        if scheme not in ("https", "http"):
-            raise ProviderError(
-                provider.name,
-                ProviderOutcome.AUTH_ERROR,
-                "codex responses endpoint origin must be an absolute http(s) URL",
-            )
-        if scheme == "http" and not is_loopback_host(parsed.hostname or ""):
-            raise ProviderError(
-                provider.name,
-                ProviderOutcome.AUTH_ERROR,
-                "http transport is allowed only for loopback hosts; remote providers require https",
-            )
-        credential = self._credential_source
-        if credential is None:
-            raise ProviderError(
-                provider.name,
-                ProviderOutcome.AUTH_ERROR,
-                "provider requires auth 'codex_chatgpt' but no credential source is injected",
-            )
-        if not credential.access_token:
-            raise ProviderError(
-                provider.name,
-                ProviderOutcome.AUTH_ERROR,
-                "injected credential source carries an empty access token",
-            )
-        access_token = credential.access_token
-        url = f"{origin}{path}"
-        body = _codex_request_body(provider, prompt)
-        data = json.dumps(body).encode("utf-8")
-        headers: dict[str, str] = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {access_token}",
-            "User-Agent": CODEX_USER_AGENT,
-            "originator": CODEX_ORIGINATOR,
-            "session-id": self._codex_session_id,
-        }
-        if credential.account_id:
-            headers["ChatGPT-Account-Id"] = credential.account_id
-        request = urllib.request.Request(url, data=data, method="POST", headers=headers)
-        # Fail-closed transport, same rationale as the chat path.
-        handlers: list[urllib.request.BaseHandler] = [_NoRedirectHandler()]
-        if scheme == "http":
-            handlers.append(urllib.request.ProxyHandler({}))
-        opener = urllib.request.build_opener(*handlers)
-        start = time.monotonic()
-        http_error: ProviderError | None = None
-        http_cause: _SanitizedHTTPError | None = None
-        stream = ""
-        try:
-            with opener.open(request, timeout=timeout_s) as response:
-                stream = _read_provider_response(response, provider.name).decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            status = exc.code
-            try:
-                error_body = _read_provider_response(exc, provider.name).decode(
-                    "utf-8", errors="replace"
-                )
-            except ProviderError:
-                raise
-            except Exception:
-                error_body = ""
-            safe_body = _redact_error_text(error_body, access_token)[:500]
-            http_cause = _SanitizedHTTPError(
-                status, _redact_error_text(str(exc.reason), access_token)
-            )
-            http_error = self._classify_http(
-                provider,
-                status,
-                safe_body,
-                cause=http_cause,
-                retry_after_s=(_parse_retry_after(exc.headers) if status in (403, 429) else None),
-                account_quota_owner=_account_quota_owner(error_body, access_token),
-            )
-        except urllib.error.URLError as exc:
-            reason = exc.reason
-            if isinstance(reason, TimeoutError):
-                outcome = ProviderOutcome.TIMEOUT
-            else:
-                outcome = ProviderOutcome.ERROR
-            raise ProviderError(provider.name, outcome, f"transport error: {reason}", exc) from exc
-        except TimeoutError as exc:
-            raise ProviderError(
-                provider.name,
-                ProviderOutcome.TIMEOUT,
-                f"timeout after {timeout_s}s",
-                exc,
-            ) from exc
-        except (OSError, ValueError) as exc:
-            raise ProviderError(
-                provider.name, ProviderOutcome.ERROR, f"request failed: {exc}", exc
-            ) from exc
-        if http_error is not None:
-            assert http_cause is not None
-            raise http_error from http_cause
-        payload, text, stream_error = _parse_codex_sse(provider, stream, access_token)
-        if stream_error is not None:
-            raise stream_error
-        return _CodexRawResponse(payload, time.monotonic() - start, text)
 
     def _classify_http(
         self,
@@ -3323,10 +3384,8 @@ class Diffundo:
         retry_after_s: float | None = None,
         account_quota_owner: str | None = None,
     ) -> ProviderError:
-        config_400 = (
-            status == 400
-            and provider.protocol is Protocol.CODEX_RESPONSES
-            and _codex_config_400(message)
+        transport_outcome = self._transports[provider.protocol].classify_error(
+            status, message
         )
         structured = _structured_error_outcome(
             message,
@@ -3385,10 +3444,10 @@ class Diffundo:
                 provider.name, ProviderOutcome.AUTH_ERROR, f"HTTP {status}: {message}", cause
             )
         if status == 400:
-            if config_400:
+            if transport_outcome is not None:
                 return ProviderError(
                     provider.name,
-                    ProviderOutcome.CONFIG_ERROR,
+                    transport_outcome,
                     f"HTTP 400: {message}",
                     cause,
                 )
@@ -3399,11 +3458,6 @@ class Diffundo:
                     f"HTTP 400 prompt/content flag: {message}",
                     cause,
                 )
-            # Codex split (review requirement): a machine-readable 400 naming a
-            # model/parameter problem is a permanent CONFIG error that
-            # quarantines the provider, NOT a content refusal. The generic
-            # all-400 -> REFUSAL rule below is unchanged for chat_completions
-            # providers.
             # Deterministic HTTP 400s are permanent request-level rejections
             # (verified live: zai 1214 'messages illegal' was retried then
             # cooled down). A generic 400 used to fall to the retryable ERROR
