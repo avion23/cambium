@@ -305,9 +305,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         },
                         "requirements": {
                             "type": "object",
-                            "description": (
-                                "Capability constraints used by supervisor admission."
-                            ),
+                            "description": ("Capability constraints used by supervisor admission."),
                         },
                         "model_candidates": {
                             "type": "array",
@@ -439,11 +437,7 @@ def _validate_value(schema: dict[str, Any], value: Any, label: str) -> list[str]
                 errors.append(f"validation failed: '{label}' must be >= {minimum}")
         exclusive_minimum = schema.get("exclusiveMinimum")
         if isinstance(exclusive_minimum, bool):
-            if (
-                exclusive_minimum
-                and isinstance(minimum, int | float)
-                and numeric_value <= minimum
-            ):
+            if exclusive_minimum and isinstance(minimum, int | float) and numeric_value <= minimum:
                 errors.append(f"validation failed: '{label}' must be > {minimum}")
         elif isinstance(exclusive_minimum, int | float) and not isinstance(exclusive_minimum, bool):
             if numeric_value <= exclusive_minimum:
@@ -454,11 +448,7 @@ def _validate_value(schema: dict[str, Any], value: Any, label: str) -> list[str]
                 errors.append(f"validation failed: '{label}' must be <= {maximum}")
         exclusive_maximum = schema.get("exclusiveMaximum")
         if isinstance(exclusive_maximum, bool):
-            if (
-                exclusive_maximum
-                and isinstance(maximum, int | float)
-                and numeric_value >= maximum
-            ):
+            if exclusive_maximum and isinstance(maximum, int | float) and numeric_value >= maximum:
                 errors.append(f"validation failed: '{label}' must be < {maximum}")
         elif isinstance(exclusive_maximum, int | float) and not isinstance(exclusive_maximum, bool):
             if numeric_value >= exclusive_maximum:

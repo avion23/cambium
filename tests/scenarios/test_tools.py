@@ -46,10 +46,7 @@ def test_read_batch_returns_bounded_files_and_windows(tmp_path: Path) -> None:
 
     assert whole.ok and whole.output == "--- hello.txt ---\nhello\n"
     assert window.ok and window.output == (
-        "--- lines.txt ---\n"
-        "showing lines 2-3 of 5\n"
-        "line 2\n"
-        "line 3\n"
+        "--- lines.txt ---\nshowing lines 2-3 of 5\nline 2\nline 3\n"
     )
     assert capped.ok
     assert "[file truncated]" in capped.output
@@ -66,10 +63,7 @@ def test_read_batch_reports_an_empty_window_past_eof(tmp_path: Path) -> None:
     )
 
     assert result.ok
-    assert result.output == (
-        "--- lines.txt ---\n"
-        "showing no lines from 10; file has 2 lines\n"
-    )
+    assert result.output == ("--- lines.txt ---\nshowing no lines from 10; file has 2 lines\n")
 
 
 def test_read_batch_offset_only_uses_default_line_cap(tmp_path: Path) -> None:

@@ -244,16 +244,26 @@ def test_compaction_deferral_count_survives_generation_boundary(tmp_path: Path) 
     assert resumed["failure_reason"] == (
         "compaction_failed: summary response must be exactly one JSON object"
     )
-    assert len(
-        [
-            message
-            for message in resumed_writer.messages()
-            if message["type"] == "compaction_deferred"
-        ]
-    ) == 1
-    assert len(
-        [message for message in resumed_writer.messages() if message["type"] == "compaction_failed"]
-    ) == 1
+    assert (
+        len(
+            [
+                message
+                for message in resumed_writer.messages()
+                if message["type"] == "compaction_deferred"
+            ]
+        )
+        == 1
+    )
+    assert (
+        len(
+            [
+                message
+                for message in resumed_writer.messages()
+                if message["type"] == "compaction_failed"
+            ]
+        )
+        == 1
+    )
     assert resumed_router.summary_calls == 4
 
 
@@ -481,13 +491,9 @@ def test_deferred_compaction_survives_stall_restart_and_later_folds(
     assert len(deferred) == 1
     assert len(deferred[0]["reason"].encode()) <= worker.MAX_ENVELOPE_FIELD_CHARS
     checkpoint = json.loads(
-        (
-            session
-            / ".cambium"
-            / "checkpoints"
-            / "compaction-resume"
-            / "turn-001.json"
-        ).read_text(encoding="utf-8")
+        (session / ".cambium" / "checkpoints" / "compaction-resume" / "turn-001.json").read_text(
+            encoding="utf-8"
+        )
     )
     assert checkpoint["compaction_deferred"] is True
 

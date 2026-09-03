@@ -263,15 +263,15 @@ def _unframe_bracketed_paste(value: str, source: TextIO) -> str:
                 _strip_bracketed_paste_markers(accumulated[:end] + suffix)
             )
         if start < 0 and not pending:
-            return sanitize_terminal_text(
-                _strip_bracketed_paste_markers(accumulated)
-            ).rstrip("\r\n")
+            return sanitize_terminal_text(_strip_bracketed_paste_markers(accumulated)).rstrip(
+                "\r\n"
+            )
 
         line = source.readline()
         if line == "":
-            return sanitize_terminal_text(
-                _strip_bracketed_paste_markers(accumulated)
-            ).rstrip("\r\n")
+            return sanitize_terminal_text(_strip_bracketed_paste_markers(accumulated)).rstrip(
+                "\r\n"
+            )
         accumulated += pending + line
 
 
@@ -446,8 +446,10 @@ def _restore_turn_transcript(
         payload = _event_payload(event)
         if kind == "task_assigned":
             task_id = event.get("task_id")
-            if task_id is None or task_id == "interactive-main" or (
-                isinstance(task_id, str) and task_id.startswith("interactive-task-")
+            if (
+                task_id is None
+                or task_id == "interactive-main"
+                or (isinstance(task_id, str) and task_id.startswith("interactive-task-"))
             ):
                 prompt = _event_text(payload, "task", "prompt", "user_prompt")
                 prompt_key = task_id if isinstance(task_id, str) else "__unassigned__"
@@ -1057,7 +1059,7 @@ async def _run_interactive(
                         cumulative_line=_cumulative.line(snapshot=live_snapshot),
                         activity_line=_activity.render(),
                         turn_active=True,
-                )
+                    )
 
                 _start_input_read()
                 turn_active = True

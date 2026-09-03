@@ -88,13 +88,9 @@ def _parse_tool_ref(value: Any) -> tuple[str, int, int, int, bool]:
         turn = int(parts[3])
         batch_index = int(parts[4]) if not legacy else 0
     except ValueError:
-        raise BranchHistoryError(
-            "tool ref generation, turn, and index must be integers"
-        ) from None
+        raise BranchHistoryError("tool ref generation, turn, and index must be integers") from None
     if not task_id or generation < 0 or turn < 1 or batch_index < 0:
-        raise BranchHistoryError(
-            "tool ref contains an invalid task, generation, turn, or index"
-        )
+        raise BranchHistoryError("tool ref contains an invalid task, generation, turn, or index")
     return task_id, generation, turn, batch_index, legacy
 
 
@@ -195,9 +191,7 @@ def _branches(events: Sequence[_Event]) -> list[_Branch]:
                 mode = event.payload.get("context_mode")
                 placement = event.payload.get("placement")
                 branch.context_mode = mode if isinstance(mode, str) else branch.context_mode
-                branch.placement = (
-                    placement if isinstance(placement, str) else branch.placement
-                )
+                branch.placement = placement if isinstance(placement, str) else branch.placement
         if event.kind == "tool_event" and event.task_id is not None:
             get(event.task_id).tool_count += 1
         if event.kind == "usage_event" and event.task_id is not None:
@@ -281,9 +275,7 @@ def _tool_identity(event: _Event) -> tuple[str, int, int, int]:
     )
 
 
-def _list_tools(
-    events: Sequence[_Event], task_id: str | None, offset: int, limit: int
-) -> str:
+def _list_tools(events: Sequence[_Event], task_id: str | None, offset: int, limit: int) -> str:
     rows = _tool_events(events, task_id)
     lines = [f"tool_calls={len(rows)}"]
     for event in rows:
@@ -434,9 +426,7 @@ def _read_tool(events: Sequence[_Event], ref: Any) -> str:
     return _bounded("\n".join(lines))
 
 
-def _latest_transcript(
-    events: Sequence[_Event], task_id: str, offset: int, limit: int
-) -> str:
+def _latest_transcript(events: Sequence[_Event], task_id: str, offset: int, limit: int) -> str:
     checkpoint = _checkpoint_event(events, task_id, None, None)
     if checkpoint is None:
         raise BranchHistoryError(f"branch has no retrievable checkpoint: {task_id}")

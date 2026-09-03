@@ -180,9 +180,7 @@ def test_batched_tool_calls_have_distinct_retrievable_references(tmp_path: Path)
     events[3]["seq"] = 5
     events[4]["seq"] = 6
     events.insert(2, second_tool)
-    events_path.write_text(
-        "".join(json.dumps(event) + "\n" for event in events), encoding="utf-8"
-    )
+    events_path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
 
     first_ref = tool_ref("child", 1, 2, 0)
     second_ref = tool_ref("child", 1, 2, 1)

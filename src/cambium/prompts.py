@@ -19,7 +19,7 @@ SUMMARY_PROTOCOL_LINES = (
     "or their evidence, approaches and outcomes, reproduction steps/status, expensive "
     "tool findings, or open questions.",
     "Use decisions_superseded and facts_invalidated to make changed conclusions explicit.",
-    "The object must contain \"objective\" and \"outcome\" (non-empty strings) and may "
+    'The object must contain "objective" and "outcome" (non-empty strings) and may '
     "contain these lists of short strings: decisions_added, decisions_superseded, "
     "facts_added, facts_invalidated, files_and_symbols_changed, verification_results, "
     "relevant_failed_approaches, open_items. No other fields; type, sequence, "

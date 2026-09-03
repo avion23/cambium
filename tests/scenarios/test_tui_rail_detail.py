@@ -71,8 +71,7 @@ def test_narrow_rail_keeps_summary_only() -> None:
 
     assert [value for _, value in rows][:3] == [" LANES", "└●= root E3", " CONTEXT"]
     assert not any(
-        value.strip().startswith(("phase", "tail", "duration", "status", "•"))
-        for _, value in rows
+        value.strip().startswith(("phase", "tail", "duration", "status", "•")) for _, value in rows
     )
 
 

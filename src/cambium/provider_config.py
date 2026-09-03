@@ -947,11 +947,7 @@ def _validate_provider_mapping(raw: object, index: int) -> _ProviderMapping:
         raise _error(f"{location}.tier", f"invalid tier {tier_value!r}; expected {choices}")
 
     auth = _parse_auth_mode(raw, location)
-    api_key = (
-        _validate_api_key(raw["api_key"], f"{location}.api_key")
-        if "api_key" in raw
-        else None
-    )
+    api_key = _validate_api_key(raw["api_key"], f"{location}.api_key") if "api_key" in raw else None
     protocol = _parse_protocol(raw, location)
     if protocol is Protocol.CODEX_RESPONSES and auth is not AuthMode.CODEX_CHATGPT:
         raise _error(

@@ -350,12 +350,8 @@ def test_summary_flush_appends_second_entry_after_raw_tail_crosses_threshold(
     assert second_folded.continuation_suffix == []
     assert action_prompts[0]["messages"][:-1] == first_folded.full_messages
     assert action_prompts[1]["messages"][:-1] == second_folded.full_messages
-    assert action_prompts[0]["messages"][-1]["content"].startswith(
-        "<cambium-loop-state>budget="
-    )
-    assert action_prompts[1]["messages"][-1]["content"].startswith(
-        "<cambium-loop-state>budget="
-    )
+    assert action_prompts[0]["messages"][-1]["content"].startswith("<cambium-loop-state>budget=")
+    assert action_prompts[1]["messages"][-1]["content"].startswith("<cambium-loop-state>budget=")
     assert summary_prompts[1]["messages"][: len(first_folded.full_messages)] == (
         first_folded.full_messages
     )

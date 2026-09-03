@@ -268,9 +268,7 @@ def test_unsequenced_and_invalid_sequence_replays_are_deduplicated() -> None:
     unsequenced = {
         "kind": "usage_event",
         "task_id": "root",
-        "payload": {
-            "usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12}
-        },
+        "payload": {"usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12}},
     }
     invalid_sequence = {**unsequenced, "seq": 0}
 

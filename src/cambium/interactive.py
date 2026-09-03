@@ -1106,8 +1106,7 @@ class InteractiveSession:
                 network_permission=False,
                 heartbeat_interval_s=1.0,
                 max_wall_s=(
-                    self._base_config.max_wall_s
-                    or oneshot.DEFAULT_INTERACTIVE_WALL_BUDGET_S
+                    self._base_config.max_wall_s or oneshot.DEFAULT_INTERACTIVE_WALL_BUDGET_S
                 ),
                 checkpoint_root=checkpoint_root,
                 provider_env_keys=self._base_config.provider_env_keys,
@@ -1297,9 +1296,7 @@ class InteractiveSession:
                     config,
                     prompt=prompt,
                     task_id=(
-                        "interactive-main"
-                        if index == 1
-                        else f"interactive-task-{number}-{index}"
+                        "interactive-main" if index == 1 else f"interactive-task-{number}-{index}"
                     ),
                     worktree_path=session_dir / (f"wt-{index}" if batch else "wt"),
                     branch=(f"cambium-interactive-{number}-{index}" if batch else None),

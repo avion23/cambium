@@ -645,9 +645,10 @@ def test_tool_rows_put_positive_duration_first(
 
     line = tui_screen._tool_line(entry, count=count, last_duration_ms=duration_ms)
     assert line == expected
-    assert tui_screen._tool_compact_lines(
-        entry, 80, count=count, last_duration_ms=duration_ms
-    )[0][1] == "  " + expected
+    assert (
+        tui_screen._tool_compact_lines(entry, 80, count=count, last_duration_ms=duration_ms)[0][1]
+        == "  " + expected
+    )
 
 
 def test_activity_state_reports_waiting_streaming_done_error_and_cooldown() -> None:
@@ -1345,12 +1346,8 @@ def test_live_rows_sanitize_multiline_ansi_and_wide_output() -> None:
 
 def test_current_tool_counters_reset_at_the_next_turn() -> None:
     transcript = Transcript()
-    transcript.observe_event(
-        {"kind": "tool_event", "payload": {"tool": "run_shell", "ok": False}}
-    )
-    transcript.observe_event(
-        {"kind": "tool_event", "payload": {"tool": "read_batch", "ok": True}}
-    )
+    transcript.observe_event({"kind": "tool_event", "payload": {"tool": "run_shell", "ok": False}})
+    transcript.observe_event({"kind": "tool_event", "payload": {"tool": "read_batch", "ok": True}})
 
     assert transcript.tool_count == 2
     assert transcript.current_tool_count == 2
@@ -1459,8 +1456,7 @@ def test_live_tool_tail_and_duration_clear_at_provider_boundary() -> None:
 
     rows = _live_window_lines(transcript, 100)
     assert all(
-        value not in " ".join(rows)
-        for value in ("stale command output", "run_shell", "1250ms")
+        value not in " ".join(rows) for value in ("stale command output", "run_shell", "1250ms")
     )
     assert "provider call" in " ".join(rows)
 

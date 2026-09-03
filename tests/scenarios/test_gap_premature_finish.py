@@ -56,8 +56,7 @@ def test_forced_finish_with_verified_code_change_succeeds(tmp_path: Path) -> Non
         [
             '{"type":"tool_call","name":"edit_file","arguments":{"path":"alpha.txt",'
             '"old_string":"alpha-content\\n","new_string":"changed\\n"}}',
-            '{"type":"tool_call","name":"run_shell","arguments":{"cmd":['
-            '"git","diff","--check"]}}',
+            '{"type":"tool_call","name":"run_shell","arguments":{"cmd":["git","diff","--check"]}}',
             '{"type":"finish","summary":"changed and verified","objective_met":true}',
         ],
         usages,
@@ -92,8 +91,7 @@ def test_non_forced_finish_with_objective_false_is_failed(tmp_path: Path) -> Non
     config = _agent_config(worktree, max_tokens=100)
     router = _ScriptedRouter(
         [
-            '{"type":"finish","summary":"task remains incomplete",'
-            '"objective_met":false}',
+            '{"type":"finish","summary":"task remains incomplete","objective_met":false}',
         ]
     )
 
@@ -120,8 +118,7 @@ def test_forced_finish_without_code_change_but_objective_met_succeeds_review(
     router = _UsageScriptedRouter(
         [
             '{"type":"tool_call","name":"read_batch","arguments":{"paths":["alpha.txt"]}}',
-            '{"type":"finish","summary":"review complete; no defect found",'
-            '"objective_met":true}',
+            '{"type":"finish","summary":"review complete; no defect found","objective_met":true}',
         ],
         [usage, usage],
     )
@@ -215,9 +212,10 @@ def test_forced_finish_resume_restores_no_code_change_gate(tmp_path: Path) -> No
     assert checkpoint["code_changed"] is False
     checkpoint.pop("code_changed")
     checkpoint_path.write_text(json.dumps(checkpoint), encoding="utf-8")
-    assert worker._load_turn_checkpoint(config, f"{config.task_id}/turn-001.json")[
-        "code_changed"
-    ] is False
+    assert (
+        worker._load_turn_checkpoint(config, f"{config.task_id}/turn-001.json")["code_changed"]
+        is False
+    )
 
     write_generation(worktree, 2)
     resumed_config = replace(
@@ -232,8 +230,7 @@ def test_forced_finish_resume_restores_no_code_change_gate(tmp_path: Path) -> No
         },
     )
     resumed_router = _UsageScriptedRouter(
-        ['{"type":"finish","summary":"still incomplete after resume",'
-         '"objective_met":false}'],
+        ['{"type":"finish","summary":"still incomplete after resume","objective_met":false}'],
         [usage],
     )
 
@@ -273,10 +270,13 @@ def test_progress_hash_retains_only_recent_reads() -> None:
 
 def test_finish_schema_requires_boolean_objective_signal() -> None:
     assert "objective_met" in FINISH_ACTION_SCHEMA["required"]
-    assert validate_tool_call(
-        FINISH_ACTION_SCHEMA,
-        {"type": "finish", "summary": "done", "objective_met": True},
-    ) == []
+    assert (
+        validate_tool_call(
+            FINISH_ACTION_SCHEMA,
+            {"type": "finish", "summary": "done", "objective_met": True},
+        )
+        == []
+    )
     assert validate_tool_call(
         FINISH_ACTION_SCHEMA,
         {"type": "finish", "summary": "done"},
@@ -315,9 +315,7 @@ def test_prompt_context_usage_counts_the_serialized_raw_tail() -> None:
         {"role": "assistant", "content": "raw observation é"},
     ]
 
-    fields = worker._prompt_context_usage_fields(
-        {"messages": messages}, call_kind="agent"
-    )
+    fields = worker._prompt_context_usage_fields({"messages": messages}, call_kind="agent")
 
     assert fields["active_context_bytes"] == len(worker._canonical_json_bytes(messages))
     assert fields["summary_trunk_bytes"] == len(worker._canonical_json_bytes(messages[:2]))

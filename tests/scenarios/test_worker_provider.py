@@ -1354,9 +1354,7 @@ def test_worker_token_budget_fails_before_executing(tmp_path, usages, branch) ->
         env = _worker_env(config_path, session_dir)
         init = _agent_init(config_path, max_tokens=1500, spec=TASK_TEXT)
         result, _messages, rc, _stderr = asyncio.run(
-            _drive_worker(
-                session_dir, repo, env, init=init, run={"task": TASK_TEXT}, branch=branch
-            )
+            _drive_worker(session_dir, repo, env, init=init, run={"task": TASK_TEXT}, branch=branch)
         )
 
         assert result["status"] == "failed"

@@ -83,10 +83,7 @@ CRITICAL_KINDS = frozenset(
     {
         "result",
         "checkpoint",
-        "worker_exit",
         "worker_terminated",
-        "task_failed",
-        "merge_progress",
         "task_assigned",
         "merge_committed",
         "join_invariant_failed",

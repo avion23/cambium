@@ -360,9 +360,7 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def _finish_payload(model: str) -> dict[str, Any]:
-    content = json.dumps(
-        {"type": "finish", "summary": "done on " + model, "objective_met": True}
-    )
+    content = json.dumps({"type": "finish", "summary": "done on " + model, "objective_met": True})
     return {
         "id": "chatcmpl-scored",
         "object": "chat.completion",

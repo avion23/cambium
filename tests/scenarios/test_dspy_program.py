@@ -169,9 +169,7 @@ def test_metric_scores_matching_and_mismatching_predictions(
         expected={label: matching_decision, "reason": "expected"},
     )
 
-    matching = example.with_prediction(
-        output_cls(decision=matching_decision, reason="predicted")
-    )
+    matching = example.with_prediction(output_cls(decision=matching_decision, reason="predicted"))
     mismatching = example.with_prediction(
         output_cls(decision=mismatching_decision, reason="predicted")
     )

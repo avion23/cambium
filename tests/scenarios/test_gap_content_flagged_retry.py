@@ -126,11 +126,7 @@ def _config_for(tmp_path: Path) -> worker.AgentConfig:
 
 def _router(server: FakeServer) -> _ObservedDiffundo:
     return _ObservedDiffundo(
-        (
-            _config(
-                "p_summary", server, "K_SUMMARY", model="loopback-model", max_retries=2
-            ),
-        ),
+        (_config("p_summary", server, "K_SUMMARY", model="loopback-model", max_retries=2),),
         pause_timeout_s=0.01,
     )
 
@@ -210,9 +206,7 @@ def test_content_flagged_summary_retries_once_with_redacted_tail(
         assert calls[1]["messages"][:2] == calls[0]["messages"][:2]
         assert calls[1]["messages"][-1] == calls[0]["messages"][-1]
         assert '"summary":"***' in calls[1]["messages"][-2]["content"]
-        assert len(calls[1]["messages"][-2]["content"]) < len(
-            calls[0]["messages"][-2]["content"]
-        )
+        assert len(calls[1]["messages"][-2]["content"]) < len(calls[0]["messages"][-2]["content"])
         assert len(server.calls) == 3
         assert router.summary_failure_health == [HealthState.HEALTHY]
         assert router.health("p_summary") is HealthState.HEALTHY
@@ -220,18 +214,13 @@ def test_content_flagged_summary_retries_once_with_redacted_tail(
         error = router.summary_failures[0].last_error
         assert isinstance(error, ProviderError)
         assert error.outcome is ProviderOutcome.CONTENT_FLAGGED
-        assert _failed_summary_events(writer)[0]["failure_reason"].startswith(
-            "content_flagged:"
-        )
+        assert _failed_summary_events(writer)[0]["failure_reason"].startswith("content_flagged:")
     finally:
         server.close()
 
 
 def test_content_flagged_transform_preserves_trunk_and_earlier_tail() -> None:
-    control = (
-        "<cambium-summary-control>\n{}\n"
-        "</cambium-summary-control>"
-    )
+    control = "<cambium-summary-control>\n{}\n</cambium-summary-control>"
     prompt = {
         "messages": [
             {"role": "system", "content": "stable system"},

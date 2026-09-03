@@ -27,6 +27,7 @@ def test_default_max_restarts_resolves_to_one(tmp_path: Path, interactive: bool)
 
     assert _plan(config, tmp_path)["tasks"][0]["max_restarts"] == 1
 
+
 def test_run_max_restarts_zero_is_forwarded(monkeypatch, tmp_path: Path) -> None:
     captured: list[oneshot.OneShotConfig] = []
 
