@@ -34,9 +34,7 @@ def test_cursor_controls_require_a_capable_terminal_but_ignore_no_color(
     assert not supports_cursor_controls(io.StringIO())
 
 
-def test_dashboard_screen_mode_uses_terminal_capability_not_color(
-    monkeypatch, tmp_path
-) -> None:
+def test_dashboard_screen_mode_uses_terminal_capability_not_color(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("TERM", "xterm-256color")
     monkeypatch.setenv("NO_COLOR", "1")
     capable_stream = _Tty()
@@ -71,9 +69,7 @@ def test_sanitizer_exposes_bidi_controls_and_normalizes_line_boundaries() -> Non
     text = "left\u202eright\u202c\u2028next\u0085last"
 
     assert sanitize_terminal_text(text) == "left\\u202Eright\\u202C\nnext\nlast"
-    assert sanitize_terminal_text(text, single_line=True) == (
-        "left\\u202Eright\\u202C next last"
-    )
+    assert sanitize_terminal_text(text, single_line=True) == ("left\\u202Eright\\u202C next last")
 
 
 def test_monitor_frame_keeps_cell_width_with_wide_and_combining_text(tmp_path) -> None:

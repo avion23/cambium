@@ -521,9 +521,7 @@ def _sandbox_restriction_detected(
     """Recognize environment/OS restrictions without treating them as outages."""
     text = _error_message_text(body)
     normalized_text = text.replace("_", " ").replace("-", " ")
-    if _SANDBOX_RESTRICTION_RE.search(text) or _SANDBOX_RESTRICTION_RE.search(
-        normalized_text
-    ):
+    if _SANDBOX_RESTRICTION_RE.search(text) or _SANDBOX_RESTRICTION_RE.search(normalized_text):
         return True
     tokens = _error_tokens(body)
     if tokens is not None and _SANDBOX_RESTRICTION_TOKENS.intersection(tokens):
@@ -1973,11 +1971,9 @@ class _ProviderTransport(TypingProtocol):
         provider: ProviderConfig,
         prompt: dict[str, Any],
         timeout_s: float,
-    ) -> _RawResponse:
-        ...
+    ) -> _RawResponse: ...
 
-    def classify_error(self, status: int, message: str) -> ProviderOutcome | None:
-        ...
+    def classify_error(self, status: int, message: str) -> ProviderOutcome | None: ...
 
 
 def _is_opencode_destination(base_url: str) -> bool:
@@ -3376,9 +3372,7 @@ class Diffundo:
     def _post_sync(
         self, provider: ProviderConfig, prompt: dict[str, Any], timeout_s: float
     ) -> _RawResponse:
-        return self._transports[provider.protocol].post_sync(
-            self, provider, prompt, timeout_s
-        )
+        return self._transports[provider.protocol].post_sync(self, provider, prompt, timeout_s)
 
     def _classify_http(
         self,
@@ -3390,9 +3384,7 @@ class Diffundo:
         retry_after_s: float | None = None,
         account_quota_owner: str | None = None,
     ) -> ProviderError:
-        transport_outcome = self._transports[provider.protocol].classify_error(
-            status, message
-        )
+        transport_outcome = self._transports[provider.protocol].classify_error(status, message)
         structured = _structured_error_outcome(
             message,
             policy_outcome=ProviderOutcome.CONTENT_FLAGGED,

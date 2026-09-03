@@ -1285,11 +1285,7 @@ def test_parse_agent_action_accepts_fenced_tool_call() -> None:
 
 
 def test_parse_agent_action_accepts_fenced_finish_with_backticks_in_body() -> None:
-    fenced = (
-        "```\n"
-        '{"type":"finish","summary":"kept ``` inline","objective_met":true}\n'
-        "```"
-    )
+    fenced = '```\n{"type":"finish","summary":"kept ``` inline","objective_met":true}\n```'
     assert worker._parse_agent_action(fenced) == {
         "type": "finish",
         "summary": "kept ``` inline",
@@ -1298,18 +1294,14 @@ def test_parse_agent_action_accepts_fenced_finish_with_backticks_in_body() -> No
 
 
 def test_parse_agent_action_rejects_fenced_with_prose_or_unclosed_fence() -> None:
-    prose = (
-        "Here is the action:\n"
-        '```json\n{"type":"plan","steps":["a"]}\n```'
-    )
+    prose = 'Here is the action:\n```json\n{"type":"plan","steps":["a"]}\n```'
     with pytest.raises(ValueError, match="not valid JSON"):
         worker._parse_agent_action(prose)
     unclosed = '```json\n{"type":"plan","steps":["a"]}\n'
     with pytest.raises(ValueError, match="not valid JSON"):
         worker._parse_agent_action(unclosed)
     two_fences = (
-        '```json\n{"type":"plan","steps":["a"]}\n```\n'
-        '```json\n{"type":"plan","steps":["b"]}\n```'
+        '```json\n{"type":"plan","steps":["a"]}\n```\n```json\n{"type":"plan","steps":["b"]}\n```'
     )
     with pytest.raises(ValueError):
         worker._parse_agent_action(two_fences)

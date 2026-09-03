@@ -52,7 +52,9 @@ def test_own_session_rejection_reports_submitted_path_not_resolved(
     link.symlink_to(real, target_is_directory=True)
     monkeypatch.setenv("CAMBIUM_SESSION_ID", str(real))
 
-    result = _run("read_batch", {"paths": [str(link / ".cambium" / "events.db")]}, ToolContext(tmp_path))
+    result = _run(
+        "read_batch", {"paths": [str(link / ".cambium" / "events.db")]}, ToolContext(tmp_path)
+    )
 
     assert not result.ok
     assert "worker's own active session" in result.output

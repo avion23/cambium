@@ -31,6 +31,7 @@ def _uv_bin_dir() -> list[str]:
     parent = str(Path(uv).resolve().parent)
     return [parent]
 
+
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 
 # These are the only names that trusted supervisor code may set in addition

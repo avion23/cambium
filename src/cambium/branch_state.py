@@ -525,13 +525,9 @@ class BranchState:
             control=Control(
                 plan=_required_string_tuple(control_data.get("plan", ())),
                 current_step=_optional_nonnegative_int(control_data.get("current_step")),
-                open_obligations=_required_string_tuple(
-                    control_data.get("open_obligations", ())
-                ),
+                open_obligations=_required_string_tuple(control_data.get("open_obligations", ())),
                 blockers=_required_string_tuple(control_data.get("blockers", ())),
-                last_meaningful_delta=_optional_string(
-                    control_data.get("last_meaningful_delta")
-                ),
+                last_meaningful_delta=_optional_string(control_data.get("last_meaningful_delta")),
             ),
             knowledge=Knowledge(
                 observations=_required_string_tuple(knowledge_data.get("observations", ())),
@@ -545,7 +541,9 @@ class BranchState:
             ),
             resources=Resources(
                 remaining_turns=_optional_nonnegative_int(resources_data.get("remaining_turns")),
-                remaining_wall_s=_optional_nonnegative_number(resources_data.get("remaining_wall_s")),
+                remaining_wall_s=_optional_nonnegative_number(
+                    resources_data.get("remaining_wall_s")
+                ),
                 context_pressure=_known_or_unknown_string(
                     resources_data.get("context_pressure"), "unknown"
                 ),

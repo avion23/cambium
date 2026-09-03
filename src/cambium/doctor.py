@@ -174,9 +174,7 @@ def _cache_provider_name(payload: Mapping[str, Any]) -> str:
     return provider if isinstance(provider, str) and provider else "<unknown>"
 
 
-def record_cache_event(
-    providers: dict[str, CacheProviderStats], event: Mapping[str, Any]
-) -> None:
+def record_cache_event(providers: dict[str, CacheProviderStats], event: Mapping[str, Any]) -> None:
     """Fold one usage event into per-provider cache evidence."""
     if event.get("kind") != "usage_event":
         return
@@ -681,11 +679,7 @@ def check_auth_coverage(cwd: Path, path: Path | None = None) -> tuple[Status, st
 
     missing_required = [p.name for p in providers if p.required and not covered(p)]
     missing_optional = [p.name for p in providers if not p.required and not covered(p)]
-    present = [
-        f"{p.name}={_doctor_credential_label(p)}"
-        for p in providers
-        if covered(p)
-    ]
+    present = [f"{p.name}={_doctor_credential_label(p)}" for p in providers if covered(p)]
     configured_names = {p.name for p in providers}
     extra = sorted(name for name in auth_names if name not in configured_names)
 
