@@ -695,6 +695,9 @@ class ProviderConfig:
     # absent -> the request body carries no reasoning field; the pinned codex
     # provider entry sets "max".
     reasoning_effort: str | None = None
+    # Optional per-provider User-Agent override (config `user_agent`); None
+    # means the shared USER_AGENT default.
+    user_agent: str | None = None
     # ``max_concurrency`` is the historical spelling.  ``max_in_flight`` is
     # the independent admission capacity; legacy configurations derive it
     # conservatively from the old field (normally one slot).
@@ -3123,7 +3126,7 @@ class Diffundo:
         data = json.dumps(body).encode("utf-8")
         headers = {
             "Content-Type": "application/json",
-            "User-Agent": USER_AGENT,
+            "User-Agent": provider.user_agent or USER_AGENT,
             "x-opencode-session": self._task_id,
         }
         if provider.auth is not AuthMode.NONE:

@@ -112,6 +112,7 @@ _PROVIDER_FIELDS = frozenset(
         "max_concurrency",
         "max_in_flight",
         "billing_mode",
+        "user_agent",
         "quota_windows",
         "price_per_1m_in",
         "price_per_1m_cached_in",
@@ -166,6 +167,9 @@ _DEFAULTS: dict[str, object] = {
     # conservative legacy derivation in ProviderConfig.__post_init__.
     "max_in_flight": None,
     "billing_mode": "metered",
+    # Optional per-provider User-Agent override (some backends admit or bill
+    # differently per client tag); None means the shared default.
+    "user_agent": None,
     "quota_windows": (),
     "price_per_1m_in": 0.0,
     "price_per_1m_cached_in": 0.0,
@@ -207,6 +211,7 @@ class _ProviderMapping(TypedDict):
     max_concurrency: int
     max_in_flight: int | None
     billing_mode: BillingMode
+    user_agent: str | None
     quota_windows: tuple[QuotaWindowSpec, ...]
     price_per_1m_in: float
     price_per_1m_cached_in: float
@@ -1176,6 +1181,14 @@ def _validate_provider_mapping(raw: object, index: int) -> _ProviderMapping:
             )
         reasoning_effort = reasoning_effort.strip()
 
+    # Optional per-provider User-Agent override; transport-generic, so no
+    # protocol coupling. Absent/blank means the shared default.
+    user_agent = raw.get("user_agent")
+    if user_agent is not None:
+        if not isinstance(user_agent, str) or not user_agent.strip():
+            raise _error(f"{location}.user_agent", "must be a non-empty string")
+        user_agent = user_agent.strip()
+
     return {
         "name": name,
         "tier": tier_value,
@@ -1200,6 +1213,7 @@ def _validate_provider_mapping(raw: object, index: int) -> _ProviderMapping:
         "max_concurrency": max_concurrency,
         "max_in_flight": max_in_flight,
         "billing_mode": billing_mode,
+        "user_agent": user_agent,
         "quota_windows": quota_windows,
         "price_per_1m_in": price_per_1m_in,
         "price_per_1m_cached_in": price_per_1m_cached_in,
@@ -1334,6 +1348,7 @@ def _provider_from_values(values: _ProviderMapping, index: int) -> ProviderConfi
         "max_concurrency": values["max_concurrency"],
         "max_in_flight": values["max_in_flight"],
         "billing_mode": values["billing_mode"],
+        "user_agent": values["user_agent"],
         "quota_windows": values["quota_windows"],
         "price_per_1m_cached_in": values["price_per_1m_cached_in"],
         "cache_capability": values["cache_capability"],
