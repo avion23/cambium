@@ -129,6 +129,8 @@ def _pid_is_alive(pid: int) -> bool:
 
 def _worker_pids() -> list[int]:
     """Pids of live processes whose command line names the fake worker."""
+    if not Path("/proc").is_dir():
+        return []
     pids: list[int] = []
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():

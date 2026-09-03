@@ -69,6 +69,9 @@ CODING_AGENT = "\n".join(
         "- If a tool call fails, diagnose the error and retry with a corrected call.",
         "- When the task changes code, run the relevant tests via run_shell; only emit "
         "finish after the change is verified and the tests pass. If tests fail, iterate.",
+        "- Never run git commit, git merge, or git push yourself. Cambium verifies "
+        "your worktree and creates the single publication commit; a self-made commit "
+        "makes the result unverifiable and the task will be rejected.",
         "- Emit finish only when the task is complete and verified.",
         "- Delegate only a separable scoped subtask. Every delegate spec must declare "
         "context_mode and placement. Valid pairs are trunk+inherit, semantic+inherit, "

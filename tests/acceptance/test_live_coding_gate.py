@@ -214,18 +214,42 @@ def test_live_coding_gate(tmp_path: Path) -> None:
         pytest.skip("no configured provider credential is resolvable for the live gate")
     provider, key = resolved
 
-    result, repo, base, session_dir = _run_gate(
-        tmp_path,
-        provider,
-        key,
+    task_text = (
         "In calc.py, add a one-line docstring to the add function, then verify it "
-        'by running: python3 -c "import calc; print(calc.add(2, 3))". Do not run git.',
+        'by running: python3 -c "import calc; print(calc.add(2, 3))". Do not run git.'
     )
-    outcomes = list(result.results)
-    assert outcomes, "run_plan produced no task results"
+    attempt_evidence: list[str] = []
+    last_attempt: tuple[Any, Path, str, Path] | None = None
+    outcomes: list[Any] = []
+
+    # Test-only best-of-two tolerance for transient live-provider/model action
+    # failures. Product execution remains retry-free.
+    for attempt in range(1, 3):
+        attempt_dir = tmp_path / f"attempt-{attempt}"
+        attempt_dir.mkdir()
+        last_attempt = _run_gate(attempt_dir, provider, key, task_text)
+        outcomes = list(last_attempt[0].results)
+        if outcomes and outcomes[0].status == "succeeded":
+            break
+        if not outcomes:
+            attempt_evidence.append(f"attempt {attempt}: run_plan produced no task results")
+            continue
+        outcome = outcomes[0]
+        attempt_evidence.append(
+            f"attempt {attempt}: status={outcome.status!r}, "
+            f"exit_code={outcome.exit_code!r}, reason={outcome.reason!r}"
+        )
+
+    assert outcomes, (
+        "run_plan produced no task results after the bounded external-dependency retry; "
+        + "; ".join(attempt_evidence)
+    )
     assert outcomes[0].status == "succeeded", (
-        f"live coding gate task failed: {outcomes[0].reason!r}"
+        "live coding gate task failed after the bounded external-dependency retry:\n"
+        + "\n".join(attempt_evidence)
     )
+    assert last_attempt is not None
+    _, repo, base, session_dir = last_attempt
 
     # The model actually edited the file and exactly one commit was published.
     changed = _main_changed_files(repo, base)

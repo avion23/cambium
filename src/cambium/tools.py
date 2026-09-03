@@ -191,7 +191,10 @@ def _reject_active_session_read(
         and _assigned_worktree_file(resolved_path, worktree)
     )
     if in_session and not assigned_worktree:
-        raise _ToolFailure(f"{OWN_SESSION_READ_ERROR}: {resolved_path}")
+        # Report the path as submitted (symlinks intact). The resolved form
+        # would leak host-internal spellings (macOS /tmp -> /private/tmp)
+        # into tool output and downstream redacted artifacts.
+        raise _ToolFailure(f"{OWN_SESSION_READ_ERROR}: {requested_absolute}")
 
 
 def _read_text(path: Path) -> str:

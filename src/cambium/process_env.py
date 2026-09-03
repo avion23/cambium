@@ -11,8 +11,25 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 from collections.abc import Iterable, Mapping
 from pathlib import Path
+
+
+def _uv_bin_dir() -> list[str]:
+    """Directory of the ``uv`` executable the parent resolved, if any.
+
+    The strict child PATH deliberately never copies the host PATH, but
+    workers and doctor subprocesses invoke the same package manager the
+    operator uses. Homebrew installs (macOS) keep ``uv`` outside
+    ``os.defpath`` and the repo venv, so propagate only the resolved
+    tool's directory — not the surrounding environment.
+    """
+    uv = shutil.which("uv")
+    if uv is None:
+        return []
+    parent = str(Path(uv).resolve().parent)
+    return [parent]
 
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 
@@ -89,6 +106,7 @@ def build_subprocess_env(
                 os.defpath,
                 str(Path(__file__).resolve().parents[2] / ".venv" / "bin"),
                 str(Path.home() / ".local" / "bin"),
+                *_uv_bin_dir(),
             ]
         ),
         "PYTHONPATH": str(Path(__file__).resolve().parents[1]),

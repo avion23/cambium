@@ -35,6 +35,33 @@ def test_read_batch_refuses_own_active_session(tmp_path: Path, monkeypatch) -> N
     assert "private" not in result.output
 
 
+def test_own_session_rejection_reports_submitted_path_not_resolved(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The rejection names the path as submitted; symlinks stay intact.
+
+    macOS resolves /tmp to /private/tmp; leaking the resolved spelling into
+    tool output put host-internal paths into redacted artifacts.
+    """
+    real = tmp_path / "real-dir"
+    real.mkdir()
+    artifact = real / ".cambium" / "events.db"
+    artifact.parent.mkdir()
+    artifact.write_text("private", encoding="utf-8")
+    link = tmp_path / "link-dir"
+    link.symlink_to(real, target_is_directory=True)
+    monkeypatch.setenv("CAMBIUM_SESSION_ID", str(real))
+
+    result = _run("read_batch", {"paths": [str(link / ".cambium" / "events.db")]}, ToolContext(tmp_path))
+
+    assert not result.ok
+    assert "worker's own active session" in result.output
+    submitted = str(link / ".cambium" / "events.db")
+    resolved = str(artifact.resolve())
+    assert submitted in result.output
+    assert resolved not in result.output
+
+
 def test_read_batch_allows_an_earlier_session(tmp_path: Path, monkeypatch) -> None:
     sessions = tmp_path / ".cambium" / "sessions"
     current = sessions / "run-current"

@@ -20,6 +20,7 @@ and cascade-design contracts:
 from __future__ import annotations
 
 import asyncio
+import socket
 import threading
 import time
 import urllib.request
@@ -1502,6 +1503,15 @@ def test_non_http_provider_schemes_are_rejected_before_urllib(scheme: str, base_
 # --------------------------------------------------------------------------- #
 
 
+def _can_bind_host(host: str) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        try:
+            probe.bind((host, 0))
+        except OSError:
+            return False
+    return True
+
+
 def test_loopback_redirect_to_non_loopback_http_never_contacts_target() -> None:
     # A provider completion endpoint must never redirect: urllib replays the
     # original request headers — including Authorization — against the redirect
@@ -1509,7 +1519,11 @@ def test_loopback_redirect_to_non_loopback_http_never_contacts_target() -> None:
     # redirect must be rejected before any follow-up request is made.
     # 127.0.0.2 is reachable on the loopback interface but is NOT in the
     # transport allowlist (only localhost/127.0.0.1/::1), so it is a genuine
-    # non-loopback http origin for the redirect target.
+    # non-loopback http origin for the redirect target. Some hosts (macOS)
+    # refuse to bind addresses other than 127.0.0.1 on loopback; skip there
+    # rather than fake the geometry.
+    if not _can_bind_host("127.0.0.2"):
+        pytest.skip("host cannot bind an alternate loopback address")
     target = FakeServer([(200, _ok_payload("must never arrive"), 0.0)], host="127.0.0.2")
     redirector = FakeServer([(302, {}, 0.0, {"Location": f"{target.base_url}/chat/completions"})])
     router = Diffundo(
