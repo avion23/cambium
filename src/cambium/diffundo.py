@@ -122,7 +122,7 @@ from email.utils import parsedate_to_datetime
 from enum import Enum
 from typing import Any, cast
 from typing import Protocol as TypingProtocol
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 
 from . import __version__
 from .provider_config import CODEX_CHATGPT_PROFILE, AuthMode, Protocol, is_loopback_host
@@ -1980,6 +1980,11 @@ class _ProviderTransport(TypingProtocol):
         ...
 
 
+def _is_opencode_destination(base_url: str) -> bool:
+    hostname = urlsplit(base_url).hostname
+    return hostname is not None and "opencode" in hostname.casefold()
+
+
 class _ChatCompletionsTransport:
     """OpenAI-compatible chat-completions transport."""
 
@@ -2054,8 +2059,9 @@ class _ChatCompletionsTransport:
         headers = {
             "Content-Type": "application/json",
             "User-Agent": provider.user_agent or USER_AGENT,
-            "x-opencode-session": router._task_id,
         }
+        if _is_opencode_destination(provider.base_url):
+            headers["x-opencode-session"] = router._task_id
         if provider.auth is not AuthMode.NONE:
             headers["Authorization"] = f"Bearer {api_key}"
         request = urllib.request.Request(url, data=data, method="POST", headers=headers)
