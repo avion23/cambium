@@ -5,9 +5,9 @@ from h1), fenced ``` blocks (content verbatim with a dim-cyan tint), inline
 ``code`` (yellow), ``**bold**``, ``*italic*`` (dim), unordered/ordered lists,
 and ``>`` blockquotes. Paragraphs and blank lines pass through verbatim.
 
-Every C0/C1 control character except ``\\n`` and ``\\t`` is stripped before
-any processing so raw escape sequences decoded from model output can never reach
-the terminal.
+Untrusted text crosses the shared terminal sanitization boundary before any
+styling is added. Complete terminal control sequences are removed and explicit
+bidirectional-format controls remain visible as ``\\uXXXX`` escapes.
 """
 
 from __future__ import annotations
@@ -15,6 +15,8 @@ from __future__ import annotations
 import os
 import re
 from typing import TextIO
+
+from .terminal import sanitize_terminal_text
 
 _RESET = "\x1b[0m"
 _HEADING_STYLES = {
@@ -29,7 +31,6 @@ _BOLD_STYLE = "\x1b[1m"
 _ITALIC_STYLE = "\x1b[2m"
 _QUOTE_PREFIX_STYLE = "\x1b[2;3m"
 
-_C0_CONTROLS = re.compile(r"[\x00-\x08\x0b-\x0d\x0e-\x1f\x80-\x9f]")
 _HEADING = re.compile(r"^(#{1,4}) (.*)$")
 _FENCE_MARKER = re.compile(r"^```")
 _INLINE = re.compile(
@@ -37,10 +38,6 @@ _INLINE = re.compile(
     r"|\*\*(\S(?:[^*\n]*\S)?)\*\*"  # bold
     r"|\*(\S(?:[^*\n]*\S)?)\*"  # italic
 )
-
-
-def _strip_controls(text: str) -> str:
-    return _C0_CONTROLS.sub("", text)
 
 
 def _render_inline(text: str) -> str:
@@ -56,8 +53,8 @@ def _render_inline(text: str) -> str:
 
 
 def render_markdown(text: str) -> str:
-    """Render one markdown document to an ANSI-styled terminal string."""
-    clean = _strip_controls(text)
+    """Render one sanitized markdown document to an ANSI-styled string."""
+    clean = sanitize_terminal_text(text)
     out: list[str] = []
     in_fence = False
     for line in clean.split("\n"):
@@ -86,8 +83,8 @@ def render_markdown(text: str) -> str:
 
 
 def render_markdown_if_tty(text: str, stream: TextIO) -> str:
-    """Render ``text`` only for color-capable terminals; otherwise pass through."""
-    clean = _strip_controls(text)
+    """Style ``text`` only for color-capable terminals; always sanitize it."""
+    clean = sanitize_terminal_text(text)
     try:
         is_tty = bool(stream.isatty())
     except (AttributeError, OSError, ValueError):
