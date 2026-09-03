@@ -35,6 +35,7 @@ _STATE_PRIORITY = {
 }
 _CONTEXT_EVENT_KINDS = frozenset(
     {
+        "checkpoint",
         "context_checkpoint",
         "context_epoch_advanced",
         "context_resume",
@@ -311,9 +312,16 @@ def _message_bytes(messages: Sequence[Mapping[str, Any]]) -> int:
 
 def _checkpoint_path(session_dir: Path, checkpoint_ref: str) -> Path | None:
     relative = Path(checkpoint_ref)
-    if relative.is_absolute() or ".." in relative.parts:
-        return None
     session_root = session_dir.resolve()
+    if relative.is_absolute():
+        try:
+            candidate = relative.resolve()
+            candidate.relative_to(session_root)
+        except (OSError, RuntimeError, ValueError):
+            return None
+        return candidate if candidate.is_file() else None
+    if ".." in relative.parts:
+        return None
     state_root = (session_root / ".cambium").resolve()
     try:
         state_root.relative_to(session_root)
@@ -367,8 +375,13 @@ def _read_checkpoint_context(
         return None
     if not isinstance(document, Mapping):
         return None
-    provider_messages = document.get("provider_messages")
-    continuation = document.get("continuation_suffix")
+    transcript = document.get("transcript")
+    if isinstance(transcript, list):
+        provider_messages = transcript
+        continuation = []
+    else:
+        provider_messages = document.get("provider_messages")
+        continuation = document.get("continuation_suffix")
     if not isinstance(provider_messages, list) or not isinstance(continuation, list):
         return None
     messages = [item for item in provider_messages if isinstance(item, Mapping)]
@@ -570,6 +583,8 @@ class ObservabilityState:
 
             if kind in _CONTEXT_EVENT_KINDS:
                 checkpoint_ref = _string(payload.get("checkpoint_ref"))
+                if checkpoint_ref is None:
+                    checkpoint_ref = _string(payload.get("state_ref"))
                 if checkpoint_ref is not None:
                     agent.checkpoint_ref = checkpoint_ref
                 cache_key = payload.get("cache_key")
@@ -604,6 +619,22 @@ class ObservabilityState:
     def extend(self, events: Sequence[Mapping[str, Any]]) -> None:
         for event in events:
             self.apply(event)
+
+    def seed_context(self, context: ContextSnapshot) -> None:
+        """Carry the last durable context into a new live-turn fold."""
+        task_id = _string(context.task_id)
+        if task_id is None:
+            return
+        agent = self._ensure_agent(task_id)
+        if context.checkpoint_ref is not None:
+            agent.checkpoint_ref = context.checkpoint_ref
+        agent.epoch = max(agent.epoch, context.epoch)
+        agent.exact_prompt_tokens = context.exact_prompt_tokens
+        agent.active_context_bytes = context.active_context_bytes
+        agent.active_context_messages = context.active_context_messages
+        agent.summary_trunk_bytes = context.summary_trunk_bytes
+        agent.summary_segments = context.summary_segments
+        agent.raw_tail_bytes = context.raw_tail_bytes
 
     def _root_task_id(self) -> str | None:
         for task_id in self._order:

@@ -894,6 +894,53 @@ def _default_branch(session_dir: Path) -> str:
     return f"cambium-oneshot-{suffix}"
 
 
+def _oneshot_branch_for_cleanup(
+    config: OneShotConfig, plan: dict[str, Any], session_dir: Path
+) -> str | None:
+    """Return the generated branch owned by this one-shot, if any."""
+    if config.branch is not None:
+        return None
+    tasks = plan.get("tasks")
+    if not isinstance(tasks, list) or len(tasks) != 1:
+        return None
+    task = tasks[0]
+    if not isinstance(task, dict):
+        return None
+    branch = task.get("branch")
+    if branch != _default_branch(session_dir):
+        return None
+    return branch
+
+
+def _delete_oneshot_branch(repo: Path, branch: str) -> None:
+    """Delete one generated branch, treating an absent branch as success."""
+    present = _git(repo, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}")
+    if present.returncode == 1:
+        return
+    if present.returncode != 0:
+        detail = (present.stderr + present.stdout).strip()[:512]
+        raise RuntimeError(f"branch lookup failed: {detail or f'git exit {present.returncode}'}")
+    deleted = _git(repo, "branch", "-D", "--", branch)
+    if deleted.returncode != 0:
+        detail = (deleted.stderr + deleted.stdout).strip()[:512]
+        raise RuntimeError(f"branch deletion failed: {detail or f'git exit {deleted.returncode}'}")
+
+
+def _delete_routing_state_lock(lock_path: Path) -> None:
+    """Remove the transient lock next to the durable routing-state file."""
+    with suppress(FileNotFoundError):
+        lock_path.unlink()
+
+
+def _warn_oneshot_cleanup(target: str, error: Exception) -> None:
+    """Report cleanup trouble without changing the successful run verdict."""
+    detail = str(error).strip().replace("\n", " ")[:512]
+    print(
+        f"cambium: WARN: could not clean up {target}{f': {detail}' if detail else ''}",
+        file=sys.stderr,
+    )
+
+
 def build_plan(
     config: OneShotConfig,
     repo: Path | None = None,
@@ -1014,6 +1061,7 @@ async def run_oneshot(config: OneShotConfig, on_event: EventSink | None = None) 
     )
     preflight(resolved, repo, session_dir)
     plan = build_plan(resolved, repo, session_dir)
+    oneshot_branch = _oneshot_branch_for_cleanup(resolved, plan, session_dir)
     initial_branch = _git_stdout(repo, "symbolic-ref", "--quiet", "--short", "HEAD")
     initial_head = _git_stdout(repo, "rev-parse", "--verify", "HEAD^{commit}")
     initially_pristine = _primary_checkout_is_pristine(repo)
@@ -1024,6 +1072,9 @@ async def run_oneshot(config: OneShotConfig, on_event: EventSink | None = None) 
         resolved.routing_state_path
         if resolved.routing_state_path is not None
         else repo / ".cambium" / "routing-state.json"
+    )
+    routing_state_lock_path = Path(routing_state_path).with_name(
+        f".{Path(routing_state_path).name}.lock"
     )
     reject_reused = resolved.session_mode is SessionMode.NEW
     if provider_environment:
@@ -1045,6 +1096,16 @@ async def run_oneshot(config: OneShotConfig, on_event: EventSink | None = None) 
             reject_reused_session=reject_reused,
             context_reuse=resolved.context_reuse,
         )
+    if result.exit_code == 0 and oneshot_branch is not None:
+        try:
+            _delete_oneshot_branch(repo, oneshot_branch)
+        except Exception as exc:  # noqa: BLE001 - cleanup must not fail publication
+            _warn_oneshot_cleanup(f"one-shot branch {oneshot_branch!r}", exc)
+    if result.exit_code == 0:
+        try:
+            _delete_routing_state_lock(routing_state_lock_path)
+        except Exception as exc:  # noqa: BLE001 - cleanup must not fail publication
+            _warn_oneshot_cleanup(f"routing-state lock {routing_state_lock_path!s}", exc)
     _refresh_primary_checkout(
         repo,
         initial_branch,

@@ -1033,6 +1033,7 @@ async def _run_interactive(
                 dispatch = turns[0] if len(turns) == 1 else turns
                 turn = turns[0]
                 state = ObservabilityState(recent_limit=16)
+                state.seed_context(last_snapshot.context)
                 sequence = 0
                 task_ids = [
                     getattr(getattr(item, "config", None), "task_id", None)

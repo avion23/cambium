@@ -51,6 +51,160 @@ def test_default_sessions_get_distinct_branches(monkeypatch, tmp_path: Path) -> 
     assert runs[0][1] != runs[1][1]
 
 
+def test_successful_run_deletes_its_generated_branch(monkeypatch, tmp_path: Path) -> None:
+    repo = _repo(tmp_path / "repo")
+    session_dir = tmp_path / "session"
+
+    async def fake_run_plan(session_dir, plan, on_event=None, **kwargs):
+        del session_dir, on_event, kwargs
+        branch = plan["tasks"][0]["branch"]
+        subprocess.run(
+            ["git", "-C", str(repo), "branch", branch, "main"],
+            check=True,
+            capture_output=True,
+        )
+        state_dir = repo / ".cambium"
+        state_dir.mkdir()
+        (state_dir / "routing-state.json").write_text(
+            '{"version": 1, "providers": {}}\n', encoding="utf-8"
+        )
+        (state_dir / ".routing-state.json.lock").write_text("", encoding="ascii")
+        return PlanResult((TaskResult(task_id="oneshot", status="succeeded", exit_code=0),))
+
+    monkeypatch.setattr(oneshot.supervisor, "run_plan", fake_run_plan)
+    result = asyncio.run(
+        oneshot.run_oneshot(
+            oneshot.OneShotConfig(
+                prompt="append marker",
+                repo=repo,
+                session_root=session_dir,
+                target_file="file.txt",
+                marker="// marker",
+            )
+        )
+    )
+
+    assert result.exit_code == 0
+    branches = subprocess.run(
+        ["git", "-C", str(repo), "branch", "--list", "cambium-oneshot-*"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    assert branches == []
+    status = subprocess.run(
+        ["git", "-C", str(repo), "status", "--short", "--untracked-files=all"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    assert status == ["?? .cambium/routing-state.json"]
+    assert (
+        subprocess.run(
+            ["git", "-C", str(repo), "branch", "--list", "main"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == "* main"
+    )
+
+
+def test_successful_run_preserves_another_user_branch(monkeypatch, tmp_path: Path) -> None:
+    repo = _repo(tmp_path / "repo")
+    user_branch = "cambium-oneshot-user-branch"
+    subprocess.run(
+        ["git", "-C", str(repo), "branch", user_branch, "main"],
+        check=True,
+        capture_output=True,
+    )
+
+    async def fake_run_plan(session_dir, plan, on_event=None, **kwargs):
+        del session_dir, on_event, kwargs
+        branch = plan["tasks"][0]["branch"]
+        subprocess.run(
+            ["git", "-C", str(repo), "branch", branch, "main"],
+            check=True,
+            capture_output=True,
+        )
+        return PlanResult((TaskResult(task_id="oneshot", status="succeeded", exit_code=0),))
+
+    monkeypatch.setattr(oneshot.supervisor, "run_plan", fake_run_plan)
+    asyncio.run(
+        oneshot.run_oneshot(
+            oneshot.OneShotConfig(
+                prompt="append marker",
+                repo=repo,
+                session_root=tmp_path / "session",
+                target_file="file.txt",
+                marker="// marker",
+            )
+        )
+    )
+
+    assert (
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "show-ref",
+                "--verify",
+                "--quiet",
+                f"refs/heads/{user_branch}",
+            ],
+            check=False,
+        ).returncode
+        == 0
+    )
+    generated = subprocess.run(
+        ["git", "-C", str(repo), "branch", "--list", "cambium-oneshot-*"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    assert generated == [f"  {user_branch}"]
+
+
+def test_branch_cleanup_failure_warns_without_failing_run(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    repo = _repo(tmp_path / "repo")
+
+    async def fake_run_plan(session_dir, plan, on_event=None, **kwargs):
+        del session_dir, on_event, kwargs
+        branch = plan["tasks"][0]["branch"]
+        subprocess.run(
+            ["git", "-C", str(repo), "branch", branch, "main"],
+            check=True,
+            capture_output=True,
+        )
+        return PlanResult((TaskResult(task_id="oneshot", status="succeeded", exit_code=0),))
+
+    def fail_delete(repo, branch):
+        raise RuntimeError(f"forced deletion failure for {branch} in {repo}")
+
+    monkeypatch.setattr(oneshot.supervisor, "run_plan", fake_run_plan)
+    monkeypatch.setattr(oneshot, "_delete_oneshot_branch", fail_delete)
+    result = asyncio.run(
+        oneshot.run_oneshot(
+            oneshot.OneShotConfig(
+                prompt="append marker",
+                repo=repo,
+                session_root=tmp_path / "session",
+                target_file="file.txt",
+                marker="// marker",
+            )
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert result.exit_code == 0
+    assert result.results[0].status == "succeeded"
+    assert "cambium: WARN: could not clean up one-shot branch" in captured.err
+    assert result.results[0].reason is None
+
+
 def test_default_branch_is_stable_and_explicit_branch_is_preserved(tmp_path: Path) -> None:
     repo = _repo(tmp_path / "repo")
     session_dir = tmp_path / "session-provider-secret"

@@ -58,6 +58,14 @@ _MD_CODE = "\x1b[33m"
 _MD_BOLD = "\x1b[1m"
 _MD_ITALIC = "\x1b[3m"
 _MD_RULE = "\x1b[2;36m"
+_STATUS_PALETTE = {
+    "cyan": _CYAN,
+    "dim": _DIM,
+    "green": _GREEN,
+    "yellow": _YELLOW,
+    "red": _RED,
+    "bold": _MD_BOLD,
+}
 _CONTROLLED_ANSI = frozenset(
     {
         _RESET,
@@ -184,6 +192,21 @@ _ACTIVITY_PHASE_RE = re.compile(
     r"^[◌▸…]\s+(thinking|streaming|waiting)\s+(\d+(?:\.\d+)?)s(?:\s+·\s*(.*))?$",
     re.IGNORECASE,
 )
+_STATUS_PHASE_RE = re.compile(r"^(\S+)(\s+)([a-z][a-z-]*)(.*)$", re.IGNORECASE)
+_STATUS_PHASE_STYLES = {
+    "idle": "dim",
+    "thinking": "green",
+    "streaming": "green",
+    "responding": "green",
+    "running": "green",
+    "done": "green",
+    "failed": "red",
+    "error": "red",
+    "queued": "yellow",
+    "waiting": "yellow",
+    "cooldown": "yellow",
+    "suspended": "yellow",
+}
 _FIRST_TOKEN_KINDS = frozenset(
     {
         "assistant_first_token",
@@ -418,6 +441,11 @@ def _color_enabled(stream: Any) -> bool:
 def _paint(text: str, color: str, enabled: bool) -> str:
     clean = _safe_rendered(text)
     return f"{color}{clean}{_RESET}" if enabled else clean
+
+
+def _status_paint(text: str, style: str, enabled: bool) -> str:
+    """Apply one status palette entry, gated by the caller's color capability."""
+    return _paint(text, _STATUS_PALETTE[style], enabled)
 
 
 def _event_data(record: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -3720,6 +3748,7 @@ def _primary_status_line(
     previous: Mapping[str, str] | None = None,
     transcript: Transcript | None = None,
     activity_line: str = "",
+    color: bool = False,
 ) -> str:
     """Build the one-line status strip used by both cockpit renderers."""
     fields = _status_fields(
@@ -3730,19 +3759,19 @@ def _primary_status_line(
     )
     del previous
     width = max(8, width)
-    parts = [_activity_status(snapshot, activity_line)]
+    parts = [_status_activity(_activity_status(snapshot, activity_line), color)]
     provider = fields.get("provider")
     model = fields.get("model")
     if provider or model:
         provider = _side_clean(provider or "?").strip()
         model = _short_model(model or "?")
-        parts.append(f"{provider}/{model}")
+        parts.append(_status_paint(f"{provider}/{model}", "cyan", color))
     if turn := fields.get("turn"):
         parts.append(f"t{_side_clean(turn)}")
     tokens = _human_count(
         _usage_int(fields.get("tokens"), _usage_int(getattr(snapshot, "total_tokens", 0)))
     )
-    parts.append(f"{tokens} tok")
+    parts.append(_status_paint(f"{tokens} tok", "dim", color))
     if transcript is not None and transcript.current_tool_error_count > 0:
         parts.append(f"err{transcript.current_tool_error_count}")
     return _clip(" · ".join(parts), width)
@@ -3771,6 +3800,8 @@ def _activity_status(snapshot: Any, activity_line: str) -> str:
         return f"{spinner} suspended"
     if "COOLDOWN" in upper:
         verb = "cooldown"
+    elif "QUEUED" in upper:
+        verb = "queued"
     elif "STREAMING" in upper or "RESPONDING" in upper:
         verb = "responding"
     elif "IDLE" in upper:
@@ -3802,6 +3833,21 @@ def _activity_status(snapshot: Any, activity_line: str) -> str:
         f" {_format_duration(_usage_float(duration) * 1000)}" if duration is not None else ""
     )
     return f"{spinner} {verb}{duration_text}"
+
+
+def _status_activity(activity_line: str, color: bool) -> str:
+    clean = _safe_rendered(activity_line)
+    match = _STATUS_PHASE_RE.match(clean)
+    if match is None:
+        return clean
+    phase = match.group(3).casefold()
+    style = _STATUS_PHASE_STYLES.get(phase)
+    if style is None:
+        return clean
+    return (
+        f"{match.group(1)}{match.group(2)}"
+        f"{_status_paint(match.group(3), style, color)}{match.group(4)}"
+    )
 
 
 def _short_model(value: Any) -> str:
@@ -3842,7 +3888,13 @@ def _tool_activity_row(transcript: Transcript, activity_line: str, width: int) -
     return _status_row(parts, width)
 
 
-def _detail_status_line(snapshot: Any, cumulative_line: str, width: int) -> str:
+def _detail_status_line(
+    snapshot: Any,
+    cumulative_line: str,
+    width: int,
+    *,
+    color: bool = False,
+) -> str:
     """Render the one-line ambient agent, usage, and context summary."""
 
     lane = _current_lane(snapshot)
@@ -3887,16 +3939,41 @@ def _detail_status_line(snapshot: Any, cumulative_line: str, width: int) -> str:
     cache_rate = _cache_rate(cached_tokens, input_tokens)
     cache = f"{cache_rate:.0%}" if cache_rate is not None else "n/a"
 
-    agents = (
-        f"agents active={_usage_int(getattr(snapshot, 'active_agents', 0))} "
-        f"queued={_usage_int(getattr(snapshot, 'queued_agents', 0))} "
-        f"ok={_usage_int(getattr(snapshot, 'succeeded_agents', 0))} "
-        f"failed={_usage_int(getattr(snapshot, 'failed_agents', 0))}"
+    agents = " ".join(
+        (
+            "agents",
+            _status_paint(
+                f"active={_usage_int(getattr(snapshot, 'active_agents', 0))}",
+                "bold",
+                color,
+            ),
+            _status_paint(
+                f"queued={_usage_int(getattr(snapshot, 'queued_agents', 0))}",
+                "yellow",
+                color,
+            ),
+            _status_paint(
+                f"ok={_usage_int(getattr(snapshot, 'succeeded_agents', 0))}",
+                "green",
+                color,
+            ),
+            _status_paint(
+                f"failed={_usage_int(getattr(snapshot, 'failed_agents', 0))}",
+                "red",
+                color,
+            ),
+        )
     )
+    cache_style = "green" if cache_rate is not None and cache_rate >= 0.5 else "yellow"
+    cache_text = _status_paint(cache, cache_style, color) if cache_rate is not None else cache
     usage = (
-        f"usage in={_human_count(input_tokens)} out={_human_count(output_tokens)} "
-        f"cached={_human_count(cached_tokens)} ({cache}) "
-        f"total={_human_count(total_tokens)} calls={calls} summaries={summaries} "
+        "usage "
+        f"{_status_paint(f'in={_human_count(input_tokens)}', 'dim', color)} "
+        f"{_status_paint(f'out={_human_count(output_tokens)}', 'dim', color)} "
+        f"{_status_paint(f'cached={_human_count(cached_tokens)}', 'dim', color)} "
+        f"({cache_text}) "
+        f"{_status_paint(f'total={_human_count(total_tokens)}', 'dim', color)} "
+        f"calls={calls} summaries={summaries} "
         f"out/s={rate:.1f} cost={cost}"
     )
     line = f"{agents} · {usage}"
@@ -3909,6 +3986,7 @@ def _detail_status_line(snapshot: Any, cumulative_line: str, width: int) -> str:
             f"trunk{trunk_prefix}{_human_count(getattr(context, 'estimated_trunk_tokens', 0))}tok "
             f"segments={_usage_int(getattr(context, 'summary_segments', 0))}"
         )
+        context_line = _status_paint(context_line, "dim", color)
         candidate = f"{line} · {context_line}"
         if _display_width(candidate) <= max(1, width):
             line = candidate
@@ -3941,6 +4019,7 @@ def _status_rows(
     activity_line: str = "",
     show_detail: bool = True,
     include_live: bool = False,
+    color: bool = False,
 ) -> list[str]:
     """Render the rolling tool row, fixed live window, and status rows."""
     width = max(1, width)
@@ -3958,13 +4037,14 @@ def _status_rows(
                     width=width,
                     transcript=transcript,
                     activity_line=activity_line if not include_live else "",
+                    color=color,
                 )
             ],
             width,
         ),
     )
     if show_detail:
-        rows.append(_detail_status_line(snapshot, cumulative_line, width))
+        rows.append(_detail_status_line(snapshot, cumulative_line, width, color=color))
     return rows
 
 
@@ -4022,6 +4102,7 @@ def _cockpit_frame_lines(
         activity_line=activity_line,
         show_detail=show_detail,
         include_live=True,
+        color=color,
     )
     conversation_capacity = max(1, height - _frame_overhead(show_detail))
     status = _sanitize(getattr(snapshot, "session_status", "idle"))
@@ -4160,6 +4241,7 @@ def render_primary(
         activity_line=activity_line,
         show_detail=show_detail,
         include_live=True,
+        color=color,
     )
     # Keep the legacy stream renderer's tool/status suffix intact; the two
     # live rows still stay in the same bottom block, ahead of that suffix.
@@ -4591,6 +4673,7 @@ class Cockpit:
                 activity_line=activity_line,
                 show_detail=self._show_detail,
                 include_live=True,
+                color=self.color,
             )
         )
         self._fixed_frame = True
@@ -4724,6 +4807,7 @@ class Cockpit:
                 activity_line=activity_line,
                 show_detail=self._show_detail,
                 include_live=True,
+                color=self.color,
             )
         )
         self._redraw_live_status(request, status_rows)
@@ -4864,6 +4948,7 @@ class Cockpit:
                 activity_line=activity_line,
                 show_detail=self._show_detail,
                 include_live=True,
+                color=self.color,
             )
         )
         if self._fixed_frame and (
@@ -5004,6 +5089,7 @@ class Cockpit:
             activity_line=request[-1],
             show_detail=self._show_detail,
             include_live=True,
+            color=self.color,
         )
         status_line = status_rows[3]
         detail_line = status_rows[4] if self._show_detail else ""
@@ -5152,6 +5238,7 @@ class Cockpit:
                 activity_line=self._activity_line,
                 show_detail=self._show_detail,
                 include_live=True,
+                color=self.color,
             )
         )
         self._redraw_live_status(request, status_rows)

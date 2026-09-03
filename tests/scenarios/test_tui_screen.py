@@ -558,6 +558,75 @@ def test_detail_row_reports_traffic_and_context() -> None:
     assert "context epoch=4 trunk≈9ktok segments=3" in detail
 
 
+def test_status_palette_is_gated_without_changing_visible_text() -> None:
+    snapshot = _traffic_snapshot()
+    snapshot.active_agents = 0
+    snapshot.queued_agents = 1
+    snapshot.succeeded_agents = 0
+    snapshot.failed_agents = 0
+    snapshot.input_tokens = 749_000
+    snapshot.output_tokens = 44_700
+    snapshot.cached_tokens = 677_600
+    snapshot.total_tokens = 793_600
+    snapshot.calls = 9
+    snapshot.summary_calls = 2
+    snapshot.estimated_cost_usd = 0.123456
+    arguments: dict[str, Any] = dict(
+        session_description="session",
+        branch_line="branch: turn=4",
+        cumulative_line=(
+            "usage: calls=9 summaries=2 tokens=793600 "
+            "(in=749000 out=44700 cached=677600) out/s=12.5 cost=$0.123456"
+        ),
+        width=220,
+        activity_line="⠋ idle",
+    )
+
+    colored = render_primary(snapshot, Transcript(), color=True, **arguments)
+    plain = render_primary(snapshot, Transcript(), color=False, **arguments)
+
+    assert "\x1b[" in colored[-2] + colored[-1]
+    assert "\x1b[" not in plain[-2] + plain[-1]
+    assert _visible(colored[-2:][0]) == plain[-2]
+    assert _visible(colored[-2:][1]) == plain[-1]
+    assert f"{tui_screen._DIM}idle{tui_screen._RESET}" in colored[-2]
+    assert f"{tui_screen._CYAN}codex/gpt-5.6{tui_screen._RESET}" in colored[-2]
+    assert f"{tui_screen._DIM}793.6k tok{tui_screen._RESET}" in colored[-2]
+    assert f"{tui_screen._MD_BOLD}active=0{tui_screen._RESET}" in colored[-1]
+    assert f"{tui_screen._YELLOW}queued=1{tui_screen._RESET}" in colored[-1]
+    assert f"{tui_screen._GREEN}ok=0{tui_screen._RESET}" in colored[-1]
+    assert f"{tui_screen._RED}failed=0{tui_screen._RESET}" in colored[-1]
+    assert f"{tui_screen._GREEN}90%{tui_screen._RESET}" in colored[-1]
+    context_style = f"{tui_screen._DIM}context epoch=4 trunk≈9ktok segments=3{tui_screen._RESET}"
+    assert context_style in colored[-1]
+
+
+@pytest.mark.parametrize(
+    ("activity_line", "phase", "style"),
+    [
+        ("⠋ idle", "idle", "_DIM"),
+        ("▸ streaming 1s", "streaming", "_GREEN"),
+        ("⠋ queued", "queued", "_YELLOW"),
+        ("✗ ERROR", "error", "_RED"),
+    ],
+)
+def test_status_phase_palette_follows_activity_state(
+    activity_line: str, phase: str, style: str
+) -> None:
+    rendered = _status_rows(
+        _snapshot(),
+        Transcript(),
+        session_description="session",
+        branch_line="branch: turn=2",
+        cumulative_line="usage: calls=0 tokens=12345",
+        width=120,
+        color=True,
+        activity_line=activity_line,
+    )[1]
+
+    assert f"{getattr(tui_screen, style)}{phase}{tui_screen._RESET}" in rendered
+
+
 def test_detail_command_hides_row_on_next_frame(monkeypatch) -> None:
     monkeypatch.setattr(
         tui_screen.shutil,
@@ -1077,7 +1146,7 @@ def test_cockpit_replaces_failed_to_idle_status_in_place() -> None:
         cockpit.flush()
 
     assert len(cockpit._last_status_rows) == 5
-    assert cockpit._last_status_rows[-2].startswith(" ⠋ idle")
+    assert _visible(cockpit._last_status_rows[-2]).startswith(" ⠋ idle")
     assert stream.getvalue().count("┌ Cambium · conversation") == 1
 
 
@@ -1231,6 +1300,43 @@ def test_cockpit_updates_fixed_status_pane_in_place() -> None:
     assert "last run_shell 1s" in delta
     assert "last run_shell 2s" in second_delta
     assert "┌ Cambium · conversation" not in delta
+
+
+def test_status_counter_updates_repaint_in_place_without_stale_width(monkeypatch) -> None:
+    monkeypatch.setattr(
+        tui_screen.shutil,
+        "get_terminal_size",
+        lambda _fallback: os.terminal_size((110, 24)),
+    )
+    stream = _Tty()
+    snapshot = _traffic_snapshot()
+    snapshot.queued_agents = 123456
+    cockpit = Cockpit(stream)
+
+    with cockpit:
+        cockpit.draw(
+            snapshot,
+            Transcript(),
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=9",
+        )
+        first = stream.getvalue()
+        snapshot.queued_agents = 1
+        cockpit.draw(
+            snapshot,
+            Transcript(),
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=9",
+        )
+
+    delta = stream.getvalue()[len(first) :]
+    assert "queued=1" in delta
+    assert "queued=123456" not in delta
+    assert tui_screen._CLEAR_LINE in delta
+    assert "┌ Cambium · conversation" not in delta
+    assert cockpit._last_rendered_width == 110
 
 
 def test_live_window_updates_two_fixed_rows_without_reflow() -> None:
