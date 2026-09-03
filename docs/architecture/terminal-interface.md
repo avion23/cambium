@@ -99,21 +99,28 @@ lineage, usage, quota, and recent events. The compact rail is deliberately an
 overview; detailed inspection remains available through `/agents`, `/events`,
 and the full layout.
 
+The standalone monitor uses the same event projection but a separate full-frame
+renderer. Its boxes and fixed columns are measured in terminal cells, so wide
+CJK characters and combining marks do not shift borders or neighbouring fields.
+It enters alternate-screen mode only on a TTY whose `TERM` is not `dumb`.
+
 ## TUI best-practice checklist
 
 | Practice | Cambium status | Contract |
 | --- | --- | --- |
-| Preserve normal terminal scrollback | Applied | Primary buffer, not alternate-screen ownership |
+| Preserve normal terminal scrollback | Applied | Primary buffer, not alternate-screen ownership, in the interactive cockpit |
 | Keep input location predictable | Applied | Stable input row after event updates and resize |
 | Use deterministic layout breakpoints | Applied | Three width bands; no content-dependent geometry |
 | Degrade conversation-first | Applied | Rail shrinks, then disappears |
+| Measure terminal cells, not code points | Applied | Cockpit and monitor clip/pad wide and combining Unicode by display width |
+| Separate color preference from cursor capability | Applied | `NO_COLOR` suppresses styling; standalone screen mode depends on TTY/`TERM` capability |
 | Do not encode state by color alone | Applied | Text and glyphs duplicate semantic color |
-| Sanitize untrusted terminal text | Applied | Control characters and dynamic fields are bounded |
+| Sanitize untrusted terminal text | Applied | One shared boundary removes complete CSI/OSC sequences, exposes bidi-format controls, and normalizes Unicode line separators |
 | Bound every dynamic region | Applied | Rail, activity, recent events, and transcript rows |
 | Make resize atomic | Applied | Full-frame repaint rather than incremental geometry edits |
 | Drive UI from durable state | Applied | Event reducer and replay, not widget-local authority |
 | Support reconnect | Applied | Persistent interactive manifest and turn stores |
-| Provide non-TTY fallback | Applied | Deterministic line/JSON output without ANSI controls |
+| Provide non-TTY and no-color output | Applied | Deterministic line/JSON output; styling is optional |
 | Make cancellation observable | Applied | Active-turn cancel acknowledgement and return to input |
 | Make subagents inspectable | Applied, compact view limited | Full rail and `/agents`; glyph rail is overview only |
 | Avoid layout jitter | Applied | Fixed section ordering and integer duration formatting |
@@ -191,8 +198,11 @@ summary-trunk bytes/estimated tokens, segment count, raw-tail size, message
 count, checkpoint, epoch, and collapsed tool-error count. Byte-derived token
 estimates are marked approximate.
 
-Colors aid scanning but are redundant. `NO_COLOR`, dumb terminals, non-TTY
-output, and JSON output remain free of ANSI styling.
+Colors aid scanning but are redundant. `NO_COLOR` disables styling without
+disabling interactive cursor handling. Non-TTY and JSON output remain free of
+ANSI controls. The standalone monitor treats `TERM=dumb` as lacking screen
+capabilities and uses line-oriented frames rather than alternate-screen control
+sequences.
 
 ## Persistence and crash behavior
 
@@ -224,13 +234,21 @@ monitor never mutates or cancels the runtime.
 - Previous checkpoint files are immutable.
 - Replaying the same event sequence yields the same operator view.
 - Cached tokens remain a subset of input and are not added twice.
-- Terminal control characters from model output are sanitized.
+- Terminal control sequences from model/provider output are removed as complete
+  sequences at one shared boundary.
+- Bidirectional-format controls remain visible as escaped text rather than
+  reordering neighbouring paths, diagnostics, or source snippets.
+- Framed rows have deterministic terminal-cell widths.
 - Non-TTY behavior remains deterministic and line-oriented.
 
 ## Source and executable proof
 
+- Shared sanitation, cursor capability, cell width, clipping, and padding:
+  `src/cambium/terminal.py`
 - Frame construction and breakpoints: `_cockpit_frame_lines`, `_rail_width`,
   `_rail_rows`, and `_side_sections` in `src/cambium/tui_screen.py`
+- Standalone cell-aware frame and alternate-screen gate:
+  `render_dashboard` and `AnsiDashboard` in `src/cambium/monitor.py`
 - Heartbeat phase state and emission: `AgentProgress` and `_heartbeat_loop` in
   `src/cambium/worker.py`
 - Activity heartbeat and ticker rendering: `ActivityState._observe_heartbeat`,
@@ -241,5 +259,7 @@ monitor never mutates or cancels the runtime.
 - Interactive manifest ownership: `src/cambium/interactive.py`
 - Width proof: `test_side_sections_are_width_safe` in
   `tests/scenarios/test_tui_screen.py`
+- Shared terminal/monitor capability proof:
+  `tests/scenarios/test_terminal_presentation.py`
 - Resize, scrollback, paste, cancellation, shutdown, and reconnect proofs:
   named `test_*` functions in `tests/scenarios/test_tui_*.py`
