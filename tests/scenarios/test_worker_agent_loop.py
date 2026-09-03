@@ -2202,8 +2202,19 @@ def test_tool_progress_callback_delivers_pending_tail_before_completion() -> Non
 
 
 def test_run_shell_delivery_survives_backpressure_and_reports_final_tail(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Keep the process output callbacks inside the worker's throttle window
+    # without changing the event loop clock used by asyncio.
+    monkeypatch.setattr(
+        worker,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: 1_000.0,
+            monotonic_ns=lambda: 1_000_000_000_000,
+            time=time.time,
+        ),
+    )
     repo = tmp_path / "repo"
     worktree = _make_worktree(repo)
     config = _agent_config(worktree)

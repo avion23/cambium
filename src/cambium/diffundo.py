@@ -3124,6 +3124,7 @@ class Diffundo:
         headers = {
             "Content-Type": "application/json",
             "User-Agent": USER_AGENT,
+            "x-opencode-session": self._task_id,
         }
         if provider.auth is not AuthMode.NONE:
             headers["Authorization"] = f"Bearer {api_key}"

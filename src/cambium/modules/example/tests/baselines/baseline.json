@@ -51,7 +51,7 @@
     "canaries": 10
   },
   "tests": {
-    "count": 53,
+    "count": 52,
     "wall_seconds": {
       "p50": 0.000519,
       "p90": 0.004243,
@@ -59,7 +59,6 @@
     },
     "by_nodeid": {
       "src/cambium/modules/example/tests/test_dataset_splits.py::test_all_260_records_score_perfectly": 0.011795,
-      "src/cambium/modules/example/tests/test_dataset_splits.py::test_bench_falls_back_after_load_rejects_split_version_drift": 0.133647,
       "src/cambium/modules/example/tests/test_dataset_splits.py::test_canaries_excluded_from_train_and_eval": 0.003869,
       "src/cambium/modules/example/tests/test_dataset_splits.py::test_canary_flag_filtered_from_train_file": 0.000504,
       "src/cambium/modules/example/tests/test_dataset_splits.py::test_cross_split_collision_rejected": 0.000785,

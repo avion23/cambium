@@ -2,7 +2,7 @@
 
 from .summary_trunk import SUMMARY_FINDING_PRESERVATION_CONTRACT
 
-PROMPTS_VERSION = 3
+PROMPTS_VERSION = 4
 
 SUMMARY_PROTOCOL_LINES = (
     "Two output modes exist; the final user control block selects the mode.",
@@ -48,7 +48,6 @@ CODING_AGENT = "\n".join(
         "spill files; stay focused on the assigned task.",
         "Format final answers in Markdown (short headings, bullets, tables where useful); "
         "the operator TUI renders Markdown.",
-        SEMANTIC_SUMMARIZER,
         "In normal mode, return exactly one JSON object; it must be one action:",
         '  plan:      {"type": "plan", "steps": ["...", "..."]}',
         '  tool_call: {"type": "tool_call", "calls": [{"name": <tool name>, '
@@ -83,6 +82,7 @@ CODING_AGENT = "\n".join(
         '"arguments": {"paths": ["src/a.py", "src/b.py"]}}]}',
         '  {"type": "finish", "summary": "implemented and verified the change", '
         '"objective_met": true}',
+        SEMANTIC_SUMMARIZER,
         "Available tools:",
     )
 )

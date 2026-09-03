@@ -46,7 +46,7 @@
     "canaries": 6
   },
   "tests": {
-    "count": 59,
+    "count": 58,
     "wall_seconds": {
       "p50": 0.000959,
       "p90": 0.005426,
@@ -79,7 +79,6 @@
       "src/cambium/modules/should_review/tests/test_review_cli.py::test_cli_returns_json_error_for_invalid_input_document[{\"task\": \"one\"} {\"task\": \"two\"}]": 0.000198,
       "src/cambium/modules/should_review/tests/test_review_cli.py::test_cli_returns_one_wire_object_and_no_diagnostics_on_success": 0.001124,
       "src/cambium/modules/should_review/tests/test_review_dataset_splits.py::test_baseline_anchors_metadata_and_content": 0.005047,
-      "src/cambium/modules/should_review/tests/test_review_dataset_splits.py::test_bench_falls_back_after_load_rejects_split_version_drift": 0.376637,
       "src/cambium/modules/should_review/tests/test_review_dataset_splits.py::test_canaries_excluded_from_train_and_eval": 0.002341,
       "src/cambium/modules/should_review/tests/test_review_dataset_splits.py::test_canary_flag_filtered_from_train_file": 0.000959,
       "src/cambium/modules/should_review/tests/test_review_dataset_splits.py::test_cross_split_collision_rejected": 0.002797,

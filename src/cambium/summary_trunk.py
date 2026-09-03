@@ -268,12 +268,13 @@ def _bounded_text(value: Any, field: str, *, allow_empty: bool = False) -> str:
 
 
 def _coerced_summary_text(item: Any) -> Any:
-    """Coerce one untrusted summary item to text without losing information.
+    """Coerce one untrusted summary item to bounded text.
 
     Summary CONTENT is model-owned JSON, so list items are occasionally
     emitted as objects or numbers.  Compaction is recovery infrastructure:
     coerce such items to their canonical JSON spelling instead of killing
-    the session.  Bounds and forbidden-marker checks still apply afterwards.
+    the session.  Values that cannot be represented as JSON use a stable
+    placeholder.  Bounds and forbidden-marker checks still apply afterwards.
     Objects deeper than :data:`SUMMARY_MAX_COERCE_DEPTH` are represented by a
     bounded placeholder so recovery never recurses through attacker-shaped
     data.
@@ -306,10 +307,7 @@ def _coerced_summary_text(item: Any) -> Any:
     try:
         return json.dumps(item, sort_keys=True, ensure_ascii=False, allow_nan=False)
     except (TypeError, ValueError, UnicodeEncodeError, RecursionError):
-        try:
-            return str(item)
-        except (TypeError, ValueError, UnicodeEncodeError, RecursionError):
-            return _SUMMARY_DEEP_PLACEHOLDER
+        return _SUMMARY_DEEP_PLACEHOLDER
 
 
 def _bounded_items(value: Any, field: str) -> tuple[str, ...]:

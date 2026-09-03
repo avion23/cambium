@@ -48,7 +48,11 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
 
 
 @pytest.fixture(autouse=True)
-def _isolate_routing_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def _isolate_routing_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+):
     """Keep every test away from the developer's real routing-state ledger.
 
     The DebtStore defaults to ``~/.config/cambium/routing-state.json``;
@@ -56,6 +60,13 @@ def _isolate_routing_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     requests into the real ledger. Tests that exercise ledger persistence
     pass their own explicit path and are unaffected.
     """
+
+    # The isolated module gate installs a provider-import blocker before test
+    # setup. Module tests do not use routing, so importing it here would make
+    # this unrelated scenario fixture violate that gate.
+    if request.config.getoption("cambium_isolated_module", default=None) is not None:
+        yield
+        return
 
     import cambium.routing
 

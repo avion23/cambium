@@ -186,7 +186,12 @@ def _delegate_action(child_task_id: str) -> str:
             {
                 "child_task_id": child_task_id,
                 "kind": "test",
-                "spec": {"task": "child task", "child_only": True},
+                "spec": {
+                    "task": "child task",
+                    "child_only": True,
+                    "context_mode": "fresh",
+                    "placement": "spread",
+                },
             }
         )
         + "}"
