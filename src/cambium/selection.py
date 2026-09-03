@@ -95,7 +95,7 @@ def quality_score(
     slo_miss = 1 if latency_count > 0 and latency > weights.latency_slo_s else 0
 
     cost = _number(_field(entry, "cost", 0.0))
-    if cost > 0.0 and successes > 0:
+    if cost >= 0.0 and successes > 0:
         expected_cost = cost / successes
     else:
         expected_cost = float(math.inf)

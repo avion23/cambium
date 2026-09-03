@@ -56,7 +56,6 @@ from __future__ import annotations
 
 import collections
 import errno
-import fcntl
 import json
 import logging
 import os
@@ -71,6 +70,12 @@ from pathlib import Path
 from typing import Any, cast
 
 from .redact import EVENT_RECORD_STRUCTURAL_FIELDS, Redactor
+
+try:
+    fcntl: Any
+    import fcntl
+except ImportError:  # pragma: no cover - exercised on Windows
+    fcntl = None
 
 logger = logging.getLogger(__name__)
 
@@ -456,7 +461,8 @@ def _acquire_writer_lock(path: Path) -> int:
             0o600,
         )
         os.fchmod(fd, 0o600)
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError as exc:
         if fd >= 0:
             os.close(fd)
@@ -470,7 +476,8 @@ def _acquire_writer_lock(path: Path) -> int:
 
 def _release_writer_lock(fd: int) -> None:
     try:
-        fcntl.flock(fd, fcntl.LOCK_UN)
+        if fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_UN)
     except OSError:
         pass
     try:

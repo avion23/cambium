@@ -20,6 +20,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Iterable
+from dataclasses import replace
 from enum import IntEnum
 from pathlib import Path
 from typing import Any, NoReturn, TypeVar, cast, overload
@@ -1426,8 +1427,23 @@ def _live_architectus_llm(
             account_id=account_id,
         )
     elif selected.auth is AuthMode.API_KEY:
-        if not selected.api_key:
+        api_key = selected.api_key or os.environ.get(selected.api_key_env, "")
+        if not api_key:
+            credentials = AuthStore().read().providers
+            api_key = next(
+                (
+                    credential.api_key
+                    for credential in credentials
+                    if credential.provider == selected.name
+                ),
+                "",
+            )
+        if not api_key:
             raise ValueError("API-key Architectus calls require a credential-source interface")
+        providers = [
+            replace(candidate, api_key=api_key) if candidate.name == selected.name else candidate
+            for candidate in providers
+        ]
 
     diffundo = Diffundo(providers, **options)
     lm = CambiumLM(diffundo, selected_tier, model=selected.model)

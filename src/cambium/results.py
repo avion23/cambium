@@ -99,6 +99,10 @@ _REJECT_TOKENS = frozenset(
         "review_rejection",
     }
 )
+_SUCCESS_SIGNAL_TOKENS = frozenset(
+    {"done", "succeeded", "success", "complete", "completed", "ok", "passed"}
+)
+_EVALUATOR_SUCCESS_SIGNAL_TOKENS = _SUCCESS_SIGNAL_TOKENS | {"approved"}
 _HARD_FAILURE_TOKENS = frozenset(
     {
         "crash",
@@ -203,6 +207,8 @@ def _signal_failed(value: Any) -> bool:
     token = _token(value)
     if token is None:
         return True
+    if token in _SUCCESS_SIGNAL_TOKENS:
+        return False
     return True
 
 
@@ -230,6 +236,8 @@ def _signal_rejected(value: Any) -> bool:
     token = _token(value)
     if token in _REJECT_TOKENS or _has_marker(token, ("evaluator_reject", "review_reject")):
         return True
+    if token in _EVALUATOR_SUCCESS_SIGNAL_TOKENS:
+        return False
     return True
 
 
@@ -830,7 +838,7 @@ def _validate_event_log_ref(event_log_ref: str, session_dir: Path | str) -> None
     state_dir = Path(session_dir) / ".cambium"
     _reject_symlink(state_dir, "the session .cambium directory")
     _reject_symlink(Path(referenced_path), "the event log")
-    expected_path = (state_dir / "events.db").absolute()
+    expected_path = (state_dir / "events.db").resolve()
     if Path(referenced_path).absolute() != expected_path:
         raise ValueError("result event_log_ref does not match the session events.db")
 

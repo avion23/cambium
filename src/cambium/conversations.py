@@ -528,7 +528,8 @@ class ConversationStore:
             while True:
                 remaining = next_fsync - time.monotonic()
                 try:
-                    item = self._queue.get(timeout=max(remaining, 0.0))
+                    timeout = None if self._fsync_interval_s == 0 else max(remaining, 0.0)
+                    item = self._queue.get(timeout=timeout)
                 except queue.Empty:
                     if dirty:
                         self._fsync_now()

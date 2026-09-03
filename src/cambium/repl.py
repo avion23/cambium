@@ -243,9 +243,9 @@ async def run_repl(
                     if sigint_fired:  # noqa: B023
                         return
                     if not _stream_tty:
-                        output_stream.write(
-                            render.render_event_line(record, stream=output_stream) + "\n"
-                        )
+                        line = render.render_event_line(record, stream=output_stream)
+                        if line:
+                            output_stream.write(line + "\n")
                         status = render.render_live_status_line(_events)
                         if status:
                             output_stream.write(status + "\n")

@@ -270,8 +270,8 @@ def _generic_reference_positions(text: str, symbol: str) -> list[tuple[int, int]
     pattern = re.compile(rf"\b{re.escape(symbol)}\b")
     positions: list[tuple[int, int]] = []
     for line_no, line in enumerate(text.splitlines(), start=1):
-        code = _GENERIC_STRING.sub("", line)
-        code = _GENERIC_COMMENT.sub("", code)
+        code = _GENERIC_STRING.sub(lambda match: " " * len(match.group(0)), line)
+        code = _GENERIC_COMMENT.sub(lambda match: " " * len(match.group(0)), code)
         positions.extend((line_no, match.start() + 1) for match in pattern.finditer(code))
     return positions
 

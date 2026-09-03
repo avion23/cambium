@@ -103,6 +103,7 @@ import errno
 import hashlib
 import json
 import math
+import os
 import random
 import re
 import socket
@@ -2222,7 +2223,7 @@ class Diffundo:
                 if self._fallback_origin is not None:
                     result = replace(result, fell_back_from=self._fallback_origin)
                 return result
-            if probe_rejected and not tried:
+            if probe_rejected:
                 continue
             raise self._all_providers_failed(tried, last_error)
 
@@ -3079,7 +3080,11 @@ class Diffundo:
                 ProviderOutcome.AUTH_ERROR,
                 "http transport is allowed only for loopback hosts; remote providers require https",
             )
-        api_key = provider.api_key or ""
+        api_key = (
+            provider.api_key
+            if provider.api_key is not None
+            else os.environ.get(provider.api_key_env, "")
+        )
         if provider.auth is not AuthMode.NONE and not api_key:
             raise ProviderError(
                 provider.name,

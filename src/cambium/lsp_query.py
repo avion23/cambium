@@ -306,13 +306,26 @@ def query_lsp(
             }
         raise LspQueryError("language server query timed out") from exc
     finally:
+        shutdown_complete = False
         try:
             _write_message(
                 process.stdin,
-                {"jsonrpc": "2.0", "method": "exit", "params": {}},
+                {"jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": {}},
             )
-        except (BrokenPipeError, OSError, ValueError, LspQueryError):
+            while True:
+                if reader.message(deadline).get("id") == 3:
+                    shutdown_complete = True
+                    break
+        except (BrokenPipeError, OSError, ValueError, LspQueryError, TimeoutError):
             pass
+        if shutdown_complete:
+            try:
+                _write_message(
+                    process.stdin,
+                    {"jsonrpc": "2.0", "method": "exit", "params": {}},
+                )
+            except (BrokenPipeError, OSError, ValueError, LspQueryError):
+                pass
         reader.close()
         _terminate(process)
 

@@ -550,7 +550,7 @@ def parse_summary_message(message: Mapping[str, Any]) -> SummaryEntry | None:
     return _entry_from_mapping(decoded)
 
 
-_SEMANTIC_ID_RE = re.compile(r"^[DF]\d+$")
+_SEMANTIC_ID_RE = re.compile(r"^([DF]\d+)(?:\b|:)")
 
 
 def _entry_id_sets(
@@ -559,12 +559,14 @@ def _entry_id_sets(
     """Split ID-shaped items into (added, referenced) sets; prose passes through."""
     added: set[str] = set()
     for item in (*entry.decisions_added, *entry.facts_added):
-        if _SEMANTIC_ID_RE.match(item):
-            added.add(item)
+        match = _SEMANTIC_ID_RE.match(item)
+        if match is not None:
+            added.add(match.group(1))
     referenced: set[str] = set()
     for item in (*entry.decisions_superseded, *entry.facts_invalidated):
-        if _SEMANTIC_ID_RE.match(item):
-            referenced.add(item)
+        match = _SEMANTIC_ID_RE.match(item)
+        if match is not None:
+            referenced.add(match.group(1))
     return added, referenced
 
 

@@ -233,16 +233,105 @@ def default_session_root(repo: str | Path | None = None) -> Path:
     return session_root(target)
 
 
-def _git_stdout(repo: Path, *args: str) -> str | None:
-    result = subprocess.run(
+def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
         ["git", "-C", str(repo), *args],
         capture_output=True,
         text=True,
         env=scrub_environment(),
     )
+
+
+def _git_stdout(repo: Path, *args: str) -> str | None:
+    result = _git(repo, *args)
     if result.returncode != 0:
         return None
     return result.stdout.strip() or None
+
+
+def _primary_checkout_is_pristine(repo: Path) -> bool:
+    """Check that tracked primary-checkout files are unchanged before a run."""
+    return all(
+        _git(repo, *args).returncode == 0
+        for args in (
+            ("diff", "--no-ext-diff", "--quiet", "HEAD", "--"),
+            ("diff", "--cached", "--no-ext-diff", "--quiet", "HEAD", "--"),
+        )
+    )
+
+
+def _primary_checkout_matches_base(repo: Path, base_commit: str) -> bool:
+    """Check that the caller did not change tracked files during the run."""
+    return all(
+        _git(repo, *args).returncode == 0
+        for args in (
+            ("diff", "--no-ext-diff", "--quiet", base_commit, "--"),
+            ("diff", "--cached", "--no-ext-diff", "--quiet", base_commit, "--"),
+        )
+    )
+
+
+def _primary_checkout_has_untracked_conflict(repo: Path, target: str) -> bool:
+    """Refuse refresh when the target tree would overwrite an untracked path."""
+    status = _git(
+        repo,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        "--ignored=matching",
+        "-z",
+    )
+    tree = _git(repo, "ls-tree", "-r", "--name-only", "-z", target)
+    if status.returncode != 0 or tree.returncode != 0:
+        return True
+    target_paths = tuple(path for path in tree.stdout.split("\0") if path)
+    for record in status.stdout.split("\0"):
+        if len(record) < 3 or record[:2] not in {"??", "!!"}:
+            continue
+        path = record[3:].rstrip("/")
+        if any(
+            path == target_path
+            or path.startswith(f"{target_path}/")
+            or target_path.startswith(f"{path}/")
+            for target_path in target_paths
+        ):
+            return True
+    return False
+
+
+def _refresh_primary_checkout(
+    repo: Path,
+    initial_branch: str | None,
+    initial_head: str | None,
+    initially_pristine: bool,
+    result: PlanResult,
+) -> None:
+    """Refresh a pristine checked-out ``main`` after a successful one-shot.
+
+    ``MergeSequencer.publish_merge`` remains ref-only.  The one-shot CLI also
+    owns the ordinary clean primary checkout, so it may refresh that checkout
+    after publication.  Any caller-owned change or branch switch suppresses
+    the refresh instead of overwriting it.
+    """
+    if (
+        not initially_pristine
+        or initial_branch != "main"
+        or initial_head is None
+        or result.exit_code != 0
+        or _git_stdout(repo, "symbolic-ref", "--quiet", "--short", "HEAD") != "main"
+    ):
+        return
+    published_head = _git_stdout(repo, "rev-parse", "--verify", "refs/heads/main^{commit}")
+    if published_head is None or published_head == initial_head:
+        return
+    if not _primary_checkout_matches_base(repo, initial_head):
+        return
+    if _primary_checkout_has_untracked_conflict(repo, "main"):
+        return
+    refreshed = _git(repo, "read-tree", "-m", "-u", "main")
+    if refreshed.returncode != 0:
+        detail = (refreshed.stderr + refreshed.stdout).strip()[:512]
+        raise ValueError(f"one-shot primary checkout refresh failed: {detail}")
 
 
 def preflight(
@@ -925,6 +1014,9 @@ async def run_oneshot(config: OneShotConfig, on_event: EventSink | None = None) 
     )
     preflight(resolved, repo, session_dir)
     plan = build_plan(resolved, repo, session_dir)
+    initial_branch = _git_stdout(repo, "symbolic-ref", "--quiet", "--short", "HEAD")
+    initial_head = _git_stdout(repo, "rev-parse", "--verify", "HEAD^{commit}")
+    initially_pristine = _primary_checkout_is_pristine(repo)
     # The usage-debt ledger is repo-scoped by default so real runs keep
     # cross-session burn per repository without touching a user-global file;
     # tests against temporary repos are isolated automatically.
@@ -935,7 +1027,7 @@ async def run_oneshot(config: OneShotConfig, on_event: EventSink | None = None) 
     )
     reject_reused = resolved.session_mode is SessionMode.NEW
     if provider_environment:
-        return await supervisor.run_plan(
+        result = await supervisor.run_plan(
             session_dir,
             plan,
             on_event=on_event,
@@ -944,11 +1036,20 @@ async def run_oneshot(config: OneShotConfig, on_event: EventSink | None = None) 
             reject_reused_session=reject_reused,
             context_reuse=resolved.context_reuse,
         )
-    return await supervisor.run_plan(
-        session_dir,
-        plan,
-        on_event=on_event,
-        routing_state_path=routing_state_path,
-        reject_reused_session=reject_reused,
-        context_reuse=resolved.context_reuse,
+    else:
+        result = await supervisor.run_plan(
+            session_dir,
+            plan,
+            on_event=on_event,
+            routing_state_path=routing_state_path,
+            reject_reused_session=reject_reused,
+            context_reuse=resolved.context_reuse,
+        )
+    _refresh_primary_checkout(
+        repo,
+        initial_branch,
+        initial_head,
+        initially_pristine,
+        result,
     )
+    return result

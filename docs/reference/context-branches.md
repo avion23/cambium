@@ -55,21 +55,12 @@ trunk + spread
 An explicit `trunk + inherit` request that cannot prove exact compatibility is
 rejected. It does not silently become semantic or fresh.
 
-### Current omission compatibility
+### Required policy fields
 
-The active model schema currently permits `context_mode` and `placement` to be
-omitted. In that case the supervisor uses automatic compatibility behavior:
-
-```text
-exact compatible checkpoint -> exact inherited fork
-otherwise suitable semantic checkpoint -> semantic reuse with inherited pin removed
-otherwise -> no fork
-```
-
-This is current compatibility behavior, not the target public contract. Phase 0
-of `../../implementation-plan.md` makes model-originated policy explicit or
-assigns the automatic path a separate named internal policy. Do not describe
-missing fields as an intentional model decision.
+The active model schema requires both `context_mode` and `placement`.
+Omitting either field is rejected before the delegate proposal reaches
+supervisor admission. The supervisor also validates the explicit policy and its
+allowed combinations.
 
 ### Optional child constraints
 

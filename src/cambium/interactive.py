@@ -1283,6 +1283,10 @@ class InteractiveSession:
             changes["model"] = self._model_preference
         if changes:
             config = replace(config, **changes)
+        if self._seed is not None and (
+            self.provider != self._seed.provider or self.model != self._seed.model
+        ):
+            context_fork = None
         self._pending_seed = None
         batch = len(prompts) > 1
         return tuple(

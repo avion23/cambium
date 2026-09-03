@@ -65,10 +65,9 @@ The call only proposes. Admission occurs at a permitted parent lifecycle
 boundary after validation of identity, task-tree bounds, paths, branch/worktree
 ownership, provider authority, policy, and budget.
 
-Current compatibility note: the active schema still permits `context_mode` and
-`placement` to be omitted. The supervisor then performs automatic exact versus
-semantic compatibility resolution. The target public model contract makes both
-fields explicit; see `implementation-plan.md` Phase 0.
+The active model schema requires `context_mode` and `placement`. Omission is
+rejected before the delegate proposal reaches supervisor admission. The
+supervisor validates the same explicit policy and rejects invalid combinations.
 
 ### Architectus child
 

@@ -215,18 +215,28 @@ def decide_heavy_work(
     elif minimum_memory is not None and available_frac < minimum_memory:
         reasons.append(f"mem_available_frac {available_frac:.3f} < {minimum_memory:.3f}")
 
+    load_is_valid = load1 is not None and _is_finite_number(load1) and load1 >= 0.0
     if load1 is None:
         reasons.append("load1 unavailable")
-    elif not _is_finite_number(load1) or load1 < 0.0:
+    elif not load_is_valid:
         reasons.append("load1 invalid")
-    elif (
+    if not (
         not isinstance(cpu_count, int)
         or isinstance(cpu_count, bool)
         or cpu_count <= 0
         or not _is_finite_number(cpu_count)
     ):
+        cpu_is_valid = True
+    else:
+        cpu_is_valid = False
         reasons.append("cpu_count unavailable")
-    elif maximum_load_per_cpu is not None:
+    if (
+        load_is_valid
+        and cpu_is_valid
+        and load1 is not None
+        and cpu_count is not None
+        and maximum_load_per_cpu is not None
+    ):
         cutoff = cpu_count * maximum_load_per_cpu
         if load1 > cutoff:
             reasons.append(f"load1 {load1:.3f} > {cutoff:.3f}")

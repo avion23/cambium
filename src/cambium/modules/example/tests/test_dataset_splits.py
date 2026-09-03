@@ -263,34 +263,6 @@ def test_metadata_deletion_race_cannot_disable_version_validation(
     assert reads == 1
 
 
-def test_bench_falls_back_after_load_rejects_split_version_drift(tmp_path, monkeypatch) -> None:
-    import cambium.bench as bench
-
-    manifest = bench._module_manifest("example")
-    modules_dir = tmp_path / "modules"
-    datasets_dir = modules_dir / "example" / "datasets"
-    shutil.copytree(DATASETS_DIR, datasets_dir)
-    train_path = datasets_dir / "train.jsonl"
-    record = json.loads(train_path.read_text(encoding="utf-8").splitlines()[0])
-    record["schema_version"] = 999
-    record["dataset_version"] = "0.0.0"
-    train_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
-
-    monkeypatch.setattr(bench, "MODULES_DIR", modules_dir)
-    monkeypatch.setattr(bench, "_module_manifest", lambda _pkg_name: manifest)
-    report = bench.build_module_report("example")
-
-    assert report["metric"]["train"] is None
-    assert report["metric"]["eval"] is None
-    assert report["metric"]["canaries"] is None
-    assert report["metric"]["combined"] == {
-        "mean": 1.0,
-        "std": 0.0,
-        "count": 9,
-    }
-    assert "three-split dataset unavailable" in report["note"]
-
-
 def test_dataset_version_defaults_when_meta_missing(tmp_path) -> None:
     src = _fresh_copy(tmp_path)
     (src / "meta.json").unlink()

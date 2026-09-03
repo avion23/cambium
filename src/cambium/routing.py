@@ -624,10 +624,10 @@ def resolve_assignment(
     by name so OAuth providers are never dropped), the candidate models, an
     optional pinned tier, and lane capacity, then picks via
     :func:`select_lane` (max-min admission) or :func:`score_providers` (when
-    the task declares requirements). Returns ``None`` when no provider
-    remains; the caller decides whether that is a hard failure. Raises
-    ``ValueError`` when the filtered pool is empty after authorization but a
-    selection was required.
+    the task declares requirements). Returns ``None`` when filtering removes
+    every provider or all matching lanes are full; the caller decides whether
+    that is a hard failure. Raises ``ValueError`` for invalid candidates or
+    when no enabled provider serves a candidate model.
     """
     pool = list(providers)
     if authorized is not None:
@@ -635,11 +635,20 @@ def resolve_assignment(
     if pinned_tier:
         pool = [p for p in pool if p.tier.value == pinned_tier]
     if requirements:
-        provider_name, model, _score = score_providers(
-            pool, candidates, debt, lanes, requirements=requirements
-        )[0]
-    else:
-        provider_name, model = select_lane(pool, candidates, debt, lanes or {})
+        validate_requirements(requirements)
+    if not candidates:
+        raise ValueError("model_candidates must be a non-empty list of model ids")
+    if not pool:
+        return None
+    try:
+        if requirements:
+            provider_name, model, _score = score_providers(
+                pool, candidates, debt, lanes, requirements=requirements
+            )[0]
+        else:
+            provider_name, model = select_lane(pool, candidates, debt, lanes or {})
+    except LaneCapacityExhausted:
+        return None
     tier = _assignment_tier(pool, provider_name, pinned_tier)
     return ProviderAssignment(provider=provider_name, model=model, tier=tier)
 
@@ -1136,7 +1145,6 @@ def score_providers(
     )
     eligible: list[Any] = []
     capability_matches = 0
-    models: dict[str, str] = {}
     for provider in providers:
         if not getattr(provider, "enabled", True):
             continue
@@ -1161,7 +1169,6 @@ def score_providers(
                 if not _lane_has_capacity(provider, lane, retry_after_count):
                     continue
         eligible.append(provider)
-        models[provider.name] = model
     if not eligible:
         if capability_matches:
             raise LaneCapacityExhausted(
@@ -1180,9 +1187,7 @@ def score_providers(
         now=time.time(),
         weights=DEFAULT_WEIGHTS,
     )
-    return [
-        (provider.name, models[provider.name], float(rank)) for rank, provider in enumerate(ordered)
-    ]
+    return [(provider.name, provider.model, float(rank)) for rank, provider in enumerate(ordered)]
 
 
 __all__ = [

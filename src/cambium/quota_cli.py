@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -89,7 +90,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return run_namespace(args)
     except (OSError, QuotaLedgerError, ValueError) as exc:
-        print(f"cambium quota: {exc}")
+        print(f"cambium quota: {exc}", file=sys.stderr)
         return 2
 
 

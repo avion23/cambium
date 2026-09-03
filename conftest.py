@@ -2,7 +2,7 @@
 
 pyproject.toml's ``pythonpath = ["src"]`` already adds the source tree to
 the pytest parent's sys.path. Scenario tests spawn subprocesses (``-m
-cambium.worker``, ``-m cambium.bench``, ``-m cambium.cli``) that inherit
+cambium.worker``, ``-m cambium.cli``) that inherit
 os.environ, so export the source tree via PYTHONPATH here, before
 collection.
 """

@@ -61,7 +61,7 @@ def encode_message(msg: dict[str, Any]) -> bytes | None:
     :class:`MessageTooLong` (or otherwise handle it) themselves.
     """
     content = json.dumps(msg, allow_nan=False).encode("utf-8")
-    if len(content) > MAX_LINE_BYTES:
+    if len(content) + 1 > MAX_LINE_BYTES:
         return None
     return content + b"\n"
 
@@ -81,8 +81,8 @@ def write_message(writer: _FrameWriter, msg: dict[str, Any]) -> None:
     of letting an over-cap frame on the wire force the receiver to resync.
     """
     content = json.dumps(msg, allow_nan=False).encode("utf-8")
-    if len(content) > MAX_LINE_BYTES:
-        raise MessageTooLong(len(content))
+    if len(content) + 1 > MAX_LINE_BYTES:
+        raise MessageTooLong(len(content) + 1)
     write_frame(writer, content + b"\n")
 
 

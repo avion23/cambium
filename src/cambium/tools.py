@@ -248,7 +248,7 @@ def _line_window(
     *,
     truncated: bool,
 ) -> str:
-    selected = lines[start_line - 1 : start_line - 1 + max_lines]
+    selected = lines[:max_lines]
     total = f"at least {total_lines}" if truncated else str(total_lines)
     if not selected:
         return f"showing no lines from {start_line}; file has {total} lines\n"
@@ -272,36 +272,25 @@ def _read_file_sync(
         if offset is not None or limit is not None:
             start_line = offset if offset is not None else 1
             max_lines = limit if limit is not None else MAX_READ_LINES
-            with path.open("rb") as handle:
-                raw = handle.read(READ_BATCH_MAX_BYTES_PER_FILE + 1)
-            if len(raw) > READ_BATCH_MAX_BYTES_PER_FILE:
-                excerpt = raw[:READ_BATCH_MAX_BYTES_PER_FILE].decode("utf-8", errors="ignore")
-                lines = excerpt.splitlines(keepends=True)
-                output = (
-                    _line_window(
-                        lines,
-                        start_line,
-                        max_lines,
-                        len(lines),
-                        truncated=True,
-                    )
-                    + READ_TRUNCATION_MARKER
-                )
-                return _Outcome(
-                    ok=True,
-                    output=_truncate_text(
-                        output, READ_BATCH_MAX_BYTES_PER_FILE, READ_TRUNCATION_MARKER
-                    ),
-                )
-            lines = _decode_utf8(raw, display_path).splitlines(keepends=True)
+            selected: list[str] = []
+            total_lines = 0
+            with path.open("r", encoding="utf-8", newline="") as handle:
+                for line_number, line in enumerate(handle, start=1):
+                    total_lines = line_number
+                    if start_line <= line_number < start_line + max_lines:
+                        selected.append(line)
             return _Outcome(
                 ok=True,
-                output=_line_window(
-                    lines,
-                    start_line,
-                    max_lines,
-                    len(lines),
-                    truncated=False,
+                output=_truncate_text(
+                    _line_window(
+                        selected,
+                        start_line,
+                        max_lines,
+                        total_lines,
+                        truncated=False,
+                    ),
+                    READ_BATCH_MAX_BYTES_PER_FILE,
+                    READ_TRUNCATION_MARKER,
                 ),
             )
 

@@ -15,6 +15,7 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import unicodedata
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Iterator, Sequence
@@ -1145,7 +1146,7 @@ def extract_main(argv: Sequence[str] | None = None) -> int:
             review_gate=args.review_gate,
         )
     except (OSError, sqlite3.Error, ValueError) as exc:
-        print(f"cambium optimize extract: {exc}", file=os.sys.stderr)
+        print(f"cambium optimize extract: {exc}", file=sys.stderr)
         return 1
     _print_extraction_summary(result, output, metadata)
     return 0
@@ -1155,12 +1156,12 @@ def stats_main(argv: Sequence[str] | None = None) -> int:
     args = _stats_parser().parse_args(argv)
     path = args.dataset_option or args.dataset
     if path is None:
-        print("cambium optimize stats: DATASET or --dataset is required", file=os.sys.stderr)
+        print("cambium optimize stats: DATASET or --dataset is required", file=sys.stderr)
         return 2
     try:
         report = dataset_stats(path)
     except (OSError, ValueError) as exc:
-        print(f"cambium optimize stats: {exc}", file=os.sys.stderr)
+        print(f"cambium optimize stats: {exc}", file=sys.stderr)
         return 1
     if args.json:
         print(json.dumps(report, ensure_ascii=True, sort_keys=True))
@@ -1183,7 +1184,7 @@ def legacy_main(argv: Sequence[str] | None = None) -> int:
         result = extract_candidates(args.database, exclude_paths=args.exclude)
         write_records(args.output, result)
     except (OSError, sqlite3.Error, ValueError) as exc:
-        print(f"extractor: {exc}", file=os.sys.stderr)
+        print(f"extractor: {exc}", file=sys.stderr)
         return 1
     _print_extraction_summary(result, args.output, _metadata_path(args.output))
     return 0

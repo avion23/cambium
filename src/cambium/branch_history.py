@@ -154,6 +154,9 @@ def _events(session_dir: Path) -> list[_Event]:
             if not isinstance(row, Mapping):
                 continue
             payload = _event_payload(row)
+            generation = row.get("generation")
+            if type(generation) is int:
+                payload["generation"] = generation
             kind = row.get("kind")
             if not isinstance(kind, str) or not kind:
                 candidate = payload.get("type")
@@ -225,11 +228,15 @@ def _bounded(text: str, limit: int = MAX_HISTORY_OUTPUT_BYTES) -> str:
 
 
 def _page(lines: Sequence[str], offset: int, limit: int) -> str:
-    selected = list(lines[offset : offset + limit])
+    if not lines:
+        return ""
+    header = lines[0]
+    data = lines[1:]
+    selected = list(data[offset : offset + limit])
     suffix = ""
-    if offset + len(selected) < len(lines):
+    if offset + len(selected) < len(data):
         suffix = f"\nnext_offset={offset + len(selected)}"
-    return _bounded("\n".join(selected) + suffix)
+    return _bounded("\n".join((header, *selected)) + suffix)
 
 
 def _list_branches(events: Sequence[_Event], offset: int, limit: int) -> str:
@@ -250,7 +257,7 @@ def _list_branches(events: Sequence[_Event], offset: int, limit: int) -> str:
                 )
             )
         )
-    return _page(lines, offset, limit + 1)
+    return _page(lines, offset, limit)
 
 
 def _tool_events(events: Sequence[_Event], task_id: str | None) -> list[_Event]:
@@ -293,7 +300,7 @@ def _list_tools(
                 )
             )
         )
-    return _page(lines, offset, limit + 1)
+    return _page(lines, offset, limit)
 
 
 def _regular_json(path: Path) -> dict[str, Any]:
@@ -441,7 +448,7 @@ def _latest_transcript(
     for index, message in enumerate(messages):
         content = _bounded(message["content"], MAX_MESSAGE_BYTES)
         lines.append(f"[{index}] {message['role']}\n{content}")
-    return _page(lines, offset, limit + 1)
+    return _page(lines, offset, limit)
 
 
 def query_branch_history(session_dir: Path | str, arguments: Mapping[str, Any]) -> str:

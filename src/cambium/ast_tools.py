@@ -319,12 +319,11 @@ def _attribute_position(index: _SourceIndex, node: _stdlib_ast.Attribute) -> tup
     """Locate the attribute tail, not the beginning of the whole expression."""
     end_line = cast(int, node.end_lineno)
     end_column = cast(int, node.end_col_offset)
-    if end_line == node.lineno:
-        end_byte = index.byte_offset(end_line, end_column)
-        name_bytes = node.attr.encode("utf-8")
-        start_byte = end_byte - len(name_bytes)
-        if start_byte >= 0 and index.encoded[start_byte:end_byte] == name_bytes:
-            return index.position(start_byte)
+    end_byte = index.byte_offset(end_line, end_column)
+    name_bytes = node.attr.encode("utf-8")
+    start_byte = end_byte - len(name_bytes)
+    if start_byte >= 0 and index.encoded[start_byte:end_byte] == name_bytes:
+        return index.position(start_byte)
     return index.position(_ast_start_byte(index, node))
 
 

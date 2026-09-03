@@ -755,7 +755,9 @@ class SharedDatasetLoader(DatasetLoader):
     def _canonical_digest(example: Example) -> str:
         payload = (example.input.task, example.input.context)
         return hashlib.sha256(
-            json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+            json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode(
+                "utf-8"
+            )
         ).hexdigest()
 
     def _validate(self, record: dict, line_no: int, path: Path) -> None:

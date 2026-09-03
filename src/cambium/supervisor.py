@@ -2284,6 +2284,7 @@ class _GenerationState:
     message_too_long: bool = False
     stderr_tail: str | None = None
     phase: Any = "ready"
+    heartbeat_phase: Any = None
     last_heartbeat: float | None = None
     turn: int = 0
     run_rid: str | None = None
@@ -3619,6 +3620,28 @@ class _Runtime:
             if budget_decision is not None:
                 admitted_payload["budget"] = budget_decision
             await self.emit("child_admitted", **admitted_payload)
+        except ChildPolicyError as admission_error:
+            self._rollback_child_admission(parent_task_id, child_task_id, child_spec)
+            await self.emit(
+                "child_rejected",
+                task_id=parent_task_id,
+                request_id=request_id,
+                parent_task_id=parent_task_id,
+                child_task_id=child_task_id,
+                child_kind=kind,
+                reason=admission_error.__class__.__name__,
+                message=str(admission_error)[:512],
+            )
+            await self._record_revision_conversation(
+                outcome="rejected",
+                parent_task_id=parent_task_id,
+                child_task_id=child_task_id,
+                child_kind=kind,
+                request_id=request_id,
+                reason=admission_error.__class__.__name__,
+                proposal=proposal,
+            )
+            return []
         except BaseException as admission_error:
             self._rollback_child_admission(parent_task_id, child_task_id, child_spec)
             try:
@@ -6199,9 +6222,8 @@ class _Runtime:
             "status": msg.get("status"),
         }
         phase = msg.get("phase")
-        # Preserve the original protocol phase value, including its interaction
-        # with the ready/run loop phase.
-        state.phase = phase
+        # Keep the worker sub-phase separate from the ready/run lifecycle phase.
+        state.heartbeat_phase = phase
         if type(phase) is str and phase in _HEARTBEAT_PHASES:
             forwarded["phase"] = phase
         tail = msg.get("tail")
@@ -6358,6 +6380,9 @@ class _Runtime:
             return await self._handle_ready_message(state, msg)
         if mtype in ("result", "result_envelope"):
             await self._handle_result_message(state, msg)
+            return False
+        if mtype == "fatal_error":
+            state.protocol_failure = msg.get("error_type", "fatal_error")
             return False
         if mtype == "context_checkpoint":
             await self._handle_context_checkpoint_message(state, msg)
@@ -8184,6 +8209,8 @@ def _resolve_model_candidates(
                 authorized=authorized,
                 pinned_tier=pinned_tier,
             )
+        except LaneCapacityExhausted:
+            raise
         except ValueError as exc:
             raise ValueError(
                 f"task {spec.get('task_id')}: provider assignment failed: {exc}"
@@ -8765,10 +8792,13 @@ async def _run_wave_bounded(
     frees, and the semaphore is released when the wave completes.
     """
     if width_limit is None or width_limit >= len(specs):
-        async with asyncio.TaskGroup() as tg:
-            runtime._task_group = tg
-            for spec in specs:
-                tg.create_task(runtime.supervise_task(spec))
+        try:
+            async with asyncio.TaskGroup() as tg:
+                runtime._task_group = tg
+                for spec in specs:
+                    tg.create_task(runtime.supervise_task(spec))
+        finally:
+            runtime._task_group = None
         return
     semaphore = asyncio.Semaphore(width_limit)
 
@@ -8776,10 +8806,13 @@ async def _run_wave_bounded(
         async with semaphore:
             await runtime.supervise_task(spec)
 
-    async with asyncio.TaskGroup() as tg:
-        runtime._task_group = tg
-        for spec in specs:
-            tg.create_task(bounded(spec))
+    try:
+        async with asyncio.TaskGroup() as tg:
+            runtime._task_group = tg
+            for spec in specs:
+                tg.create_task(bounded(spec))
+    finally:
+        runtime._task_group = None
 
 
 async def _dispatch_static_waves(
@@ -9033,12 +9066,15 @@ async def run_plan(
                     provider_environment=provider_environment,
                     oauth_store=oauth_store,
                 )
-                async with asyncio.TaskGroup() as tg:
-                    # Dynamic child admission spawns into the active group;
-                    # the flat fan-out path owns this group for the session.
-                    runtime._task_group = tg
-                    for spec in specs:
-                        tg.create_task(runtime.supervise_task(spec))
+                try:
+                    async with asyncio.TaskGroup() as tg:
+                        # Dynamic child admission spawns into the active group;
+                        # the flat fan-out path owns this group for the session.
+                        runtime._task_group = tg
+                        for spec in specs:
+                            tg.create_task(runtime.supervise_task(spec))
+                finally:
+                    runtime._task_group = None
         except asyncio.CancelledError:
             cancelled = True
         finally:

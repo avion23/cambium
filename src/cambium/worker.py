@@ -4064,9 +4064,17 @@ def _write_epoch_checkpoint(
     payload["checkpoint_ref"] = checkpoint_ref
     directory = config.checkpoint_root / safe_task
     path = directory / f"{prefix}-{address_persisted}.json"
-    _create_epoch_checkpoint(
-        path, json.dumps(_split_checkpoint_payload(payload), sort_keys=True, indent=2)
-    )
+    content = json.dumps(_split_checkpoint_payload(payload), sort_keys=True, indent=2)
+    try:
+        _create_epoch_checkpoint(path, content)
+    except ContextForkError:
+        try:
+            info = path.lstat()
+            existing = path.read_text(encoding="utf-8")
+        except (FileNotFoundError, OSError, UnicodeDecodeError):
+            raise
+        if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode) or existing != content:
+            raise
     return replace(
         checkpoint,
         checkpoint_ref=checkpoint_ref,
@@ -7586,6 +7594,7 @@ def _finalize_worktree(
                 "--porcelain=v1",
                 "--untracked-files=all",
                 "--ignored=matching",
+                "-z",
             ],
             cwd=worktree,
             capture_output=True,
@@ -7597,15 +7606,18 @@ def _finalize_worktree(
             return outcome
         changed: list[str] = []
         ignored: list[str] = []
-        for line in status_proc.stdout.splitlines():
-            path = line[3:].strip() if len(line) > 3 else line.strip()
-            if " -> " in path:
-                path = path.split(" -> ", 1)[1]
+        records = iter(status_proc.stdout.split("\0"))
+        for record in records:
+            if not record:
+                continue
+            path = record[3:] if len(record) > 3 else ""
+            if any(code in {"R", "C"} for code in record[:2]):
+                next(records, None)
             if not path or path == ".cambium" or path.startswith(".cambium/"):
                 continue
             if is_cache_artifact_path(path):
                 continue
-            if line[:2] == "!!":
+            if record[:2] == "!!":
                 ignored.append(path)
                 continue
             changed.append(path)
@@ -8261,7 +8273,10 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
             except ValueError as exc:
                 return await _fatal(writer, msg, f"invalid init config: {exc}")
             if new_config.worktree is not None:
-                os.chdir(new_config.worktree)
+                try:
+                    os.chdir(new_config.worktree)
+                except OSError as exc:
+                    return await _fatal(writer, msg, f"worktree chdir failed: {exc}")
             first = msg
             init_rid = msg["request_id"]
             task_id = msg.get("task_id", "unknown")
