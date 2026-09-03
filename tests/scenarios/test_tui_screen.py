@@ -10,7 +10,7 @@ from _helpers_g2 import _FlushCountingTty, _Tty  # type: ignore[reportMissingImp
 
 import cambium.tui_screen as tui_screen
 from cambium.observability import ObservabilityState, RecentEvent, snapshot_from_events
-from cambium.tui import _command_output, _queued_prompt_notice
+from cambium.tui import _command_output, _queued_prompt_notice, _safe_live_draw
 from cambium.tui_screen import (
     ActivityState,
     Cockpit,
@@ -60,6 +60,12 @@ def _snapshot():
         context=context,
         recent_events=(SimpleNamespace(kind="usage_event", detail="tokens=12345"),),
     )
+
+
+class _Utf8Tty(_Tty):
+    def write(self, value: str) -> int:
+        value.encode("utf-8")
+        return super().write(value)
 
 
 def _traffic_snapshot():
@@ -2167,3 +2173,91 @@ def test_activity_keeps_tool_in_flight_until_matching_end() -> None:
         now=4.0,
     )
     assert "running run_shell" not in activity.render(now=4.0)
+
+
+def test_restore_input_line_escapes_lone_surrogates_before_writing() -> None:
+    stream = _Utf8Tty()
+    cockpit = Cockpit(stream)
+    with cockpit:
+        cockpit.move_to_input()
+        cockpit._restore_input_line("\udc80\udc81\udc82", force=True)
+
+    rendered = stream.getvalue()
+    assert r"\udc80\udc81\udc82" in rendered
+    assert all(value not in rendered for value in ("\udc80", "\udc81", "\udc82"))
+
+
+def test_live_draw_failure_is_contained_and_disables_rendering() -> None:
+    error = io.StringIO()
+    enabled = True
+
+    def disable() -> None:
+        nonlocal enabled
+        enabled = False
+
+    def fail() -> None:
+        raise RuntimeError("render failed")
+
+    enabled = _safe_live_draw(
+        fail,
+        error=error,
+        disable=disable,
+    )
+
+    assert enabled is False
+    assert "live rendering disabled (RuntimeError)" in error.getvalue()
+
+
+def test_consecutive_identical_queued_system_notices_are_collapsed() -> None:
+    transcript = Transcript()
+    transcript.system("queued: follow-up")
+    transcript.system("queued: follow-up")
+    transcript.system("queued: another")
+    transcript.system("queued: follow-up")
+
+    assert [entry.text for entry in transcript.entries] == [
+        "queued: follow-up",
+        "queued: another",
+        "queued: follow-up",
+    ]
+
+
+def test_live_resize_repaints_before_rewriting_live_rows(monkeypatch) -> None:
+    sizes = iter((os.terminal_size((110, 24)), os.terminal_size((90, 24))))
+    monkeypatch.setattr(tui_screen.shutil, "get_terminal_size", lambda _fallback: next(sizes))
+    stream = _Tty()
+    transcript = Transcript()
+    cockpit = Cockpit(stream)
+
+    with cockpit:
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+            activity_line="⠋ WAITING",
+            turn_active=True,
+        )
+        cockpit.move_to_input()
+        transcript.observe_event(
+            {
+                "kind": "heartbeat",
+                "payload": {"phase": "streaming", "tail": "resized"},
+            }
+        )
+        before = stream.getvalue()
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+            activity_line="▸ streaming",
+            turn_active=True,
+        )
+
+    delta = stream.getvalue()[len(before) :]
+    assert cockpit._last_rendered_width == 90
+    assert "┌ Cambium · conversation" in delta
+    assert f"{tui_screen._CLEAR_LINE}{' ' * 110}" in delta

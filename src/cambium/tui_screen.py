@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from .provider_scheduler import QuotaLedger
-from .terminal import sanitize_terminal_text
+from .terminal import pad_terminal_text, sanitize_terminal_text
 
 try:
     import readline as _readline
@@ -299,7 +299,8 @@ def _is_tty(stream: Any) -> bool:
 
 
 def _sanitize(value: Any) -> str:
-    return sanitize_terminal_text(value)
+    clean = sanitize_terminal_text(value)
+    return clean.encode("utf-8", errors="backslashreplace").decode("utf-8")
 
 
 def _single_line(value: Any) -> str:
@@ -847,6 +848,14 @@ class Transcript:
         self.add("assistant", text)
 
     def system(self, text: str) -> None:
+        clean = _sanitize(text).strip("\n")
+        if (
+            clean.startswith("queued:")
+            and self._entries
+            and self._entries[-1].role == "system"
+            and self._entries[-1].text == clean
+        ):
+            return
         self.add("system", text)
 
     def error(self, text: str) -> None:
@@ -4234,6 +4243,7 @@ class Cockpit:
         self._turn_active = False
         self._last_live_draw_at = 0.0
         self._draw_in_flight = False
+        self._last_rendered_width: int | None = None
         self._last_primary_rows: tuple[tuple[str, str], ...] = ()
         self._last_conversation_rows: tuple[tuple[str, str], ...] = ()
         self._last_frame_conversation_rows: tuple[tuple[str, str], ...] = ()
@@ -4462,15 +4472,17 @@ class Cockpit:
     def _restore_input_line(self, text: str, *, force: bool = False) -> None:
         if not self._input_active:
             return
+        text = _sanitize(text).replace("\r", " ").replace("\n", " ").replace("\t", " ")
+        label = _sanitize(self._input_prompt_label)
         if (
             not force
             and self._last_restored_input_text == text
-            and self._last_restored_input_label == self._input_prompt_label
+            and self._last_restored_input_label == label
         ):
             return
-        self.stream.write(f"\r{_CLEAR_LINE}{self._input_prompt_label} {text}")
+        self.stream.write(f"\r{_CLEAR_LINE}{label} {text}")
         self._last_restored_input_text = text
-        self._last_restored_input_label = self._input_prompt_label
+        self._last_restored_input_label = label
 
     def _small_live_rows(
         self,
@@ -4589,6 +4601,7 @@ class Cockpit:
         self._small_total_rows = len(lines)
         self._last_request = request
         self._activity_line = activity_line
+        self._last_rendered_width = self._last_size.columns
         self._last_primary_rows = conversation_rows
         self._last_conversation_rows = conversation_rows
         self._last_frame_conversation_rows = conversation_rows
@@ -4748,6 +4761,10 @@ class Cockpit:
         live_only: bool = False,
     ) -> None:
         input_text = self._input_line_text()
+        geometry_changed = self._frame_size != self._last_size or (
+            self._last_rendered_width is not None
+            and self._last_rendered_width != self._last_size.columns
+        )
         # A result event can be live-only before finish_stream commits it.
         # Promote only the post-commit revision into the conversation frame.
         final_response_pending = (
@@ -4756,15 +4773,19 @@ class Cockpit:
             and not request[1].streaming_text
             and request[1].live_revision != self._last_live_revision
         )
-        live_only_render = not final_response_pending and (
-            live_only
-            or (
-                force
-                and self._fixed_frame
-                and (
-                    request[1].live_final
-                    or request[1].live_revision != self._last_live_revision
-                    or _terminal_activity_status(request[-1]) is not None
+        live_only_render = (
+            not geometry_changed
+            and not final_response_pending
+            and (
+                live_only
+                or (
+                    force
+                    and self._fixed_frame
+                    and (
+                        request[1].live_final
+                        or request[1].live_revision != self._last_live_revision
+                        or _terminal_activity_status(request[-1]) is not None
+                    )
                 )
             )
         )
@@ -4847,10 +4868,19 @@ class Cockpit:
         )
         if self._fixed_frame and (
             self._frame_size != self._last_size
+            or (
+                self._last_rendered_width is not None
+                and self._last_rendered_width != self._last_size.columns
+            )
             or self._frame_show_detail != self._show_detail
             or (force and rows != self._last_primary_rows)
         ):
             # Leave the current input/status row before appending a fresh frame.
+            if (
+                self._last_rendered_width is not None
+                and self._last_rendered_width != self._last_size.columns
+            ):
+                self._clear_previous_rendered_width()
             self.stream.write("\x1b[1B\r\n")
             self._fixed_frame = False
         if not self._fixed_frame:
@@ -4889,6 +4919,7 @@ class Cockpit:
             self.stream.write("\x1b[1A\r")
             self.stream.flush()
             self._fixed_frame = True
+            self._last_rendered_width = self._last_size.columns
             self._frame_size = self._last_size
             self._frame_show_detail = self._show_detail
             self._last_primary_rows = rows
@@ -4942,6 +4973,12 @@ class Cockpit:
                 include_stream=False,
             )
         )
+
+    def _clear_previous_rendered_width(self) -> None:
+        """Clear the prior frame's full cell width before changing geometry."""
+        if self._last_rendered_width is None:
+            return
+        self.stream.write(f"\r{_CLEAR_LINE}{pad_terminal_text('', self._last_rendered_width)}\r")
 
     def _draw_stream_now(
         self,

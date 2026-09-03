@@ -201,11 +201,51 @@ def _is_tty(stream: Any) -> bool:
         return False
 
 
+def _safe(value: Any, *, single_line: bool = False) -> str:
+    clean = sanitize_terminal_text(value, single_line=single_line)
+    return clean.encode("utf-8", errors="backslashreplace").decode("utf-8")
+
+
+def _safe_output(value: Any) -> str:
+    """Keep renderer-owned ANSI while making a write UTF-8 encodable."""
+    return str(value).encode("utf-8", errors="backslashreplace").decode("utf-8")
+
+
 def _write_line(out: TextIO, line: str) -> None:
+    line = _safe_output(line)
     if line:
         out.write(line)
         if not line.endswith("\n"):
             out.write("\n")
+
+
+def _safe_live_draw(
+    draw: Callable[[], None],
+    *,
+    error: TextIO,
+    disable: Callable[[], None],
+) -> bool:
+    """Contain presentation failures so an observer cannot kill a turn."""
+    try:
+        draw()
+    except Exception as exc:
+        try:
+            disable()
+        except Exception:
+            pass
+        try:
+            error.write(
+                _safe(
+                    f"cambium tui: live rendering disabled ({type(exc).__name__})",
+                    single_line=True,
+                )
+            )
+            error.write("\n")
+            error.flush()
+        except Exception:
+            pass
+        return False
+    return True
 
 
 @contextmanager
@@ -244,7 +284,7 @@ def _strip_bracketed_paste_markers(value: str) -> str:
 def _unframe_bracketed_paste(value: str, source: TextIO) -> str:
     """Remove terminal paste framing while retaining newlines in the payload."""
     if not _is_tty(source):
-        return sanitize_terminal_text(value).rstrip("\r\n")
+        return _safe(value).rstrip("\r\n")
 
     accumulated = value
     while True:
@@ -259,19 +299,13 @@ def _unframe_bracketed_paste(value: str, source: TextIO) -> str:
         )
         if end >= 0 and not pending:
             suffix = accumulated[end + len(_BRACKETED_PASTE_END) :].rstrip("\r\n")
-            return sanitize_terminal_text(
-                _strip_bracketed_paste_markers(accumulated[:end] + suffix)
-            )
+            return _safe(_strip_bracketed_paste_markers(accumulated[:end] + suffix))
         if start < 0 and not pending:
-            return sanitize_terminal_text(_strip_bracketed_paste_markers(accumulated)).rstrip(
-                "\r\n"
-            )
+            return _safe(_strip_bracketed_paste_markers(accumulated)).rstrip("\r\n")
 
         line = source.readline()
         if line == "":
-            return sanitize_terminal_text(_strip_bracketed_paste_markers(accumulated)).rstrip(
-                "\r\n"
-            )
+            return _safe(_strip_bracketed_paste_markers(accumulated)).rstrip("\r\n")
         accumulated += pending + line
 
 
@@ -580,6 +614,7 @@ async def _run_legacy(
 
     dashboard_enabled = render.should_color(out) and not quiet
     failed = False
+    live_render_enabled = True
     try:
         while True:
             prompt = _read_prompt(source, out)
@@ -611,20 +646,31 @@ async def _run_legacy(
                     _dashboard: AnsiDashboard = dashboard,
                     _session_dir: Path = session_dir,
                 ) -> None:
+                    nonlocal live_render_enabled
                     _state.apply(record)
-                    if _dashboard.enabled:
-                        _dashboard.draw(_state.snapshot(session_dir=_session_dir))
-                    elif not quiet:
-                        _write_line(out, render.render_event_line(record, stream=out))
-                        snapshot = _state.snapshot()
-                        _write_line(
-                            out,
-                            "live: "
-                            f"out/s={snapshot.output_tokens_per_s:.1f} · "
-                            f"active={snapshot.active_agents} · "
-                            f"tokens={snapshot.total_tokens}",
-                        )
-                    out.flush()
+                    if not live_render_enabled:
+                        return
+
+                    def draw_live() -> None:
+                        if _dashboard.enabled:
+                            _dashboard.draw(_state.snapshot(session_dir=_session_dir))
+                        elif not quiet:
+                            _write_line(out, render.render_event_line(record, stream=out))
+                            snapshot = _state.snapshot()
+                            _write_line(
+                                out,
+                                "live: "
+                                f"out/s={snapshot.output_tokens_per_s:.1f} · "
+                                f"active={snapshot.active_agents} · "
+                                f"tokens={snapshot.total_tokens}",
+                            )
+                        out.flush()
+
+                    live_render_enabled = _safe_live_draw(
+                        draw_live,
+                        error=err,
+                        disable=lambda: setattr(_dashboard, "enabled", False),
+                    )
 
                 with dashboard:
                     response = await oneshot.run_oneshot(
@@ -639,8 +685,7 @@ async def _run_legacy(
                 return ExitCode.SUCCESS
             except (AuthError, OSError, SessionAlreadyRunningError, ValueError) as exc:
                 failed = True
-                err.write(f"cambium tui: {exc}\n")
-                err.flush()
+                _write_line(err, _safe(f"cambium tui: {exc}", single_line=True))
                 continue
             _write_result(out, render, response)
             try:
@@ -653,8 +698,10 @@ async def _run_legacy(
                     stats.session_usage_stats(session_dir), worktree=worktree
                 )
             except (OSError, ValueError, sqlite3.Error) as exc:
-                err.write(f"cambium tui: usage stats unavailable: {exc}\n")
-                err.flush()
+                _write_line(
+                    err,
+                    _safe(f"cambium tui: usage stats unavailable: {exc}", single_line=True),
+                )
                 stats_line = ""
             _write_line(out, stats_line)
             out.flush()
@@ -784,8 +831,7 @@ async def _run_interactive(
         session.acquire()
         lock_acquired = True
     except InteractiveSessionBusyError as exc:
-        err.write(f"cambium tui: {exc}\n")
-        err.flush()
+        _write_line(err, _safe(f"cambium tui: {exc}", single_line=True))
         return ExitCode.TEMPORARY_FAILURE
 
     try:
@@ -819,6 +865,11 @@ async def _run_interactive(
     failed = False
     native_input = source is sys.stdin and out is sys.stdout
     cockpit = Cockpit(out, enabled=not quiet)
+    live_render_enabled = True
+
+    def disable_live_render() -> None:
+        cockpit.enabled = False
+
     history_path = _history_path(session)
     if native_input:
         _load_history(history_path)
@@ -902,6 +953,8 @@ async def _run_interactive(
             reader.join(timeout=0.05)
 
     def _draw_final(snapshot: SessionSnapshot, *, activity_line: str = "") -> None:
+        if not live_render_enabled:
+            return
         cockpit.draw(
             snapshot,
             transcript,
@@ -1019,11 +1072,18 @@ async def _run_interactive(
                 loop = asyncio.get_running_loop()
 
                 async def _activity_ticks(_activity: ActivityState = activity) -> None:
+                    nonlocal live_render_enabled
                     try:
                         while _activity.active:
                             await asyncio.sleep(0.1)
-                            if _activity.active:
-                                cockpit.draw_activity(_activity.tick())
+                            if _activity.active and live_render_enabled:
+                                live_render_enabled = _safe_live_draw(
+                                    lambda: cockpit.draw_activity(_activity.tick()),
+                                    error=err,
+                                    disable=disable_live_render,
+                                )
+                                if not live_render_enabled:
+                                    return
                     except asyncio.CancelledError:
                         raise
                     except (BrokenPipeError, OSError, ValueError):
@@ -1040,7 +1100,7 @@ async def _run_interactive(
                     _turns_by_task=turns_by_task,
                     _turns=turns,
                 ) -> None:
-                    nonlocal sequence
+                    nonlocal live_render_enabled, sequence
                     session.observe_event(
                         _turns_by_task.get(record.get("task_id"), _turns[0]), record
                     )
@@ -1051,15 +1111,20 @@ async def _run_interactive(
                     normalized["seq"] = sequence
                     _state.apply(normalized)
                     live_snapshot = _state.snapshot(session_dir=_turn.session_dir)
-                    cockpit.draw(
-                        live_snapshot,
-                        transcript,
-                        session_description=session.describe(),
-                        branch_line=_branch_line(session),
-                        cumulative_line=_cumulative.line(snapshot=live_snapshot),
-                        activity_line=_activity.render(),
-                        turn_active=True,
-                    )
+                    if live_render_enabled:
+                        live_render_enabled = _safe_live_draw(
+                            lambda: cockpit.draw(
+                                live_snapshot,
+                                transcript,
+                                session_description=session.describe(),
+                                branch_line=_branch_line(session),
+                                cumulative_line=_cumulative.line(snapshot=live_snapshot),
+                                activity_line=_activity.render(),
+                                turn_active=True,
+                            ),
+                            error=err,
+                            disable=disable_live_render,
+                        )
 
                 _start_input_read()
                 turn_active = True
@@ -1107,18 +1172,32 @@ async def _run_interactive(
                                         if _is_quit_prompt(queued_prompt):
                                             input_closing = True
                                         transcript.system(notice)
-                                        cockpit.draw(
-                                            state.snapshot(session_dir=turn.session_dir),
-                                            transcript,
-                                            session_description=session.describe(),
-                                            branch_line=_branch_line(session),
-                                            cumulative_line=cumulative.line(
-                                                snapshot=state.snapshot(
-                                                    session_dir=turn.session_dir
+                                        if live_render_enabled:
+                                            queued_snapshot = state.snapshot(
+                                                session_dir=turn.session_dir
+                                            )
+                                            queued_cumulative_line = cumulative.line(
+                                                snapshot=queued_snapshot
+                                            )
+
+                                            def draw_queued(
+                                                snapshot: Any = queued_snapshot,
+                                                cumulative_line: str = queued_cumulative_line,
+                                            ) -> None:
+                                                cockpit.draw(
+                                                    snapshot,
+                                                    transcript,
+                                                    session_description=session.describe(),
+                                                    branch_line=_branch_line(session),
+                                                    cumulative_line=cumulative_line,
+                                                    turn_active=True,
                                                 )
-                                            ),
-                                            turn_active=True,
-                                        )
+
+                                            live_render_enabled = _safe_live_draw(
+                                                draw_queued,
+                                                error=err,
+                                                disable=disable_live_render,
+                                            )
                                 _start_input_read()
 
                             if turn_task in done:
@@ -1165,8 +1244,7 @@ async def _run_interactive(
                     failed = True
                     transcript.error(str(exc))
                     transcript.finish_stream()
-                    err.write(f"cambium tui: {exc}\n")
-                    err.flush()
+                    _write_line(err, _safe(f"cambium tui: {exc}", single_line=True))
                     snapshot = state.snapshot(session_dir=turn.session_dir)
                     last_snapshot = snapshot
                     cumulative.add(snapshot)
