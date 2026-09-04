@@ -1319,7 +1319,9 @@ class TokenManager:
             except OSError as exc:
                 if exc.errno == errno.ELOOP:
                     raise OAuthStoreError("oauth lock file must not be a symlink") from exc
-                raise OAuthStoreError("could not open the oauth lock file") from exc
+                raise OAuthStoreError(
+                    f"could not open the oauth lock file (errno {exc.errno})"
+                ) from exc
         finally:
             os.close(directory_fd)
         try:
