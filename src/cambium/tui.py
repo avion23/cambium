@@ -27,6 +27,7 @@ from .interactive import (
 )
 from .monitor import AnsiDashboard, render_agent_lines
 from .observability import ObservabilityState, SessionSnapshot
+from .provider_scheduler import QuotaLedgerError, read_quota_snapshots
 from .store import StoreError, read_events_file
 from .terminal import SynchronizedOutput, sanitize_terminal_text, terminal_capabilities
 from .tui_screen import ActivityState, Cockpit, Transcript, render_quota_rows
@@ -742,7 +743,11 @@ def _command_output(
     if name == "/session" and not argument:
         return session.describe()
     if name == "/quota" and not argument:
-        rows = render_quota_rows(snapshot)
+        try:
+            windows = read_quota_snapshots()
+        except (OSError, QuotaLedgerError) as exc:
+            return f"quota: unavailable ({exc})"
+        rows = render_quota_rows(replace(snapshot, quota_windows=windows))
         if not rows:
             return "quota: no provider quota observations"
         return "\n".join(("quota:", *rows))

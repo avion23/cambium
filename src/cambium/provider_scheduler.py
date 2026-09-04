@@ -23,12 +23,17 @@ import sqlite3
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import closing
 from dataclasses import asdict, dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, TypeVar
 
 _RESERVATION_RETENTION_S = 24 * 60 * 60
+_QUOTA_SNAPSHOT_SQL = (
+    "SELECT provider,name,reset_at,allowance_tokens,used_tokens,"
+    "allowance_requests,used_requests,reserve_fraction FROM quota_windows"
+)
 
 # SQLite's built-in busy timeout is deliberately kept short.  The ledger
 # retries the *whole transaction* instead of allowing one connection to sleep
@@ -1009,10 +1014,7 @@ class QuotaLedger:
         self._run_transaction("observe", observe_transaction)
 
     def snapshots(self, provider: str | None = None) -> tuple[QuotaWindowSnapshot, ...]:
-        sql = (
-            "SELECT provider,name,reset_at,allowance_tokens,used_tokens,"
-            "allowance_requests,used_requests,reserve_fraction FROM quota_windows"
-        )
+        sql = _QUOTA_SNAPSHOT_SQL
         params: tuple[Any, ...] = ()
         if provider is not None:
             sql += " WHERE provider=?"
@@ -1023,6 +1025,28 @@ class QuotaLedger:
             lambda connection: connection.execute(sql, params).fetchall(),
         )
         return tuple(QuotaWindowSnapshot(*row) for row in rows)
+
+
+def read_quota_snapshots(
+    path: str | Path | None = None, provider: str | None = None
+) -> tuple[QuotaWindowSnapshot, ...]:
+    """Read operator quota state without creating a ledger or changing its mode."""
+    path = _state_path() if path is None else Path(path).expanduser().resolve()
+    if not path.is_file():
+        return ()
+    sql = _QUOTA_SNAPSHOT_SQL
+    params: tuple[str, ...] = ()
+    if provider is not None:
+        sql += " WHERE provider=?"
+        params = (provider,)
+    try:
+        with closing(
+            sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=0.1)
+        ) as connection:
+            rows = connection.execute(sql + " ORDER BY provider,name", params).fetchall()
+    except sqlite3.Error as exc:
+        raise QuotaLedgerError(f"quota ledger read failed: {exc}") from exc
+    return tuple(QuotaWindowSnapshot(*row) for row in rows)
 
 
 def quota_snapshot_json(snapshot: QuotaWindowSnapshot) -> dict[str, Any]:
@@ -1045,4 +1069,5 @@ __all__ = [
     "QuotaWindowSnapshot",
     "QuotaWindowSpec",
     "quota_snapshot_json",
+    "read_quota_snapshots",
 ]

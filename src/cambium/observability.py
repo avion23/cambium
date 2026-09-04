@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .provider_scheduler import QuotaWindowSnapshot
 from .summary_trunk import SUMMARY_ENTRY_OPEN
 
 _TERMINAL_STATES = frozenset({"succeeded", "failed", "cancelled", "exited", "rejected"})
@@ -120,6 +121,7 @@ class SessionSnapshot:
     context: ContextSnapshot
     recent_events: tuple[RecentEvent, ...]
     last_seq: int
+    quota_windows: tuple[QuotaWindowSnapshot, ...] = ()
 
 
 @dataclass(slots=True)
@@ -421,6 +423,7 @@ class ObservabilityState:
         self._first_time: float | None = None
         self._last_time: float | None = None
         self._session_status = "idle"
+        self._quota_windows: dict[tuple[str, str], QuotaWindowSnapshot] = {}
 
     @property
     def last_seq(self) -> int:
@@ -457,6 +460,26 @@ class ObservabilityState:
         if timestamp is not None:
             self._first_time = timestamp if self._first_time is None else self._first_time
             self._last_time = timestamp
+
+        if kind == "usage_event":
+            windows = payload.get("quota_windows", ())
+            for window in windows if isinstance(windows, list | tuple) else ():
+                if not isinstance(window, Mapping):
+                    continue
+                provider = _string(window.get("provider"))
+                name = _string(window.get("name"))
+                if provider is None or name is None:
+                    continue
+                self._quota_windows[provider, name] = QuotaWindowSnapshot(
+                    provider=provider,
+                    name=name,
+                    reset_at=_finite_non_negative(window.get("reset_at")) or 0.0,
+                    allowance_tokens=_count(window.get("allowance_tokens")),
+                    used_tokens=_count(window.get("used_tokens")),
+                    allowance_requests=_count(window.get("allowance_requests")),
+                    used_requests=_count(window.get("used_requests")),
+                    reserve_fraction=_finite_non_negative(window.get("reserve_fraction")) or 0.0,
+                )
 
         parent_id = _string(payload.get("parent_task_id"))
         child_id = _string(payload.get("child_task_id"))
@@ -563,8 +586,17 @@ class ObservabilityState:
                 agent.cached_tokens += cached_tokens
                 agent.total_tokens += total_tokens
                 latency = _finite_non_negative(payload.get("latency_s"))
-                if latency is not None and latency > 0:
-                    agent.output_tokens_per_s = output_tokens / latency
+                usage = payload.get("usage")
+                measured_output = None
+                if isinstance(usage, Mapping):
+                    measured_output = _finite_non_negative(usage.get("output_tokens"))
+                    if measured_output is None:
+                        measured_output = _finite_non_negative(usage.get("completion_tokens"))
+                agent.output_tokens_per_s = (
+                    measured_output / latency
+                    if measured_output is not None and latency is not None and latency > 0
+                    else None
+                )
                 cost = _finite_non_negative(payload.get("estimated_cost_usd"))
                 if cost is not None:
                     agent.estimated_cost_usd += cost
@@ -768,6 +800,7 @@ class ObservabilityState:
             context=context,
             recent_events=tuple(self._recent),
             last_seq=self._last_seq,
+            quota_windows=tuple(self._quota_windows[key] for key in sorted(self._quota_windows)),
         )
 
 

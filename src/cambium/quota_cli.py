@@ -9,7 +9,12 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .provider_scheduler import QuotaLedger, QuotaLedgerError, quota_snapshot_json
+from .provider_scheduler import (
+    QuotaLedger,
+    QuotaLedgerError,
+    quota_snapshot_json,
+    read_quota_snapshots,
+)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -42,11 +47,11 @@ def _format_reset(reset_at: float) -> str:
 
 
 def run_namespace(args: argparse.Namespace) -> int:
-    ledger = QuotaLedger(getattr(args, "db", None))
     command = args.quota_command
     if command == "observe":
         if args.reset_in_s <= 0:
             raise ValueError("--reset-in-s must be positive")
+        ledger = QuotaLedger(getattr(args, "db", None))
         ledger.observe(
             args.provider,
             args.window,
@@ -58,7 +63,7 @@ def run_namespace(args: argparse.Namespace) -> int:
             reserve_fraction=args.reserve_fraction,
         )
         return 0
-    snapshots = ledger.snapshots(getattr(args, "provider", None))
+    snapshots = read_quota_snapshots(getattr(args, "db", None), getattr(args, "provider", None))
     if getattr(args, "json", False):
         print(json.dumps([quota_snapshot_json(item) for item in snapshots], sort_keys=True))
         return 0
@@ -69,12 +74,12 @@ def run_namespace(args: argparse.Namespace) -> int:
     for item in snapshots:
         reset_in = max(0, int(item.reset_at - now))
         tokens = (
-            "unbounded"
+            "tokens unknown"
             if item.remaining_tokens is None
             else f"{item.remaining_tokens}/{item.allowance_tokens} tokens"
         )
         requests = (
-            "unbounded"
+            "requests unknown"
             if item.remaining_requests is None
             else f"{item.remaining_requests}/{item.allowance_requests} requests"
         )

@@ -186,11 +186,9 @@ class ProviderDebt:
                     and not isinstance(outputs, bool)
                 ):
                     self.tokens += int(inputs) + int(outputs)
-            # Generation throughput deliberately uses output-side tokens so
-            # prompt/cache tokens do not make a provider look faster.  Older
-            # events may only carry total_tokens, matching the existing
-            # render_tokens_per_s fallback.
-            for key in ("completion_tokens", "output_tokens", "total_tokens"):
+            # Total tokens include the prompt, not just generated output.
+            # Missing output counts are unknown throughput, not a fast lane.
+            for key in ("output_tokens", "completion_tokens"):
                 value = usage.get(key)
                 if isinstance(value, int | float) and not isinstance(value, bool):
                     try:

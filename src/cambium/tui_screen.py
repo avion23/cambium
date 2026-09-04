@@ -19,7 +19,6 @@ import os
 import re
 import shutil
 import signal
-import sqlite3
 import textwrap
 import time
 import unicodedata
@@ -28,10 +27,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 from functools import lru_cache
-from pathlib import Path
 from typing import Any, TextIO
 
-from .provider_scheduler import QuotaLedger
 from .terminal import (
     clip_terminal_text,
     pad_terminal_text,
@@ -3454,37 +3451,16 @@ def _quota_field(window: Any, key: str, default: Any = None) -> Any:
     return getattr(window, key, default)
 
 
-def _quota_db_exists() -> bool:
-    configured = os.environ.get("CAMBIUM_QUOTA_DB")
-    if configured:
-        path = Path(configured).expanduser()
-    else:
-        state_home = os.environ.get("XDG_STATE_HOME")
-        root = Path(state_home).expanduser() if state_home else Path.home() / ".local" / "state"
-        path = root / "cambium" / "provider-quota.db"
-    try:
-        return path.is_file()
-    except OSError:
-        return False
-
-
 def _quota_windows(snapshot: Any) -> tuple[Any, ...]:
     windows = getattr(snapshot, "quota_windows", None)
     if windows is None:
         windows = getattr(snapshot, "quota_snapshots", None)
     if windows is None:
-        for agent in getattr(snapshot, "agents", ()):
-            agent_windows = getattr(agent, "quota_windows", None)
-            if agent_windows is not None:
-                windows = agent_windows
-                break
-    if windows is None and _quota_db_exists():
-        try:
-            windows = QuotaLedger().snapshots()
-        except (OSError, ValueError, sqlite3.Error):
-            windows = ()
-    if windows is None:
-        return ()
+        windows = tuple(
+            window
+            for agent in getattr(snapshot, "agents", ())
+            for window in (getattr(agent, "quota_windows", ()) or ())
+        )
     if isinstance(windows, Mapping):
         if "provider" in windows and "name" in windows:
             return (windows,)

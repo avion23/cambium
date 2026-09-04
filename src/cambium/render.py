@@ -672,23 +672,11 @@ def render_subagent_status(events: Any) -> str:
 
 
 def render_tokens_per_s(events: Any) -> str:
-    """Render generation throughput in tokens per second from the latest
-    usable ``usage_event``.
+    """Render output tokens / call wall time from the latest usable usage event.
 
-    ``events`` is a sequence of already-redacted event records (mappings with
-    at least ``kind`` and ``payload`` keys).  For every ``usage_event`` whose
-    payload ``latency_s`` is a positive finite number, the rate is that
-    event's ``payload.usage.completion_tokens`` divided by its ``latency_s``
-    -- generation throughput, so cache-served prompt tokens do not inflate
-    it; only when ``completion_tokens`` is absent or non-numeric does the
-    rate fall back to ``payload.usage.total_tokens``.  The LATEST such rate
-    is returned as ``"tokens/s=12.3"`` with one decimal.  The guard is
-    applied per event, so a single usage_event is handled identically: its
-    own token count and ``latency_s`` define the rate.  Events without a
-    usable token count (both ``completion_tokens`` and ``total_tokens``
-    missing, non-numeric, or non-finite), or with a missing, zero, negative,
-    or non-finite ``latency_s``, are skipped.  Returns ``""`` when no usable
-    usage_event exists.
+    Accept Responses and Chat Completions output counts. Total tokens include
+    the prompt and cannot measure generation speed. Missing evidence stays
+    unknown; this is not a measurement of decoder-only throughput.
     """
     rate: float | None = None
     for event in events:
@@ -706,10 +694,10 @@ def render_tokens_per_s(events: Any) -> str:
         usage = payload.get("usage")
         if not isinstance(usage, Mapping):
             continue
-        tokens = _finite_number(usage.get("completion_tokens"))
+        tokens = _finite_number(usage.get("output_tokens"))
         if tokens is None:
-            tokens = _finite_number(usage.get("total_tokens"))
-        if tokens is None:
+            tokens = _finite_number(usage.get("completion_tokens"))
+        if tokens is None or tokens < 0:
             continue
         rate = tokens / latency
     if rate is None:

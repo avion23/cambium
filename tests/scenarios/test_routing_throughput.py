@@ -112,7 +112,7 @@ def test_provider_debt_records_and_persists_measured_tokens_per_second(
     debt.record(
         {
             "provider": "fast",
-            "usage": {"total_tokens": 300},
+            "usage": {"output_tokens": 300, "total_tokens": 300},
             "latency_s": 10.0,
         },
         now=101.0,
