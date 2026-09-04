@@ -44,6 +44,23 @@ _BRACKETED_PASTE_ENABLE = "\x1b[?2004h"
 _BRACKETED_PASTE_DISABLE = "\x1b[?2004l"
 _BRACKETED_PASTE_START = "\x1b[200~"
 _BRACKETED_PASTE_END = "\x1b[201~"
+_LIVE_COMMANDS = frozenset(
+    {
+        "/help",
+        "/status",
+        "/usage",
+        "/agents",
+        "/context",
+        "/session",
+        "/model",
+        "/branches",
+        "/quota",
+        "/dashboard",
+        "/detail",
+        "/events",
+        "/tail",
+    }
+)
 
 
 @dataclass(slots=True)
@@ -83,30 +100,45 @@ class _Cumulative:
         ]
         self.latest_output_tokens_per_s = sum(rates)
 
-    def line(self, *, snapshot: SessionSnapshot | None = None) -> str:
+    def line(self, *, snapshot: SessionSnapshot | None = None, active: bool = False) -> str:
+        totals = {
+            key: getattr(self, key) + (getattr(snapshot, key, 0) if active else 0)
+            for key in (
+                "calls",
+                "summary_calls",
+                "input_tokens",
+                "output_tokens",
+                "cached_tokens",
+                "total_tokens",
+                "estimated_cost_usd",
+            )
+        }
+        rate = (
+            snapshot.output_tokens_per_s if active and snapshot else self.latest_output_tokens_per_s
+        )
         providers = set(self.providers_seen)
         if snapshot is not None:
             providers.update(self._providers(snapshot))
         subscription = any(
             self.billing_labels.get(provider) == "subscription" for provider in providers
         )
-        if subscription and self.estimated_cost_usd <= 0:
+        if subscription and totals["estimated_cost_usd"] <= 0:
             cost = "subscription"
         elif (
-            self.estimated_cost_usd <= 0
+            totals["estimated_cost_usd"] <= 0
             and providers
             and all(self.billing_labels.get(provider) == "free" for provider in providers)
         ):
             cost = "free"
         else:
-            cost = f"${self.estimated_cost_usd:.6f}"
+            cost = f"${totals['estimated_cost_usd']:.6f}"
         return (
             "usage: "
-            f"calls={self.calls} summaries={self.summary_calls} "
-            f"tokens={self.total_tokens} "
-            f"(in={self.input_tokens} out={self.output_tokens} "
-            f"cached={self.cached_tokens}) "
-            f"out/s={self.latest_output_tokens_per_s:.1f} "
+            f"calls={totals['calls']} summaries={totals['summary_calls']} "
+            f"tokens={totals['total_tokens']} "
+            f"(in={totals['input_tokens']} out={totals['output_tokens']} "
+            f"cached={totals['cached_tokens']}) "
+            f"out/s={rate:.1f} "
             f"cost={cost}"
         )
 
@@ -178,6 +210,7 @@ _HELP = """Commands:
   /dashboard  explain the visible live cockpit
   /detail     toggle the compact agents/usage/context detail row
   /events     recent durable event summaries
+  /cancel     cancel the active turn and return to the prompt
   /new        start a fresh semantic branch; old turn artifacts remain
   /clear      clear the visible cockpit transcript
   /exit       leave Cambium (also /quit or a prompt containing only q)
@@ -187,7 +220,9 @@ Transcript view:
   Live output is appended to the terminal's native scrollback; use the
   terminal's normal PageUp/PageDown or search controls to review it.
 
-During a running turn, !cancel or Ctrl-C cancels that turn and returns to this cockpit.
+During a running turn, /cancel, !cancel, or Ctrl-C cancels that turn.
+Inspection commands (/status, /usage, /agents, /events) work immediately.
+Other prompts and branch/model changes are queued for the next turn.
 The last successfully published context checkpoint remains the branch head.
 
 Multiline input:
@@ -730,6 +765,7 @@ def _command_output(
     cumulative: _Cumulative,
     snapshot: SessionSnapshot,
     cockpit: Cockpit | None = None,
+    active: bool = False,
 ) -> str | None:
     parts = command.split(maxsplit=1)
     name = parts[0] if parts else command
@@ -737,7 +773,7 @@ def _command_output(
     if name == "/help" and not argument:
         return _HELP
     if name == "/usage" and not argument:
-        return cumulative.line(snapshot=snapshot)
+        return cumulative.line(snapshot=snapshot, active=active)
     if name == "/agents" and not argument:
         return "\n".join(render_agent_lines(snapshot))
     if name == "/context" and not argument:
@@ -817,7 +853,7 @@ def _command_output(
                 session.describe(),
                 _branch_line(session),
                 _context_line(snapshot),
-                cumulative.line(snapshot=snapshot),
+                cumulative.line(snapshot=snapshot, active=active),
                 *render_agent_lines(snapshot),
             ]
         )
@@ -940,7 +976,7 @@ async def _run_interactive(
                 transcript,
                 session_description=session.describe(),
                 branch_line=_branch_line(session),
-                cumulative_line=cumulative.line(snapshot=snapshot),
+                cumulative_line=cumulative.line(snapshot=snapshot, active=running),
                 input_label=getattr(cockpit, "_input_prompt_label", "›"),
                 activity_line=activity_line,
                 turn_active=running,
@@ -1203,7 +1239,9 @@ async def _run_interactive(
                                 transcript,
                                 session_description=session.describe(),
                                 branch_line=_branch_line(session),
-                                cumulative_line=_cumulative.line(snapshot=live_snapshot),
+                                cumulative_line=_cumulative.line(
+                                    snapshot=live_snapshot, active=True
+                                ),
                                 activity_line=_activity.render(),
                                 turn_active=True,
                             ),
@@ -1251,21 +1289,35 @@ async def _run_interactive(
                                 _flush_cockpit()
                                 if queued_prompt is None:
                                     input_eof = True
-                                elif queued_prompt.strip() == "!cancel" and not turn_task.done():
+                                elif queued_prompt.strip() in {"!cancel", "/cancel"}:
                                     _request_cancel()
                                 else:
-                                    notice = _queued_prompt_notice(queued_prompt)
+                                    command = queued_prompt.strip()
+                                    inspection = (
+                                        _command_output(
+                                            command,
+                                            session=session,
+                                            cumulative=cumulative,
+                                            snapshot=state.snapshot(session_dir=turn.session_dir),
+                                            cockpit=cockpit,
+                                            active=True,
+                                        )
+                                        if command in _LIVE_COMMANDS
+                                        else None
+                                    )
+                                    notice = inspection or _queued_prompt_notice(queued_prompt)
                                     if notice is not None:
-                                        pending_prompts.append(queued_prompt)
-                                        if _is_quit_prompt(queued_prompt):
-                                            input_closing = True
+                                        if inspection is None:
+                                            pending_prompts.append(queued_prompt)
+                                            if _is_quit_prompt(queued_prompt):
+                                                input_closing = True
                                         transcript.system(notice)
                                         if live_render_enabled:
                                             queued_snapshot = state.snapshot(
                                                 session_dir=turn.session_dir
                                             )
                                             queued_cumulative_line = cumulative.line(
-                                                snapshot=queued_snapshot
+                                                snapshot=queued_snapshot, active=True
                                             )
 
                                             def draw_queued(
@@ -1279,6 +1331,7 @@ async def _run_interactive(
                                                     branch_line=_branch_line(session),
                                                     cumulative_line=cumulative_line,
                                                     turn_active=True,
+                                                    force=True,
                                                 )
 
                                             live_render_enabled = _safe_live_draw(

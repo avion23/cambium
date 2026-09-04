@@ -760,30 +760,50 @@ def test_finalization_may_use_scaled_headroom_past_hard_cap(tmp_path: Path) -> N
     )
 
 
-def test_max_turns_edge_injects_the_same_finalization_directive(tmp_path: Path) -> None:
+def test_three_turn_budget_allows_edit_verify_finish(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     worktree = _make_worktree(repo)
     config = _agent_config(worktree, max_turns=3)
     router = _ScriptedRouter(
         [
-            '{"type":"tool_call","name":"read_batch","arguments":{"paths":["alpha.txt"]}}',
-            '{"type":"finish","summary":"read the file","objective_met":false}',
+            json.dumps(
+                {
+                    "type": "tool_call",
+                    "name": "write_file",
+                    "arguments": {"path": "alpha.txt", "content": "changed"},
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "tool_call",
+                    "name": "run_shell",
+                    "arguments": {
+                        "cmd": [
+                            "python3",
+                            "-c",
+                            "from pathlib import Path; "
+                            "assert Path('alpha.txt').read_text() == 'changed'",
+                        ]
+                    },
+                }
+            ),
+            '{"type":"finish","summary":"changed and verified alpha.txt","objective_met":true}',
         ]
     )
 
     outcome = asyncio.run(_drive_loop(config, worktree, router))
 
-    assert outcome["status"] == "failed"
-    assert outcome["failure_reason"] == (
-        "forced finalization: investigation incomplete, no changes made"
+    assert outcome["status"] == "succeeded"
+    assert outcome["failure_reason"] is None
+    assert len(router.prompts) == 3
+    assert not any(
+        message.get("content") == worker.FINAL_SYNTHESIS_DIRECTIVE
+        for prompt in router.prompts[:2]
+        for message in prompt["messages"]
     )
-    assert len(router.prompts) == 2
-    assert (
-        sum(
-            message.get("content") == worker.FINAL_SYNTHESIS_DIRECTIVE
-            for message in router.prompts[1]["messages"]
-        )
-        == 1
+    assert any(
+        message.get("content") == worker.FINAL_SYNTHESIS_DIRECTIVE
+        for message in router.prompts[2]["messages"]
     )
 
 

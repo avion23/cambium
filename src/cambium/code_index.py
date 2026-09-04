@@ -135,7 +135,9 @@ def _walk_source_files(
 
 def _read(path: Path) -> str | None:
     try:
-        return path.read_text(encoding="utf-8")
+        with path.open("rb") as source:
+            data = source.read(2 * 1024 * 1024 + 1)
+        return data.decode("utf-8") if len(data) <= 2 * 1024 * 1024 else None
     except (OSError, UnicodeError):
         return None
 
@@ -187,7 +189,7 @@ def _generic_symbols(path: Path, text: str, root: Path) -> list[SourceLocation]:
     lines = text.splitlines()
     result: list[SourceLocation] = []
     for match in _GENERIC_SYMBOL.finditer(text):
-        line_no = text.count("\n", 0, match.start()) + 1
+        line_no = text.count("\n", 0, match.start("name")) + 1
         line = lines[line_no - 1] if line_no <= len(lines) else ""
         result.append(
             SourceLocation(
@@ -261,7 +263,7 @@ def _python_reference_positions(text: str, symbol: str) -> list[tuple[int, int]]
 
 
 _GENERIC_STRING = re.compile(r"""(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)""")
-_GENERIC_COMMENT = re.compile(r"(?:#|//|/\\*|--).*$")
+_GENERIC_COMMENT = re.compile(r"(?:#|//|/\*|--).*$")
 
 
 def _generic_reference_positions(text: str, symbol: str) -> list[tuple[int, int]]:
@@ -337,6 +339,8 @@ def read_symbol(
     if text is None:
         raise ValueError("source file is not readable UTF-8")
     lines = text.splitlines()
+    if line > len(lines):
+        raise ValueError(f"line {line} is past the end of the file ({len(lines)} lines)")
     start = max(1, line - context_lines // 2)
     end = min(len(lines), start + context_lines - 1)
     return {
@@ -351,10 +355,68 @@ def locations_json(locations: list[SourceLocation]) -> str:
     return json.dumps([asdict(location) for location in locations], ensure_ascii=False)
 
 
+def query_repository(root: str | Path, arguments: dict[str, Any]) -> str:
+    """Dispatch the model's bounded navigation query using the existing scanners."""
+    root = Path(root).resolve()
+    action = arguments["action"]
+    limit = arguments.get("limit", 40)
+    if action == "symbols":
+        return locations_json(
+            search_symbols(
+                root, arguments["query"], exact=arguments.get("exact", False), max_results=limit
+            )
+        )
+    if action == "references":
+        return locations_json(find_references(root, arguments["query"], max_results=limit))
+    if action == "window":
+        return json.dumps(
+            read_symbol(root, arguments["path"], arguments["line"], context_lines=limit),
+            ensure_ascii=False,
+        )
+    if action == "lsp":
+        from .lsp_query import query_lsp
+
+        return json.dumps(
+            query_lsp(
+                root,
+                method=arguments["method"],
+                path=arguments["path"],
+                line=arguments.get("line", 1),
+                column=arguments.get("column", 1),
+            ),
+            ensure_ascii=False,
+        )
+    if action not in {"tree", "search"}:
+        raise ValueError(f"unknown repository query: {action}")
+    selected = _inside(root, root / arguments.get("path", "."))
+    paths = [selected] if selected.is_file() else _walk_source_files(selected)
+    query = arguments["query"] if action == "search" else None
+    rows: list[str] = []
+    for path in paths:
+        relative = str(path.relative_to(root))
+        if query is None:
+            rows.append(relative)
+        else:
+            text = _read(path)
+            if text is None:
+                continue
+            for line, content in enumerate(text.splitlines(), 1):
+                if query in content:
+                    rows.append(f"{relative}:{line}: {_preview(content)}")
+                    if len(rows) > limit:
+                        break
+        if len(rows) > limit:
+            break
+    if len(rows) > limit:
+        rows[limit:] = ["[more results; narrow the path or query]"]
+    return "\n".join(rows) or "No matches in the bounded source scan."
+
+
 __all__ = [
     "SourceLocation",
     "find_references",
     "locations_json",
     "read_symbol",
     "search_symbols",
+    "query_repository",
 ]

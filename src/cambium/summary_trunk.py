@@ -70,27 +70,6 @@ SUMMARY_ENTRY_FIELDS = frozenset(
     }
 )
 
-SUMMARY_PROTOCOL_LINES = (
-    "Two output modes exist; the final user control block selects the mode.",
-    "- Normal mode: return one plan, tool_call, or finish action as specified below.",
-    "- Summary mode: when the final message is <cambium-summary-control>, return "
-    "exactly one summary_entry JSON object and no tool call, markdown, or prose.",
-    "In summary mode, summarize only the raw messages after the last "
-    "<cambium-summary-entry> and before the control block. Existing summary entries "
-    "are immutable history: do not rewrite, restate, or summarize them.",
-    SUMMARY_FINDING_PRESERVATION_CONTRACT,
-    "Discard only transient execution noise: malformed actions, routine command mistakes, "
-    "repeated reads, superseded outputs, and abandoned scratch plans. Never discard "
-    "preserved findings inside those messages: file:line references, defect hypotheses "
-    "or their evidence, approaches and outcomes, reproduction steps/status, expensive "
-    "tool findings, or open questions.",
-    "Use decisions_superseded and facts_invalidated to make changed conclusions explicit.",
-    "The summary_entry object has exactly: type, sequence, source_sha256, "
-    "source_message_count, through_turn, objective, outcome, decisions_added, "
-    "decisions_superseded, facts_added, facts_invalidated, files_and_symbols_changed, "
-    "verification_results, relevant_failed_approaches, open_items.",
-)
-
 
 class SummaryTrunkError(ValueError):
     """A summary trunk, control block, or model-produced entry is invalid."""
@@ -1023,7 +1002,6 @@ def append_summary_entry(
 __all__ = [
     "SUMMARY_ENTRY_PROVENANCE",
     "SUMMARY_FINDING_PRESERVATION_CONTRACT",
-    "SUMMARY_PROTOCOL_LINES",
     "K0Projection",
     "SummaryEntry",
     "SummaryExpectation",

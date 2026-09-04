@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
 import pytest
 
 from cambium.branch_history import BranchHistoryError, query_branch_history, tool_ref
+from cambium.tools import ToolContext, run_tool
 
 
 def _write_session(tmp_path: Path) -> Path:
@@ -96,6 +98,22 @@ def _write_session(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     return session
+
+
+def test_worker_can_reopen_exact_evidence_without_mutating_history(
+    tmp_path: Path, monkeypatch
+) -> None:
+    session = _write_session(tmp_path)
+    monkeypatch.setenv("CAMBIUM_SESSION_ID", str(session))
+    before = {path: path.read_bytes() for path in session.rglob("*") if path.is_file()}
+    ctx = ToolContext(tmp_path)
+    listing = asyncio.run(run_tool("branch_history", {"action": "tools"}, ctx))
+    assert listing.ok and "tool:child:1:2:0" in listing.output
+    detail = asyncio.run(
+        run_tool("branch_history", {"action": "tool", "ref": "tool:child:1:2:0"}, ctx)
+    )
+    assert detail.ok and "parser evidence" in detail.output
+    assert before == {path: path.read_bytes() for path in session.rglob("*") if path.is_file()}
 
 
 def test_branch_listing_distinguishes_task_and_context_policy(tmp_path: Path) -> None:
