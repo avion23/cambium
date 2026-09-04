@@ -133,6 +133,13 @@ def _walk_source_files(
             yield path
 
 
+def _query_files(root: Path, scope: str | None):
+    selected = _inside(root, root / (scope or "."))
+    if not selected.exists():
+        raise ValueError(f"source path does not exist: {scope}")
+    return [selected] if selected.is_file() else _walk_source_files(selected)
+
+
 def _read(path: Path) -> str | None:
     try:
         with path.open("rb") as source:
@@ -210,6 +217,7 @@ def search_symbols(
     *,
     exact: bool = False,
     max_results: int = 50,
+    scope: str | None = None,
 ) -> list[SourceLocation]:
     """Search declarations with bounded portable syntax extraction."""
 
@@ -221,7 +229,7 @@ def search_symbols(
     folded = needle.casefold()
     resolved = Path(root).resolve()
     matches: list[SourceLocation] = []
-    for path in _walk_source_files(resolved):
+    for path in _query_files(resolved, scope):
         text = _read(path)
         if text is None:
             continue
@@ -289,6 +297,7 @@ def find_references(
     symbol: str,
     *,
     max_results: int = 100,
+    scope: str | None = None,
 ) -> list[SourceLocation]:
     """Find bounded exact-identifier references across source files."""
 
@@ -298,7 +307,7 @@ def find_references(
         raise ValueError("max_results must be in [1, 1000]")
     resolved = Path(root).resolve()
     matches: list[SourceLocation] = []
-    for path in _walk_source_files(resolved):
+    for path in _query_files(resolved, scope):
         text = _read(path)
         if text is None:
             continue
@@ -363,11 +372,17 @@ def query_repository(root: str | Path, arguments: dict[str, Any]) -> str:
     if action == "symbols":
         return locations_json(
             search_symbols(
-                root, arguments["query"], exact=arguments.get("exact", False), max_results=limit
+                root,
+                arguments["query"],
+                exact=arguments.get("exact", False),
+                max_results=limit,
+                scope=arguments.get("path"),
             )
         )
     if action == "references":
-        return locations_json(find_references(root, arguments["query"], max_results=limit))
+        return locations_json(
+            find_references(root, arguments["query"], max_results=limit, scope=arguments.get("path"))
+        )
     if action == "window":
         return json.dumps(
             read_symbol(root, arguments["path"], arguments["line"], context_lines=limit),
@@ -388,8 +403,7 @@ def query_repository(root: str | Path, arguments: dict[str, Any]) -> str:
         )
     if action not in {"tree", "search"}:
         raise ValueError(f"unknown repository query: {action}")
-    selected = _inside(root, root / arguments.get("path", "."))
-    paths = [selected] if selected.is_file() else _walk_source_files(selected)
+    paths = _query_files(root, arguments.get("path"))
     query = arguments["query"] if action == "search" else None
     rows: list[str] = []
     for path in paths:
