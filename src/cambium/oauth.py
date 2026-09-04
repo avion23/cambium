@@ -1312,16 +1312,33 @@ class TokenManager:
             raise OAuthStoreError("oauth store directory is unavailable")
         try:
             flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW
-            try:
-                lock_fd = os.open(
-                    self._lock_path().name, flags, AUTH_FILE_MODE, dir_fd=directory_fd
-                )
-            except OSError as exc:
-                if exc.errno == errno.ELOOP:
-                    raise OAuthStoreError("oauth lock file must not be a symlink") from exc
+            # APFS returns a spurious ENOENT when openat(O_CREAT) races
+            # another process's first-time create of the same name (dentry
+            # lag). Retry the exact same open briefly; a genuinely missing
+            # directory still ENOENTs on every attempt and surfaces below.
+            lock_fd = None
+            last_exc: OSError | None = None
+            for attempt in range(5):
+                try:
+                    lock_fd = os.open(
+                        self._lock_path().name, flags, AUTH_FILE_MODE, dir_fd=directory_fd
+                    )
+                    break
+                except OSError as exc:
+                    last_exc = exc
+                    if exc.errno == errno.ELOOP:
+                        raise OAuthStoreError(
+                            "oauth lock file must not be a symlink"
+                        ) from exc
+                    if exc.errno == errno.ENOENT:
+                        time.sleep(0.001 * (attempt + 1))
+                        continue
+                    break
+            if lock_fd is None:
+                assert last_exc is not None
                 raise OAuthStoreError(
-                    f"could not open the oauth lock file (errno {exc.errno})"
-                ) from exc
+                    f"could not open the oauth lock file (errno {last_exc.errno})"
+                ) from last_exc
         finally:
             os.close(directory_fd)
         try:
