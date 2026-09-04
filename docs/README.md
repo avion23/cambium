@@ -29,28 +29,29 @@ from target names or the existence of a library.
 ## Reference and usage
 
 [Context/navigation reference](reference/context-branches.md) owns exact public
-tool and policy values. [Delegate and inspect work](how-to/context-branches.md)
-shows the current workflow. CLI `--help`, schemas, and source own exact command
-arguments and configuration defaults.
+tool and policy values. [The driving loop](how-to/agent-driving-loop.md) and
+[delegate and inspect work](how-to/context-branches.md) show the current workflow.
+CLI `--help`, schemas, and source own exact command arguments and configuration
+defaults.
 
 The contributor contract is [agents.md](../agents.md).
 [The implementation plan](../implementation-plan.md) contains open work only.
 
 ## Design proposals and experiments
 
-[Agent operating model](architecture/agent-operating-model.md),
-[agent-state reference](reference/agent-state.md),
-[context requirements](architecture/context-branch-requirements.md), and
-[agent driving loop](how-to/agent-driving-loop.md) describe broader targets.
-Use them to guide a small implemented slice, not as a checklist requiring new
-per-turn control layers. Planning is optional for a small task in the current
-worker.
+[Agent operating model](architecture/agent-operating-model.md) explains the
+rationale. [Branch contracts](architecture/context-branch-requirements.md)
+distinguish current invariants from gaps, while
+[agent-state reference](reference/agent-state.md) marks the remaining target
+shapes. Use proposals to guide a small implemented slice, not as a checklist
+requiring new per-turn control layers. Planning is optional for a small task.
 
 [Agent-system evaluation](research/agent-system-evaluation.md) contains proposed
 experiments and metrics. [Codex activation research](research/codex-activation.md)
 is provider-specific research whose conclusions need checking against current
 configuration and transports. Neither research page proves runtime support or
-an optimization gain.
+an optimization gain. The [2026-09-04 harness audit](research/harness-audit-2026-09-04.md)
+records concrete failures, repairs, test outcomes, and remaining limitations.
 
 ## Editing rule
 

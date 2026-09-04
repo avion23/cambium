@@ -57,18 +57,20 @@ landed.
 
 ## 3. System model
 
-Cambium is one linked control system, not a bag of utilities:
+Cambium is a direct execution loop with explicit owners:
 
 ```text
-repository/providers/operator intent
-        -> tools/workers/transports/merge
-        -> events/checkpoints/Git/quota
-        -> CAST/artifact/provider views
-        -> canonical BranchState          target integration layer
-        -> model SituationFrame + TUI
-        -> agent/supervisor decisions
-        -> evaluation and policy promotion
+operator task -> supervisor -> isolated worker -> model action -> tool observation
+                    |                |
+                    |                +-> immutable context checkpoints
+                    +-> child lifetime, artifact joins and publication
+
+provider usage + durable events + checkpoints + Git -> inspection and TUI
 ```
+
+`BranchState` and CLI replay inspection exist. Sharing all state semantics with
+the model and TUI, including the proposed SituationFrame, is separate integration
+work. Do not treat a diagram or proposed type as an implemented consumer.
 
 Keep these identities separate:
 
@@ -230,13 +232,16 @@ edit_file
 git_op
 run_shell
 read_batch
+repo_query
+branch_history
 delegate
 ```
 
-`branch_history.py`, `code_index.py`, and `lsp_query.py` are implemented library
-boundaries but are not yet in that active roster. Do not describe them as model
-capabilities until the schema, dispatch, prompt, provider-tool hash, and live
-scenario path are wired.
+`repo_query` uses bounded source scans and an optional configured LSP adapter.
+`branch_history` reads recorded session evidence without re-executing tools.
+Their schemas, dispatch, prompts, and real frontend scenarios are wired. A
+model-facing `inspect_state` and shared SituationFrame remain separate work;
+CLI `inspect-state` and the BranchState inspection library already exist.
 
 ## 7. Context and branch rules
 

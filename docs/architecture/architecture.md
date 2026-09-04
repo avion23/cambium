@@ -1,405 +1,122 @@
-# Cambium architecture
+# Runtime architecture
 
-**Status:** current runtime map plus target integration direction. Source and
-tests are authoritative for landed behavior. Target-only interfaces are labelled
-and ordered in `implementation-plan.md`.
+**Status:** current runtime map. Source and executable tests take precedence.
+Design rationale is in [agent operating model](agent-operating-model.md).
 
-The synthetic system model is defined in
-[`agent-operating-model.md`](agent-operating-model.md). This document maps that
-model to the repository and its current runtime boundaries.
-
-## 1. System definition
-
-Cambium is a local multi-provider coding-agent runtime. Each task executes as a
-bounded branch with:
+## Execution path
 
 ```text
-task contract
-+ context state
-+ provider/model lease
-+ isolated Git worktree
-+ durable events/checkpoints
-+ tools and children
-+ verification
-+ semantic result
-+ accepted artifact head
+CLI / TUI
+  -> oneshot or persistent interactive session
+  -> supervisor: admit task, allocate worktree, assign provider, start worker
+  -> worker: build context, request action, execute tools, checkpoint
+  -> Diffundo: provider transport, deadlines, retry/fallback, usage
+  -> worker result
+  -> supervisor: verify artifact boundary, publish, join children, resume parent
+  -> durable events -> operator display / inspection
 ```
 
-The model proposes actions. Cambium owns authority, execution, persistence,
-resource limits, process lifecycle, child admission, context publication, Git
-integration, and recovery.
+A provider call does not publish code. A successful tool does not finish a task.
+A child result does not by itself put the child's code into the parent's tree.
+The supervisor owns these transitions and their ordering.
 
-A correct final message is not sufficient. Success requires agreement between:
+## Module ownership
+
+| Owner | Responsibility |
+| --- | --- |
+| `cli.py` | Command parsing and frontend selection |
+| `oneshot.py`, `interactive.py` | One request or a persistent branch across operator turns |
+| `supervisor.py` | Task/process lifetime, admission, isolated worktrees, child joins, publication |
+| `worker.py` | Model/action loop, context assembly, verification tracking, checkpoints and summaries |
+| `schemas.py`, `tools.py` | Model-facing tool contract and actual dispatch |
+| `diffundo.py` | Call-time transport, deadlines, retries, fallback and provider usage |
+| `provider_config.py`, `routing.py`, `selection.py` | Declared capabilities, task admission and candidate ordering |
+| `provider_scheduler.py` | Lease/cache values and quota reservations; not another task scheduler |
+| `store.py` | Durable execution records |
+| `summary_trunk.py` | Immutable summary entries and their content contract |
+| `branch_state.py` | Replay-derived branch state and `inspect-state` support |
+| `branch_history.py` | Read-only historical tool/transcript retrieval |
+| `code_index.py`, `lsp_query.py` | Bounded source scans and optional configured LSP queries |
+| `observability.py`, `tui.py`, `tui_screen.py` | Incremental operator projection, input handling and rendering |
+| `prompts.py` | Versioned coding and summary instructions |
+| `optimize.py`, `modules/*/dspy_program.py` | Offline DSPy experiments, not the worker's prompt loader |
+
+Paths in this table are relative to `src/cambium/`. Large ownership modules,
+especially worker and supervisor, still contain too much policy. Extract only a
+cohesive operation with real callers; do not replace them with a class hierarchy.
+
+## Current agent tools
+
+The active schema and dispatch contain:
 
 ```text
-semantic result
-accepted repository artifact
-required verification
-supervisor terminal verdict
+read_batch   write_file   edit_file   git_op   run_shell   delegate
+repo_query   branch_history
 ```
 
-## 2. Tower of abstractions
+Permissions still determine which effects a worker may perform. Navigation and
+history are read-only and can share the independent-read batch path.
 
-```text
-Evaluation / optimization
-        ^
-Human + model projections
-        ^
-Branch controller and policy
-        ^
-BranchState inspection           shared-consumer integration remains
-        ^
-CAST + artifact + lease views
-        ^
-Events + checkpoints + Git + quota
-        ^
-Workers + tools + transports + merge
-        ^
-Repository + providers + operator intent
+`repo_query` exposes the existing tree/search/symbol/reference/window scans and
+optional LSP adapter. The portable reference scan is lexical, not a semantic
+language-service answer. A missing LSP configuration is reported as unavailable.
+
+`branch_history` lists branches or calls, reopens a returned call reference, or
+pages a checkpoint transcript. It reads existing artifacts and never reruns a
+tool. Interactive references include the enclosing operator turn so counters
+repeated in later turns cannot resolve to unrelated evidence.
+
+Exact navigation examples are in [agent-state reference](../reference/agent-state.md);
+history and delegation formats are in
+[context-branch reference](../reference/context-branches.md).
+
+## State: implemented versus proposed
+
+`BranchState` and the `cambium inspect-state` command are implemented. It was
+incorrect for earlier docs to describe their existence as future work.
+`observability.py` still owns the TUI's separate event projection; adding
+`BranchState` did not automatically make every consumer share one reducer.
+
+The base runtime does not yet implement the complete model-facing
+`SituationFrame`/`inspect_state` proposal, an evidence-linked WorkLedger, or a
+new versioned ResultCapsule protocol. The existing summary entries, child
+result envelope, verification state and Git joins already work. Extend those
+paths where needed rather than introducing parallel mutable stores.
+
+The current source/tests for a feature must land before its status changes from
+proposed to implemented. Architecture diagrams and data types alone do not
+establish that a worker can use it.
+
+## Important boundaries
+
+* Task ownership, conversation history, accepted Git state and provider cache
+  lineage are distinct. See [context branches](context-branches.md).
+* Provider feasibility is checked before ranking; leases, call-time health and
+  account quotas have different owners. See [provider routing](provider-routing.md).
+* Published context prefixes stay immutable. Raw history survives projection
+  changes; cache availability never changes the semantic request.
+* Model text proposes actions and claims. Tool observations, actual checks and
+  accepted Git heads establish effects. Worktree isolation protects parallel
+  changes and is not an optional prompt instruction.
+* Frontends render events and send operator input; widget memory is not recovery
+  state. See [interactive TUI](interactive-tui.md).
+
+## Executable checks
+
+Use focused tests for the owner being changed. The regular suite excludes
+`slow` tests; a green regular run does not prove a real terminal or provider ran.
+
+```sh
+python -m pytest -n 4 -q
+python -m pytest -n 0 -m slow tests/scenarios/test_tui_live_pty.py -q
+python -m pytest -n 0 -m acceptance tests/acceptance/test_live_frontends.py -q
+python -m pytest -n 0 -m acceptance tests/acceptance/test_live_coding_gate.py -q
 ```
 
-Each layer owns one class of fact. A higher layer may derive or display lower
-state but cannot mutate it outside the lower layer's validated interface.
-
-The architectural rule is:
-
-```text
-one canonical branch state, many projections
-```
-
-`branch_state.py` and CLI `inspect-state` already provide a pure inspection
-projection. The operator still uses `observability.py`; making model and operator
-surfaces consume shared semantics is unfinished integration, not a missing
-state library. Do not add another mutable state store to bridge them.
-
-## 3. Orthogonal structures
-
-Cambium must not collapse these structures into one vague “agent tree.”
-
-| Structure | Question it answers | Current authority |
-| --- | --- | --- |
-| Task tree | Who owns which work and child lifetime? | supervisor/tasktree |
-| Conversation branches | What did each model branch see and do? | events/checkpoints |
-| Git artifact graph | Which filesystem states were accepted? | Git/merge/supervisor |
-| Provider-cache lineage | Which exact request prefixes are compatible? | checkpoint cache key/provider evidence |
-| Epistemic state projection | Which claims, decisions, obligations, and checks are current? | CAST summary today; target WorkLedger projection |
-
-The first four have distinct identity and failure modes. The fifth is a derived
-semantic view over durable records, not another database.
-
-## 4. Branch model
-
-The root and every child share one conceptual entity:
-
-```text
-ContextBranch
-├── identity: session/task/parent/generation
-├── mission: objective/constraints/done criteria
-├── authority: repo/worktree/branch/tools/providers
-├── context: checkpoint/epoch/trunk/raw tail/lineage
-├── artifacts: base/head/accepted integration
-├── control: plan/open work/blockers
-├── resources: turns/wall/context/quota/cache/lease
-├── children: deterministic admission and join order
-├── verification: checks tied to artifact state
-└── result: bounded semantic capsule
-```
-
-Current source represents these fields across supervisor state, worker
-checkpoints, event records, Git, quota/routing values, and TUI reducers. The
-target BranchState composes them without changing their owners.
-
-## 5. Runtime flow
-
-### 5.1 Session and task admission
-
-```text
-CLI / interactive session / plan
-        |
-        v
-validate task, repo, authority, dependencies, provider feasibility
-        |
-        v
-persist plan and task_assigned
-        |
-        v
-create isolated worktree + generation fence
-```
-
-Static dependency plans use validated ready waves. Dynamic children enter as
-typed proposals and are durably admitted before their coroutine/process exists.
-
-### 5.2 Worker decision loop
-
-```text
-supervisor init/run_task
-        |
-        v
-worker builds stable prompt head + CAST state + recent tail
-        |
-        v
-provider call through Diffundo
-        |
-        v
-plan | tool_call batch | finish
-        |
-        v
-execute bounded tools, append observations, checkpoint, repeat
-```
-
-Current model tools are `write_file`, `edit_file`, `git_op`, `run_shell`,
-`read_batch`, `repo_query`, `branch_history`, and `delegate`. Repository queries
-include the optional configured LSP path. Exact current actions are in
-[the navigation reference](../reference/context-branches.md); model-facing
-`inspect_state` and richer state shapes remain in
-[the target state reference](../reference/agent-state.md). A short task may
-start directly with a tool; a plan is optional, not an extra required turn.
-
-### 5.3 Context loop
-
-```text
-stable system/tool head
-+ immutable semantic summary entries
-+ bounded raw working tail
-```
-
-A summary flush covers one disjoint raw range. Existing summary entries are not
-rewritten. K0 rollover materializes current active semantic state under policy
-bounds while source entries remain durable. Provider cache is an optional
-performance outcome, never correctness state.
-
-See [`context-engine.md`](context-engine.md).
-
-### 5.4 Child fork and join
-
-```text
-parent delegate proposal
-        |
-        v
-validate task tree + authority + budget + child policy
-        |
-        +--> trunk/inherit: exact compatible checkpoint
-        +--> semantic: immutable summary state under a fresh head
-        +--> fresh: task-only parent-independent context
-        |
-        v
-child worker + isolated worktree
-        |
-        v
-bounded semantic result + artifact integration
-        |
-        v
-verify parent HEAD == accepted integration HEAD
-        |
-        v
-parent resume
-```
-
-Current supervisor source consumes declared context/placement policy. The model
-contract requires explicit policy; only harness-originated children with omitted
-policy still enter automatic exact/semantic resolution
-(`_declared_child_policy`), which the target contract must remove or explicitly
-name.
-
-See [`context-branches.md`](context-branches.md),
-[`context-branch-requirements.md`](context-branch-requirements.md), and
-[`subagents.md`](subagents.md).
-
-### 5.5 Provider flow
-
-```text
-supervisor admission
-  hard feasibility + credentials + authorization + capacity + task constraints
-        |
-        v
-provider/model lease
-        |
-        v
-Diffundo attempt execution
-  deadline + retry/cooldown + typed failure + bounded cascade
-        |
-        v
-transport and provider evidence
-```
-
-There is one scheduler ownership path. Provider configuration describes
-capabilities; routing admits and ranks; Diffundo executes attempts; quota and
-usage stores supply evidence. Prompt prose does not select credentials.
-
-See [`provider-routing.md`](provider-routing.md).
-
-### 5.6 Publication and recovery
-
-A successful worker owns at most one fenced commit. The supervisor verifies
-branch attachment, clean state, envelope/HEAD consistency, and expected-old
-publication before a ref advance. Child integration and root publication are
-serialized.
-
-On interruption, Cambium preserves bounded salvage and the latest valid
-checkpoint. Resume is legal only when workspace identity matches. Otherwise the
-worktree is fenced, salvaged, and recovered from the accepted base.
-
-## 6. Control surfaces
-
-### Human surface
-
-The persistent TUI and monitor reduce durable events into an operator view with
-agents, context, usage, quota, and recent activity. The frontend is not runtime
-authority.
-
-See [`interactive-tui.md`](interactive-tui.md) and
-[`terminal-interface.md`](terminal-interface.md).
-
-### Model surface
-
-Current model context contains the coding-agent prompt, task, optional parent
-context, CAST summaries, recent observations, and tool schemas.
-
-Target model control adds a deterministic late `SituationFrame` and three
-separate read surfaces:
-
-```text
-inspect_state   current accepted branch state
-branch_history  prior branch/tool/transcript evidence
-repo_query      repository location and code navigation
-```
-
-The model and TUI then share BranchState fields rather than learning different
-versions of the session.
-
-## 7. Durable data and ownership
-
-| Data | Writer | Reader | Mutation rule |
-| --- | --- | --- | --- |
-| event log | supervisor/worker through EventStore | replay, TUI, monitor, history, target BranchState | append only |
-| ordinary checkpoint | worker | restart/recovery/history | immutable file |
-| context epoch | worker, supervisor validates | fork/resume/CAST/history | immutable; successor epoch only |
-| interactive manifest | InteractiveSession single writer | reconnect/TUI | atomic replace after successful turn |
-| routing debt | usage-event fold | admission/doctor | transactional merge |
-| quota ledger | reservation owner | admission/operator | transactional reservation/reconcile |
-| worker branch | fenced worker | supervisor/merge | one generation owner |
-| main/parent integration ref | merge sequencer/supervisor | all artifact consumers | expected-old atomic advance |
-| semantic summary | model proposal, worker validates | active context/target WorkLedger | append only; invalidate/supersede by delta |
-
-## 8. Module map
-
-```text
-src/cambium/
-  cli.py                   command routing
-  interactive.py           persistent interactive branch ownership
-  tui.py                    terminal command/input loop
-  tui_screen.py             deterministic rendering
-  observability.py          current event-sourced operator projection
-
-  supervisor.py            task/worker/child lifecycle, admission, join, publication
-  worker.py                model/tool/context loop and checkpoints
-  tasktree.py              static/dynamic hierarchy bounds
-  merge.py                 ref-only serialized publication and recovery
-  fencing.py               generation authority
-
-  prompts.py               current coding and summary prompt text
-  schemas.py               model action/tool schemas
-  tools.py                 active executable worker tools
-  branch_history.py        bounded history projection; wiring pending
-  code_index.py            bounded portable navigation; wiring pending
-  lsp_query.py             optional one-shot LSP boundary; wiring pending
-
-  summary_trunk.py         semantic deltas and K0 projection
-  context_policy.py        hard CAST bounds
-  child_policy.py          child context/placement values
-  conversations.py         optional raw conversation rows
-
-  routing.py               provider/model admission and usage debt
-  provider_scheduler.py    leases, cache/quota values and reservations
-  provider_config.py       provider capability/auth/protocol configuration
-  diffundo.py              call-time execution and failure handling
-  oauth.py / auth.py       credential stores and safe worker handoff
-
-  store.py                 durable events
-  results.py               canonical terminal result
-  modules/                 optimizable decision modules
-```
-
-Target additions should remain small:
-
-```text
-branch_state.py            pure canonical reducer/value objects
-situation.py               bounded SituationFrame projection
-```
-
-Names may change, but ownership must not spread across another scheduler or
-frontend-local state machine.
-
-## 9. Invariants
-
-### Authority
-
-- A worker may mutate only its assigned worktree under the current generation.
-- A child cannot widen parent credential/provider or filesystem authority.
-- A frontend or model response cannot mutate supervisor state directly.
-- Publication uses expected-old atomic ref advancement.
-
-### Context
-
-- Raw history remains durable outside the active projection.
-- Published summary/checkpoint bytes are immutable.
-- Exact fork compatibility is proven from all relevant identity fields.
-- Provider cache hits come only from provider evidence.
-- Compaction never silently loses current obligations or required verification.
-
-### Branching
-
-- Admission is validated and durable before spawn.
-- Parent lifetime bounds children through structured concurrency.
-- Child completion order does not determine join order.
-- Semantic result acceptance cannot imply artifact acceptance.
-- Parent resume after code changes requires the accepted integration head.
-
-### Agent state
-
-- Current accepted facts, model claims, unknowns, and stale values are distinct.
-- Model and operator projections agree at the same source watermark.
-- Every lossy current item can expose a stable evidence/source reference or an
-  explicit inferred/hypothesis label.
-- A verification is tied to the artifact state it tested.
-
-### Resources
-
-- Hard provider/task constraints precede scoring.
-- Request rate, concurrency, token windows, wall time, cash, and cache state are
-  separate dimensions.
-- Missing evidence remains unknown.
-- Retries, children, summaries, and verification consume the parent/session
-  budget explicitly.
-
-## 10. Documentation and truth
-
-Documentation types have different authority:
-
-```text
-architecture  rationale, ownership, invariants, current/target boundary
-reference     exact public or target values and schemas
-how-to        recommended workflows
-research      hypotheses and evaluation protocols
-implementation-plan ordered open work only
-```
-
-A target document must say target. An implemented-contract document must point
-to executable source/tests. Historical branch status belongs in Git history,
-not the active plan.
-
-## 11. Definition of architectural coherence
-
-```text
-one branch identity across process, context, artifacts, resources, and UI
-one durable record for replay
-one derived branch state for model and operator
-one scheduler ownership path
-one explicit effect boundary per tool/process/ref update
-one bounded semantic accumulation path
-one deterministic child admission/join order
-one evidence-linked explanation of why an action and final result were valid
-```
-
-The ordered path from the current runtime to that state is
-[`../../implementation-plan.md`](../../implementation-plan.md).
+The live frontend tests exercise CLI publication and a real PTY coding turn
+followed by exact historical retrieval. They use disposable repositories and
+configured provider credentials. Report model/provider failures as failures,
+not as evidence that the harness path passed.
+
+Open work belongs only in [implementation-plan.md](../../implementation-plan.md),
+not in another copy of the runtime map.
