@@ -25,6 +25,7 @@ from typing import Any
 
 from . import supervisor
 from .auth import (
+    AuthError,
     AuthStore,
     effective_home,
     scrub_environment,
@@ -617,8 +618,13 @@ def _stored_provider_environment(
     *,
     provider_config_path: str | Path | None = None,
 ) -> dict[str, str]:
-    """Return one selected credential without changing ``os.environ``."""
-    del auth_store
+    """Return one selected credential without changing ``os.environ``.
+
+    The inline config key wins; otherwise the AuthStore entry for the
+    provider is handed over under its configured ``api_key_env`` name, so a
+    provider the readiness gate authorized via the store actually reaches
+    the worker.
+    """
     try:
         provider = next(
             provider
@@ -627,9 +633,19 @@ def _stored_provider_environment(
         )
     except StopIteration:
         raise ValueError("provider credential is not configured") from None
-    if not provider.api_key:
-        raise ValueError("provider credential is not configured")
-    return {provider.api_key_env: provider.api_key} if provider.api_key_env else {}
+    if provider.api_key:
+        return {provider.api_key_env: provider.api_key} if provider.api_key_env else {}
+    store = auth_store if auth_store is not None else AuthStore()
+    try:
+        document = store.read()
+    except AuthError as exc:
+        raise ValueError("provider credential is not configured") from exc
+    for credential in document.providers:
+        if credential.provider == provider_name:
+            if not provider.api_key_env:
+                return {}
+            return {provider.api_key_env: credential.api_key}
+    raise ValueError("provider credential is not configured")
 
 
 def _is_codex_oauth_provider(provider: Any) -> bool:
@@ -663,17 +679,26 @@ def _oauth_doc_present(provider_name: str) -> bool:
 def _provider_credential_ready(provider: Any, auth_store: AuthStore) -> bool:
     """One credential-availability boundary over the separate stores.
 
-    API-key providers are ready when their file-backed key is non-empty;
+    API-key providers are ready when their inline key is non-empty or the
+    auth store holds an entry for them (matching doctor's coverage rule);
     ``none`` providers need no credential; OAuth providers are ready when the
     local OAuth store holds a document for them. The function never returns a
-    credential value and never changes process-global state.
+    credential value and never changes process-global state. A store without
+    a ``has_provider`` probe (e.g. a minimal test double) contributes no
+    coverage; a corrupt store propagates instead of reading as uncovered.
     """
     if _is_codex_oauth_provider(provider):
         return _oauth_doc_present(provider.name)
     if getattr(provider, "auth", None) is AuthMode.NONE:
         return True
-    del auth_store
-    return bool(getattr(provider, "api_key", None))
+    if bool(getattr(provider, "api_key", None)):
+        return True
+    if not getattr(provider, "api_key_env", None):
+        return False
+    has_provider = getattr(auth_store, "has_provider", None)
+    if has_provider is None:
+        return False
+    return bool(has_provider(provider.name))
 
 
 def _authorized_provider_names(providers: list[Any], auth_store: AuthStore) -> list[Any]:
@@ -751,7 +776,9 @@ def _resolve_provider(
             if _is_codex_oauth_provider(candidate) or candidate.auth is AuthMode.NONE:
                 continue
             environment.update(
-                _stored_provider_environment(candidate.name, provider_config_path=config_path)
+                _stored_provider_environment(
+                    candidate.name, store, provider_config_path=config_path
+                )
             )
         resolved = replace(
             config,
@@ -786,10 +813,11 @@ def _resolve_provider(
 
     if config.provider is None and config.provider_env_keys:
         environment = {}
+        env_store = auth_store if auth_store is not None else AuthStore()
         for provider_name in config.provider_env_keys:
             environment.update(
                 _stored_provider_environment(
-                    provider_name, provider_config_path=config.provider_config_path
+                    provider_name, env_store, provider_config_path=config.provider_config_path
                 )
             )
         return _apply_interactive_wall_budget(config, ()), environment
@@ -811,17 +839,13 @@ def _resolve_provider(
         raise ValueError(f"provider selection failed: {exc}") from exc
 
     # AUDIT-001: an explicitly selected provider must be authorized before it
-    # can become the assigned primary. Otherwise a credentialed sibling could
+    # can become the pinned primary. Otherwise a credentialed sibling could
     # be handed to the worker while the selected provider silently fell back.
-    # Codex-oauth providers are the intentional exception to the API-key
-    # check: their credential is an OAuth document, not an api_key_env key.
+    # Authorization covers inline keys and AuthStore entries alike; OAuth
+    # providers are the intentional exception to the key check since their
+    # credential is an OAuth document, not an api_key_env key.
     store = auth_store if auth_store is not None else AuthStore()
     authorized = _authorized_provider_names(providers, store)
-    if selected.auth is AuthMode.API_KEY and not selected.api_key:
-        raise ValueError(
-            f"selected provider {selected.name!r} is not authorized: "
-            "no credential key is configured"
-        )
     if not any(candidate.name == selected.name for candidate in authorized):
         raise ValueError(
             f"selected provider {selected.name!r} is not authorized: credential is unavailable"
@@ -853,7 +877,9 @@ def _resolve_provider(
     for candidate in authorized:
         if not _is_codex_oauth_provider(candidate) and candidate.auth is not AuthMode.NONE:
             environment.update(
-                _stored_provider_environment(candidate.name, provider_config_path=config_path)
+                _stored_provider_environment(
+                    candidate.name, store, provider_config_path=config_path
+                )
             )
     resolved = replace(
         config,

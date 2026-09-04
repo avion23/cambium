@@ -466,7 +466,10 @@ src/cambium/tools.py
     executable worker tool dispatch and policy validation
 
 src/cambium/prompts.py
-    separately named branch-decision and history-recall policies
+    coding-agent and semantic-summary prompts (current export list is in
+    ../reference/context-branches.md section 6; separate branch-decision
+    and history-recall exports do not exist yet — see implementation-plan
+    Phase 0 step 3)
 
 src/cambium/supervisor.py
     admission, exact/semantic/fresh materialization, provider affinity

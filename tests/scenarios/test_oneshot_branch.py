@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import subprocess
 from pathlib import Path
 
@@ -410,6 +411,57 @@ def test_explicit_provider_requires_usable_credential_and_key_in_plan(
     resolved, environment = _resolve_provider(config, repo)
     assert "CAMBIUM_PROVIDER_PB_API_KEY" in resolved.provider_env_keys
     assert environment["CAMBIUM_PROVIDER_PB_API_KEY"] == "secret-b"
+
+
+def test_explicit_provider_with_auth_store_key_resolves(tmp_path: Path) -> None:
+    """An explicit provider with no inline key resolves via its AuthStore entry.
+
+    The readiness gate must agree with doctor's coverage rule (store entry
+    counts), and the worker environment must carry the stored key under the
+    provider's configured ``api_key_env`` name.
+    """
+    from cambium.auth import AuthStore
+    from cambium.oneshot import _resolve_provider
+
+    repo = _repo(tmp_path / "repo")
+    config_path = _write_providers(tmp_path / "providers.json", pa_key="", pb_key="")
+    store = AuthStore(tmp_path / "auth.json")
+    store.set_provider("pb", "store-secret-b")
+    config = oneshot.OneShotConfig(
+        prompt="p",
+        repo=repo,
+        provider="pb",
+        provider_config_path=config_path,
+    )
+    resolved, environment = _resolve_provider(config, repo, auth_store=store)
+    assert resolved.provider == "pb"
+    assert resolved.provider_env_keys == ("CAMBIUM_PROVIDER_PB_API_KEY",)
+    assert environment == {"CAMBIUM_PROVIDER_PB_API_KEY": "store-secret-b"}
+
+
+def test_store_key_does_not_authorize_provider_without_api_key_env(tmp_path: Path) -> None:
+    from cambium.auth import AuthStore
+    from cambium.oneshot import _resolve_provider
+
+    repo = _repo(tmp_path / "repo")
+    config_path = _write_providers(tmp_path / "providers.json", pa_key="", pb_key="")
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    del config["providers"][0]["api_key_env"]
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    store = AuthStore(tmp_path / "auth.json")
+    store.set_provider("pa", "stored-key-pa")
+
+    with pytest.raises(ValueError, match="not authorized"):
+        _resolve_provider(
+            oneshot.OneShotConfig(
+                prompt="p",
+                repo=repo,
+                provider="pa",
+                provider_config_path=config_path,
+            ),
+            repo,
+            auth_store=store,
+        )
 
 
 def test_resume_requires_existing_session_artifact(tmp_path: Path) -> None:
