@@ -1,7 +1,7 @@
 # Decompose work with context branches
 
-**Status:** current policy guide with target inspection steps labelled. Exact
-current/target values are in
+**Status:** current delegation and historical-inspection guide. Exact
+current values and separately proposed extensions are in
 [`../reference/context-branches.md`](../reference/context-branches.md).
 The complete agent decision loop is in
 [`agent-driving-loop.md`](agent-driving-loop.md).
@@ -195,21 +195,21 @@ The parent must not treat a summary or `files_changed` list as proof that its
 worktree contains the child artifact. After an accepted code join, verify the
 parent worktree head and run the required combined-tree checks.
 
-Start from the bounded result. The target inspection ladder is:
+Start from the existing bounded child result:
 
 ```text
-ResultCapsule
-    -> inspect_state(children)
+child result envelope
     -> branch_history branches/tools
     -> one exact tool ref
     -> bounded transcript window
 ```
 
-Current wiring note: `branch_history.py` implements this projection, but it is
-not yet in the active worker tool roster. The JSON examples below become live
-model calls only after `implementation-plan.md` Phase 3 lands.
+`branch_history` is an active worker tool. ResultCapsule-v2 and model
+`inspect_state` are separate proposals, not prerequisites for these queries.
+The examples below show tool invocations; wrap them in a normal `tool_call`
+action when producing a text-protocol response.
 
-### Target: list branches
+### List branches
 
 ```json
 {
@@ -218,7 +218,7 @@ model calls only after `implementation-plan.md` Phase 3 lands.
 }
 ```
 
-### Target: list one branch's calls
+### List one branch's calls
 
 ```json
 {
@@ -227,7 +227,7 @@ model calls only after `implementation-plan.md` Phase 3 lands.
 }
 ```
 
-### Target: reopen one call
+### Reopen one call
 
 ```json
 {
@@ -236,10 +236,13 @@ model calls only after `implementation-plan.md` Phase 3 lands.
 }
 ```
 
-The final coordinate is the zero-based index within a batched tool action.
-Legacy references without it resolve to batch index zero.
+The final numeric coordinate is the zero-based index within a batched action.
+Interactive references also include `@turn-<number>`; preserve that suffix from
+the listing to distinguish repeated counters across operator turns. Legacy
+references without a batch index resolve to index zero, but an ambiguous
+unscoped reference is rejected rather than returning unrelated evidence.
 
-### Target: broader transcript window
+### Broader transcript window
 
 ```json
 {

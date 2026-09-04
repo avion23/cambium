@@ -174,12 +174,14 @@ Each model call has a declared context budget and output reserve. The active
 projection must fit before dispatch; provider fallback cannot silently select a
 smaller context window.
 
-### C7. Least-authority inheritance
+### C7. Explicit context inheritance
 
-A child receives only the stable task contract, relevant evidence projection,
-required tool schemas, and explicit parent state. It does not automatically
-inherit unrelated sibling transcripts, secrets, or the complete parent
-scratch history.
+A `trunk` child receives the complete validated parent checkpoint prefix,
+including its raw tail. A `semantic` child receives immutable summary entries
+under a fresh head; a `fresh` child receives its task without parent context.
+No mode automatically injects unrelated sibling transcripts. A branch can
+request session history through `branch_history` when needed. Context policy
+and filesystem/provider authority are separate boundaries.
 
 Recursive reuse is typed and bounded, not process cloning. A child is admitted
 against an immutable parent epoch/generation with a scoped task/capability
@@ -207,8 +209,11 @@ Record at least input, output, cache-read, cache-write, total, current-turn,
 cumulative, latency, and estimated cost. The budget prompt baseline is
 `max(0, prompt_tokens - cached_tokens)`; the charged prompt delta is that
 baseline minus the previous baseline, clamped at zero. Missing cache data treats
-the full prompt as uncached, and completions remain billable
-(`src/cambium/worker.py:2200-2226`).
+the full prompt as uncached for that baseline
+(`src/cambium/worker.py`, `_usage_budget_charge`). This marginal-growth guard is
+not a billable-token counter: repeated uncached input still consumes provider
+resources. Keep actual provider usage and account quotas separate; see
+[provider routing](provider-routing.md).
 
 ## 5. Turn, fork, merge, and compaction protocol
 
@@ -241,27 +246,20 @@ provider_boundary
 
 The context-fork descriptor is immutable. An exact-context child is eligible only
 when the provider boundary, model/protocol/reasoning settings, tool schema,
-hashes, and prefix bytes match. Otherwise Cambium can reuse semantic summaries
-under a new provider head. Neither path claims a provider cache hit; only
-provider usage can make that claim (`src/cambium/worker.py:389-401,503-556`).
+hashes, and prefix bytes match. An explicit `trunk` request that cannot meet
+this contract is rejected; it does not silently become semantic. Semantic mode
+and the separate internal harness compatibility path may reuse summaries under
+a new provider head. Neither path claims a provider cache hit; only provider
+usage can make that claim.
 
 ### 5.3 Child result
 
-The child returns a bounded envelope, not its full transcript:
-
-```text
-status
-claims[] { text, evidence_refs[] }
-changed_artifacts[] { path, old_id, new_id }
-open_questions[]
-failed_checks[]
-usage
-source_epoch_id
-child_checkpoint_id
-```
-
-The parent validates source identity, generation, artifact state, and declared
-checks before admission.
+The child returns the current bounded result envelope: status, summary,
+diff/commit/file evidence, metrics and parent identity, not its full transcript.
+The parent validates source identity, generation and artifact state before
+acceptance. Evidence-linked claims, obligations and a richer versioned capsule
+are proposals in [agent-state reference](../reference/agent-state.md), not the
+current result wire schema. Join mechanics are owned by [subagents](subagents.md).
 
 ### 5.4 Merge
 
@@ -376,8 +374,9 @@ See [`terminal-interface.md`](terminal-interface.md).
 
 ## 10. Verification
 
-A cache/context change is accepted only with frozen configuration and repeated
-trials:
+Choose checks that exercise the changed cache/context boundary. Performance
+claims need frozen configuration and repeated trials; a passing unit test does
+not establish a provider cache-hit rate:
 
 1. **Replay identity:** canonical checkpoint identity and compatibility equality;
    provider hit evidence is checked separately.

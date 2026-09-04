@@ -1,195 +1,113 @@
-# DSPy optimization and OpenCode data
+# Prompt experiments and DSPy
 
-**Status:** executable contract.
+**Status:** offline module optimization is implemented. Automatic optimization or
+loading of the live coding prompt is not.
 
-## Commands
-
-```sh
-uv run cambium optimize should_decompose --dry-run
-uv run cambium optimize should_decompose --optimizer zero --budget-usd 2
-uv run cambium optimize should_decompose --optimizer bootstrap --budget-usd 2
-```
-
-The optimizer writes one replace-in-place artifact set:
+## What is connected today
 
 ```text
-optimized/<module>/
-  program.json
-  lm.json
-  report.json
+module manifest + dataset loader + DSPy program + metric
+    -> optimize / evaluate
+    -> saved program under optimized/<module>
+    -> optimize eval can load that program
 ```
 
-A failed gate does not become a runtime default.
+The registered examples are `should_decompose` (under `modules/example`) and
+`should_review`. Their `dspy_program.py` implementations are not selected by the
+normal worker/supervisor coding loop. `worker.py` builds its instructions from
+`prompts.CODING_AGENT`; summary calls use `SEMANTIC_SUMMARIZER`. Saving an
+optimized classifier does not change either prompt.
 
-## Program evaluation
+The implementation supports zero-stage evaluation, BootstrapFewShot and GEPA.
+It loads examples, applies a metric, accounts for optimizer calls and can save
+program state for later evaluation. DSPy remains outside the ordinary runtime's
+import path. This is an experiment facility, not a background learning process.
 
-Evaluate a module's fresh or saved DSPy program against all three reviewed
-splits:
+## Commands and scope
+
+These validate registration without making a model call:
 
 ```sh
-uv run cambium optimize eval should_review \
-  --dataset /path/to/reviewed-dataset \
-  --json
+cambium optimize should_decompose --dry-run
+cambium optimize should_review --dry-run
 ```
 
-`MODULE` and `--dataset PATH` are required. `--program-dir PATH` explicitly
-loads `program.json` from that artifact directory. When it is omitted, the
-command checks `optimized/<MODULE>/program.json` in the current directory and
-uses a fresh program when that state is absent. `--budget-usd` defaults to
-`2.0`, `--tier` defaults to `fast`, and `--json` emits one JSON object with
-this shape:
-
-```json
-{
-  "module": "should_review",
-  "program": "fresh",
-  "dataset": "/path/to/reviewed-dataset",
-  "splits": {
-    "train": {
-      "mean": 1.0,
-      "std": 0.0,
-      "count": 40,
-      "records": [{"index": 0, "score": 1.0}]
-    },
-    "eval": {"mean": 1.0, "std": 0.0, "count": 10, "records": []},
-    "canaries": {"mean": 1.0, "std": 0.0, "count": 5, "records": []}
-  }
-}
-```
-
-The example counts above are illustrative; the command reports the actual
-counts from the supplied dataset. Each split summary always contains
-`mean`, `std`, `count`, and `records`; each record contains its zero-based
-`index` and normalized `score`.
-
-## Module program and label wiring
-
-An optimizable module must set the manifest's `dspy_program` field to its
-package-local DSPy program module. The optimizer derives the conventional
-`<ModuleName>ModuleDSPy` class name from the logical module name and fails
-closed when the field or class is unavailable. The `label_field` manifest
-field selects the expected decision key instead of assuming the v1
-`decompose` name. `should_review` sets `label_field` to `review` and points
-`dspy_program` at `cambium.modules.should_review.dspy_program`; its
-`ShouldReviewModuleDSPy` also declares `label_field = "review"`. The
-label-aware optimizer uses that field for metric lookup, prediction parsing,
-fallbacks, gold labels, and DSPy training examples, so the second module does
-not get coerced through the `decompose` label.
-
-## OpenCode extraction
-
-The installed CLI reads one or more local OpenCode SQLite databases, or a
-fixture/storage directory containing them.  The command is read-only and does
-not discover or use a user's database unless that path is supplied explicitly.
-Use a repository fixture or an intentionally exported test database when
-testing:
+A real experiment is explicit and budgeted:
 
 ```sh
-uv run cambium optimize extract \
-  --database /path/to/opencode-fixture.db \
-  --repo /path/to/example-repo \
-  --from 2026-01-01T00:00:00Z \
-  --to 2026-01-31T23:59:59Z \
-  --output accepted-trajectories.jsonl
+cambium optimize should_review --optimizer bootstrap --budget-usd 2 \
+  --dataset /path/to/reviewed.jsonl
+cambium optimize eval should_review --dataset /path/to/reviewed.jsonl \
+  --budget-usd 2 --json
 ```
 
-`--session-dir` may be used instead of `--database` when the fixture is an
-OpenCode storage directory; `--database` and `--session-dir` are repeatable.
-The time bounds accept epoch seconds/milliseconds or ISO-8601 timestamps.
-The extractor is schema-aware, read-only, bounded, deduplicated, and redacts
-credentials, personal identifiers, local paths, URLs with credentials, and
-sensitive code blocks. It writes a versioned JSONL dataset plus
-`<output>.meta.json` containing source file digests, filters, counts, and
-provenance. Records contain only explicit visible decision/rationale pairs;
-the extractor never invents trajectories.
+`optimize eval` requires `--dataset`. With no `--program-dir`, it loads
+`optimized/<module>` when available, otherwise a fresh program. An explicitly
+requested program directory must contain usable state. This auto-loading is
+for **evaluation**, not production worker requests.
 
-The normal output is the accepted set (`review_status: "approved"`). To keep
-newly extracted records out of the accepted set until a human reviews them,
-use the review gate:
+`optimize extract` and `optimize stats` handle trajectory candidates and dataset
+reports. Their options are documented by `cambium optimize --help`. Extraction
+is not label validation: a successful parse or redaction pass says nothing
+about whether an expected action is useful.
 
-```json
-{"candidate": true, "review_status": "needs_review", "redacted": true}
-```
+## What the current data can and cannot establish
 
-```sh
-uv run cambium optimize extract \
-  --session-dir /path/to/opencode-fixture \
-  --repo example-repo \
-  --output review-queue.jsonl \
-  --review-gate
-```
+The module datasets mix task text with observed session outcomes. For example,
+`modules/should_review/datasets/eval.jsonl` contains failed/cancelled status,
+final tool counts and labels recommending review because a session failed.
+Other labels prescribe review at a security boundary. Those are labeling
+policies, not measured reductions in total task cost.
 
-The review queue is not training data. Reviewers must explicitly change every
-admitted record to `review_status: "approved"`; pending or unknown statuses
-fail closed when the optimizer loads candidates. The legacy fixture-only
-script remains available as `uv run python
-scripts/extract_opencode_transcript_candidates.py`, and retains its
-review-queue default.
+Post-task outcome information can be legitimate input to a post-task review
+decision. It leaks future information if used to claim a pre-task decomposition
+policy. A provider outage also does not establish that more agents or an extra
+review call would have helped. Keep those decision timings and objectives
+separate.
 
-## Dataset report
+The actual coding question is not "can a classifier reproduce these labels?"
+It is "does this prompt or delegation choice complete the task correctly with
+less time and scarce account usage?" Current classifier scores do not answer
+that question.
 
-Report counts per repository, UTC day, label, review status, and tool
-vocabulary from either an accepted set or a review queue:
+## A useful coding-prompt experiment
 
-```sh
-uv run cambium optimize stats accepted-trajectories.jsonl
-uv run cambium optimize report --dataset review-queue.jsonl --json
-```
+Use small repositories with executable outcomes: locate and explain a symbol,
+make a bounded edit and verify it, recall exact prior evidence, resume after a
+checkpoint, or integrate an independent child. Keep repository state, tools,
+provider/model configuration and budgets fixed between candidates.
 
-## Review gate
+Measure accepted correctness first, then whole-task wall time and actual
+provider usage. Include malformed actions, retries, cached/uncached input,
+output, summary calls, duplicate reads, verification and repair work. Report
+sample counts and unsuccessful trials. The worker's marginal context-growth
+budget is not physical provider consumption.
 
-DSPy accepts transcript candidates only when each admitted record has:
+Keep training tasks separate from evaluation tasks and split related
+trajectories together. Examples from the same session should not appear on
+both sides merely because their prompts differ. Compare against the current
+short static prompt, not only another generated candidate.
 
-```json
-{"candidate": true, "review_status": "approved", "redacted": true}
-```
+Only instructions should vary in a prompt experiment. Do not simultaneously
+change tool behavior, loosen acceptance criteria or relabel failures as success.
+Optimization may add demonstrations and make a prompt longer. Include serialized
+request size and actual input usage in the comparison; do not assume DSPy means
+shorter prompts.
 
-`rejected`/`excluded` records are ignored. Any remaining `needs_review` or
-unknown status fails closed. This prevents an opt-in flag from silently turning
-raw model output into labels.
+## Adoption
 
-Use either the module-local reviewed file:
+There is no reason to add a review/decomposition model call to every task just
+because a module can be optimized. Keep a direct coding path. An offline winner
+can become a reviewed change to `prompts.py`, with a prompt version change and
+real task regressions. Exact context/cache identity must reflect the changed
+instructions and tools.
 
-```sh
-uv run cambium optimize should_decompose \
-  --include-transcript-candidates
-```
+The live frontend tests provide concrete tasks and traces for such experiments,
+but one successful run is not a statistical prompt-quality result. Current
+mechanical prompt reductions are likewise not a measured tokens/week gain.
 
-or an explicit reviewed file:
-
-```sh
-uv run cambium optimize should_decompose \
-  --transcript-candidates /path/to/reviewed-candidates.jsonl
-```
-
-## Split discipline
-
-Do not randomly split adjacent turns from the same coding session. Training,
-validation, evaluation, and canaries must be separated by source session and,
-where possible, repository and time. Otherwise near-duplicate trajectories leak
-across splits and invalidate the measured gain.
-
-The frozen evaluation and canary sets never receive transcript candidates.
-Candidate deduplication uses canonical `(task, context)` pairs and excludes
-collisions with every frozen split.
-
-## Provider and OAuth behavior
-
-The optimizer uses the same provider configuration and Diffundo transport as the
-runtime. Codex ChatGPT OAuth credentials are refreshed through `TokenManager`
-before the LM is constructed; an expired access token is never passed directly
-to DSPy. The public Codex client identifier is pinned in the provider profile,
-with `CAMBIUM_CODEX_CLIENT_ID` retained only as an override.
-
-## Promotion gate
-
-A compiled program is promotable only when:
-
-- frozen evaluation meets the absolute threshold;
-- it does not regress beyond the baseline tolerance;
-- every canary passes;
-- budget accounting is complete;
-- the artifact and report are written atomically.
-
-Train gain without held-out/canary gain is reported as an anti-reward gap, not
-as evidence of improvement.
+Implementation: `optimize.py`, the module manifests, `modules/*/dspy_program.py`
+and the corresponding dataset/metric modules. Regression coverage includes
+`tests/scenarios/test_dspy_program.py` and module-local tests. The missing coding
+prompt experiment/consumer belongs in the [open plan](../../implementation-plan.md),
+not in a new runtime approval framework.

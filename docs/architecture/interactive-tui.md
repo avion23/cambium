@@ -73,10 +73,11 @@ left and an operator rail on the right.
 | `<80` columns | Conversation-first single pane |
 
 A resize invalidates geometry and repaints one complete deterministic frame.
-Terminals shorter than twelve rows use bounded unframed output. Non-TTY and
-`NO_COLOR` modes remain line-oriented and free of cursor control.
+Terminals shorter than twelve rows use bounded unframed output. Non-TTY output
+is line-oriented. `NO_COLOR` suppresses styling; it does not disable cursor
+handling on an interactive terminal.
 
-The detailed layout and usability checklist are in
+The detailed layout and command behavior are in
 [`terminal-interface.md`](terminal-interface.md).
 
 ## Input and commands
@@ -99,7 +100,7 @@ Operator commands include:
 /status     compact session status
 /dashboard  repaint the dashboard
 /events     recent durable events
-/usage      cumulative usage
+/usage      completed usage plus the active turn
 /agents     main/subagent lifecycle
 /context    checkpoint, epoch, trunk, and raw tail
 /session    interactive root and branch lease
@@ -108,14 +109,22 @@ Operator commands include:
 /compact    compact the active context
 /model      inspect or change provider/model preference
 /quota      provider quota windows
-/cancel     explain active-turn cancellation
+/cancel     cancel the active turn
 /new        start a fresh semantic branch
 /clear      clear visible transcript
 /exit       close the frontend
 ```
 
-Ctrl-C during an active turn cancels it and returns to the prompt. Input entered
-while a turn is active is queued as a follow-up rather than lost.
+`/cancel`, `!cancel` and Ctrl-C cancel an active turn and return to the prompt.
+Inspection commands such as `/status`, `/usage`, `/agents` and `/events` execute
+immediately while the provider is running. Their output triggers a full repaint;
+ordinary activity updates retain the lightweight repaint path. Other prompts and
+branch/model changes are queued as follow-ups rather than lost.
+
+Usage includes the active snapshot without adding it to completed totals on each
+repaint. The completed turn is accumulated once. PTY coverage is in
+`tests/scenarios/test_tui_live_pty.py`; real-provider coding and historical recall
+are exercised in `tests/acceptance/test_live_frontends.py`.
 
 ## Correctness boundaries
 

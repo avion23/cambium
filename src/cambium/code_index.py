@@ -381,7 +381,9 @@ def query_repository(root: str | Path, arguments: dict[str, Any]) -> str:
         )
     if action == "references":
         return locations_json(
-            find_references(root, arguments["query"], max_results=limit, scope=arguments.get("path"))
+            find_references(
+                root, arguments["query"], max_results=limit, scope=arguments.get("path")
+            )
         )
     if action == "window":
         return json.dumps(

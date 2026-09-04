@@ -1,8 +1,16 @@
 # Agent state reference
 
-**Status:** target interface reference. These values define the intended
-agent-facing control model. Current wire schemas remain authoritative until the
-corresponding implementation-plan phase lands.
+**Status:** current inspection/navigation interfaces plus explicitly proposed
+state shapes. `BranchState` and CLI replay inspection exist:
+
+```sh
+cambium inspect-state /path/to/session
+```
+
+`repo_query` below and `branch_history` in the [context-branch reference](context-branches.md)
+are active worker tools. The SituationFrame, WorkLedger, ResourceEnvelope,
+ResultCapsule-v2 and model `inspect_state` sections are proposals, not current
+worker wire contracts.
 
 Rationale is in
 [`../architecture/agent-operating-model.md`](../architecture/agent-operating-model.md).
@@ -59,17 +67,19 @@ obligation:<percent-encoded-task-id>:<sequence>
 verification:<percent-encoded-task-id>:<sequence>
 ```
 
-Tool batch index is zero-based. The current branch-history reader also accepts
-the legacy form without `:<batch-index>` and resolves it to index zero. New
-references should use the canonical five-part form.
+Tool batch index is zero-based. Interactive tool references append
+`@turn-<number>` to distinguish repeated counters in different operator turns.
+Use the reference returned by `branch_history`. Legacy forms without batch
+index resolve to index zero, but ambiguous unscoped references are rejected.
 
 A reference identifies evidence; it does not grant authority or re-execute an
 effect. Missing or stale references fail explicitly.
 
 ## 3. BranchState
 
-`BranchState` is a pure read model reconstructed from durable sources.
-Illustrative JSON shape:
+`BranchState` is a pure read model reconstructed from durable sources. Use
+`inspect-state` for its actual current serialization. The following JSON is an
+illustration of the broader proposed state model, not that command's schema:
 
 ```json
 {
@@ -394,28 +404,38 @@ The tool reads the current canonical projection only. It does not read raw
 transcripts, execute tools, or mutate state. Historical detail remains in
 `branch_history`.
 
-## 10. repo_query tool
+## 10. repo_query tool — implemented
 
-Target model-facing schema:
+The schema is in `src/cambium/schemas.py`; dispatch uses `code_index.py` and the
+optional one-shot `lsp_query.py` adapter. All paths are worktree-relative.
+
+| Action | Required arguments beyond `action` | Result |
+| --- | --- | --- |
+| `tree` | none | Bounded source-file listing, optionally below `path` |
+| `search` | `query` | Literal matches with source locations, optionally scoped by `path` |
+| `symbols` | `query` | Declarations; optional `exact` and file/directory `path` |
+| `references` | `query` | Lexical identifier uses, optionally scoped by `path` |
+| `window` | `path`, `line` | Nearby source lines |
+| `lsp` | `path`, `method` | Configured language-server result |
+
+`limit` is 1–100 and defaults to 40. It bounds returned rows or the source-window
+size. Tool output is capped at 16 KiB. Scans skip generated directories and
+large/non-text files. A supplied scope is honored before scanning; a nonexistent
+supplied path is reported as an error rather than a successful empty search.
 
 ```json
-{
-  "name": "repo_query",
-  "arguments": {
-    "action": "tree|symbols|definition|references|search|window|diagnostics",
-    "query": "optional text or symbol",
-    "path": "optional repository-relative path",
-    "line": 1,
-    "offset": 0,
-    "limit": 20
-  }
-}
+{"action":"symbols","query":"select_lane","path":"src/cambium/routing.py","exact":true,"limit":10}
 ```
 
-Portable actions use the bounded `code_index.py` implementation. Rich
-definition/reference/diagnostic actions may use the optional one-shot LSP
-boundary. An unavailable LSP returns an explicit unsupported result and may
-fall back only to a semantically equivalent portable query.
+```json
+{"action":"window","path":"src/cambium/routing.py","line":1,"limit":30}
+```
+
+LSP `method` is `definition`, `references`, `hover`, `document_symbols` or
+`diagnostics`. `line` and `column` are one-based and default to 1. The operator
+supplies the server argv through `CAMBIUM_LSP_COMMAND`; Cambium does not install
+or start a permanent indexing service. An unavailable server is reported
+explicitly. Portable references are not relabeled as semantic LSP results.
 
 ## 11. Projection events
 
@@ -434,9 +454,10 @@ provider_lease_migrated
 operator_steer_admitted
 ```
 
-Events should contain identifiers, versions, hashes, counts, and bounded
-summaries. Large frame or knowledge payloads should remain reconstructible from
-existing checkpoints/events rather than duplicated without need.
+These names are candidates, not a requirement to add every event. Add an event
+only when a real reader or recovery path needs it. Existing tool, usage,
+checkpoint and result records should be reused; do not duplicate large frame or
+knowledge payloads that are already reconstructible.
 
 ## 12. Compatibility and migration
 

@@ -126,10 +126,13 @@ It enters alternate-screen mode only on a TTY whose `TERM` is not `dumb`.
 | Avoid layout jitter | Applied | Fixed section ordering and integer duration formatting |
 | Keep commands discoverable | Applied | `/help`, command aliases, and explicit multiline mode |
 
-The remaining usability limitation is discoverability in the six-column rail:
-glyphs cannot carry the same detail as the full rail. That is an intentional
-space trade-off, not a second hidden state. Text inspection commands remain the
-accessible fallback.
+This checklist describes intended behavior and focused coverage, not a claim
+that the interface is finished. The six-column rail remains hard to discover;
+glyphs cannot carry full text detail. The TUI also still uses its own event
+projection rather than sharing every semantic field with BranchState. Text
+inspection commands are the accessible fallback. Real-provider coding and
+follow-up history retrieval are covered by `test_live_frontends.py`, separately
+from renderer unit tests.
 
 ## Activity ticker
 
@@ -152,7 +155,7 @@ This keeps columns stable while activity changes.
 /status     compact branch status
 /dashboard  repaint the dashboard
 /events     recent durable events
-/usage      cumulative usage
+/usage      completed usage plus the active turn
 /agents     main/subagent lifecycle and provider/model rows
 /context    checkpoint, epoch, summary trunk, and raw tail
 /session    interactive root, branch generation, lease, and checkpoint
@@ -161,11 +164,22 @@ This keeps columns stable while activity changes.
 /compact    compact the active context
 /model      inspect or change provider/model preference
 /quota      provider quota state
-/cancel     active-turn cancellation help
+/cancel     cancel the active turn
 /new        start a fresh semantic branch without deleting old artifacts
 /clear      clear visible transcript
 /exit       close the frontend
 ```
+
+While a turn is running, `/status`, `/usage`, `/agents`, `/events` and the other
+read-only inspection commands execute immediately. `/cancel`, `!cancel` and
+Ctrl-C cancel the active turn. Ordinary prompts and branch/model mutations are
+queued. Explicit inspection forces a repaint so the live-only rendering path
+cannot hide its output.
+
+Live usage is completed totals plus the current snapshot, not repeated additions
+to the accumulator. A finished turn is counted once. This is covered by
+`test_tui_live_usage.py`; blocked-provider inspection/cancellation is exercised
+through a real PTY in `test_tui_live_pty.py`.
 
 Multiline input:
 

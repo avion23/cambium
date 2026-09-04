@@ -118,10 +118,9 @@ Query shape used by the library boundary:
 }
 ```
 
-Current integration status: this implementation is **not yet in the active
-worker tool schema/dispatch roster**. It is therefore not a current model tool
-until Phase 3 wires schema, dispatch, worker init, prompt, provider tool hash,
-and scenarios.
+This is an active worker tool. `schemas.py` defines its arguments, `tools.py`
+dispatches to the projection, and the worker exposes it alongside other
+independent reads. Limits are 64 rows and 32 KiB of returned history.
 
 ### `branches`
 
@@ -193,7 +192,16 @@ tool:parser%3Awindows:2:11:3
 
 Generation is part of identity because a restarted worker can repeat a logical
 turn number. Batch index is zero-based and distinguishes calls emitted in one
-batched action.
+batched action. Interactive archives append the enclosing operator-turn scope:
+
+```text
+tool:review-routing:1:7:0@turn-0003
+```
+
+The listing returns this scope automatically. It prevents a later operator turn
+with the same task/generation/model-call counters from colliding with old calls.
+Archives are read in numeric operator-turn order, including when inspection
+starts from the newest turn directory.
 
 The legacy three-coordinate suffix remains accepted:
 
@@ -202,7 +210,8 @@ tool:<percent-encoded-task-id>:<generation>:<turn>
 ```
 
 It resolves to batch index zero. Events written before batch indexes existed are
-treated the same way.
+treated the same way. An older unscoped reference is accepted only when it is
+unambiguous across operator turns; otherwise list tools again for scoped refs.
 
 Target additional evidence-reference forms are defined in
 [`agent-state.md`](agent-state.md).
@@ -230,25 +239,18 @@ SUMMARY_PROTOCOL_LINES
 PROMPTS_VERSION
 ```
 
-Earlier documents named separate branch-decision and history-recall prompt
-components that do not currently exist as exports. Phase 0 either adds real
-independently testable components or removes those claims. Target optimization
-components are listed in
-[`../research/agent-system-evaluation.md`](../research/agent-system-evaluation.md).
+Branch choice and historical recall are short instructions within the coding
+prompt, not separate runtime agents or independently loaded DSPy programs.
+Prompt experiments are described in
+[`../architecture/optimization.md`](../architecture/optimization.md).
 
-## 7. Target state interfaces
+## 7. Other state interfaces
 
-The integrated target adds:
+`BranchState` and CLI `inspect-state` exist. `repo_query` and `branch_history`
+are current worker tools. The complete model SituationFrame/`inspect_state`,
+ResultCapsule-v2 and ResourceEnvelope remain proposals. Their status and the
+actual navigation arguments are in [`agent-state.md`](agent-state.md).
 
-```text
-SituationFrame   automatic bounded current operating picture
-inspect_state    deeper current BranchState sections
-branch_history   historical exact evidence
-repo_query       bounded repository location/navigation
-ResultCapsule    versioned child result
-ResourceEnvelope model-visible resource pressure and lease state
-```
-
-Exact target shapes are in [`agent-state.md`](agent-state.md). None of those
-target values should be inferred as current wire support solely from this
-reference.
+Model-originated child policy is explicit. The supervisor retains an internal
+harness-originated compatibility path when both policy fields are omitted;
+that is not permission for the model to omit its required fields.

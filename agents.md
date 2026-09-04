@@ -57,18 +57,20 @@ landed.
 
 ## 3. System model
 
-Cambium is one linked control system, not a bag of utilities:
+Cambium is a direct execution loop with explicit owners:
 
 ```text
-repository/providers/operator intent
-        -> tools/workers/transports/merge
-        -> events/checkpoints/Git/quota
-        -> CAST/artifact/provider views
-        -> canonical BranchState          target integration layer
-        -> model SituationFrame + TUI
-        -> agent/supervisor decisions
-        -> evaluation and policy promotion
+operator task -> supervisor -> isolated worker -> model action -> tool observation
+                    |                |
+                    |                +-> immutable context checkpoints
+                    +-> child lifetime, artifact joins and publication
+
+provider usage + durable events + checkpoints + Git -> inspection and TUI
 ```
+
+`BranchState` and CLI replay inspection exist. Sharing all state semantics with
+the model and TUI, including the proposed SituationFrame, is separate integration
+work. Do not treat a diagram or proposed type as an implemented consumer.
 
 Keep these identities separate:
 
