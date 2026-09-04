@@ -167,8 +167,12 @@ def decide_heavy_work(
     Threshold keys are minimum ``mem_available_frac``, maximum
     ``load1_per_cpu`` (the multiplier applied to the logical CPU count), and
     minimum ``disk_free`` bytes.  Defaults are 0.10, 2.0, and 1 GiB.
-    Minimum thresholds and the maximum load threshold are inclusive. Missing
-    or invalid readings and thresholds fail closed and add a reason.
+    Minimum thresholds and the maximum load threshold are inclusive. Invalid
+    thresholds fail closed and add a reason. A reading the host cannot
+    provide (e.g. memory on macOS has no ``/proc/meminfo``) is skipped —
+    it cannot be enforced, and blocking all heavy work on such hosts makes
+    the product unusable — while a present-but-invalid reading still fails
+    closed.
     """
     configured = {} if thresholds is None else dict(thresholds)
     reasons: list[str] = []
@@ -209,7 +213,7 @@ def decide_heavy_work(
         reasons.append("disk_free threshold invalid")
 
     if available_frac is None:
-        reasons.append("mem_available_frac unavailable")
+        pass  # unreadable on this host: skipped, not failed closed
     elif not _is_finite_number(available_frac) or not 0.0 <= available_frac <= 1.0:
         reasons.append("mem_available_frac invalid")
     elif minimum_memory is not None and available_frac < minimum_memory:
@@ -242,7 +246,7 @@ def decide_heavy_work(
             reasons.append(f"load1 {load1:.3f} > {cutoff:.3f}")
 
     if disk_free is None:
-        reasons.append("disk_free unavailable")
+        pass  # unreadable on this host: skipped, not failed closed
     elif not _is_finite_number(disk_free) or disk_free < 0:
         reasons.append("disk_free invalid")
     elif minimum_disk_free is not None and disk_free < minimum_disk_free:

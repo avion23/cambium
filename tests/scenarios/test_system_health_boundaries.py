@@ -84,11 +84,9 @@ def test_zero_readings_are_valid_at_zero_thresholds() -> None:
 @pytest.mark.parametrize(
     ("kwargs", "reason"),
     [
-        ({"available_frac": None}, "mem_available_frac unavailable"),
         ({"load1": None}, "load1 unavailable"),
         ({"cpu_count": None}, "cpu_count unavailable"),
         ({"cpu_count": 0}, "cpu_count unavailable"),
-        ({"disk_free": None}, "disk_free unavailable"),
     ],
 )
 def test_unavailable_or_zero_cpu_readings_fail_closed(kwargs: dict[str, Any], reason: str) -> None:
@@ -99,6 +97,26 @@ def test_unavailable_or_zero_cpu_readings_fail_closed(kwargs: dict[str, Any], re
 
 
 @pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"available_frac": None},
+        {"disk_free": None},
+    ],
+)
+def test_unreadable_readings_are_skipped(kwargs: dict[str, Any]) -> None:
+    """Readings a host cannot provide are skipped, not failed closed.
+
+    macOS exposes no memory reading; blocking all heavy work there makes
+    the product unusable. A present-but-invalid reading still fails
+    closed (covered by the invalid-value tests).
+    """
+    result, reasons = _decision(**kwargs)
+
+    assert result is True, reasons
+    assert reasons == []
+
+
+@pytest.mark.parametrize(
     "contents",
     ["", "MemAvailable: 0 kB\nMemTotal: 0 kB\n", "MemAvailable: 1 kB\n"],
 )
@@ -106,15 +124,15 @@ def test_empty_or_zero_proc_memory_is_unavailable(contents: str) -> None:
     assert system_health._parse_meminfo(contents) is None
 
 
-def test_missing_memory_sources_fail_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_missing_memory_sources_are_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(system_health, "_memory_from_proc", lambda: None)
     monkeypatch.setattr(system_health, "_memory_from_sysconf", lambda: None)
 
     assert system_health._memory_metrics() == (None, None, None)
     result, reasons = _decision(available_frac=None)
 
-    assert result is False
-    assert "mem_available_frac unavailable" in reasons
+    assert result is True, reasons
+    assert reasons == []
 
 
 @pytest.mark.parametrize(

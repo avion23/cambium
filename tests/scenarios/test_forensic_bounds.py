@@ -24,7 +24,7 @@ def test_read_batch_refuses_own_active_session(tmp_path: Path, monkeypatch) -> N
     current.mkdir(parents=True)
     artifact = current / ".cambium" / "events.db"
     artifact.parent.mkdir()
-    artifact.write_text("private", encoding="utf-8")
+    artifact.write_text("SESSION-ARTIFACT-CONTENT", encoding="utf-8")
     monkeypatch.setenv("CAMBIUM_SESSION_ID", str(current))
 
     result = _run("read_batch", {"paths": [str(artifact)]}, ToolContext(tmp_path))
@@ -32,7 +32,9 @@ def test_read_batch_refuses_own_active_session(tmp_path: Path, monkeypatch) -> N
     assert not result.ok
     assert "worker's own active session" in result.output
     assert "assigned task" in result.output
-    assert "private" not in result.output
+    # Assert on a content marker, never a path word: on macOS every temp
+    # path lives under /private/var, so "private" appears legitimately.
+    assert "SESSION-ARTIFACT-CONTENT" not in result.output
 
 
 def test_own_session_rejection_reports_submitted_path_not_resolved(
@@ -47,7 +49,7 @@ def test_own_session_rejection_reports_submitted_path_not_resolved(
     real.mkdir()
     artifact = real / ".cambium" / "events.db"
     artifact.parent.mkdir()
-    artifact.write_text("private", encoding="utf-8")
+    artifact.write_text("SESSION-ARTIFACT-CONTENT", encoding="utf-8")
     link = tmp_path / "link-dir"
     link.symlink_to(real, target_is_directory=True)
     monkeypatch.setenv("CAMBIUM_SESSION_ID", str(real))
