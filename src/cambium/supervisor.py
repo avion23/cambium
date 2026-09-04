@@ -1458,7 +1458,7 @@ def _worker_environment(
     worktree = Path(spec["worktree_path"]).resolve() if "worktree_path" in spec else None
     env = _strip_sensitive_env(
         source,
-        allowed_keys=allowed_provider_keys,
+        allowed_keys=allowed_provider_keys | {"CAMBIUM_LSP_COMMAND"},
         worktree=worktree,
         overrides=overrides,
     )

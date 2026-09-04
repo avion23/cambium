@@ -240,6 +240,58 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         ),
     },
     {
+        "name": "repo_query",
+        "description": (
+            "Locate code before reading whole files. tree lists source files; search finds "
+            "literal text; symbols finds declarations; references finds identifier uses "
+            "(not semantic references). window reads nearby lines. lsp uses the operator's "
+            "configured language server and reports unavailable rather than guessing."
+        ),
+        "parameters": _parameters(
+            {
+                "action": {
+                    "type": "string",
+                    "enum": ["tree", "search", "symbols", "references", "window", "lsp"],
+                },
+                "query": {"type": "string", "minLength": 1},
+                "path": {"type": "string", "description": "Worktree-relative path."},
+                "line": {"type": "integer", "minimum": 1},
+                "column": {"type": "integer", "minimum": 1},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                "exact": {"type": "boolean"},
+                "method": {
+                    "type": "string",
+                    "enum": [
+                        "definition",
+                        "references",
+                        "hover",
+                        "document_symbols",
+                        "diagnostics",
+                    ],
+                },
+            },
+            ["action"],
+        ),
+    },
+    {
+        "name": "branch_history",
+        "description": (
+            "Read this session's recorded branches, tools, or transcript without rerunning "
+            "them. Start with branches or tools; reopen one tool by its returned ref. "
+            "transcript requires task_id. offset is zero-based; limit is at most 64 rows."
+        ),
+        "parameters": _parameters(
+            {
+                "action": {"type": "string", "enum": ["branches", "tools", "tool", "transcript"]},
+                "task_id": {"type": "string", "minLength": 1},
+                "ref": {"type": "string", "minLength": 1},
+                "offset": {"type": "integer", "minimum": 0},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 64},
+            },
+            ["action"],
+        ),
+    },
+    {
         "name": "delegate",
         "description": (
             "Propose one scoped child workload for work you should not do yourself. The child "

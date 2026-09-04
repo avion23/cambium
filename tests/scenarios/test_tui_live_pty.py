@@ -211,6 +211,40 @@ def _kill_child(process: subprocess.Popen[bytes]) -> None:
     process.wait()
 
 
+@pytest.mark.parametrize("cancel_command", [b"/cancel\n", b"!cancel\n"])
+def test_inspection_and_cancel_work_while_provider_is_running(
+    tmp_path: Path, cancel_command: bytes
+) -> None:
+    server = _CannedOpenAIServer()
+    process = None
+    master_fd = -1
+    output = bytearray()
+    try:
+        repo = tmp_path / "repo"
+        _init_repo(repo)
+        providers = _provider_file(tmp_path / "providers.json", server.base_url)
+        process, master_fd = _spawn_tui(repo, providers)
+        _read_until(master_fd, output, _PROMPT_REPAINT, 5.0)
+        os.write(master_fd, b"hello\n")
+        assert server.request_started.wait(5.0)
+        output.clear()
+        os.write(master_fd, b"/usage\n")
+        _read_until(master_fd, output, b"usage: calls=", 2.0)
+        _read_into(master_fd, output, 0.2)
+        assert b"queued: /usage" not in output
+        os.write(master_fd, cancel_command)
+        _read_until(master_fd, output, b"turn cancelled;", 3.0)
+        assert b"queued: /cancel" not in output
+        os.write(master_fd, b"/exit\n")
+        assert _wait_exit(process, master_fd, output, 3.0) == 0
+    finally:
+        server.close()
+        if process is not None:
+            _kill_child(process)
+        if master_fd >= 0:
+            os.close(master_fd)
+
+
 def test_live_tui_resize_repaints_one_input_prompt(tmp_path: Path) -> None:
     server = _CannedOpenAIServer()
     process = None
