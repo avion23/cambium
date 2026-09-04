@@ -118,3 +118,20 @@ def test_completed_rail_does_not_reserve_empty_live_detail_rows() -> None:
     rows = _rail_rows(snapshot, 32, 24)
     assert all(line.strip() for _, line in rows)
     assert any("status succeeded" in line for _, line in rows)
+
+
+def test_renderer_does_not_read_another_threads_native_editor(monkeypatch) -> None:
+    from io import StringIO
+    from types import SimpleNamespace
+
+    from cambium import tui_screen
+
+    def forbidden_read():
+        raise AssertionError("renderer accessed a live native editor")
+
+    monkeypatch.setattr(tui_screen, "_readline", SimpleNamespace(get_line_buffer=forbidden_read))
+    cockpit = tui_screen.Cockpit(StringIO(), enabled=True)
+    cockpit._native_input = True
+    cockpit._input_active = True
+    cockpit._input_owner = -1
+    assert cockpit._input_line_text() is None

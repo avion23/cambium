@@ -1,4 +1,4 @@
-"""Worker agent-loop improvements: plan-before-act, transcript bounding,
+"""Worker agent-loop behavior: direct actions, transcript bounding,
 lint feedback visibility, read_batch exposure, and the heartbeat drain fix.
 
 The provider-backed loop is driven in-process with a scripted fake router
@@ -1837,10 +1837,11 @@ def test_concatenated_actions_are_rejected(tmp_path: Path) -> None:
 
 
 def test_three_invalid_actions_fail_fast_with_no_progress(tmp_path: Path) -> None:
-    """Distinct malformed responses hit the dedicated invalid-action bound."""
+    """Malformed responses remain inspectable without spending more model calls."""
     repo = tmp_path / "repo"
     worktree = _make_worktree(repo)
-    config = _agent_config(worktree)
+    config = _agent_config(worktree, checkpoint_root=tmp_path / "checkpoints")
+    writer = _FakeWriter()
     router = _ScriptedRouter(
         [
             "not-json-one",
@@ -1850,13 +1851,18 @@ def test_three_invalid_actions_fail_fast_with_no_progress(tmp_path: Path) -> Non
         ]
     )
 
-    outcome = asyncio.run(_drive_loop(config, worktree, router))
+    outcome = asyncio.run(_drive_loop(config, worktree, router, writer))
 
     assert outcome["status"] == "failed"
     assert outcome["failure_reason"] == "agent emitted 3 consecutive invalid actions"
     assert "max turns exceeded" not in outcome["failure_reason"]
     assert outcome["turn"] == 3  # failed on the 3rd consecutive invalid action
     assert len(router.prompts) == 3  # no further router calls
+    checkpoints = [m for m in writer.messages() if m["type"] == "checkpoint"]
+    assert [m["turn"] for m in checkpoints] == [1, 2, 3]
+    recorded = json.loads(Path(checkpoints[-1]["state_ref"]).read_text())["transcript"]
+    assert recorded[-2] == {"role": "assistant", "content": "not-json-three"}
+    assert "JSON-escape" in recorded[-1]["content"]
 
 
 def test_valid_action_resets_consecutive_invalid_action_bound(tmp_path: Path) -> None:

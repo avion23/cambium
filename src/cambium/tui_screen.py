@@ -20,6 +20,7 @@ import re
 import shutil
 import signal
 import textwrap
+import threading
 import time
 import unicodedata
 from collections import deque
@@ -4615,9 +4616,13 @@ class Cockpit:
         finally:
             self._draw_in_flight = False
 
-    def _input_line_text(self) -> str:
-        if not self._native_input or _readline is None:
+    def _input_line_text(self) -> str | None:
+        if not self._native_input or _readline is None or not self._input_active:
             return ""
+        if getattr(self, "_input_owner", None) != threading.get_ident():
+            # libedit converts mutable editor storage here. Even a read from
+            # another thread can corrupt it while native input inserts text.
+            return None
         try:
             value = _readline.get_line_buffer()
         except (AttributeError, OSError, RuntimeError):
@@ -4924,6 +4929,23 @@ class Cockpit:
         live_only: bool = False,
     ) -> None:
         input_text = self._input_line_text()
+        if input_text is None:
+            # Native editing owns the input row. Keep live cells moving, but
+            # defer destructive frame/input repaint until the line completes.
+            self._pending_draw = request
+            if self._fixed_frame:
+                self._draw_live_event_now(request)
+                capacity = max(1, self._last_size.lines - _frame_overhead(self._show_detail))
+                rows = tuple(_primary_rows(
+                    request[1], _frame_content_width(self._last_size.columns),
+                    color=self.color, include_stream=False,
+                ))
+                visible = rows[-capacity:]
+                self._redraw_rail(visible, self._last_rail_rows)
+                self._last_frame_conversation_rows = visible
+                self._last_conversation_rows = rows
+                self._last_primary_rows = _primary_request_rows(rows, self._last_rail_rows)
+            return
         geometry_changed = self._frame_size != self._last_size or (
             self._last_rendered_width is not None
             and self._last_rendered_width != self._last_size.columns
@@ -5212,16 +5234,18 @@ class Cockpit:
         conversation_rows: tuple[tuple[str, str], ...],
         rail_rows: tuple[tuple[str, str], ...],
     ) -> None:
-        """Rewrite changed rail cells without rebuilding the live frame."""
+        """Rewrite changed conversation/rail cells without touching native input."""
         rail_width = _rail_width(self._last_size.columns)
-        if not rail_width:
-            return
         capacity = max(1, self._last_size.lines - _frame_overhead(self._show_detail))
         changed = [
             index
             for index in range(capacity)
             if (self._last_rail_rows[index] if index < len(self._last_rail_rows) else ("", ""))
             != (rail_rows[index] if index < len(rail_rows) else ("", ""))
+            or (
+                self._last_frame_conversation_rows[index]
+                if index < len(self._last_frame_conversation_rows) else ("", "")
+            ) != (conversation_rows[index] if index < len(conversation_rows) else ("", ""))
         ]
         if not changed:
             return
@@ -5333,6 +5357,7 @@ class Cockpit:
         if not self.enabled:
             return
         self._input_active = True
+        self._input_owner = threading.get_ident()
         self._native_input = native
         label_text = _clip(_sanitize(label).replace(chr(10), " "), 8)
         self._input_prompt_label = label_text

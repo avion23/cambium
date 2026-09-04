@@ -96,6 +96,7 @@ rather than requesting the whole transcript.
 ```text
 branch:<percent-encoded-task-id>
 tool:<percent-encoded-task-id>:<generation>:<turn>:<batch-index>
+tool:<percent-encoded-task-id>:<generation>:<turn>:<batch-index>@turn-NNNN
 ```
 
 Examples:
@@ -104,11 +105,18 @@ Examples:
 branch:review-routing
 tool:review-routing:1:7:0
 tool:parser%3Awindows:2:11:3
+tool:interactive:1:2:0@turn-0002
 ```
 
 Generation distinguishes repeated turn numbers after restart. Batch index is
-zero-based. Older three-coordinate tool references remain readable as index
-zero because existing durable sessions use them.
+zero-based. Interactive sessions append the turn-directory identity because
+task, generation, and model-turn counters can repeat across user turns. Reopen
+the reference returned by `tools`; do not remove its suffix. An unscoped
+reference matching several interactive turns is rejected as ambiguous rather
+than returning whichever event happened to be last.
+
+Older three-coordinate tool references remain readable as index zero when
+unambiguous because existing durable sessions use them.
 
 ## Tools, prompts, and future state
 

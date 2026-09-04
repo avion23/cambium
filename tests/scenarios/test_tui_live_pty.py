@@ -248,7 +248,7 @@ def test_inspection_and_cancel_work_while_provider_is_running(
             os.close(master_fd)
 
 
-def test_live_tui_resize_repaints_one_input_prompt(tmp_path: Path) -> None:
+def test_live_tui_resize_preserves_one_input_prompt(tmp_path: Path) -> None:
     server = _CannedOpenAIServer()
     process = None
     master_fd = -1
@@ -275,6 +275,13 @@ def test_live_tui_resize_repaints_one_input_prompt(tmp_path: Path) -> None:
 
         _read_until(master_fd, output, b"canned response", 8.0)
         _read_into(master_fd, output, 0.3)
+        # A native edit owns its line: full geometry repaint waits for input
+        # completion, while live result/status cells remain visible above it.
+        inspection = bytearray()
+        os.write(master_fd, b"/usage\n")
+        _read_until(master_fd, inspection, b"usage: calls=", 3.0)
+        _read_into(master_fd, inspection, 0.1)
+        output.extend(inspection)
         assert output.count(_PROMPT_REPAINT) >= 2
         final_frame = output.rsplit(b"\x1b[1A\r", 1)[-1]
         assert final_frame.count(b"\r\x1b[2K\xe2\x80\xba ") <= 1

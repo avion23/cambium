@@ -6135,12 +6135,10 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                     {
                         "role": "user",
                         "content": _bounded_text(
-                            f"invalid action: {exc}. Reply with exactly ONE JSON object of "
-                            "one of these shapes, and nothing else (no prose, no "
-                            'markdown): {"type":"plan","steps":["..."]} | '
-                            '{"type":"tool_call","name":"read_batch",'
-                            '"arguments":{"paths":["file.py"]}} | '
-                            '{"type":"finish","summary":"...","objective_met":true}',
+                            f"invalid action: {exc}. Return one JSON action with type "
+                            "plan, tool_call, or finish. Keep the intended action; JSON-escape "
+                            "quotes, backslashes, and newlines inside its string arguments. "
+                            "No prose or markdown.",
                             MAX_OBSERVATION_BYTES,
                         ),
                     },
@@ -6207,6 +6205,16 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                 )
                 consecutive_invalid_actions += 1
                 if writer is not None:
+                    # Preserve the failed response and repair feedback too, not
+                    # only the last valid tool call. This is existing history,
+                    # not a new trace store or another model request.
+                    await _persist_checkpoint(
+                        writer, config, turn, transcript, cumulative_usage, [],
+                        compaction_deferred=compaction_deferred,
+                        consecutive_compaction_deferrals=consecutive_compaction_deferrals,
+                        code_changed=code_changed,
+                    )
+                    last_turn_checkpoint = turn
                     await send(
                         writer,
                         {

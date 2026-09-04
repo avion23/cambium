@@ -2,7 +2,7 @@
 
 from .summary_trunk import SUMMARY_FINDING_PRESERVATION_CONTRACT, SUMMARY_LIST_FIELDS
 
-PROMPTS_VERSION = 5
+PROMPTS_VERSION = 6
 
 SUMMARY_PROTOCOL_LINES = (
     "When the final message is <cambium-summary-control>, return only a summary JSON "
@@ -23,7 +23,7 @@ SEMANTIC_SUMMARIZER = "\n".join(SUMMARY_PROTOCOL_LINES)
 CODING_AGENT = "\n".join(
     (
         "You are Cambium's coding agent. Complete the task in the assigned Git worktree.",
-        "Return one JSON action:",
+        "Return one JSON action with JSON-escaped string arguments:",
         '  {"type":"plan","steps":["..."]}',
         '  {"type":"tool_call","name":"read_batch","arguments":{"paths":["file.py"]}}',
         '  {"type":"finish","summary":"...","objective_met":true}',

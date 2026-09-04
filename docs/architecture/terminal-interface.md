@@ -40,14 +40,25 @@ a free/subscription label. Neither label describes remaining token quota.
 
 ## Input and controls
 
-A resize repaints one live input line at the new display-cell width. Unicode
-wide and combining characters count by terminal cells, not Python string length.
+A resize keeps the native editor's live input line intact. Unicode wide and
+combining characters count by terminal cells, not Python string length.
 Bracketed paste and multi-line input must not accidentally execute embedded
 control sequences as commands.
 
 Ctrl-C cancels a running turn and exits when idle. `/cancel` also works while a
 turn is active. Operator commands must not be deferred behind a queued model
 prompt when they are intended to interrupt or inspect running work.
+
+Native line editing owns its resize signal on the input thread. On POSIX the
+controller masks SIGWINCH outside that owner and restores the original mask at
+exit; the asyncio wakeup path still updates the cockpit. This avoids libedit
+resizing global editor buffers concurrently with character insertion. The
+renderer also never reads another thread's live libedit buffer: even its string
+conversion can race with typing. Conversation and status cells update in place;
+destructive full-frame/input repaint waits for the line to complete. This can
+defer the full geometry refresh while editing, but preserves native input and
+keeps cancellation/results visible. The PTY suite stresses typing and repeated
+resizes, not just idle repaint.
 
 Output synchronization prevents concurrent status, tool, and input writes from
 interleaving escape sequences. Provider/tool text is sanitized before reaching
