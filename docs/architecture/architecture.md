@@ -47,7 +47,7 @@ Human + model projections
         ^
 Branch controller and policy
         ^
-Canonical BranchState             target integration layer
+BranchState inspection           shared-consumer integration remains
         ^
 CAST + artifact + lease views
         ^
@@ -67,9 +67,10 @@ The architectural rule is:
 one canonical branch state, many projections
 ```
 
-Today the operator projection is implemented in `observability.py`; the target
-is to factor its shared semantics into a pure BranchState reducer consumed by
-both the TUI and the model SituationFrame.
+`branch_state.py` and CLI `inspect-state` already provide a pure inspection
+projection. The operator still uses `observability.py`; making model and operator
+surfaces consume shared semantics is unfinished integration, not a missing
+state library. Do not add another mutable state store to bridge them.
 
 ## 3. Orthogonal structures
 
@@ -147,10 +148,12 @@ execute bounded tools, append observations, checkpoint, repeat
 ```
 
 Current model tools are `write_file`, `edit_file`, `git_op`, `run_shell`,
-`read_batch`, and `delegate`. Implementations of branch history, bounded code
-indexing, and optional LSP queries exist but are not yet wired into this active
-roster. Target state/history/navigation tools are defined in
-[`../reference/agent-state.md`](../reference/agent-state.md).
+`read_batch`, `repo_query`, `branch_history`, and `delegate`. Repository queries
+include the optional configured LSP path. Exact current actions are in
+[the navigation reference](../reference/context-branches.md); model-facing
+`inspect_state` and richer state shapes remain in
+[the target state reference](../reference/agent-state.md). A short task may
+start directly with a tool; a plan is optional, not an extra required turn.
 
 ### 5.3 Context loop
 

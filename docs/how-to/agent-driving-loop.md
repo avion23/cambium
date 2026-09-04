@@ -2,8 +2,9 @@
 
 **Status:** target operating guide. The current worker already supports bounded
 planning, tools, CAST, explicit child policies when declared, and verification.
-The automatic SituationFrame, `inspect_state`, and `repo_query` surfaces
-described here are ordered in `implementation-plan.md`.
+`repo_query` and `branch_history` are live tools. Automatic SituationFrame and
+model-facing `inspect_state` integration remain in `implementation-plan.md`;
+do not assume a frame exists merely because this target guide describes it.
 
 This guide describes the behavior Cambium should make natural rather than
 behavior a model must remember from a long prompt.
@@ -36,10 +37,11 @@ required final verification
 Do not reconstruct session status from old prose when the frame supplies a
 newer harness-owned value.
 
-## 2. Make a control plan
+## 2. Plan only when it helps
 
-The first plan should be short and falsifiable. Use steps that end in observable
-state, not vague activity.
+A small task can start directly with a tool or valid finish. For multi-step
+work, use a short, falsifiable plan with observable outcomes, not vague activity.
+Do not spend a separate provider round trip just to satisfy planning boilerplate.
 
 Bad:
 
@@ -67,14 +69,16 @@ following a stale plan to appear consistent.
 Use the least expensive precision ladder:
 
 ```text
-repo_query tree/symbol/search
+repo_query tree/symbols/search
     -> exact source windows
     -> read_batch for the selected files
     -> run_shell only when a typed query cannot answer the question
 ```
 
-When `repo_query` is not yet available, use one bounded shell search or one
-batched read rather than serially guessing filenames.
+Use the live `repo_query` tool for bounded repository queries. When a query
+cannot answer the question, use one bounded shell search or batched read rather
+than serially guessing filenames. Missing LSP support means unavailable, not
+permission to label textual matches as semantic references.
 
 Good read batch:
 

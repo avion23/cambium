@@ -1,137 +1,69 @@
-# Persistent interactive terminal cockpit
+# Interactive branch lifecycle
 
-**Status:** implemented operator contract; source and tests remain authoritative.
+**Status:** implemented. This page owns session/context behavior;
+[terminal interface](terminal-interface.md) owns layout, input, and commands.
 
-## Interactive session
+## One conversation, durable turns
 
-`cambium tui` keeps one persistent CAST branch across operator turns. Each turn
-gets a fresh worker leaf under `turn-NNNN`; a successful immutable checkpoint
-seeds the next turn. `-c`/`--continue` reopens the latest or a named durable
-interactive root. Without it, Cambium allocates a new root.
+`InteractiveSession` attaches successive prompts to a durable interactive root.
+Each turn has its own supervisor run and event store, while the interactive
+manifest records the accepted continuation checkpoint and branch identity.
+The TUI is a frontend to that session, not a second agent runtime.
 
-The frontend is persistent. Worker execution remains isolated:
+A successful turn can seed the next turn from its compatible checkpoint or
+semantic continuation. A failed turn does not silently replace the accepted
+head. Turn number, worker generation, context epoch, and Git head are different
+identities; display and recovery code must not infer one from another.
 
-```text
-interactive root
-    |
-    +--> turn-0001 / worker worktree / checkpoint C1
-    |
-    +--> turn-0002 / worker worktree / checkpoint C2
-    |
-    +--> turn-0003 / worker worktree / checkpoint C3
-```
+The normal model loop can start directly with a useful tool call. A plan is
+available when it helps, not a required extra model turn for every prompt.
 
-## Turn lifecycle
+## Code state and context state
 
-1. The single interactive-session writer allocates a fresh turn leaf.
-2. The turn starts from the latest compatible checkpoint.
-3. A worker executes inside the canonical supervisor/worktree boundary.
-4. Checkpoint and result events are observed durably.
-5. Successful finalization atomically advances the branch manifest.
-6. Failure or cancellation keeps the previous valid context seed.
+The supervisor validates and publishes mutating work. A clean read-only result
+needs no commit. Later prompts must see accepted artifacts as well as the
+correct context continuation; remembering a claimed edit is not equivalent to
+having the edit in the current Git tree.
 
-Checkpoint reuse requires compatible workspace and provider-cache identity. On
-incompatibility, the runtime uses provider-neutral semantic summaries when
-legal; otherwise it starts fresh. No frontend path edits an existing checkpoint.
+`/fork` branches the conversation from the available durable state. `/branches`
+inspects checkpoint heads. These are conversation operations, not arbitrary
+Git branch mutation commands. `/compact` uses the existing context mechanism;
+it does not make old raw evidence disappear.
 
-## Subagents in the cockpit
+`/model` lists or changes provider/model preference for subsequent work.
+Existing context is subject to the explicit compatibility rules in
+[context branches](context-branches.md). A changed provider cannot inherit an
+incompatible exact prefix or claim the old provider's cache.
 
-Subagents are supervised worker tasks, not provider-native agents. The operator
-rail projects their task-tree and lifecycle state from durable events:
+## Exit, cancellation, and reconnect
 
-```text
-main
-├─ review-routing   ~ active
-├─ add-tests        = merging
-└─ inspect-tui      ∅ succeeded
-```
+An interactive root has one active frontend owner. Reconnect reconstructs
+accepted state from the manifest and durable turn artifacts, not widget memory.
+The event stream remains usable by monitoring and history inspection.
 
-Lineage glyphs mean:
+During a running turn, Ctrl-C or `/cancel` requests cancellation. At idle,
+Ctrl-C exits cleanly. Queued prompts are distinct from cancellation and from
+status commands. Terminal resizing must not duplicate or swallow the input
+line; neither rendering nor a quota query should block cancellation behind a
+writable ledger retry.
 
-- `=` exact cache-affine checkpoint lineage;
-- `~` semantic-summary reuse with a fresh provider head;
-- `∅` fresh context;
-- `?` lineage not yet known.
+## Observation
 
-Lifecycle glyphs are redundant with text in the full rail so color is never the
-only signal. The compact rail is an overview; `/agents`, `/events`, and the full
-rail are the inspection surfaces.
+`ObservabilityState` reduces the current turn's events. The TUI combines that
+snapshot with completed-turn cumulative usage without double counting.
+`branch_history` can reopen recorded evidence across the interactive root's
+turn directories. Its reads do not rerun tools or reconstruct hidden reasoning.
 
-Subagent workload, provider selection, prompt construction, and join behavior
-are defined in [`subagents.md`](subagents.md).
+The canonical `branch_state.py` inspection projection also exists, but complete
+agreement between all model/operator state surfaces is separate integration
+work. Do not call a new frame or shared work ledger implemented solely because
+this frontend retains a checkpoint.
 
-## Layout contract
+## Source and checks
 
-The cockpit uses the terminal primary buffer so normal scrollback remains
-available. At twelve or more rows it renders conversation/status/input on the
-left and an operator rail on the right.
-
-| Width | Layout |
-| --- | --- |
-| `>=100` columns | Full 32-column operator rail |
-| `80-99` columns | Compact six-column glyph rail |
-| `<80` columns | Conversation-first single pane |
-
-A resize invalidates geometry and repaints one complete deterministic frame.
-Terminals shorter than twelve rows use bounded unframed output. Non-TTY and
-`NO_COLOR` modes remain line-oriented and free of cursor control.
-
-The detailed layout and usability checklist are in
-[`terminal-interface.md`](terminal-interface.md).
-
-## Input and commands
-
-The input row remains at a stable location after updates and resizes. Bracketed
-paste preserves embedded newlines. A trailing backslash continues input on the
-next line. Explicit multiline mode is:
-
-```text
-<<<
-first line
-second line
->>>
-```
-
-Operator commands include:
-
-```text
-/help       command help
-/status     compact session status
-/dashboard  repaint the dashboard
-/events     recent durable events
-/usage      cumulative usage
-/agents     main/subagent lifecycle
-/context    checkpoint, epoch, trunk, and raw tail
-/session    interactive root and branch lease
-/branches   persistent branch list
-/fork       fork the current checkpoint
-/compact    compact the active context
-/model      inspect or change provider/model preference
-/quota      provider quota windows
-/cancel     explain active-turn cancellation
-/new        start a fresh semantic branch
-/clear      clear visible transcript
-/exit       close the frontend
-```
-
-Ctrl-C during an active turn cancels it and returns to the prompt. Input entered
-while a turn is active is queued as a follow-up rather than lost.
-
-## Correctness boundaries
-
-- `InteractiveSession` is the single manifest writer.
-- Each operator turn uses one isolated supervisor leaf.
-- Durable events, not widget state, drive the operator projection.
-- Exact cache reuse and semantic reuse are distinct states.
-- Model/tool text is sanitized before terminal rendering.
-- A failed turn cannot replace the last successful branch checkpoint.
-- Monitor attachment is read-only and cannot cancel or mutate the session.
-
-## Source map
-
-- Interactive branch ownership: `src/cambium/interactive.py`
-- Frontend command loop: `src/cambium/tui.py`
-- Deterministic frame rendering: `src/cambium/tui_screen.py`
-- Event reducer and agent snapshots: `src/cambium/observability.py`
-- Session event aggregation: `src/cambium/supervisor.py`
-- TTY and PTY behavior: `tests/scenarios/test_tui_*.py`
+- [Interactive lifecycle](../../src/cambium/interactive.py),
+  [TUI controller](../../src/cambium/tui.py)
+- [Real two-turn coding and read-only continuation](../../tests/acceptance/test_live_tui_coding.py)
+- [Live frontend history inspection](../../tests/acceptance/test_live_frontends.py),
+  [PTY input/resize/cancel tests](../../tests/scenarios/test_tui_live_pty.py),
+  [live usage projection tests](../../tests/scenarios/test_tui_live_usage.py)

@@ -29,6 +29,7 @@ from summary_helpers import _summary_completion
 from cambium import worker
 from cambium.fencing import write_generation
 from cambium.ipc import MAX_LINE_BYTES, read_message
+from cambium.prompts import CODING_AGENT
 from cambium.supervisor import read_events, run_plan, run_session
 from cambium.tui_screen import Cockpit, Transcript
 
@@ -1200,7 +1201,7 @@ def test_run_session_provider_mode_sends_task_to_worker(tmp_path, monkeypatch) -
             assert len(REQUESTS) == 3
             assert REQUESTS[0]["model"] == "loopback-model"
             system = REQUESTS[0]["messages"][0]["content"]
-            assert system.startswith("You are Cambium's autonomous coding agent.")
+            assert system.startswith(CODING_AGENT.splitlines()[0])
             assert "Available tools:" in system
             # §9.1.6: the task is delimited user-role data, never system text.
             assert TASK_TEXT not in system

@@ -568,7 +568,7 @@ Examples:
 
 ## 14. Current implementation truth
 
-At the time this design was written, current `main` provides:
+The implemented runtime provides:
 
 - durable events, immutable checkpoints, isolated/fenced workers, salvage, and
   ref-only Git publication;
@@ -578,21 +578,24 @@ At the time this design was written, current `main` provides:
 - explicit child context/placement behavior when those fields are declared;
 - automatic exact/semantic compatibility behavior when a harness-originated
   child omits them (the model contract requires both fields);
-- implementations of branch-history projection, bounded code indexing, and
-  optional LSP queries.
+- live `branch_history` and `repo_query` tools, including optional configured
+  LSP queries, plus `branch_state.py` and CLI `inspect-state`;
+- output-only throughput accounting and an event-sourced TUI resource/quota
+  projection, with explicit read-only account quota inspection.
 
 The following target layers are not yet a coherent runtime surface:
 
 - a canonical `BranchState` shared by supervisor, model, and TUI;
 - an automatically injected SituationFrame;
 - `inspect_state` as a model tool;
-- branch-history, code-index, and LSP access in the active worker tool roster;
 - evidence-linked epistemic item identities and a versioned ResultCapsule;
 - a model-visible ResourceEnvelope and critical-path child view;
-- named branch-decision/history-recall prompt components matching current docs;
 - strict removal or explicit naming of the omitted-policy compatibility path.
 
-These gaps are ordered in the repository `implementation-plan.md`.
+These gaps are ordered in the repository `implementation-plan.md`. They do not
+require separate branch-planner/history-policy prompt components or a mandatory
+first planning turn. The current short prompt and tool schemas are the baseline;
+add a projection or policy only when an executable case shows its benefit.
 
 ## 15. Non-goals
 

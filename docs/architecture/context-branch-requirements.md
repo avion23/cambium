@@ -1,8 +1,9 @@
 # Agent and context-branch requirements
 
-**Status:** target normative contract. `MUST`, `MUST NOT`, `SHOULD`, and `MAY`
-have their usual requirements meaning. Current compatibility behavior and open
-work are listed explicitly in section 13 and `implementation-plan.md`.
+**Status:** target design requirements, not a list of shipped features or new
+per-turn gates. `MUST`, `MUST NOT`, `SHOULD`, and `MAY` describe the intended
+interfaces when implemented. Current behavior is listed in section 13;
+`implementation-plan.md` identifies the remaining small implementation slices.
 
 Rationale is in [`agent-operating-model.md`](agent-operating-model.md).
 
@@ -137,7 +138,9 @@ These concepts MUST remain distinct in source, events, documentation, and UI.
 
 ## 7. Agent action protocol
 
-1. The first model action MUST be a short plan tied to observable outcomes.
+1. A model MAY produce a short plan for multi-step work. A small task MAY start
+   directly with a tool call or valid finish; planning MUST NOT require an
+   otherwise unnecessary provider round trip.
 2. The agent SHOULD use the loop:
 
    ```text
@@ -268,15 +271,16 @@ These are current-source facts, not exceptions to the target requirements:
   and rejects omission before admission. The remaining ambiguity is internal:
   a harness-originated `proposed_children` spec may omit both, and the
   supervisor's `_declared_child_policy` then falls back to automatic
-  exact/semantic compatibility resolution. Phase 0 must remove or explicitly
-  name that internal path.
-- `branch_history.py`, `code_index.py`, and `lsp_query.py` exist, but the active
-  worker tool schema/dispatch roster currently contains only `write_file`,
-  `edit_file`, `git_op`, `run_shell`, `read_batch`, and `delegate`.
+  exact/semantic compatibility resolution. This internal compatibility path is
+  named in the context reference and is not a model-facing default.
+- `branch_history` and `repo_query` are active worker tools. Repository queries
+  include the configured optional LSP path; internal filenames are not separate
+  public tool names. Current fields live in the context/navigation reference.
 - `prompts.py` currently exports the coding and summary prompts, not all named
   branch-decision/history components claimed by earlier documents.
-- `observability.py` is an event-sourced operator reducer, but there is no shared
-  canonical BranchState or model SituationFrame yet.
+- `branch_state.py` and CLI `inspect-state` exist. `observability.py` remains a
+  separate operator reducer; a shared canonical model/operator projection and
+  automatic SituationFrame are unfinished integration work.
 - The existing strict child envelope and SummaryEntry are the migration base for
   ResultCapsule and WorkLedger; target schemas are not current wire claims.
 

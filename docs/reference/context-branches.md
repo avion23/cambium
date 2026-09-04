@@ -1,185 +1,100 @@
-# Context branch reference
+# Context and navigation reference
 
-**Status:** current values plus target public-contract notes. Rationale is in
-[`../architecture/context-branches.md`](../architecture/context-branches.md)
-and the integrated model is in
-[`../architecture/agent-operating-model.md`](../architecture/agent-operating-model.md).
+**Status:** current model tools and context-policy values. Rationale belongs in
+[context branches](../architecture/context-branches.md), lifecycle in
+[child agents](../architecture/subagents.md), and proposed state shapes in
+[agent-state](agent-state.md).
 
-## 1. Delegate child policy
-
-Current accepted explicit shape:
+## Delegate policy
 
 ```json
 {
-  "child_task_id": "stable-child-id",
-  "kind": "investigation",
-  "spec": {
-    "task": "Objective, ownership boundary, done criteria, and verification.",
-    "context_mode": "trunk",
-    "placement": "inherit"
+  "name": "delegate",
+  "arguments": {
+    "child_task_id": "routing-review",
+    "kind": "investigation",
+    "spec": {
+      "task": "Review routing.py without edits. Return a concrete defect, reproduction, and source evidence, or report none found.",
+      "context_mode": "semantic",
+      "placement": "spread"
+    }
   }
 }
 ```
 
-### `context_mode`
+Both policy fields are required in model-originated calls.
 
-| Value | Meaning |
+| `context_mode` | Meaning |
 | --- | --- |
-| `trunk` | Complete exact parent checkpoint prefix |
-| `semantic` | Immutable semantic summary state under a fresh provider head |
-| `fresh` | No parent checkpoint, semantic trunk, or parent-result context |
+| `trunk` | Complete compatible parent checkpoint prefix; requires `inherit` |
+| `semantic` | Immutable semantic summaries under a fresh provider head |
+| `fresh` | Task only; no parent checkpoint, summaries, or result envelope |
 
-### `placement`
-
-| Value | Meaning |
+| `placement` | Meaning |
 | --- | --- |
 | `inherit` | Preserve parent provider/model affinity when known and feasible |
-| `spread` | Prefer another hard-feasible provider, then fall back to all feasible providers |
+| `spread` | Prefer another feasible provider; otherwise use the feasible set |
 
-Valid explicit combinations:
+`trunk+spread` is invalid. An incompatible explicit `trunk+inherit` request is
+rejected, not silently changed to another mode. Internal harness-originated
+specifications retain an automatic compatibility path; it is not a model-tool
+default.
 
-```text
-trunk    + inherit
-semantic + inherit
-semantic + spread
-fresh    + inherit
-fresh    + spread
-```
+Optional provider requirements and task budgets further constrain admission;
+they cannot widen the parent's provider authority. Exact accepted fields are in
+[schemas.py](../../src/cambium/schemas.py). `kind` is validated as a task-tree
+kind, not a special prompt or separate worker implementation.
 
-Invalid:
+## `repo_query`
 
-```text
-trunk + spread
-```
+This is a live tool backed by `code_index.py` and the optional configured LSP
+transport. Its required `action` is one of:
 
-An explicit `trunk + inherit` request that cannot prove exact compatibility is
-rejected. It does not silently become semantic or fresh.
+| Action | Useful arguments | Result |
+| --- | --- | --- |
+| `tree` | `path`, `limit` | Bounded source-file locations |
+| `search` | `query`, `path`, `limit` | Literal text matches |
+| `symbols` | `query`, `path`, `exact`, `limit` | Source declaration locations |
+| `references` | `query`, `path`, `limit` | Identifier uses, not semantic references |
+| `window` | `path`, `line`, `limit` | Nearby source lines |
+| `lsp` | `method`, `path`, `line`, `column` | Configured language-server query |
 
-### Required policy fields
-
-The active model schema requires both `context_mode` and `placement`.
-Omitting either field is rejected before the delegate proposal reaches
-supervisor admission. The supervisor also validates the explicit policy and its
-allowed combinations.
-
-### Optional child constraints
-
-```json
-{
-  "requirements": {
-    "quality": "high",
-    "min_context_window": 100000,
-    "allow_paid": true
-  },
-  "model_candidates": ["model-a", "model-b"],
-  "authorized_providers": ["provider-a", "provider-b"],
-  "authorized_providers_explicit": true,
-  "max_turns": 20,
-  "max_wall_s": 900
-}
-```
-
-These constrain supervisor admission. They do not select credentials directly
-and cannot widen parent authority.
-
-## 2. Resolved context behavior
-
-### Trunk
-
-The child receives an exact `context_fork` descriptor containing checkpoint,
-provider/model, stable-prompt/tool hashes, prefix/suffix/full hashes, prefix
-bytes, and provider boundary. The provider/model lease is inherited.
-
-### Semantic
-
-The child receives `summary_trunk_ref`, no exact `context_fork`, and a fresh
-provider-specific head. `inherit` preserves the parent lease; `spread` removes
-inherited pinning and lets normal admission prefer another feasible lane.
-
-### Fresh
-
-The child receives neither `context_fork`, `summary_trunk_ref`, nor the parent
-result envelope. Placement is resolved independently.
-
-## 3. Branch-history projection
-
-`src/cambium/branch_history.py` implements a bounded read-only projection over
-existing session events and checkpoints.
-
-Query shape used by the library boundary:
+Line and column are one-based; `limit` is 1–100. LSP methods are `definition`,
+`references`, `hover`, `document_symbols`, and `diagnostics`. No configured server
+means unavailable, not guessed semantic results or an automatic installation.
 
 ```json
-{
-  "action": "branches | tools | tool | transcript",
-  "task_id": "optional branch id",
-  "ref": "optional tool reference",
-  "offset": 0,
-  "limit": 20
-}
+{"name":"repo_query","arguments":{"action":"symbols","query":"select_lane","limit":10}}
 ```
 
-Current integration status: this implementation is **not yet in the active
-worker tool schema/dispatch roster**. It is therefore not a current model tool
-until Phase 3 wires schema, dispatch, worker init, prompt, provider tool hash,
-and scenarios.
+Use `read_batch` to read exact relevant regions after locating them. Ordinary
+repository navigation does not require an embedding service or a second index
+store.
 
-### `branches`
+## `branch_history`
 
-Lists branch identity, parent, lifecycle, provider, context mode, placement,
-tool count, and last turn from durable events.
+This is a live read-only worker tool. It reads existing session events and
+checkpoints, including previous turns of an interactive session.
 
-```text
-branches=3
-branch:root parent=- status=succeeded provider=provider-a context=- placement=- tools=4 turn=12
-branch:routing parent=root status=active provider=provider-b context=semantic placement=spread tools=2 turn=4
+```json
+{"name":"branch_history","arguments":{"action":"tools","task_id":"routing-review","offset":0,"limit":20}}
 ```
 
-### `tools`
+| Action | Required detail | Meaning |
+| --- | --- | --- |
+| `branches` | None | Branch identity, parent, lifecycle, provider and context policy |
+| `tools` | Optional `task_id` | Recorded tool calls and stable refs |
+| `tool` | `ref` | Reopen one recorded action/observation, without running it |
+| `transcript` | `task_id` | Bounded checkpoint transcript window |
 
-Lists stable historical tool references globally or for one task branch. A
-batched model action has one independently addressable reference per call.
+`offset` is zero-based. `limit` is 1–64. A batched action has an independently
+addressable reference for each tool call. Start with a list or exact reference
+rather than requesting the whole transcript.
 
-```text
-tool_calls=2
-tool:routing:1:2:0 branch=branch:routing tool=read_batch ok=true duration_ms=7
-tool:routing:1:3:0 branch=branch:routing tool=run_shell ok=true duration_ms=91
-```
-
-### `tool`
-
-Reopens one matching tool event and, when present in a checkpoint, the original
-assistant action and the corresponding batched tool observation. It never
-executes the tool again.
-
-```text
-tool:routing:1:2:0
-branch=branch:routing generation=1 turn=2 batch_index=0
-tool=read_batch ok=true
-assistant_action:
-{"type":"tool_call","calls":[{"name":"read_batch","arguments":{"paths":["src/routing.py"]}}]}
-tool_observation:
-tool read_batch ok=True
-...
-```
-
-### `transcript`
-
-Returns one bounded checkpoint transcript window for a branch. Use it only when
-the branch capsule and exact tool refs are insufficient.
-
-## 4. Stable references
-
-### Branch
+## Stable history references
 
 ```text
 branch:<percent-encoded-task-id>
-```
-
-### Tool
-
-Canonical current form:
-
-```text
 tool:<percent-encoded-task-id>:<generation>:<turn>:<batch-index>
 ```
 
@@ -191,64 +106,31 @@ tool:review-routing:1:7:0
 tool:parser%3Awindows:2:11:3
 ```
 
-Generation is part of identity because a restarted worker can repeat a logical
-turn number. Batch index is zero-based and distinguishes calls emitted in one
-batched action.
+Generation distinguishes repeated turn numbers after restart. Batch index is
+zero-based. Older three-coordinate tool references remain readable as index
+zero because existing durable sessions use them.
 
-The legacy three-coordinate suffix remains accepted:
+## Tools, prompts, and future state
 
-```text
-tool:<percent-encoded-task-id>:<generation>:<turn>
-```
+The active schema exposes `write_file`, `edit_file`, `git_op`, `run_shell`,
+`read_batch`, `repo_query`, `branch_history`, and `delegate`. A tool's internal
+implementation filename is not another public tool name.
 
-It resolves to batch index zero. Events written before batch indexes existed are
-treated the same way.
+[prompts.py](../../src/cambium/prompts.py) exports `CODING_AGENT`,
+`SEMANTIC_SUMMARIZER`, `SUMMARY_PROTOCOL_LINES`, and `PROMPTS_VERSION`. It does
+not have separate branch-planner/history-policy prompt components. A small task
+may start with a tool or a valid finish; a plan is optional.
 
-Target additional evidence-reference forms are defined in
-[`agent-state.md`](agent-state.md).
+`branch_state.py` and CLI `inspect-state` provide current inspection. A
+model-facing `inspect_state`, unified SituationFrame/operator projection, typed
+WorkLedger, and richer ResultCapsule are separate work tracked in
+[the implementation plan](../../implementation-plan.md); do not infer their wire
+support from target names in [agent-state](agent-state.md).
 
-## 5. Source artifacts
+## Executable anchors
 
-Branch-history projection reads only existing artifacts:
-
-```text
-<session>/.cambium/events.db
-<session>/.cambium/checkpoints/<task>/turn-NNN.json
-interactive-root/turn-NNNN/.cambium/events.db
-```
-
-It does not create an embedding, database, summary, index, or cache entry.
-
-## 6. Current prompt exports
-
-`src/cambium/prompts.py` currently exports:
-
-```text
-CODING_AGENT
-SEMANTIC_SUMMARIZER
-SUMMARY_PROTOCOL_LINES
-PROMPTS_VERSION
-```
-
-Earlier documents named separate branch-decision and history-recall prompt
-components that do not currently exist as exports. Phase 0 either adds real
-independently testable components or removes those claims. Target optimization
-components are listed in
-[`../research/agent-system-evaluation.md`](../research/agent-system-evaluation.md).
-
-## 7. Target state interfaces
-
-The integrated target adds:
-
-```text
-SituationFrame   automatic bounded current operating picture
-inspect_state    deeper current BranchState sections
-branch_history   historical exact evidence
-repo_query       bounded repository location/navigation
-ResultCapsule    versioned child result
-ResourceEnvelope model-visible resource pressure and lease state
-```
-
-Exact target shapes are in [`agent-state.md`](agent-state.md). None of those
-target values should be inferred as current wire support solely from this
-reference.
+[Schema](../../src/cambium/schemas.py), [dispatch](../../src/cambium/tools.py),
+[repository query](../../src/cambium/code_index.py),
+[history query](../../src/cambium/branch_history.py),
+[navigation scenarios](../../tests/scenarios/test_navigation_tools.py),
+[history scenarios](../../tests/scenarios/test_branch_history.py).
