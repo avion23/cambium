@@ -2093,9 +2093,9 @@ def _is_sibling_target(target: str, spec: ModuleSpec) -> bool:
 
 
 def _is_harness_target(target: str, spec: ModuleSpec) -> bool:
-    """Reject cambium harness imports that are not the shared base or own package.
+    """Keep decision modules independent of runtime workers and scheduling.
 
-    A decision module may import the shared module base, its own package, and
+    A decision module may import the shared base or DSPy adapter, its own package, and
     the enclosing package markers; importing any other ``cambium.*`` module
     (``cambium.supervisor``, ``cambium.routing``, ...) crosses the module
     boundary and is a static gate failure.
@@ -2106,7 +2106,7 @@ def _is_harness_target(target: str, spec: ModuleSpec) -> bool:
         return False
     if target.startswith("cambium.modules."):
         child = target[len("cambium.modules.") :].split(".")[0]
-        return child not in {spec.name, "base"}
+        return child not in {spec.name, "base", "dspy_module"}
     return True
 
 

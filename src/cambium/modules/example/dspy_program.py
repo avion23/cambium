@@ -1,6 +1,6 @@
 """DSPy program implementing the should_decompose decision."""
 
-from cambium.modules.base import DSPyModuleBase
+from cambium.modules.dspy_module import DSPyModuleBase
 
 from .decide import Decision, DecomposeOutput
 

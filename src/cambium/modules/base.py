@@ -32,7 +32,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, ClassVar, Literal, NoReturn, Protocol, cast
+from typing import Any, ClassVar, NoReturn, Protocol
 
 from cambium.auth import is_provider_env_name
 from cambium.redact import Redactor, is_secret_name
@@ -1059,70 +1059,3 @@ def run_module_entrypoint(
     except Exception as exc:
         return write_error(exc)
     return 0
-
-
-class DSPyModuleBase:
-    """Lazy DSPy classifier base shared by the shipped module programs."""
-
-    name: ClassVar[str]
-    label_field: ClassVar[str]
-    fallback_decision: ClassVar[Enum]
-    output_type: ClassVar[type]
-    decision_type: ClassVar[type[Enum]]
-    signature_name: ClassVar[str]
-    signature_docstring: ClassVar[str]
-
-    def __init__(self, lm) -> None:
-        import dspy  # type: ignore[import-untyped]
-
-        cls = type(self)
-        if DSPyModuleBase in cls.__bases__:
-            cls.__init__ = DSPyModuleBase.__init__
-            cls.decide = DSPyModuleBase.decide
-            cls.metric = DSPyModuleBase.metric
-            cls.__bases__ = (dspy.Module,)
-        dspy.Module.__init__(cast(Any, self))
-
-        decision_values = tuple(member.value for member in self.decision_type)
-        signature = type(
-            self.signature_name,
-            (dspy.Signature,),
-            {
-                "__module__": cls.__module__,
-                "__doc__": self.signature_docstring,
-                "__annotations__": {
-                    "task": str,
-                    "context": str,
-                    "decision": Literal[decision_values],
-                    "reason": str,
-                },
-                "task": dspy.InputField(),
-                "context": dspy.InputField(),
-                "decision": dspy.OutputField(desc="exactly one of the allowed values"),
-                "reason": dspy.OutputField(desc="one short sentence naming the evidence"),
-            },
-        )
-        self._predict = dspy.Predict(signature)
-        self._lm = lm
-
-    async def decide(self, input: Any) -> Any:
-        """Run the DSPy predictor and map its output to the domain enum."""
-        import dspy  # type: ignore[import-untyped]
-
-        try:
-            with dspy.context(lm=self._lm):
-                pred = await self._predict.acall(task=input.task, context=input.context)
-            decision = self.decision_type(str(pred.decision))
-        except (ValueError, dspy.AdapterParseError):
-            return self.output_type(
-                decision=self.fallback_decision,
-                reason=PARSE_FAILURE_REASON,
-                confidence=0.0,
-            )
-        return self.output_type(decision=decision, reason=str(pred.reason), confidence=0.5)
-
-    def metric(self, example: Example) -> float:
-        """Score a prediction with the module's exact decision metric."""
-        return score_decision(
-            example, label_field=self.label_field, decision_type=self.decision_type
-        )
