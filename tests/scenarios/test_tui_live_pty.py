@@ -136,7 +136,9 @@ def _provider_file(path: Path, base_url: str) -> Path:
     return path
 
 
-def _spawn_tui(repo: Path, provider_file: Path) -> tuple[subprocess.Popen[bytes], int]:
+def _spawn_tui(
+    repo: Path, provider_file: Path, *args: str
+) -> tuple[subprocess.Popen[bytes], int]:
     env = os.environ.copy()
     env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(SRC_DIR), env.get("PYTHONPATH")]))
     env.update(
@@ -154,7 +156,7 @@ def _spawn_tui(repo: Path, provider_file: Path) -> tuple[subprocess.Popen[bytes]
 
     try:
         process = subprocess.Popen(
-            [sys.executable, "-m", "cambium", "tui", "--repo", str(repo)],
+            [sys.executable, "-m", "cambium", "tui", "--repo", str(repo), *args],
             stdin=slave_fd,
             stdout=slave_fd,
             stderr=slave_fd,

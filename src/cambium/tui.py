@@ -92,7 +92,11 @@ class _Cumulative:
         )
         if subscription and self.estimated_cost_usd <= 0:
             cost = "subscription"
-        elif self.estimated_cost_usd <= 0:
+        elif (
+            self.estimated_cost_usd <= 0
+            and providers
+            and all(self.billing_labels.get(provider) == "free" for provider in providers)
+        ):
             cost = "free"
         else:
             cost = f"${self.estimated_cost_usd:.6f}"
@@ -113,8 +117,8 @@ def _provider_billing_labels(config: Any, repo: Path) -> dict[str, str]:
     Codex OAuth entries from older provider files may omit ``billing_mode``.
     When their auth mode is ``codex_chatgpt`` and every token tariff is zero,
     the UI treats that combination as subscription-backed.  This is a
-    presentation-only heuristic; ordinary zero-tariff API-key providers stay
-    ``free`` unless their config explicitly declares ``subscription``.
+    presentation-only heuristic. API-key providers are labelled free only
+    when configured that way; missing tariffs are not evidence of free usage.
     """
     try:
         from . import oneshot
@@ -153,8 +157,6 @@ def _provider_billing_labels(config: Any, repo: Path) -> dict[str, str]:
         auth = getattr(getattr(provider, "auth", None), "value", None)
         if zero_tariffs and auth == AuthMode.CODEX_CHATGPT.value:
             labels[name] = "subscription"
-        elif zero_tariffs:
-            labels[name] = "free"
         else:
             labels[name] = "metered"
     return labels
