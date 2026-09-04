@@ -1000,6 +1000,13 @@ async def _run_interactive(
         except (NotImplementedError, OSError, RuntimeError, ValueError):
             previous_sigwinch_handler = None
 
+    # libedit resizes global editor buffers in its SIGWINCH handler. Route
+    # that signal to the input owner, not a thread concurrently inserting text.
+    # The asyncio wakeup fd still delivers the cockpit resize callback.
+    resize_mask = None
+    if native_input and sigwinch_installed and hasattr(signal, "pthread_sigmask"):
+        resize_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {sigwinch})
+
     async def _read_line_source() -> str | None:
         """Read a prompt without stopping live turn events or input steering."""
         result: asyncio.Future[str | None] = loop.create_future()
@@ -1013,6 +1020,9 @@ async def _run_interactive(
                 result.set_exception(error)
 
         def read() -> None:
+            previous_mask = None
+            if resize_mask is not None:
+                previous_mask = signal.pthread_sigmask(signal.SIG_UNBLOCK, {sigwinch})
             try:
                 value = _read_cockpit_prompt(source, cockpit, native=native_input)
             except BaseException as exc:
@@ -1026,6 +1036,8 @@ async def _run_interactive(
                 except RuntimeError:
                     pass
             finally:
+                if previous_mask is not None:
+                    signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
                 reader_threads.discard(threading.current_thread())
 
         reader = threading.Thread(target=read, name="cambium-tui-input", daemon=True)
@@ -1449,6 +1461,8 @@ async def _run_interactive(
         except (BrokenPipeError, OSError, ValueError):
             pass
         await _close_input_reader()
+        if resize_mask is not None:
+            signal.pthread_sigmask(signal.SIG_SETMASK, resize_mask)
         if native_input:
             _save_history(history_path)
         if lock_acquired:

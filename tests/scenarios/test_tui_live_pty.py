@@ -144,6 +144,7 @@ def _spawn_tui(
     env.update(
         {
             "CAMBIUM_PROVIDERS": str(provider_file),
+            "PYTHONFAULTHANDLER": "1",
             "NO_PROXY": "127.0.0.1,localhost",
             "no_proxy": "127.0.0.1,localhost",
         }
@@ -283,6 +284,27 @@ def test_live_tui_resize_repaints_one_input_prompt(tmp_path: Path) -> None:
             if process is not None:
                 _kill_child(process)
             os.close(master_fd)
+
+
+@pytest.mark.parametrize("attempt", range(3))
+def test_resize_while_readline_is_editing_does_not_crash(tmp_path: Path, attempt: int) -> None:
+    del attempt
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    process, fd = _spawn_tui(repo, tmp_path / "missing-providers.json")
+    output = bytearray()
+    try:
+        _read_until(fd, output, _PROMPT_REPAINT, 5)
+        for index in range(40):
+            os.write(fd, b"typing while the terminal resizes ")
+            _set_size(fd, 90 if index % 2 else 110)
+            _read_into(fd, output, 0.01)
+            assert process.poll() is None, output[-5000:].decode("utf-8", "replace")
+        os.write(fd, b"\x15/exit\n")
+        assert _wait_exit(process, fd, output, 5) == 0, output[-5000:].decode("utf-8", "replace")
+    finally:
+        _kill_child(process)
+        os.close(fd)
 
 
 def test_idle_ctrl_c_exits_cleanly_within_three_seconds(tmp_path: Path) -> None:
