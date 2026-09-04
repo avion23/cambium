@@ -51,6 +51,7 @@ class _Event:
     kind: str
     payload: dict[str, Any]
     task_id: str | None
+    session: str = ""
 
 
 @dataclass(slots=True)
@@ -70,15 +71,21 @@ def branch_ref(task_id: str) -> str:
     return f"branch:{quote(task_id, safe='')}"
 
 
-def tool_ref(task_id: str, generation: int, turn: int, batch_index: int = 0) -> str:
-    """Stable reference for one tool call on one LLM branch."""
-    return f"tool:{quote(task_id, safe='')}:{generation}:{turn}:{batch_index}"
+def tool_ref(
+    task_id: str, generation: int, turn: int, batch_index: int = 0, *, session: str = ""
+) -> str:
+    """Identify a call, including its interactive turn when counters can repeat."""
+    suffix = f"@{session}" if session else ""
+    return f"tool:{quote(task_id, safe='')}:{generation}:{turn}:{batch_index}{suffix}"
 
 
-def _parse_tool_ref(value: Any) -> tuple[str, int, int, int, bool]:
+def _parse_tool_ref(value: Any) -> tuple[str, int, int, int, str | None]:
     if not isinstance(value, str):
         raise BranchHistoryError("branch_history action=tool requires ref")
-    parts = value.split(":")
+    identity, separator, session = value.partition("@")
+    if separator and not re.fullmatch(r"turn-[0-9]+", session):
+        raise BranchHistoryError("tool ref session must be turn-<number>")
+    parts = identity.split(":")
     if len(parts) not in (4, 5) or parts[0] != "tool":
         raise BranchHistoryError("tool ref must be tool:<task>:<generation>:<turn>[:<index>]")
     legacy = len(parts) == 4
@@ -91,7 +98,7 @@ def _parse_tool_ref(value: Any) -> tuple[str, int, int, int, bool]:
         raise BranchHistoryError("tool ref generation, turn, and index must be integers") from None
     if not task_id or generation < 0 or turn < 1 or batch_index < 0:
         raise BranchHistoryError("tool ref contains an invalid task, generation, turn, or index")
-    return task_id, generation, turn, batch_index, legacy
+    return task_id, generation, turn, batch_index, session if separator else None
 
 
 def _positive_limit(value: Any, default: int = 20) -> int:
@@ -121,14 +128,15 @@ def _session_event_stores(session_dir: Path) -> tuple[Path, ...]:
             candidates.append(path)
 
     add(root / ".cambium" / "events.db")
-    if selected != root:
-        add(selected / ".cambium" / "events.db")
     try:
-        children = sorted(root.iterdir(), key=lambda path: path.name)
+        children = sorted(
+            (child for child in root.iterdir() if re.fullmatch(r"turn-[0-9]+", child.name)),
+            key=lambda path: int(path.name[5:]),
+        )
     except OSError:
         children = []
     for child in children:
-        if re.fullmatch(r"turn-[0-9]+", child.name) and child.is_dir() and not child.is_symlink():
+        if child.is_dir() and not child.is_symlink():
             add(child / ".cambium" / "events.db")
     return tuple(candidates)
 
@@ -162,7 +170,9 @@ def _events(session_dir: Path) -> list[_Event]:
                 task_id = None
             seq = row.get("seq")
             sequence = seq if type(seq) is int and seq >= 0 else row_index
-            events.append(_Event((store_index, sequence), kind, payload, task_id))
+            name = path.parent.parent.name
+            session = name if re.fullmatch(r"turn-[0-9]+", name) else ""
+            events.append(_Event((store_index, sequence), kind, payload, task_id, session))
     events.sort(key=lambda event: event.order)
     return events
 
@@ -283,7 +293,7 @@ def _list_tools(events: Sequence[_Event], task_id: str | None, offset: int, limi
         lines.append(
             " ".join(
                 (
-                    tool_ref(branch, generation, turn, batch_index),
+                    tool_ref(branch, generation, turn, batch_index, session=event.session),
                     f"branch={branch_ref(branch)}",
                     f"tool={event.payload.get('tool', '-')}",
                     f"ok={str(bool(event.payload.get('ok'))).lower()}",
@@ -341,11 +351,18 @@ def _checkpoint_messages(path: Path) -> list[dict[str, str]]:
 
 
 def _checkpoint_event(
-    events: Sequence[_Event], task_id: str, generation: int | None, turn: int | None
+    events: Sequence[_Event],
+    task_id: str,
+    generation: int | None,
+    turn: int | None,
+    *,
+    session: str | None = None,
 ) -> _Event | None:
     matches: list[_Event] = []
     for event in events:
         if event.kind != "checkpoint" or event.task_id != task_id:
+            continue
+        if session is not None and event.session != session:
             continue
         if generation is not None and _int(event.payload, "generation") != generation:
             continue
@@ -395,14 +412,19 @@ def _extract_tool_exchange(
 
 
 def _read_tool(events: Sequence[_Event], ref: Any) -> str:
-    task_id, generation, turn, batch_index, _legacy = _parse_tool_ref(ref)
+    task_id, generation, turn, batch_index, session = _parse_tool_ref(ref)
     matches = [
         event
         for event in _tool_events(events, task_id)
         if _tool_identity(event) == (task_id, generation, turn, batch_index)
+        and (session is None or event.session == session)
     ]
     if not matches:
         raise BranchHistoryError(f"tool call not found: {ref}")
+    if len({event.session for event in matches}) > 1:
+        raise BranchHistoryError(
+            "ambiguous tool ref across interactive turns; list tools for scoped refs"
+        )
     event = matches[-1]
     tool = event.payload.get("tool")
     tool_name = tool if isinstance(tool, str) else "unknown"
@@ -413,7 +435,7 @@ def _read_tool(events: Sequence[_Event], ref: Any) -> str:
         f"tool={tool_name} ok={str(bool(event.payload.get('ok'))).lower()} ",
         f"cmd={event.payload.get('cmd', '-')}",
     ]
-    checkpoint = _checkpoint_event(events, task_id, generation, turn)
+    checkpoint = _checkpoint_event(events, task_id, generation, turn, session=event.session)
     if checkpoint is not None:
         state_ref = checkpoint.payload.get("state_ref")
         if isinstance(state_ref, str):

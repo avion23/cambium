@@ -462,6 +462,15 @@ class DebtStore:
             # session) must round-trip untouched, and a <1% decay is
             # below any selection-relevant resolution anyway.
             if factor <= 0.99:
+                latency_count = round(debt.latency_count * factor)
+                rate_count = round(debt.tokens_per_s_count * factor)
+                # Age reduces evidence weight, not measured speed. Rounding
+                # count and independently scaling its total changes the mean.
+                latency_total = (
+                    debt.latency_total_s * latency_count / debt.latency_count
+                    if debt.latency_count
+                    else 0.0
+                )
                 debt = replace(
                     debt,
                     tokens=round(debt.tokens * factor),
@@ -469,14 +478,13 @@ class DebtStore:
                     failed_requests=round(debt.failed_requests * factor),
                     retry_after_count=round(debt.retry_after_count * factor),
                     cache_hit_count=round(debt.cache_hit_count * factor),
-                    latency_total_s=debt.latency_total_s * factor,
-                    latency_count=round(debt.latency_count * factor),
-                    tokens_per_s_total=debt.tokens_per_s_total * factor,
-                    tokens_per_s_count=round(debt.tokens_per_s_count * factor),
+                    latency_total_s=latency_total,
+                    latency_count=latency_count,
+                    tokens_per_s=debt.tokens_per_s if rate_count else 0.0,
+                    tokens_per_s_total=debt.tokens_per_s * rate_count,
+                    tokens_per_s_count=rate_count,
                     cost=debt.cost * factor,
                 )
-                if debt.tokens_per_s_count > 0 and debt.tokens_per_s_total >= 0:
-                    debt.tokens_per_s = debt.tokens_per_s_total / debt.tokens_per_s_count
             debts[name] = debt
         self._debts = debts
         self._baseline_debts = _copy_debts(debts)

@@ -66,7 +66,16 @@ def test_division_is_not_a_comment(tmp_path: Path) -> None:
     assert [row["line"] for row in json.loads(result.output)] == [1, 2]
 
 
-@pytest.mark.parametrize("action", ["tree", "search", "window"])
+@pytest.mark.parametrize("action", ["symbols", "references"])
+def test_symbol_queries_honor_the_requested_path(tmp_path: Path, action: str) -> None:
+    (tmp_path / "a.py").write_text("def add(): pass\n")
+    (tmp_path / "b.py").write_text("def add(): pass\n")
+    result = query(tmp_path, action=action, query="add", path="a.py", limit=1)
+    assert result.ok
+    assert [row["path"] for row in json.loads(result.output)] == ["a.py"]
+
+
+@pytest.mark.parametrize("action", ["tree", "search", "window", "symbols", "references"])
 def test_queries_cannot_leave_the_worktree(tmp_path: Path, action: str) -> None:
     result = query(tmp_path, action=action, path="../outside.py", query="text", line=1)
     assert not result.ok and "escapes the worktree" in result.error
