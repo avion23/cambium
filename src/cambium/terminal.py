@@ -5,7 +5,26 @@ from __future__ import annotations
 import os
 import re
 import unicodedata
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
+from functools import lru_cache
+from threading import RLock
 from typing import Any
+
+SYNCHRONIZED_UPDATE_BEGIN = "\x1b[?2026h"
+SYNCHRONIZED_UPDATE_END = "\x1b[?2026l"
+_FRAME_CURSOR_REPOSITION = "\x1b[1A\r"
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalCapabilities:
+    """Capabilities that are safe to use for one terminal stream."""
+
+    color_depth: int = 0
+    cursor_controls: bool = False
+    synchronized_output: bool = False
+
 
 # CSI sequences cover common styling and cursor controls such as ``ESC[31m``.
 # Include the 8-bit CSI introducer as well because it is another terminal
@@ -81,6 +100,202 @@ def supports_cursor_controls(stream: Any) -> bool:
     return is_tty(stream) and os.environ.get("TERM", "").strip().casefold() != "dumb"
 
 
+_COLOR_TERMINALS = frozenset(
+    {
+        "alacritty",
+        "ansi",
+        "cygwin",
+        "foot",
+        "konsole",
+        "linux",
+        "mintty",
+        "putty",
+        "rxvt",
+        "screen",
+        "st",
+        "tmux",
+        "wezterm",
+        "xterm",
+    }
+)
+_SYNCHRONIZED_TERMINAL_PREFIXES = (
+    "alacritty",
+    "contour",
+    "foot",
+    "kitty",
+    "konsole",
+    "rxvt",
+    "screen",
+    "st-",
+    "tmux",
+    "wezterm",
+    "xterm",
+)
+_SYNCHRONIZED_TERMINAL_PROGRAMS = frozenset(
+    {
+        "alacritty",
+        "apple_terminal",
+        "contour",
+        "foot",
+        "hyper",
+        "iterm.app",
+        "kitty",
+        "konsole",
+        "rio",
+        "tabby",
+        "vscode",
+        "warpterminal",
+        "wezterm",
+        "windows terminal",
+    }
+)
+_SYNC_OVERRIDE_TRUE = frozenset({"1", "on", "true", "yes"})
+_SYNC_OVERRIDE_FALSE = frozenset({"0", "off", "false", "no"})
+
+
+def _terminal_color_depth(
+    tty: bool,
+    term: str,
+    colorterm: str,
+    no_color: bool,
+) -> int:
+    if not tty or no_color or term == "dumb":
+        return 0
+    if colorterm in {"24bit", "truecolor"} or term.endswith(("-direct", "-truecolor")):
+        return 24
+    if "256color" in term:
+        return 256
+    if term in _COLOR_TERMINALS or "color" in term:
+        return 16
+    return 0
+
+
+def _synchronized_output_supported(
+    tty: bool,
+    term: str,
+    term_program: str,
+    override: str,
+) -> bool:
+    if not tty or term == "dumb":
+        return False
+    if override in _SYNC_OVERRIDE_FALSE:
+        return False
+    if override in _SYNC_OVERRIDE_TRUE:
+        return True
+    if term_program in _SYNCHRONIZED_TERMINAL_PROGRAMS:
+        return True
+    return any(term.startswith(prefix) for prefix in _SYNCHRONIZED_TERMINAL_PREFIXES)
+
+
+@lru_cache(maxsize=32)
+def _probe_terminal_capabilities(
+    tty: bool,
+    term: str,
+    colorterm: str,
+    no_color: bool,
+    term_program: str,
+    sync_override: str,
+) -> TerminalCapabilities:
+    """Probe environment-derived terminal capabilities once per environment."""
+    return TerminalCapabilities(
+        color_depth=_terminal_color_depth(tty, term, colorterm, no_color),
+        cursor_controls=tty and term != "dumb",
+        synchronized_output=_synchronized_output_supported(
+            tty,
+            term,
+            term_program,
+            sync_override,
+        ),
+    )
+
+
+def terminal_capabilities(stream: Any) -> TerminalCapabilities:
+    """Return cached terminal capabilities for ``stream`` and its environment."""
+    return _probe_terminal_capabilities(
+        is_tty(stream),
+        os.environ.get("TERM", "").strip().casefold(),
+        os.environ.get("COLORTERM", "").strip().casefold(),
+        bool(os.environ.get("NO_COLOR")),
+        os.environ.get("TERM_PROGRAM", "").strip().casefold(),
+        os.environ.get("CAMBIUM_SYNCHRONIZED_OUTPUT", "").strip().casefold(),
+    )
+
+
+def terminal_color_depth(stream: Any) -> int:
+    """Return the supported color level: 0, 16, 256, or 24-bit truecolor."""
+    return terminal_capabilities(stream).color_depth
+
+
+def supports_synchronized_output(stream: Any) -> bool:
+    """Return whether DECSET 2026 is safe for the terminal stream."""
+    return terminal_capabilities(stream).synchronized_output
+
+
+@contextmanager
+def synchronized_update(stream: Any, *, enabled: bool | None = None) -> Iterator[None]:
+    """Batch one terminal update with DECSET 2026 when the capability is known."""
+    use_sync = supports_synchronized_output(stream) if enabled is None else enabled
+    if not use_sync:
+        yield
+        return
+
+    stream.write(SYNCHRONIZED_UPDATE_BEGIN)
+    try:
+        yield
+    finally:
+        stream.write(SYNCHRONIZED_UPDATE_END)
+        stream.flush()
+
+
+class SynchronizedOutput:
+    """Text stream proxy that brackets explicitly marked frame updates."""
+
+    def __init__(self, stream: Any, *, enabled: bool = False) -> None:
+        self.stream = stream
+        self.enabled = enabled
+        self._active = False
+        self._lock = RLock()
+
+    def isatty(self) -> bool:
+        return is_tty(self.stream)
+
+    def write(self, value: str) -> int:
+        with self._lock:
+            if self._active and value == _FRAME_CURSOR_REPOSITION:
+                try:
+                    self.stream.write(SYNCHRONIZED_UPDATE_END)
+                finally:
+                    self._active = False
+            return self.stream.write(value)
+
+    def flush(self) -> None:
+        with self._lock:
+            self.stream.flush()
+
+    @contextmanager
+    def frame(self) -> Iterator[None]:
+        """Bracket one renderer frame while leaving prompts and edits untouched."""
+        if not self.enabled:
+            yield
+            return
+        with self._lock:
+            self.stream.write(SYNCHRONIZED_UPDATE_BEGIN)
+            self._active = True
+        try:
+            yield
+        finally:
+            with self._lock:
+                if self._active:
+                    try:
+                        self.stream.write(SYNCHRONIZED_UPDATE_END)
+                    finally:
+                        self._active = False
+                self.stream.flush()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.stream, name)
+
+
 def _cell_width(char: str) -> int:
     if unicodedata.combining(char) or unicodedata.category(char) == "Cf":
         return 0
@@ -128,10 +343,18 @@ def pad_terminal_text(value: Any, width: int) -> str:
 
 
 __all__ = [
+    "SynchronizedOutput",
+    "SYNCHRONIZED_UPDATE_BEGIN",
+    "SYNCHRONIZED_UPDATE_END",
+    "TerminalCapabilities",
     "clip_terminal_text",
     "is_tty",
     "pad_terminal_text",
     "sanitize_terminal_text",
+    "synchronized_update",
     "supports_cursor_controls",
+    "supports_synchronized_output",
+    "terminal_capabilities",
+    "terminal_color_depth",
     "terminal_display_width",
 ]

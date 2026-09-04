@@ -16,7 +16,7 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any, TextIO, cast
 
 from cambium.render_markdown import render_markdown_if_tty
 
@@ -28,7 +28,7 @@ from .interactive import (
 from .monitor import AnsiDashboard, render_agent_lines
 from .observability import ObservabilityState, SessionSnapshot
 from .store import StoreError, read_events_file
-from .terminal import sanitize_terminal_text
+from .terminal import SynchronizedOutput, sanitize_terminal_text, terminal_capabilities
 from .tui_screen import ActivityState, Cockpit, Transcript, render_quota_rows
 
 _readline: Any
@@ -254,13 +254,16 @@ def _bracketed_paste_mode(source: TextIO, out: TextIO) -> Iterator[None]:
     if not (_is_tty(source) and _is_tty(out)):
         yield
         return
-    out.write(_BRACKETED_PASTE_ENABLE)
-    out.flush()
+    started = False
     try:
+        out.write(_BRACKETED_PASTE_ENABLE)
+        started = True
+        out.flush()
         yield
     finally:
-        out.write(_BRACKETED_PASTE_DISABLE)
-        out.flush()
+        if started:
+            out.write(_BRACKETED_PASTE_DISABLE)
+            out.flush()
 
 
 def _trailing_incomplete_csi(value: str) -> str:
@@ -612,7 +615,9 @@ async def _run_legacy(
     from cambium.cli import ExitCode
     from cambium.supervisor import SessionAlreadyRunningError
 
+    capabilities = terminal_capabilities(out)
     dashboard_enabled = render.should_color(out) and not quiet
+    dashboard_stream = SynchronizedOutput(out, enabled=capabilities.synchronized_output)
     failed = False
     live_render_enabled = True
     try:
@@ -636,7 +641,7 @@ async def _run_legacy(
                 state = ObservabilityState()
                 dashboard = AnsiDashboard(
                     session_dir,
-                    stream=out,
+                    stream=cast(TextIO, dashboard_stream),
                     enabled=dashboard_enabled,
                 )
 
@@ -653,7 +658,8 @@ async def _run_legacy(
 
                     def draw_live() -> None:
                         if _dashboard.enabled:
-                            _dashboard.draw(_state.snapshot(session_dir=_session_dir))
+                            with dashboard_stream.frame():
+                                _dashboard.draw(_state.snapshot(session_dir=_session_dir))
                         elif not quiet:
                             _write_line(out, render.render_event_line(record, stream=out))
                             snapshot = _state.snapshot()
@@ -678,7 +684,8 @@ async def _run_legacy(
                         on_event=_live_sink,
                     )
                     if dashboard.enabled:
-                        dashboard.draw(state.snapshot(session_dir=session_dir))
+                        with dashboard_stream.frame():
+                            dashboard.draw(state.snapshot(session_dir=session_dir))
                 if response.exit_code != 0:
                     failed = True
             except BrokenPipeError:
@@ -864,11 +871,33 @@ async def _run_interactive(
     sequence = 0
     failed = False
     native_input = source is sys.stdin and out is sys.stdout
-    cockpit = Cockpit(out, enabled=not quiet)
+    capabilities = terminal_capabilities(out)
+    cockpit_stream = SynchronizedOutput(out, enabled=capabilities.synchronized_output)
+    cockpit = Cockpit(cast(TextIO, cockpit_stream), enabled=not quiet)
+    cockpit.color = capabilities.color_depth > 0
     live_render_enabled = True
 
     def disable_live_render() -> None:
         cockpit.enabled = False
+        try:
+            cockpit_stream.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+
+    def _draw_cockpit(snapshot: Any, transcript_value: Transcript, **kwargs: Any) -> None:
+        with cockpit_stream.frame():
+            cockpit.draw(snapshot, transcript_value, **kwargs)
+
+    def _draw_cockpit_activity(activity_line: str) -> None:
+        with cockpit_stream.frame():
+            cockpit.draw_activity(activity_line)
+
+    def _flush_cockpit() -> None:
+        if getattr(cockpit, "_pending_draw", None) is None:
+            cockpit.flush()
+            return
+        with cockpit_stream.frame():
+            cockpit.flush()
 
     history_path = _history_path(session)
     if native_input:
@@ -881,6 +910,52 @@ async def _run_interactive(
     input_eof = False
     input_closing = False
     turn_active = False
+    active_turn: Any | None = None
+    active_activity: ActivityState | None = None
+
+    def _redraw_for_resize() -> None:
+        """Repaint the complete current frame after SIGWINCH."""
+        nonlocal live_render_enabled
+        if not live_render_enabled or not cockpit.enabled:
+            return
+
+        def redraw() -> None:
+            if turn_active and active_turn is not None and active_activity is not None:
+                snapshot = state.snapshot(session_dir=active_turn.session_dir)
+                activity_line = active_activity.render()
+                running = True
+            else:
+                snapshot = last_snapshot
+                activity_line = ""
+                running = False
+            _draw_cockpit(
+                snapshot,
+                transcript,
+                session_description=session.describe(),
+                branch_line=_branch_line(session),
+                cumulative_line=cumulative.line(snapshot=snapshot),
+                input_label=getattr(cockpit, "_input_prompt_label", "›"),
+                activity_line=activity_line,
+                turn_active=running,
+                force=True,
+            )
+
+        live_render_enabled = _safe_live_draw(
+            redraw,
+            error=err,
+            disable=disable_live_render,
+        )
+
+    sigwinch = getattr(signal, "SIGWINCH", None)
+    sigwinch_installed = False
+    previous_sigwinch_handler: Any = None
+    if sigwinch is not None:
+        try:
+            previous_sigwinch_handler = signal.getsignal(sigwinch)
+            loop.add_signal_handler(sigwinch, _redraw_for_resize)
+            sigwinch_installed = True
+        except (NotImplementedError, OSError, RuntimeError, ValueError):
+            previous_sigwinch_handler = None
 
     async def _read_line_source() -> str | None:
         """Read a prompt without stopping live turn events or input steering."""
@@ -924,7 +999,7 @@ async def _run_interactive(
         """Return queued input first, then wait for the next line source value."""
         nonlocal input_task, input_eof
         if pending_prompts:
-            cockpit.flush()
+            _flush_cockpit()
             return pending_prompts.popleft()
         _start_input_read()
         if input_task is None:
@@ -932,7 +1007,7 @@ async def _run_interactive(
         task = input_task
         prompt = await task
         input_task = None
-        cockpit.flush()
+        _flush_cockpit()
         if prompt is None:
             input_eof = True
         return prompt
@@ -955,7 +1030,7 @@ async def _run_interactive(
     def _draw_final(snapshot: SessionSnapshot, *, activity_line: str = "") -> None:
         if not live_render_enabled:
             return
-        cockpit.draw(
+        _draw_cockpit(
             snapshot,
             transcript,
             session_description=session.describe(),
@@ -968,7 +1043,7 @@ async def _run_interactive(
     try:
         with cockpit:
             while True:
-                cockpit.draw(
+                _draw_cockpit(
                     last_snapshot,
                     transcript,
                     session_description=session.describe(),
@@ -1058,7 +1133,9 @@ async def _run_interactive(
                 cancel_requested = False
                 activity = ActivityState()
                 activity.start()
-                cockpit.draw(
+                active_turn = turn
+                active_activity = activity
+                _draw_cockpit(
                     state.snapshot(session_dir=turn.session_dir),
                     transcript,
                     session_description=session.describe(),
@@ -1079,7 +1156,7 @@ async def _run_interactive(
                             await asyncio.sleep(0.1)
                             if _activity.active and live_render_enabled:
                                 live_render_enabled = _safe_live_draw(
-                                    lambda: cockpit.draw_activity(_activity.tick()),
+                                    lambda: _draw_cockpit_activity(_activity.tick()),
                                     error=err,
                                     disable=disable_live_render,
                                 )
@@ -1114,7 +1191,7 @@ async def _run_interactive(
                     live_snapshot = _state.snapshot(session_dir=_turn.session_dir)
                     if live_render_enabled:
                         live_render_enabled = _safe_live_draw(
-                            lambda: cockpit.draw(
+                            lambda: _draw_cockpit(
                                 live_snapshot,
                                 transcript,
                                 session_description=session.describe(),
@@ -1141,11 +1218,14 @@ async def _run_interactive(
                         turn_task.cancel()  # noqa: B023
 
                 signal_installed = False
+                previous_sigint_handler: Any = None
                 try:
                     try:
+                        previous_sigint_handler = signal.getsignal(signal.SIGINT)
                         loop.add_signal_handler(signal.SIGINT, _request_cancel)
                         signal_installed = True
-                    except (NotImplementedError, RuntimeError, ValueError):
+                    except (NotImplementedError, OSError, RuntimeError, ValueError):
+                        previous_sigint_handler = None
                         pass
                     try:
                         while True:
@@ -1161,7 +1241,7 @@ async def _run_interactive(
                                 task = input_task
                                 input_task = None
                                 queued_prompt = task.result()
-                                cockpit.flush()
+                                _flush_cockpit()
                                 if queued_prompt is None:
                                     input_eof = True
                                 elif queued_prompt.strip() == "!cancel" and not turn_task.done():
@@ -1185,7 +1265,7 @@ async def _run_interactive(
                                                 snapshot: Any = queued_snapshot,
                                                 cumulative_line: str = queued_cumulative_line,
                                             ) -> None:
-                                                cockpit.draw(
+                                                _draw_cockpit(
                                                     snapshot,
                                                     transcript,
                                                     session_description=session.describe(),
@@ -1263,8 +1343,17 @@ async def _run_interactive(
                     except asyncio.CancelledError:
                         pass
                     if signal_installed:
-                        loop.remove_signal_handler(signal.SIGINT)
+                        try:
+                            loop.remove_signal_handler(signal.SIGINT)
+                        finally:
+                            if previous_sigint_handler is not None:
+                                try:
+                                    signal.signal(signal.SIGINT, previous_sigint_handler)
+                                except (OSError, ValueError):
+                                    pass
                     turn_active = False
+                    active_turn = None
+                    active_activity = None
 
                 snapshot = state.snapshot(session_dir=turn.session_dir)
                 last_snapshot = snapshot
@@ -1286,6 +1375,19 @@ async def _run_interactive(
     except BrokenPipeError:
         return ExitCode.SUCCESS
     finally:
+        if sigwinch_installed and sigwinch is not None:
+            try:
+                loop.remove_signal_handler(sigwinch)
+            finally:
+                if previous_sigwinch_handler is not None:
+                    try:
+                        signal.signal(sigwinch, previous_sigwinch_handler)
+                    except (OSError, ValueError):
+                        pass
+        try:
+            cockpit_stream.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
         await _close_input_reader()
         if native_input:
             _save_history(history_path)

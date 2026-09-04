@@ -10,6 +10,7 @@ from _helpers_g2 import _FlushCountingTty, _Tty  # type: ignore[reportMissingImp
 
 import cambium.tui_screen as tui_screen
 from cambium.observability import ObservabilityState, RecentEvent, snapshot_from_events
+from cambium.terminal import terminal_display_width
 from cambium.tui import _command_output, _queued_prompt_notice, _safe_live_draw
 from cambium.tui_screen import (
     ActivityState,
@@ -335,6 +336,46 @@ def test_wide_cockpit_has_transcript_agents_context_and_input() -> None:
     assert "│ input › " in text
     assert text.count("├") == 1
     assert lines[-1].startswith("└")
+
+
+@pytest.mark.parametrize("width", [79, 80, 99, 100])
+def test_cockpit_frame_is_cell_exact_at_rail_breakpoints_with_wide_fields(width: int) -> None:
+    snapshot = _snapshot()
+    snapshot.session_status = "running\nwide"
+    snapshot.agents[0].task_id = "任务🙂-" + "界" * 40
+    snapshot.agents[0].provider = "提供者🙂"
+    snapshot.agents[0].model = "模型界"
+    transcript = Transcript()
+    transcript.user("检查界面🙂")
+    transcript.assistant("完成 wide output")
+
+    lines = render_cockpit(
+        snapshot,
+        transcript,
+        session_description="session=会话🙂",
+        branch_line="branch=分支界",
+        cumulative_line="usage: calls=3 tokens=12345",
+        width=width,
+        height=12,
+        input_label="输入🙂",
+    )
+
+    assert len(lines) == 12
+    assert all(terminal_display_width(line) == width for line in lines)
+    assert all("\n" not in line for line in lines)
+    assert all(line.endswith(("┐", "│", "┤", "┘")) for line in lines)
+    assert ("┬" in lines[0]) is (width >= 80)
+    assert ("OPERATOR RAIL" in lines[0]) is (width >= 100)
+    assert "提供者" in "\n".join(lines)
+    assert "模型界" in "\n".join(lines)
+    if width >= 100:
+        assert "任务" in "\n".join(lines)
+
+
+def test_narrow_frame_row_does_not_use_more_cells_than_the_frame() -> None:
+    for width in (8, 9, 79):
+        line = tui_screen._split_frame_row("界🙂", width, tui_screen._rail_width(width))
+        assert terminal_display_width(line) == max(8, width)
 
 
 def test_conversation_markdown_is_structured_styled_and_sanitized() -> None:
@@ -854,6 +895,45 @@ def test_long_words_wrap_without_clipping_content_or_frame_borders() -> None:
     assert long_word in conversation
     assert all(_display_width(line) <= 48 for line in lines)
     assert lines[-1] == "└" + "─" * 46 + "┘"
+
+
+def test_wide_text_wraps_by_cells_without_losing_continuation_spaces() -> None:
+    for wrapper in (tui_screen._wrap_plain_markdown, _wrap_markdown):
+        lines = wrapper("界界 a b", 5)
+        assert lines == ["界界", "a b"]
+        assert all(_display_width(line) <= 5 for line in lines)
+
+
+def test_wide_side_columns_measure_cells_before_selecting_layout() -> None:
+    agent = SimpleNamespace(
+        task_id="task",
+        role="main",
+        state="活跃",
+        provider="提供者",
+        model="模型🙂",
+        total_tokens=1,
+        output_tokens_per_s=1.0,
+        tool="工具界",
+    )
+    agent_rows = tui_screen._agent_rows((agent,), 24)
+    assert "活跃" in agent_rows[0][1]
+    assert all(terminal_display_width(text) <= 24 for _, text in agent_rows)
+
+    recent_rows = tui_screen._recent_rows(SimpleNamespace(kind="事件", detail="界界界"), 10)
+    assert [text for _, text in recent_rows] == [" 事件", "   界界界"]
+
+    quota_snapshot = SimpleNamespace(
+        quota_windows=(
+            SimpleNamespace(
+                provider="提供",
+                name="模型🙂",
+                allowance_tokens=1000,
+                remaining_tokens=500,
+            ),
+        )
+    )
+    quota_rows = tui_screen._quota_rows(quota_snapshot, 24)
+    assert [text for _, text in quota_rows] == [" 提供/模型🙂", "   500/1000 tokens"]
 
 
 def test_status_line_deduplicates_fields_and_shortens_checkpoint_hash() -> None:

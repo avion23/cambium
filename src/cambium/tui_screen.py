@@ -32,7 +32,12 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from .provider_scheduler import QuotaLedger
-from .terminal import pad_terminal_text, sanitize_terminal_text
+from .terminal import (
+    clip_terminal_text,
+    pad_terminal_text,
+    sanitize_terminal_text,
+    terminal_display_width,
+)
 
 try:
     import readline as _readline
@@ -1931,10 +1936,13 @@ def _render_inline_markdown(text: str, color: bool) -> str:
 
 def _wrap_plain_markdown(line: str, width: int) -> list[str]:
     width = max(1, width)
-    if not line:
+    clean = _sanitize(line).replace("\t", " ")
+    if not clean:
         return [""]
+    if any(_char_width(char) != 1 for char in clean):
+        return _wrap_display_cells(clean, width)
     chunks = textwrap.wrap(
-        _sanitize(line),
+        clean,
         width=width,
         replace_whitespace=False,
         drop_whitespace=True,
@@ -1953,9 +1961,63 @@ def _wrap_plain_markdown(line: str, width: int) -> list[str]:
     return output
 
 
+def _wrap_display_cells(line: str, width: int) -> list[str]:
+    """Wrap one line without treating wide code points as one cell."""
+    width = max(1, width)
+    chunks = re.findall(r"\s+|\S+", _sanitize(line).replace("\t", " "))
+    output: list[str] = []
+    current = ""
+    current_width = 0
+
+    for chunk in chunks:
+        chunk_width = _display_width(chunk)
+        if chunk.isspace():
+            if not current:
+                continue
+            if current_width + chunk_width <= width:
+                current += chunk
+                current_width += chunk_width
+            else:
+                output.append(current.rstrip())
+                current = ""
+                current_width = 0
+            continue
+
+        if current and current_width + chunk_width <= width:
+            current += chunk
+            current_width += chunk_width
+            continue
+        if current:
+            output.append(current.rstrip())
+            current = ""
+            current_width = 0
+
+        if chunk_width <= width:
+            current = chunk
+            current_width = chunk_width
+            continue
+
+        pieces: list[str] = []
+        remaining = chunk
+        while remaining:
+            head, tail = _take_display_width(remaining, width)
+            if not head:
+                head, tail = "?", remaining[1:]
+            pieces.append(head)
+            remaining = tail
+        output.extend(pieces[:-1])
+        current = pieces[-1]
+        current_width = _display_width(current)
+
+    if current or not output:
+        output.append(current.rstrip())
+    return output
+
+
 def _md_rule(width: int, closing: bool, color: bool) -> str:
     glyph = "└" if closing else "┌"
-    return _md_style("  " + glyph + "─" * max(3, width - 4), _MD_RULE, color)
+    rule = "  " + glyph + "─" * max(0, width - 3)
+    return _md_style(_clip(rule, width), _MD_RULE, color)
 
 
 def _render_markdown_lines_fallback(
@@ -2001,7 +2063,9 @@ def _render_markdown_lines_fallback(
         if heading is not None:
             leading, marks, body = heading.groups()
             indent = leading + "  " * (len(marks) - 1)
-            for index, part in enumerate(_wrap_plain_markdown(body, width - len(indent))):
+            for index, part in enumerate(
+                _wrap_plain_markdown(body, width - _display_width(indent))
+            ):
                 prefix = indent if index == 0 else " " * _display_width(indent)
                 inline = _render_inline_markdown(part, color)
                 output.append(
@@ -2051,7 +2115,7 @@ def _render_markdown_lines_fallback(
 
     while output and output[-1] == "":
         output.pop()
-    return output
+    return [_clip(line, width) for line in output]
 
 
 _MD_TABLE_DELIMITER_RE = re.compile(r"^:?-{3,}:?$")
@@ -2276,7 +2340,7 @@ def render_markdown_lines(
     clean = _sanitize(text)
     if not clean:
         return []
-    return list(_render_markdown_lines_cached(clean, width, color))
+    return [_clip(line, width) for line in _render_markdown_lines_cached(clean, width, color)]
 
 
 # Keep the private name convenient for presentation tests and old callers.
@@ -2291,14 +2355,18 @@ def _wrap_markdown(text: str, width: int) -> list[str]:
 
     def wrap(line: str, line_width: int) -> list[str]:
         line_width = max(1, line_width)
-        wrapped = textwrap.wrap(
-            line,
-            width=line_width,
-            replace_whitespace=False,
-            drop_whitespace=True,
-            break_long_words=False,
-            break_on_hyphens=False,
-        ) or [""]
+        clean = _sanitize(line).replace("\t", " ")
+        if any(_char_width(char) != 1 for char in clean):
+            wrapped = _wrap_display_cells(clean, line_width)
+        else:
+            wrapped = textwrap.wrap(
+                clean,
+                width=line_width,
+                replace_whitespace=False,
+                drop_whitespace=True,
+                break_long_words=False,
+                break_on_hyphens=False,
+            ) or [""]
         output_lines: list[str] = []
         for chunk in wrapped:
             while _display_width(chunk) > line_width:
@@ -2332,10 +2400,11 @@ def _wrap_markdown(text: str, width: int) -> list[str]:
         elif stripped.startswith(">"):
             prefix, body = "│ ", stripped[1:].lstrip()
         prefix_width = _display_width(prefix)
-        continuation = " " * prefix_width
-        wrapped = wrap(body, max(1, width - prefix_width))
-        output.append(prefix + wrapped[0])
-        output.extend(continuation + line for line in wrapped[1:])
+        visible_prefix_width = min(prefix_width, width)
+        continuation = " " * visible_prefix_width
+        wrapped = wrap(body, max(1, width - visible_prefix_width))
+        output.append(_clip(prefix + wrapped[0], width))
+        output.extend(_clip(continuation + line, width) for line in wrapped[1:])
     return output
 
 
@@ -2755,7 +2824,7 @@ def _side_clean(value: Any) -> str:
 
 def _side_row(kind: str, text: Any, width: int) -> tuple[str, str]:
     """Build a side-panel row that can never wrap at the panel boundary."""
-    return kind, _clip(_side_clean(text), max(1, width))
+    return kind, clip_terminal_text(_side_clean(text), max(1, width))
 
 
 def _usage_field(line: str, key: str) -> str | None:
@@ -2847,7 +2916,7 @@ def _usage_rows(snapshot: Any, cumulative_line: str, width: int) -> list[tuple[s
     label_width = 7
 
     def row(label: str, value: str) -> tuple[str, str]:
-        label_column = max(label_width, len(label) + 1)
+        label_column = max(label_width, _display_width(label) + 1)
         return _side_row("normal", f" {label:<{label_column}}{value}", width)
 
     token_line = f" {'tokens':<{label_width}}{_human_count(total_tokens)}"
@@ -2873,7 +2942,7 @@ def _usage_rows(snapshot: Any, cumulative_line: str, width: int) -> list[tuple[s
         selected_detail = False
         for detail, includes_cached in details:
             candidate = f"{token_line} {detail}"
-            if len(candidate) <= max(1, width):
+            if _display_width(candidate) <= max(1, width):
                 token_line = candidate
                 selected_detail = True
                 if not includes_cached:
@@ -2909,13 +2978,13 @@ def _agent_rows(agents: tuple[Any, ...], width: int) -> list[tuple[str, str]]:
     states = [_side_clean(getattr(agent, "state", "?")).strip() or "?" for agent in agents]
     tasks = [_side_clean(getattr(agent, "task_id", "?")).strip() or "?" for agent in agents]
     state_width = min(
-        max((len(state) for state in states), default=1),
+        max((terminal_display_width(state) for state in states), default=1),
         max(1, panel_width - name_start - 1),
     )
     task_width = max(
         1,
         min(
-            max((len(task) for task in tasks), default=1),
+            max((terminal_display_width(task) for task in tasks), default=1),
             panel_width - name_start - 1 - state_width,
         ),
     )
@@ -2925,7 +2994,8 @@ def _agent_rows(agents: tuple[Any, ...], width: int) -> list[tuple[str, str]]:
         rows.append(
             _side_row(
                 state,
-                f" {role} {_pad(task, task_width)} {_pad(state, state_width)}",
+                f" {role} {pad_terminal_text(task, task_width)} "
+                f"{pad_terminal_text(state, state_width)}",
                 panel_width,
             )
         )
@@ -2948,7 +3018,7 @@ def _agent_rows(agents: tuple[Any, ...], width: int) -> list[tuple[str, str]]:
         stats = " " * name_start + parts[0]
         for part in parts[1:]:
             candidate = f"{stats} · {part}"
-            if len(candidate) <= panel_width:
+            if terminal_display_width(candidate) <= panel_width:
                 stats = candidate
         rows.append(_side_row("dim", stats, panel_width))
     return rows
@@ -2983,9 +3053,10 @@ def _rail_width(columns: int) -> int:
 
 
 def _frame_content_width(columns: int) -> int:
+    columns = max(8, columns)
     rail_width = _rail_width(columns)
     separator = 1 if rail_width else 0
-    return max(8, columns - 2 - rail_width - separator)
+    return max(1, columns - 2 - rail_width - separator)
 
 
 def _rail_state_glyph(state: Any) -> str:
@@ -3345,7 +3416,9 @@ def _recent_rows(event: Any, width: int) -> list[tuple[str, str]]:
         return [_side_row("dim", f" {kind}", panel_width)]
 
     delimiter = " · "
-    kind_width = panel_width - 1 - len(delimiter) - len(detail)
+    kind_width = (
+        panel_width - 1 - terminal_display_width(delimiter) - terminal_display_width(detail)
+    )
     if kind_width >= 1:
         return [
             _side_row(
@@ -3357,7 +3430,7 @@ def _recent_rows(event: Any, width: int) -> list[tuple[str, str]]:
 
     kind_row = _side_row("dim", f" {kind}", panel_width)
     detail_row = f"   {detail}"
-    if len(detail_row) <= panel_width:
+    if terminal_display_width(detail_row) <= panel_width:
         return [kind_row, _side_row("dim", detail_row, panel_width)]
     return [kind_row]
 
@@ -3470,9 +3543,9 @@ def _quota_rows(snapshot: Any, width: int) -> list[tuple[str, str]]:
             field.replace(" tokens", " tok").replace(" requests", " req") for field in fields
         ]
         compact = f" {subject}: {', '.join(compact_fields)}"
-        if len(full) <= panel_width:
+        if terminal_display_width(full) <= panel_width:
             rows.append(_side_row("normal", full, panel_width))
-        elif len(compact) <= panel_width:
+        elif terminal_display_width(compact) <= panel_width:
             rows.append(_side_row("normal", compact, panel_width))
         else:
             rows.append(_side_row("normal", f" {subject}", panel_width))
@@ -4064,6 +4137,7 @@ def _split_frame_row(
     rail_kind: str = "dim",
     color: bool = False,
 ) -> str:
+    width = max(8, width)
     left_width = _frame_content_width(width)
     left = _paint(_frame_inside(text, left_width + 2), left_color, color)
     if not rail_width:
@@ -4105,7 +4179,7 @@ def _cockpit_frame_lines(
         color=color,
     )
     conversation_capacity = max(1, height - _frame_overhead(show_detail))
-    status = _sanitize(getattr(snapshot, "session_status", "idle"))
+    status = _single_line(getattr(snapshot, "session_status", "idle")) or "idle"
     conversation = (
         list(primary_rows[-conversation_capacity:])
         if primary_rows is not None
