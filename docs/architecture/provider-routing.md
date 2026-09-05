@@ -1,313 +1,126 @@
-# Provider routing and resource control
+# Providers are resources
 
-**Status:** current routing ownership contract plus target agent-visible resource
-projection. Source and tests remain authoritative.
+**Status:** current routing/accounting map, followed by explicitly unimplemented
+optimization work. Exact configuration is owned by
+[provider_config.py](../../src/cambium/provider_config.py).
 
-## 1. Problem
+## Objective
 
-A provider decision is not merely “pick the best model.” It is admission under
-hard constraints followed by optimization under uncertain, changing evidence:
+Optimize **correct, useful work per unit of time and available quota**, not raw
+token production. Track generated output per second and tokens consumed per
+provider window, but do not reward verbosity, repeated reads, speculative
+children, or failed retries merely because they increase throughput.
 
-```text
-credentials and authorization
-context/output/tool capability
-provider/model enablement
-task quality constraints
-request rate and in-flight capacity
-token/quota windows
-prepaid cash or subscription scarcity
-provider health and Retry-After
-prompt-cache affinity and switching cost
-wall deadline
-```
+A subscription has finite capacity even when incremental cash cost is zero.
+A free provider can be slow or congested. A faster model can waste more tokens
+than a slower one. Cache reads, uncached input, generated output, time, requests,
+and cash are different dimensions; none is a universal substitute for the rest.
 
-Parent continuation and independent child work have different affinity needs.
-A root semantic branch should remain stable while feasible; a separable child
-may use another lane when that improves capability, capacity, cost, or
-independent review value.
+## One owner at each boundary
 
-## 2. One ownership path
-
-Routing is split by time scale, not duplicated:
-
-```text
-provider configuration
-  capabilities, auth/protocol mode, tariffs, cache/quota declarations
-            |
-            v
-supervisor admission / routing.py
-  hard feasibility, authorization, credential readiness,
-  model constraints, lane/quota availability, ranking, lease
-            |
-            v
-worker pinned to provider/model lease
-            |
-            v
-Diffundo call-time execution
-  direct health evidence, deadlines, retry, cooldown, bounded cascade
-            |
-            v
-transport/provider response
-  usage, cache, rate, quota, error evidence
-            |
-            v
-usage debt / quota reconciliation / next admission
-```
-
-`provider_scheduler.py` owns shared immutable lease/cache/quota values and
-transactional reservations. It is not another scheduler. `routing.py` owns
-admission. `diffundo.py` owns attempts after admission. `provider_config.py`
-owns declared capabilities. The supervisor owns the branch lease.
-
-## 3. Hard feasibility
-
-Admission first constructs a hard-feasible set. A candidate is excluded when:
-
-- provider or model is disabled;
-- required credentials are unavailable;
-- the provider lies outside inherited authorization;
-- context/output or declared capability cannot satisfy the task;
-- task quality, paid/free, or model constraints reject it;
-- quota/cash reservation or lane capacity blocks dispatch;
-- an exact context request is incompatible with provider/model/protocol/prompt/
-  tool/checkpoint identity;
-- a permanent configuration/authentication quarantine applies.
-
-Prompt prose cannot override these facts. Unknown capability does not satisfy a
-positive hard requirement.
-
-Only after this filter may Cambium rank candidates.
-
-## 4. Ranking objective
-
-Within the feasible set, the target policy minimizes regret using measured or
-configured evidence:
-
-```text
-utility =
-    expected quality
-  + expected throughput
-  + useful idle-capacity value
-  - cash cost
-  - quota shadow price
-  - expected verification/rework cost
-  - provider/cache switching cost
-  - uncertainty penalty for weak evidence
-```
-
-The exact formula is versioned and auditable. A hard requirement is never given
-a finite penalty that allows a sufficiently attractive score to bypass it.
-
-Current source already records requests, tokens, failures, cost, cache-hit
-count, latency, throughput evidence, Retry-After pressure, and durable
-configuration/auth quarantine. A placeholder token-window allowance remains
-where real account contracts are unavailable. Target work replaces persuasive
-placeholders with measured/configured windows or `unknown`.
-
-## 5. Leases
-
-A lease is branch state:
-
-```text
-provider
-model
-protocol/reasoning identity
-credential authority fingerprint (never secret value)
-context/checkpoint affinity
-acquired_at / source evidence
-migration status
-```
-
-### Root continuation
-
-The root keeps its provider/model lease through normal turns while feasible.
-Transient slowness or one failed request does not silently create a new semantic
-branch.
-
-### Exact child
-
-`trunk + inherit` pins the compatible parent provider/model and exact checkpoint
-prefix. If compatibility fails, the explicit request is rejected rather than
-downgraded.
-
-### Semantic/fresh child with inherit
-
-The child keeps the parent provider/model but uses semantic-only or fresh
-context as requested. Context representation and placement are orthogonal.
-
-### Semantic/fresh child with spread
-
-Inherited hard pinning is removed. Admission first prefers another feasible
-lane and then falls back to the complete feasible set. Spread is a throughput
-preference, not permission to violate capability, authorization, quota, or cash
-constraints.
-
-### Migration
-
-Target transition, not current source: a permanently infeasible root lease
-moves through an explicit transition (the `provider_lease_migrated` event and
-protocol are not implemented; see §12):
-
-```text
-latest safe checkpoint
-    -> classify infeasibility
-    -> select hard-feasible migration target
-    -> construct exact/semantic/fresh continuation honestly
-    -> reserve target resources
-    -> emit provider_lease_migrated
-    -> continue under new lease
-```
-
-Migration loss of cache affinity is visible. It is never hidden inside a retry.
-
-## 6. Failure classification
-
-Provider outcomes require different state transitions:
-
-| Class | Treatment |
+| Owner | Responsibility |
 | --- | --- |
-| invalid/revoked credential | quarantine until credential identity changes or explicit recovery |
-| missing entitlement/configuration | disable affected provider/model configuration |
-| quota/rate/billing | cooldown/block until reset or top-up evidence |
-| policy/content refusal | fail/fall through this request without damaging provider health |
-| WAF/network/overload/stall | bounded retry/cooldown health transition |
-| malformed provider output | request/model evidence; do not infer credential failure |
-| success | update usage/throughput/cache evidence and clear eligible quarantine |
+| `provider_config.py` | Provider capabilities, billing/tariff declarations, quota-window configuration |
+| `routing.py` | Task admission candidates, debt balancing, provider lanes, resolved assignment |
+| `selection.py` | Pure capability/quality/cost/latency scoring within the applicable candidate set |
+| `diffundo.py` | Actual provider attempts, retry/fallback, protocol translation, provider usage |
+| `provider_scheduler.py` | Shared lease values and durable quota reservations; not a second scheduler |
+| `observability.py` | Read-only session usage and quota projection from recorded events |
 
-Health changes only from direct evidence about the attempted lane. A sibling
-provider result cannot rehabilitate or damage another lane.
+The model chooses task/context/placement intent. The harness resolves an actual
+provider/model with available credentials and the required capabilities.
+Configuration and credentials are not inferred from a model's prose.
 
-## 7. Accounting dimensions
+## Admission versus call-time selection
 
-Keep separate ledgers or fields for:
+Admission first removes unavailable or incompatible candidates: disabled
+providers, unavailable credentials, explicit provider/model restrictions,
+required capabilities, and incompatible context leases. Provider request rate
+and in-flight capacity determine whether a lane can start work now.
 
-```text
-request-rate tokens
-in-flight slots
-input tokens
-cached input tokens
-cache write tokens/cost
-output tokens
-time-window quotas
-prepaid cash
-subscription scarcity
-wall time
-retry/backoff
-verification and rework
-```
+The simple routing path balances normalized token debt, current lane load, and
+request counts with stable configuration-order tie breaks. Requirement-aware
+selection additionally uses the existing capability/quality and measured
+cost/latency/throughput scoring. These paths are heuristics, not a single global
+optimizer with a proven optimum.
 
-Cached tokens are not automatically free and may still count against provider
-limits. Unknown tariffs/limits remain unknown. Each reservation has an owner,
-expiry/reconciliation path, and durable result.
+Diffundo owns the subsequent provider call and its fallback behavior. Keep task
+assignment and call-time lease evidence distinct: an initial assignment does
+not prove which provider ultimately served every request. Summaries and child
+calls must pass through the same accounting rather than becoming invisible
+side traffic.
 
-## 8. Cache capability
+Child placement is described once in [context branches](context-branches.md).
+`spread` prefers another feasible provider; it is not permission to ignore
+quota or to migrate an exact same-provider prefix to an incompatible backend.
 
-Provider configuration may describe:
+## What the numbers mean
 
-```text
-minimum cacheable tokens
-cache TTL
-cache block granularity
-cache-read price
-cache-write price
-```
+**Generation throughput:** measured `output_tokens` (Responses) or
+`completion_tokens` (Chat Completions), divided by the provider call's wall time.
+This includes call overhead; it is not decoder-only speed. `total_tokens`
+contains prompt tokens and must never be used as generated output. Missing
+output counts mean unknown throughput.
 
-CAST may use this to decide breakpoint batching and K0 rollover economics. A
-configured TTL supports only a pre-call warm estimate. `provider_cache_hit`
-comes from provider evidence after the call.
+**Routing debt:** usage history normalized by `token_window_allowance`, with
+existing decay. The fallback allowance of 20 million tokens and 24-hour debt
+decay are balancing defaults, **not evidence of a provider's weekly allowance or
+reset**. Do not display or reason about them as an account quota.
 
-Exact fork compatibility additionally requires provider/model/protocol,
-reasoning mode, stable system prompt, tool-schema hash, checkpoint hashes, and
-authorization identity. Cross-provider semantic reuse is always cold on the new
-provider even when summary text matches.
+**Quota windows:** `QuotaLedger` reserves and reconciles declared token/request
+windows across processes. A provider can have several windows, such as a short
+request window and a weekly token window. Observations include provider, window,
+allowance, use, and reset time. Unknown allowance does not mean unlimited quota.
+The accounting must follow that provider's actual rules; cached input is not
+assumed exempt from token limits.
 
-## 9. ResourceEnvelope for the agent
+**Cash:** reported cost is an estimate under configured tariffs. Numeric zero
+alone does not prove a free service. Explicit free/subscription billing labels
+are separate from the estimate and from tokens already consumed.
 
-The target model surface is a bounded policy projection, not raw scheduler
-state:
+**Cache:** matching request prefixes indicate compatibility, not a hit. Only
+provider usage is hit evidence. Cache capability/TTL can inform a prediction;
+they cannot replace observed usage.
 
-```text
-remaining turns and wall
-context pressure
-uncached-token pressure
-provider/model lease
-cache affinity and warm estimate
-quota pressure
-cash pressure
-delegation overhead
-alternative feasible lane availability
-```
+## Inspection must not consume or mutate capacity
 
-Common values use `low`, `medium`, `high`, `critical/blocked`, or `unknown`.
-Exact underlying values remain available through `inspect_state(resources)`.
-Thresholds are versioned.
+The TUI's full rail shows output rate, input/output/cache counts, call counts,
+and known quota windows. Session replay uses the quota snapshots carried by
+`usage_event`, retaining the latest window for each provider. It must not mix
+historical session state with today's global ledger.
 
-The ResourceEnvelope lets the agent decide whether to continue, retrieve,
-delegate, verify, or finish. It does not let the model choose a credential or
-bypass admission.
+`/quota` and `cambium quota status` explicitly read account-wide observations.
+They open existing SQLite storage read-only and do not initialize a ledger,
+change directory permissions, reserve capacity, or run write retries during
+screen redraws. `cambium quota observe` is the explicit mutation command.
 
-Examples:
+The rail may omit details at small terminal sizes; `/usage`, `/agents`, and
+`/quota` provide deeper inspection. A missing observation stays unavailable.
 
-- high context pressure favors exact evidence retrieval over transcript replay;
-- low wall time makes non-critical child creation unattractive;
-- a warm exact root lease favors continuation for coupled work;
-- idle alternative capacity favors `semantic + spread` only for separable work;
-- high quota pressure discourages speculative calls but cannot justify skipping
-  required verification silently.
+## Remaining optimization work
 
-## 10. Observability and explanation
+Use traces to determine whether normalized debt should additionally account
+for **known remaining weekly capacity and time to reset**, rather than adding
+another scheduler. Compare decisions on held-out task mixes before changing
+ranking. Preserve exact-context affinity only when it pays for itself, and
+measure both critical-path completion time and quota consumed per accepted
+outcome.
 
-A provider decision should be reconstructible from durable bounded evidence:
+Important measurements are accepted tasks/hour, end-to-end output tokens/s,
+uncached/cached input and output per task, retries and summaries, child overhead,
+and consumption against each provider's actual window. Latency distributions
+and errors matter more than an isolated fast sample.
 
-```text
-request/task constraints
-excluded candidates and hard reasons
-candidate scores and evidence age/sample count
-selected lease
-reservation result
-attempt outcomes
-usage/cache/quota evidence
-migration or release
-```
+A bounded model-facing resource projection remains part of the
+[operating-model design](agent-operating-model.md). It should expose useful
+facts and unknowns, not raw scheduler internals or a mandatory policy decision
+on every turn.
 
-The TUI and model SituationFrame share lease and pressure semantics through the
-target BranchState. Secrets, bearer tokens, and raw credential material never
-enter these records.
+## Regression evidence
 
-## 11. Invariants
-
-- One scheduler ownership path.
-- Hard feasibility before ranking.
-- Credentials never enter task specs, prompts, events, or commits.
-- Health changes only on direct evidence.
-- Content/policy refusal does not poison provider health.
-- Pinned-model/root-lease behavior is explicit.
-- Every legal migration starts from a safe checkpoint.
-- Request rate, concurrency, tokens, windows, cash, and cache remain separate.
-- A child cannot widen parent provider authority.
-- Cross-provider semantic reuse is never labelled a cache hit.
-- Unknown economics remain unknown.
-- The model expresses intent; the supervisor resolves the actual lease.
-
-## 12. Current versus target
-
-Current:
-
-- admission from credential/capability/authorization constraints;
-- usage-debt and lane-aware selection;
-- provider/model pinning;
-- cache/quota value objects and transactional reservations;
-- typed call outcomes, deadlines, retry/cooldown, and bounded cascade;
-- declared child inherit/spread materialization;
-- operator usage/quota projection.
-
-Target:
-
-- real account-window/cash models replacing placeholders;
-- explicit root lease migration event/protocol;
-- uncertainty-aware ranking and recorded explanation;
-- model-visible ResourceEnvelope from the canonical BranchState;
-- measured switching/delegation/verification costs;
-- held-out policy evaluation before promotion.
-
-The target work is ordered in `../../implementation-plan.md` Phase 6.
+[Resource projection tests](../../tests/scenarios/test_resource_projection.py)
+cover output-only rates, deterministic multi-provider quota replay, read-only
+inspection, and a height-bounded resource rail.
+[Routing throughput tests](../../tests/scenarios/test_routing_throughput.py)
+cover lane capacity and measured provider scoring. Real coding/TUI tests cover
+accepted artifacts rather than self-reported success.

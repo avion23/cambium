@@ -19,8 +19,8 @@ import os
 import re
 import shutil
 import signal
-import sqlite3
 import textwrap
+import threading
 import time
 import unicodedata
 from collections import deque
@@ -28,10 +28,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 from functools import lru_cache
-from pathlib import Path
 from typing import Any, TextIO
 
-from .provider_scheduler import QuotaLedger
 from .terminal import (
     clip_terminal_text,
     pad_terminal_text,
@@ -2868,12 +2866,10 @@ def _usage_float(value: Any, default: float = 0.0) -> float:
 
 
 def _format_cost(value: Any) -> str:
-    """Format a cost with four significant digits without a noisy zero cost."""
+    """Format estimated cash cost, not a claim about free tokens or quota."""
     cost = _usage_float(value)
-    if cost == 0:
-        return "free"
-    if cost < 0:
-        return "free"
+    if cost <= 0:
+        return "$0"
     rendered = f"{cost:.4g}"
     if "e" in rendered.lower():
         rendered = format(Decimal(rendered), "f")
@@ -2888,7 +2884,9 @@ def _cache_rate(cached_tokens: int, input_tokens: int) -> float | None:
     return None
 
 
-def _usage_rows(snapshot: Any, cumulative_line: str, width: int) -> list[tuple[str, str]]:
+def _usage_rows(
+    snapshot: Any, cumulative_line: str, width: int, *, compact: bool = False
+) -> list[tuple[str, str]]:
     """Render cumulative usage as aligned, compact rows."""
 
     def field(key: str) -> str | None:
@@ -2912,6 +2910,17 @@ def _usage_rows(snapshot: Any, cumulative_line: str, width: int) -> list[tuple[s
         field("cost"),
         _usage_float(getattr(snapshot, "estimated_cost_usd", 0.0)),
     )
+
+    if compact:
+        return [
+            _side_row("normal", f" out {_human_count(output_tokens)} · {rate:.1f} tok/s", width),
+            _side_row(
+                "normal",
+                f" in {_human_count(input_tokens)} · cached {_human_count(cached_tokens)}",
+                width,
+            ),
+            _side_row("dim", f" {calls} calls · est {_format_cost(cost)}", width),
+        ]
 
     label_width = 7
 
@@ -3308,6 +3317,8 @@ def _rail_detail_rows(
     if phase not in _ACTIVITY_PHASE_GLYPHS:
         phase = phase_match.group(1).casefold() if phase_match is not None else ""
     agent_state = _side_clean(getattr(agent, "state", "")).strip().casefold()
+    if agent_state in {"succeeded", "failed", "cancelled", "exited", "rejected"}:
+        return [_side_row(agent_state, f"   status {agent_state}", panel_width)]
     if phase == "waiting" and agent_state in {"starting", "active", "merging"}:
         phase = "thinking"
     tail = _activity_tail(getattr(agent, "tail", None))
@@ -3386,6 +3397,7 @@ def _rail_rows(
     capacity: int = 32,
     *,
     activity_line: str = "",
+    cumulative_line: str = "",
 ) -> list[tuple[str, str]]:
     panel_width = max(1, width)
     if panel_width <= _RAIL_COMPACT_WIDTH:
@@ -3394,8 +3406,7 @@ def _rail_rows(
     agents = _rail_tree_order(tuple(getattr(snapshot, "agents", ())))
     if not agents:
         lines.append(_side_row("dim", " no agents yet", panel_width))
-        return lines[: max(1, capacity)]
-    lane_rows = _rail_lane_rows(agents, panel_width)
+    lane_rows = _rail_lane_rows(agents, panel_width) if agents else []
     selected = _rail_selected_agent(snapshot, agents)
     for agent, lane_row in zip(agents, lane_rows, strict=True):
         lines.append(lane_row)
@@ -3404,7 +3415,21 @@ def _rail_rows(
     lines.append(_side_row("heading", " CONTEXT", panel_width))
     lines.extend(_context_rows(snapshot, panel_width, compact_epoch=True))
     lines.extend(_rail_fold_rows(snapshot, panel_width))
-    return lines[: max(1, capacity)]
+    resources: list[tuple[str, str]] = []
+    if capacity >= 8 and (cumulative_line or hasattr(snapshot, "calls")):
+        resources.append(_side_row("heading", " RESOURCES", panel_width))
+        resources.extend(_usage_rows(snapshot, cumulative_line, panel_width, compact=True))
+        quota = _quota_rows(snapshot, panel_width)
+        if quota and capacity >= 14:
+            resources.append(_side_row("heading", " QUOTA", panel_width))
+            resources.extend(quota[:4])
+            if len(quota) > 4:
+                resources.append(_side_row("dim", " more: /quota", panel_width))
+    body_capacity = max(2, capacity - len(resources))
+    if resources and len(lines) > body_capacity:
+        lines = lines[: body_capacity - 1]
+        lines.append(_side_row("dim", " more: /agents /context", panel_width))
+    return (lines + resources)[: max(1, capacity)]
 
 
 def _recent_rows(event: Any, width: int) -> list[tuple[str, str]]:
@@ -3454,37 +3479,16 @@ def _quota_field(window: Any, key: str, default: Any = None) -> Any:
     return getattr(window, key, default)
 
 
-def _quota_db_exists() -> bool:
-    configured = os.environ.get("CAMBIUM_QUOTA_DB")
-    if configured:
-        path = Path(configured).expanduser()
-    else:
-        state_home = os.environ.get("XDG_STATE_HOME")
-        root = Path(state_home).expanduser() if state_home else Path.home() / ".local" / "state"
-        path = root / "cambium" / "provider-quota.db"
-    try:
-        return path.is_file()
-    except OSError:
-        return False
-
-
 def _quota_windows(snapshot: Any) -> tuple[Any, ...]:
     windows = getattr(snapshot, "quota_windows", None)
     if windows is None:
         windows = getattr(snapshot, "quota_snapshots", None)
     if windows is None:
-        for agent in getattr(snapshot, "agents", ()):
-            agent_windows = getattr(agent, "quota_windows", None)
-            if agent_windows is not None:
-                windows = agent_windows
-                break
-    if windows is None and _quota_db_exists():
-        try:
-            windows = QuotaLedger().snapshots()
-        except (OSError, ValueError, sqlite3.Error):
-            windows = ()
-    if windows is None:
-        return ()
+        windows = tuple(
+            window
+            for agent in getattr(snapshot, "agents", ())
+            for window in (getattr(agent, "quota_windows", ()) or ())
+        )
     if isinstance(windows, Mapping):
         if "provider" in windows and "name" in windows:
             return (windows,)
@@ -4219,6 +4223,7 @@ def _cockpit_frame_lines(
         rail_width,
         conversation_capacity,
         activity_line=activity_line,
+        cumulative_line=cumulative_line,
     )
     rail_heading = (
         _pad("", rail_width)
@@ -4611,9 +4616,13 @@ class Cockpit:
         finally:
             self._draw_in_flight = False
 
-    def _input_line_text(self) -> str:
-        if not self._native_input or _readline is None:
+    def _input_line_text(self) -> str | None:
+        if not self._native_input or _readline is None or not self._input_active:
             return ""
+        if getattr(self, "_input_owner", None) != threading.get_ident():
+            # libedit converts mutable editor storage here. Even a read from
+            # another thread can corrupt it while native input inserts text.
+            return None
         try:
             value = _readline.get_line_buffer()
         except (AttributeError, OSError, RuntimeError):
@@ -4865,6 +4874,7 @@ class Cockpit:
                     rail_width,
                     conversation_capacity,
                     activity_line=activity_line,
+                    cumulative_line=cumulative_line,
                 )
             )
             if rail_width
@@ -4919,6 +4929,23 @@ class Cockpit:
         live_only: bool = False,
     ) -> None:
         input_text = self._input_line_text()
+        if input_text is None:
+            # Native editing owns the input row. Keep live cells moving, but
+            # defer destructive frame/input repaint until the line completes.
+            self._pending_draw = request
+            if self._fixed_frame:
+                self._draw_live_event_now(request)
+                capacity = max(1, self._last_size.lines - _frame_overhead(self._show_detail))
+                rows = tuple(_primary_rows(
+                    request[1], _frame_content_width(self._last_size.columns),
+                    color=self.color, include_stream=False,
+                ))
+                visible = rows[-capacity:]
+                self._redraw_rail(visible, self._last_rail_rows)
+                self._last_frame_conversation_rows = visible
+                self._last_conversation_rows = rows
+                self._last_primary_rows = _primary_request_rows(rows, self._last_rail_rows)
+            return
         geometry_changed = self._frame_size != self._last_size or (
             self._last_rendered_width is not None
             and self._last_rendered_width != self._last_size.columns
@@ -5005,6 +5032,7 @@ class Cockpit:
                     rail_width,
                     conversation_capacity,
                     activity_line=activity_line,
+                    cumulative_line=cumulative_line,
                 )
             )
             if rail_width
@@ -5206,16 +5234,18 @@ class Cockpit:
         conversation_rows: tuple[tuple[str, str], ...],
         rail_rows: tuple[tuple[str, str], ...],
     ) -> None:
-        """Rewrite changed rail cells without rebuilding the live frame."""
+        """Rewrite changed conversation/rail cells without touching native input."""
         rail_width = _rail_width(self._last_size.columns)
-        if not rail_width:
-            return
         capacity = max(1, self._last_size.lines - _frame_overhead(self._show_detail))
         changed = [
             index
             for index in range(capacity)
             if (self._last_rail_rows[index] if index < len(self._last_rail_rows) else ("", ""))
             != (rail_rows[index] if index < len(rail_rows) else ("", ""))
+            or (
+                self._last_frame_conversation_rows[index]
+                if index < len(self._last_frame_conversation_rows) else ("", "")
+            ) != (conversation_rows[index] if index < len(conversation_rows) else ("", ""))
         ]
         if not changed:
             return
@@ -5327,6 +5357,7 @@ class Cockpit:
         if not self.enabled:
             return
         self._input_active = True
+        self._input_owner = threading.get_ident()
         self._native_input = native
         label_text = _clip(_sanitize(label).replace(chr(10), " "), 8)
         self._input_prompt_label = label_text

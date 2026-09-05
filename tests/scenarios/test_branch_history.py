@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
 import pytest
 
 from cambium.branch_history import BranchHistoryError, query_branch_history, tool_ref
+from cambium.tools import ToolContext, run_tool
 
 
-def _write_session(tmp_path: Path) -> Path:
-    session = tmp_path / "session"
+def _write_session(
+    tmp_path: Path, *, name: str = "session", evidence: str = "parser evidence"
+) -> Path:
+    session = tmp_path / name
     event_dir = session / ".cambium"
     event_dir.mkdir(parents=True)
     checkpoint = event_dir / "checkpoints" / "child" / "turn-002.json"
@@ -31,7 +35,7 @@ def _write_session(tmp_path: Path) -> Path:
                     },
                     {
                         "role": "user",
-                        "content": "tool read_batch ok=True\nparser evidence",
+                        "content": f"tool read_batch ok=True\n{evidence}",
                     },
                 ]
             }
@@ -96,6 +100,41 @@ def _write_session(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     return session
+
+
+@pytest.mark.parametrize("scopes", [("turn-0001", "turn-0002"), ("turn-9999", "turn-10000")])
+def test_interactive_history_has_chronological_and_unambiguous_tool_identity(
+    tmp_path: Path, scopes: tuple[str, str]
+) -> None:
+    root = tmp_path / "interactive"
+    _write_session(root, name=scopes[0], evidence="first-turn evidence")
+    current = _write_session(root, name=scopes[1], evidence="second-turn evidence")
+    latest = query_branch_history(current, {"action": "transcript", "task_id": "child"})
+    assert "second-turn evidence" in latest
+    listing = query_branch_history(current, {"action": "tools"})
+    for scope, evidence in zip(scopes, ("first-turn", "second-turn"), strict=True):
+        ref = f"tool:child:1:2:0@{scope}"
+        assert ref in listing
+        result = query_branch_history(current, {"action": "tool", "ref": ref})
+        assert f"{evidence} evidence" in result
+    with pytest.raises(BranchHistoryError, match="ambiguous"):
+        query_branch_history(current, {"action": "tool", "ref": "tool:child:1:2:0"})
+
+
+def test_worker_can_reopen_exact_evidence_without_mutating_history(
+    tmp_path: Path, monkeypatch
+) -> None:
+    session = _write_session(tmp_path)
+    monkeypatch.setenv("CAMBIUM_SESSION_ID", str(session))
+    before = {path: path.read_bytes() for path in session.rglob("*") if path.is_file()}
+    ctx = ToolContext(tmp_path)
+    listing = asyncio.run(run_tool("branch_history", {"action": "tools"}, ctx))
+    assert listing.ok and "tool:child:1:2:0" in listing.output
+    detail = asyncio.run(
+        run_tool("branch_history", {"action": "tool", "ref": "tool:child:1:2:0"}, ctx)
+    )
+    assert detail.ok and "parser evidence" in detail.output
+    assert before == {path: path.read_bytes() for path in session.rglob("*") if path.is_file()}
 
 
 def test_branch_listing_distinguishes_task_and_context_policy(tmp_path: Path) -> None:

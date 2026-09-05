@@ -262,7 +262,7 @@ FINAL_SYNTHESIS_MIN_HEADROOM_TOKENS = 4_000
 FINAL_SYNTHESIS_DIRECTIVE = (
     "Forced finalization: produce the final answer NOW with no further tool use. "
     'Return exactly one terminal finish action: {"type":"finish","summary":"...",'
-    '"objective_met":<true|false>} where objective_met is true only when the task '
+    '"objective_met":true}. Use false instead when incomplete; true only when the task '
     "objective was met; a complete review that found no defect counts as met. Summarize the "
     "work completed so far."
 )
@@ -2494,7 +2494,7 @@ _READ_TOOL_NAMES = frozenset({"read_file", "read_batch"})
 _EDIT_TOOL_NAMES = frozenset({"edit_file", "write_file"})
 # Allowlist, not a denylist: a batch runs concurrently only when EVERY call is
 # a known read-only tool. Anything new or unknown defaults to sequential.
-_CONCURRENT_TOOL_NAMES = frozenset({"read_file", "read_batch"})
+_CONCURRENT_TOOL_NAMES = frozenset({"read_file", "read_batch", "repo_query", "branch_history"})
 
 
 def _call_paths(name: str, arguments: dict[str, Any]) -> list[str]:
@@ -4816,7 +4816,7 @@ def _finalization_due(
     soft_cap: int,
     config: AgentConfig,
 ) -> bool:
-    return finalized or budget_new_tokens >= soft_cap or turn >= config.max_turns - 2
+    return finalized or budget_new_tokens >= soft_cap or turn >= config.max_turns - 1
 
 
 def _arm_finalization(
@@ -4838,7 +4838,7 @@ def _arm_finalization(
         and config.resume is not None
         and turn_limit
         and budget_new_tokens < soft_cap
-        and turn >= config.max_turns - 2
+        and turn >= config.max_turns - 1
     ):
         return (
             finalized,
@@ -4855,7 +4855,8 @@ def _arm_finalization(
             context_continuation,
             transcript,
         )
-    if budget_new_tokens < soft_cap and (not turn_limit or turn < config.max_turns - 2):
+    # Reserve one final answer, not two: small tasks still need room to verify.
+    if budget_new_tokens < soft_cap and (not turn_limit or turn < config.max_turns - 1):
         return (
             finalized,
             forced_finalization,
@@ -6134,11 +6135,10 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                     {
                         "role": "user",
                         "content": _bounded_text(
-                            f"invalid action: {exc}. Reply with exactly ONE JSON object of "
-                            "one of these shapes, and nothing else (no prose, no "
-                            'markdown): {"type":"plan","steps":["..."]} | '
-                            '{"type":"tool_call","calls":[{"name":"<tool>","arguments":{...}}]} | '
-                            '{"type":"finish","summary":"...","objective_met":true}',
+                            f"invalid action: {exc}. Return one JSON action with type "
+                            "plan, tool_call, or finish. Keep the intended action; JSON-escape "
+                            "quotes, backslashes, and newlines inside its string arguments. "
+                            "No prose or markdown.",
                             MAX_OBSERVATION_BYTES,
                         ),
                     },
@@ -6205,6 +6205,16 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                 )
                 consecutive_invalid_actions += 1
                 if writer is not None:
+                    # Preserve the failed response and repair feedback too, not
+                    # only the last valid tool call. This is existing history,
+                    # not a new trace store or another model request.
+                    await _persist_checkpoint(
+                        writer, config, turn, transcript, cumulative_usage, [],
+                        compaction_deferred=compaction_deferred,
+                        consecutive_compaction_deferrals=consecutive_compaction_deferrals,
+                        code_changed=code_changed,
+                    )
+                    last_turn_checkpoint = turn
                     await send(
                         writer,
                         {

@@ -1,109 +1,63 @@
 # Documentation map
 
-Cambium documentation is organized by the question a reader or agent is trying
-to answer. Source and tests remain authoritative for landed behavior.
+Start with [the current runtime map](architecture/architecture.md) and
+[providers as resources](architecture/provider-routing.md). Source and executable
+tests decide what is implemented. The [operating model](architecture/agent-operating-model.md)
+preserves the wider design; it is not a claim that every proposed layer ships.
 
-## Status language
+## Current runtime contracts
 
-Every design document should use one of these labels:
+| Question | Owning document |
+| --- | --- |
+| Which module owns which effect? | [Runtime map](architecture/architecture.md) |
+| What is a child/subagent, and why fork context? | [Context branches](architecture/context-branches.md) |
+| How are children admitted, suspended, and joined? | [Child lifecycle](architecture/subagents.md) |
+| How do summaries, checkpoints, and K0 rollover work? | [Context engine](architecture/context-engine.md) |
+| How are provider capacity, throughput, and quota accounted? | [Provider routing](architecture/provider-routing.md) |
+| What survives interactive turns and reconnect? | [Interactive lifecycle](architecture/interactive-tui.md) |
+| How does terminal input, layout, and inspection work? | [Terminal interface](architecture/terminal-interface.md) |
+| Which events are durable? | [Event glossary](architecture/events.md) |
+| How do operational plans, recovery, and publication work? | [Operations](architecture/operations.md) |
+| What does DSPy actually optimize and load? | [Offline optimization](architecture/optimization.md) |
 
-- **implemented contract** — describes behavior backed by current source and
-  executable tests;
-- **current runtime map** — maps landed modules and explicitly labels target
-  integration;
-- **target architecture** — normative or aspirational design, not an
-  implementation claim;
-- **target reference** — exact values/schemas intended for a future phase;
-- **experimental protocol** — hypotheses, measurements, and promotion gates;
-- **historical** — retained for provenance only and not part of active design.
+The active navigation tools are `repo_query` and `branch_history`, backed by
+existing source/session artifacts. `branch_state.py` and CLI `inspect-state`
+also exist. A fully shared model/operator state projection, typed WorkLedger,
+and richer ResultCapsule remain separate integration work; do not infer them
+from target names or the existence of a library.
 
-A target document must not be cited as proof that a feature exists. An active
-implemented document must not depend on a branch, workflow, or symbol that no
-longer exists.
+## Reference and usage
 
-## Start here
+[Context/navigation reference](reference/context-branches.md) owns exact public
+tool and policy values. [The driving loop](how-to/agent-driving-loop.md) and
+[delegate and inspect work](how-to/context-branches.md) show the current workflow.
+CLI `--help`, schemas, and source own exact command arguments and configuration
+defaults.
 
-1. [`architecture/agent-operating-model.md`](architecture/agent-operating-model.md)
-   — the synthetic system: branch state, SituationFrame, accretion, control,
-   resources, and linked abstraction tower.
-2. [`architecture/architecture.md`](architecture/architecture.md) — current
-   runtime/module map and ownership boundaries.
-3. [`../implementation-plan.md`](../implementation-plan.md) — ordered open work
-   only.
-4. [`../agents.md`](../agents.md) — repository operating contract for coding
-   agents and contributors.
+The contributor contract is [agents.md](../agents.md).
+[The implementation plan](../implementation-plan.md) contains open work only.
 
-## Architecture
+## Design proposals and experiments
 
-- [`architecture/agent-operating-model.md`](architecture/agent-operating-model.md)
-  — target agent control system and design laws.
-- [`architecture/architecture.md`](architecture/architecture.md) — current
-  runtime map, tower, data ownership, and invariants.
-- [`architecture/context-engine.md`](architecture/context-engine.md) — CAST,
-  immutable checkpoints, cache lineage, K0 rollover, and context economics.
-- [`architecture/context-branches.md`](architecture/context-branches.md) —
-  recursive branch rationale and exact/semantic/fresh modes.
-- [`architecture/context-branch-requirements.md`](architecture/context-branch-requirements.md)
-  — target normative agent/context requirements and current compatibility gaps.
-- [`architecture/subagents.md`](architecture/subagents.md) — current child
-  admission, worktree isolation, result, and join mechanics.
-- [`architecture/provider-routing.md`](architecture/provider-routing.md) —
-  admission versus call-time provider ownership and target resource projection.
-- [`architecture/interactive-tui.md`](architecture/interactive-tui.md) —
-  persistent interactive branch lifecycle.
-- [`architecture/terminal-interface.md`](architecture/terminal-interface.md) —
-  operator rendering and command contract.
-- [`architecture/events.md`](architecture/events.md) — current durable event
-  glossary.
-- [`architecture/operations.md`](architecture/operations.md) — executable
-  operational behavior and commands.
-- [`architecture/optimization.md`](architecture/optimization.md) — DSPy data,
-  evaluation, and promotion mechanics.
+[Agent operating model](architecture/agent-operating-model.md) explains the
+rationale. [Branch contracts](architecture/context-branch-requirements.md)
+distinguish current invariants from gaps, while
+[agent-state reference](reference/agent-state.md) marks the remaining target
+shapes. Use proposals to guide a small implemented slice, not as a checklist
+requiring new per-turn control layers. Planning is optional for a small task.
 
-## Reference
+[Agent-system evaluation](research/agent-system-evaluation.md) contains proposed
+experiments and metrics. [Codex activation research](research/codex-activation.md)
+is provider-specific research whose conclusions need checking against current
+configuration and transports. Neither research page proves runtime support or
+an optimization gain. The [2026-09-04 harness audit](research/harness-audit-2026-09-04.md)
+records concrete failures, repairs, test outcomes, and remaining limitations.
 
-Use reference documents for exact values and interfaces, not rationale.
+## Editing rule
 
-- [`reference/agent-state.md`](reference/agent-state.md) — target BranchState,
-  SituationFrame, ResourceEnvelope, epistemic item, ResultCapsule,
-  `inspect_state`, and `repo_query` contracts.
-- [`reference/context-branches.md`](reference/context-branches.md) — current and
-  target child-policy/history vocabulary and explicit compatibility notes.
-
-Provider/CLI/Python/security behavior is currently documented by the owning
-source modules, `agents.md`, the focused architecture documents, and `--help`.
-Add separate reference pages only when they can be generated or checked against
-those executable interfaces.
-
-## How-to guides
-
-- [`how-to/agent-driving-loop.md`](how-to/agent-driving-loop.md) — target
-  orient/locate/act/verify/accrete workflow for a model branch.
-- [`how-to/context-branches.md`](how-to/context-branches.md) — decompose work,
-  assign ownership, choose context/placement, and inspect child evidence.
-
-Operational setup remains in the root README, `agents.md`, CLI `--help`, and the
-focused architecture documents until dedicated guides exist.
-
-## Research and evaluation
-
-- [`research/agent-system-evaluation.md`](research/agent-system-evaluation.md) —
-  target whole-system experiments for orientation, retrieval, accretion,
-  delegation, resources, and recovery.
-- [`research/codex-activation.md`](research/codex-activation.md) — provider
-  activation research; verify conclusions against current transports/config.
-
-## Documentation rules
-
-1. Put rationale and ownership in `architecture/`.
-2. Put exact public/target shapes in `reference/`.
-3. Put recommended sequences in `how-to/`.
-4. Put hypotheses and metrics in `research/`.
-5. Keep only open ordered work in `implementation-plan.md`.
-6. Link to source/tests for implemented claims; do not freeze rotating line
-   numbers when a symbol name is sufficient.
-7. Use the same names across source, schemas, prompts, events, TUI, and docs.
-8. When source and docs disagree, state the disagreement and fix the source or
-   the document; do not explain it away with an implicit compatibility rule.
-9. Do not link to a planned page as though it exists. Create the page in the
-   same change or describe the owning source/current document directly.
+Give a contract one owner and link to it. Architecture explains rationale and
+ownership; reference gives exact shapes; how-to shows a sequence; research keeps
+hypotheses and results. Mark proposals explicitly, cite source symbols/files
+rather than rotating line numbers, and remove completed work from the plan.
+Do not repeat whole schemas, command tables, or mandatory gate lists across
+all four categories.

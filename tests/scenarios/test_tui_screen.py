@@ -2222,12 +2222,12 @@ def test_side_sections_are_width_safe(width: int) -> None:
     assert "worktree_cleanup" not in text
     assert "dirty" not in text
     assert any(
-        line.strip().startswith("cost") and line.rstrip().endswith("free")
+        line.strip().startswith("cost") and line.rstrip().endswith("$0")
         for line in text.splitlines()
     )
 
     usage_columns = []
-    for label, value in (("calls", "19"), ("tokens", "104k"), ("out/s", "12.4"), ("cost", "free")):
+    for label, value in (("calls", "19"), ("tokens", "104k"), ("out/s", "12.4"), ("cost", "$0")):
         line = next(line for line in text.splitlines() if line.strip().startswith(label))
         usage_columns.append(line.index(value))
     assert len(set(usage_columns)) == 1

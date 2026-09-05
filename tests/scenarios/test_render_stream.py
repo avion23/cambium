@@ -51,17 +51,18 @@ def _lifecycle(kind: str) -> dict[str, object]:
     return {"kind": kind, "payload": {}}
 
 
-def test_tokens_per_s_uses_completion_or_total_tokens() -> None:
+def test_tokens_per_s_uses_only_output_tokens() -> None:
     cases = [
-        ({"input_tokens": 900, "completion_tokens": 50, "total_tokens": 950}, 5.0, "10.0"),
-        ({"total_tokens": 300}, 10.0, "30.0"),
-        ({"completion_tokens": "many", "total_tokens": 300}, 10.0, "30.0"),
-        ({"completion_tokens": True, "total_tokens": 300}, 10.0, "30.0"),
-        ({"completion_tokens": float("nan"), "total_tokens": 300}, 10.0, "30.0"),
-        ({"completion_tokens": float("inf"), "total_tokens": 300}, 10.0, "30.0"),
+        ({"input_tokens": 900, "completion_tokens": 50, "total_tokens": 950}, "tokens/s=5.0"),
+        ({"input_tokens": 900, "output_tokens": 50, "total_tokens": 950}, "tokens/s=5.0"),
+        ({"total_tokens": 300}, ""),
+        ({"completion_tokens": "many", "total_tokens": 300}, ""),
+        ({"completion_tokens": True, "total_tokens": 300}, ""),
+        ({"completion_tokens": float("nan"), "total_tokens": 300}, ""),
+        ({"completion_tokens": float("inf"), "total_tokens": 300}, ""),
     ]
-    for index, (usage, latency, expected) in enumerate(cases):
-        assert render_tokens_per_s([_usage_event(index, usage, latency)]) == f"tokens/s={expected}"
+    for index, (usage, expected) in enumerate(cases):
+        assert render_tokens_per_s([_usage_event(index, usage, 10.0)]) == expected
 
 
 def test_tokens_per_s_skips_non_finite_or_non_positive_latency() -> None:

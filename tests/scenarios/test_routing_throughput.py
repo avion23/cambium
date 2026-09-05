@@ -119,8 +119,9 @@ def test_provider_debt_records_and_persists_measured_tokens_per_second(
     )
 
     assert debt.tokens == 450
-    assert debt.tokens_per_s_count == 2
-    assert debt.tokens_per_s == pytest.approx(20.0)
+    # The second report has no output count, so it cannot be a speed sample.
+    assert debt.tokens_per_s_count == 1
+    assert debt.tokens_per_s == pytest.approx(10.0)
 
     path = tmp_path / "routing-state.json"
     store = DebtStore(path)
@@ -137,6 +138,29 @@ def test_provider_debt_records_and_persists_measured_tokens_per_second(
     restored = loaded.as_mapping()["fast"]
     assert restored.tokens_per_s == pytest.approx(10.0)
     assert restored.tokens_per_s_count == 1
+
+
+def test_total_only_usage_does_not_invent_generation_speed() -> None:
+    debt = ProviderDebt()
+    debt.record({"usage": {"total_tokens": 100_000}, "latency_s": 1.0}, now=100.0)
+    assert debt.tokens == 100_000
+    assert debt.tokens_per_s_count == 0
+    assert debt.tokens_per_s == 0.0
+
+
+def test_aging_evidence_does_not_change_its_measured_speed(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(time, "time", lambda: 100.0)
+    store = DebtStore(tmp_path / "debt.json")
+    for output in (100, 300):
+        store.record({"provider": "a", "usage": {"output_tokens": output}, "latency_s": 2.0})
+    store.save()
+    monkeypatch.setattr(time, "time", lambda: 100.0 + 18 * 3600)
+    aged = DebtStore(tmp_path / "debt.json")
+    aged.load()
+    evidence = aged.as_mapping()["a"]
+    assert evidence.tokens_per_s_count == 1
+    assert evidence.tokens_per_s == pytest.approx(100.0)
+    assert evidence.latency_total_s / evidence.latency_count == pytest.approx(2.0)
 
 
 def test_equal_priority_and_cost_prefers_measured_faster_provider() -> None:

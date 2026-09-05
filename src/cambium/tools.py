@@ -829,6 +829,22 @@ async def _read_batch(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
     return _Outcome(ok=ok, output=output)
 
 
+async def _repo_query(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
+    from .code_index import query_repository
+
+    output = await asyncio.to_thread(query_repository, ctx.cwd, args)
+    return _Outcome(True, _truncate_text(output, 16 * 1024, OUTPUT_TRUNCATION_MARKER))
+
+
+async def _branch_history(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
+    from .branch_history import query_branch_history
+
+    session_dir = os.environ.get("CAMBIUM_SESSION_ID")
+    if not session_dir:
+        raise _ToolFailure("branch history requires a supervised session")
+    return _Outcome(True, await asyncio.to_thread(query_branch_history, session_dir, args))
+
+
 async def _delegate(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
     """Validate and register one child proposal for supervisor admission.
 
@@ -857,6 +873,8 @@ async def _delegate(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
 
 
 TOOL_DISPATCH: dict[str, ToolImplementation] = {
+    "repo_query": _repo_query,
+    "branch_history": _branch_history,
     "delegate": _delegate,
     "read_batch": _read_batch,
     "write_file": _write_file,

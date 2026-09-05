@@ -1,4 +1,4 @@
-"""Worker agent-loop improvements: plan-before-act, transcript bounding,
+"""Worker agent-loop behavior: direct actions, transcript bounding,
 lint feedback visibility, read_batch exposure, and the heartbeat drain fix.
 
 The provider-backed loop is driven in-process with a scripted fake router
@@ -760,30 +760,50 @@ def test_finalization_may_use_scaled_headroom_past_hard_cap(tmp_path: Path) -> N
     )
 
 
-def test_max_turns_edge_injects_the_same_finalization_directive(tmp_path: Path) -> None:
+def test_three_turn_budget_allows_edit_verify_finish(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     worktree = _make_worktree(repo)
     config = _agent_config(worktree, max_turns=3)
     router = _ScriptedRouter(
         [
-            '{"type":"tool_call","name":"read_batch","arguments":{"paths":["alpha.txt"]}}',
-            '{"type":"finish","summary":"read the file","objective_met":false}',
+            json.dumps(
+                {
+                    "type": "tool_call",
+                    "name": "write_file",
+                    "arguments": {"path": "alpha.txt", "content": "changed"},
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "tool_call",
+                    "name": "run_shell",
+                    "arguments": {
+                        "cmd": [
+                            "python3",
+                            "-c",
+                            "from pathlib import Path; "
+                            "assert Path('alpha.txt').read_text() == 'changed'",
+                        ]
+                    },
+                }
+            ),
+            '{"type":"finish","summary":"changed and verified alpha.txt","objective_met":true}',
         ]
     )
 
     outcome = asyncio.run(_drive_loop(config, worktree, router))
 
-    assert outcome["status"] == "failed"
-    assert outcome["failure_reason"] == (
-        "forced finalization: investigation incomplete, no changes made"
+    assert outcome["status"] == "succeeded"
+    assert outcome["failure_reason"] is None
+    assert len(router.prompts) == 3
+    assert not any(
+        message.get("content") == worker.FINAL_SYNTHESIS_DIRECTIVE
+        for prompt in router.prompts[:2]
+        for message in prompt["messages"]
     )
-    assert len(router.prompts) == 2
-    assert (
-        sum(
-            message.get("content") == worker.FINAL_SYNTHESIS_DIRECTIVE
-            for message in router.prompts[1]["messages"]
-        )
-        == 1
+    assert any(
+        message.get("content") == worker.FINAL_SYNTHESIS_DIRECTIVE
+        for message in router.prompts[2]["messages"]
     )
 
 
@@ -1817,10 +1837,11 @@ def test_concatenated_actions_are_rejected(tmp_path: Path) -> None:
 
 
 def test_three_invalid_actions_fail_fast_with_no_progress(tmp_path: Path) -> None:
-    """Distinct malformed responses hit the dedicated invalid-action bound."""
+    """Malformed responses remain inspectable without spending more model calls."""
     repo = tmp_path / "repo"
     worktree = _make_worktree(repo)
-    config = _agent_config(worktree)
+    config = _agent_config(worktree, checkpoint_root=tmp_path / "checkpoints")
+    writer = _FakeWriter()
     router = _ScriptedRouter(
         [
             "not-json-one",
@@ -1830,13 +1851,18 @@ def test_three_invalid_actions_fail_fast_with_no_progress(tmp_path: Path) -> Non
         ]
     )
 
-    outcome = asyncio.run(_drive_loop(config, worktree, router))
+    outcome = asyncio.run(_drive_loop(config, worktree, router, writer))
 
     assert outcome["status"] == "failed"
     assert outcome["failure_reason"] == "agent emitted 3 consecutive invalid actions"
     assert "max turns exceeded" not in outcome["failure_reason"]
     assert outcome["turn"] == 3  # failed on the 3rd consecutive invalid action
     assert len(router.prompts) == 3  # no further router calls
+    checkpoints = [m for m in writer.messages() if m["type"] == "checkpoint"]
+    assert [m["turn"] for m in checkpoints] == [1, 2, 3]
+    recorded = json.loads(Path(checkpoints[-1]["state_ref"]).read_text())["transcript"]
+    assert recorded[-2] == {"role": "assistant", "content": "not-json-three"}
+    assert "JSON-escape" in recorded[-1]["content"]
 
 
 def test_valid_action_resets_consecutive_invalid_action_bound(tmp_path: Path) -> None:

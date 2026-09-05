@@ -1,8 +1,8 @@
 # Agent-system evaluation
 
-**Status:** target experimental protocol. This document evaluates the complete
-agent operating model rather than isolated prompt wording. Hard runtime
-invariants remain fixed during experiments.
+**Status:** proposed experiments, not mandatory runtime gates. Choose a
+comparison that answers a concrete question; implementing every variant is not
+a prerequisite for a useful harness. Hard runtime invariants remain fixed.
 
 Architecture is in
 [`../architecture/agent-operating-model.md`](../architecture/agent-operating-model.md).
@@ -67,13 +67,13 @@ configuration, budgets, and acceptance checks.
 
 | Variant | Description |
 | --- | --- |
-| A0 | Current worker prompt and tools |
-| A1 | A0 plus deterministic SituationFrame |
-| A2 | A1 plus `inspect_state` |
-| A3 | A2 plus wired `branch_history` and progressive-disclosure guidance |
-| A4 | A3 plus `repo_query` backed by bounded code index/LSP |
-| A5 | A4 plus WorkLedger and ResultCapsule v2 |
-| A6 | A5 plus ResourceEnvelope and resource-aware delegation guidance |
+| A0 | Current short prompt, active `branch_history` and `repo_query` |
+| A1 | A0 plus the proposed bounded SituationFrame |
+| A2 | A1 plus model `inspect_state` |
+| A3 | A0 with historical recall disabled, to measure its contribution |
+| A4 | A0 with `repo_query` disabled, to compare ordinary reads/searches |
+| A5 | A0 plus a tested obligation/result-state extension |
+| A6 | A0 plus measured resource-pressure guidance |
 | AO | Oracle state/policy labels for diagnostic upper bound, not production |
 
 Do not change the model, repository, runtime validators, or provider settings
@@ -381,7 +381,7 @@ choice.
 - Preserve all failed variants and negative results.
 - Compare accepted outcome per resource unit, not tokens in isolation.
 
-## 15. Promotion gates
+## 15. Evidence to examine before adoption
 
 ### SituationFrame
 

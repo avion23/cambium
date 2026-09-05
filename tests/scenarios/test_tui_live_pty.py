@@ -136,12 +136,15 @@ def _provider_file(path: Path, base_url: str) -> Path:
     return path
 
 
-def _spawn_tui(repo: Path, provider_file: Path) -> tuple[subprocess.Popen[bytes], int]:
+def _spawn_tui(
+    repo: Path, provider_file: Path, *args: str
+) -> tuple[subprocess.Popen[bytes], int]:
     env = os.environ.copy()
     env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(SRC_DIR), env.get("PYTHONPATH")]))
     env.update(
         {
             "CAMBIUM_PROVIDERS": str(provider_file),
+            "PYTHONFAULTHANDLER": "1",
             "NO_PROXY": "127.0.0.1,localhost",
             "no_proxy": "127.0.0.1,localhost",
         }
@@ -154,7 +157,7 @@ def _spawn_tui(repo: Path, provider_file: Path) -> tuple[subprocess.Popen[bytes]
 
     try:
         process = subprocess.Popen(
-            [sys.executable, "-m", "cambium", "tui", "--repo", str(repo)],
+            [sys.executable, "-m", "cambium", "tui", "--repo", str(repo), *args],
             stdin=slave_fd,
             stdout=slave_fd,
             stderr=slave_fd,
@@ -211,7 +214,41 @@ def _kill_child(process: subprocess.Popen[bytes]) -> None:
     process.wait()
 
 
-def test_live_tui_resize_repaints_one_input_prompt(tmp_path: Path) -> None:
+@pytest.mark.parametrize("cancel_command", [b"/cancel\n", b"!cancel\n"])
+def test_inspection_and_cancel_work_while_provider_is_running(
+    tmp_path: Path, cancel_command: bytes
+) -> None:
+    server = _CannedOpenAIServer()
+    process = None
+    master_fd = -1
+    output = bytearray()
+    try:
+        repo = tmp_path / "repo"
+        _init_repo(repo)
+        providers = _provider_file(tmp_path / "providers.json", server.base_url)
+        process, master_fd = _spawn_tui(repo, providers)
+        _read_until(master_fd, output, _PROMPT_REPAINT, 5.0)
+        os.write(master_fd, b"hello\n")
+        assert server.request_started.wait(5.0)
+        output.clear()
+        os.write(master_fd, b"/usage\n")
+        _read_until(master_fd, output, b"usage: calls=", 2.0)
+        _read_into(master_fd, output, 0.2)
+        assert b"queued: /usage" not in output
+        os.write(master_fd, cancel_command)
+        _read_until(master_fd, output, b"turn cancelled;", 3.0)
+        assert b"queued: /cancel" not in output
+        os.write(master_fd, b"/exit\n")
+        assert _wait_exit(process, master_fd, output, 3.0) == 0
+    finally:
+        server.close()
+        if process is not None:
+            _kill_child(process)
+        if master_fd >= 0:
+            os.close(master_fd)
+
+
+def test_live_tui_resize_preserves_one_input_prompt(tmp_path: Path) -> None:
     server = _CannedOpenAIServer()
     process = None
     master_fd = -1
@@ -238,6 +275,13 @@ def test_live_tui_resize_repaints_one_input_prompt(tmp_path: Path) -> None:
 
         _read_until(master_fd, output, b"canned response", 8.0)
         _read_into(master_fd, output, 0.3)
+        # A native edit owns its line: full geometry repaint waits for input
+        # completion, while live result/status cells remain visible above it.
+        inspection = bytearray()
+        os.write(master_fd, b"/usage\n")
+        _read_until(master_fd, inspection, b"usage: calls=", 3.0)
+        _read_into(master_fd, inspection, 0.1)
+        output.extend(inspection)
         assert output.count(_PROMPT_REPAINT) >= 2
         final_frame = output.rsplit(b"\x1b[1A\r", 1)[-1]
         assert final_frame.count(b"\r\x1b[2K\xe2\x80\xba ") <= 1
@@ -247,6 +291,27 @@ def test_live_tui_resize_repaints_one_input_prompt(tmp_path: Path) -> None:
             if process is not None:
                 _kill_child(process)
             os.close(master_fd)
+
+
+@pytest.mark.parametrize("attempt", range(3))
+def test_resize_while_readline_is_editing_does_not_crash(tmp_path: Path, attempt: int) -> None:
+    del attempt
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    process, fd = _spawn_tui(repo, tmp_path / "missing-providers.json")
+    output = bytearray()
+    try:
+        _read_until(fd, output, _PROMPT_REPAINT, 5)
+        for index in range(40):
+            os.write(fd, b"typing while the terminal resizes ")
+            _set_size(fd, 90 if index % 2 else 110)
+            _read_into(fd, output, 0.01)
+            assert process.poll() is None, output[-5000:].decode("utf-8", "replace")
+        os.write(fd, b"\x15/exit\n")
+        assert _wait_exit(process, fd, output, 5) == 0, output[-5000:].decode("utf-8", "replace")
+    finally:
+        _kill_child(process)
+        os.close(fd)
 
 
 def test_idle_ctrl_c_exits_cleanly_within_three_seconds(tmp_path: Path) -> None:
