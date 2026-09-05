@@ -17,6 +17,7 @@ import termios
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -31,6 +32,7 @@ class _CannedOpenAIServer:
     def __init__(self) -> None:
         self.request_started = threading.Event()
         self.release = threading.Event()
+        self.requests: list[list[dict[str, Any]]] = []
         response = {
             "id": "chatcmpl-pty",
             "object": "chat.completion",
@@ -52,6 +54,7 @@ class _CannedOpenAIServer:
         encoded_response = json.dumps(response).encode("utf-8")
         started = self.request_started
         release = self.release
+        requests = self.requests
 
         class Handler(http.server.BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.0"
@@ -61,7 +64,8 @@ class _CannedOpenAIServer:
                     self.send_error(404)
                     return
                 length = int(self.headers.get("Content-Length") or 0)
-                self.rfile.read(length)
+                body = json.loads(self.rfile.read(length))
+                requests.append(body.get("messages") or [])
                 started.set()
                 release.wait(5.0)
                 self.send_response(200)

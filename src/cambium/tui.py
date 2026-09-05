@@ -38,6 +38,12 @@ try:
 except ImportError:  # pragma: no cover - platform dependent
     _readline = None
 
+# builtins.input() only keeps a framed paste in one prompt when the backing
+# readline implements GNU bracketed paste.  libedit (uv run, macOS system
+# Python) lacks bracketed-paste-begin entirely, so it must read and unframe
+# pastes manually in _input_line.
+_GNU_READLINE = _readline is not None and "libedit" not in (_readline.__doc__ or "")
+
 _PROMPT = "cambium> "
 _CONTINUATION_PROMPT = "... "
 _BRACKETED_PASTE_ENABLE = "\x1b[?2004h"
@@ -352,18 +358,32 @@ def _unframe_bracketed_paste(value: str, source: TextIO) -> str:
 
 def _input_line(source: TextIO, out: TextIO, prompt: str, *, native: bool) -> str | None:
     with _bracketed_paste_mode(source, out):
-        if native:
+        native_read = native and _GNU_READLINE
+        if native_read:
             try:
                 line = builtins.input(prompt)
             except EOFError:
                 return None
         else:
+            # libedit (the readline behind `uv run` and macOS system Python)
+            # silently ignores the paste-begin binding, so read the framed
+            # paste directly and reassemble it in _unframe_bracketed_paste.
             out.write(prompt)
             out.flush()
             line = source.readline()
             if line == "":
                 return None
-        return _unframe_bracketed_paste(line, source)
+        value = _unframe_bracketed_paste(line, source)
+        if not native_read:
+            # GNU input() records the line itself; keep cross-session history
+            # fresh on the manual path.  Best effort only.
+            add_history = getattr(_readline, "add_history", None)
+            if _is_tty(source) and callable(add_history):
+                try:
+                    add_history(value)
+                except Exception:
+                    pass
+        return value
 
 
 def _read_multiline(value: str, read_next: Callable[[], str | None]) -> str | None:
@@ -430,6 +450,23 @@ def _is_quit_prompt(prompt: str) -> bool:
 
 def _history_path(session: InteractiveSession) -> Path:
     return session.root / ".cambium" / "tui_history"
+
+
+def _bind_readline_paste_key() -> None:
+    """Route terminal paste framing through readline's paste handler.
+
+    ``_input_line`` enables terminal bracketed paste around every native
+    ``input()`` read, but only readline builds that bind the paste-begin key
+    consume the ``\\e[200~`` / ``\\e[201~`` framing.  Where the key is unbound
+    (libedit, GNU readline < 8.0, an inputrc remap) readline swallows the
+    markers and every newline inside a paste accepts its own prompt line.
+    Binding the key here — after readline initialized, before the first
+    ``input()`` — keeps a pasted multiline payload in one prompt regardless
+    of the system inputrc.
+    """
+    if _readline is None:
+        return
+    _readline.parse_and_bind('"\\e[200~": bracketed-paste-begin')
 
 
 def _load_history(path: Path) -> None:
@@ -944,6 +981,7 @@ async def _run_interactive(
 
     history_path = _history_path(session)
     if native_input:
+        _bind_readline_paste_key()
         _load_history(history_path)
 
     loop = asyncio.get_running_loop()
