@@ -402,10 +402,13 @@ not mean the parent accepted the artifact; join state remains supervisor-owned.
 
 `task_id` is optional and defaults to the current worker. The shared reader in
 `state_view.py` selects the latest recorded turn containing that task and uses
-`BranchState` to replay its state and children. It returns identity and source
-watermark, objective, artifact state, control/resource facts, usage, context,
-children, result and recent tool output. A running task's result is unknown,
-not an error. No section/cursor/filter vocabulary is implemented.
+`BranchState` to replay its state and children. Model and TUI inspection return
+the same SituationFrame text used by the worker, bounded to 12 KiB. It includes
+identity, source watermark, objective, artifacts, control/resource facts, usage,
+children and result. Live children precede completed children when space is
+limited. A running task's result is unknown, not an error. Truncation points to
+supported history operations, not nonexistent section/watermark query arguments.
+No section/cursor/filter vocabulary is implemented.
 
 The TUI uses the same reader for `/inspect [TASK]`, defaulting to its focused
 task. CLI `cambium inspect-state DIR [TASK]` emits the full BranchState JSON.

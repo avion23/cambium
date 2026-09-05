@@ -55,8 +55,8 @@ resource ordering after capability filtering. With a live quota observation for
 an eligible provider, quality breaks resource ties. Without one, measured
 quality/cost/latency/throughput ordering remains in force. Expired windows and
 windows belonging only to other providers do not switch the ranking strategy.
-These are heuristics, not a proven global optimum, and need no provider preflight
-request.
+Declaring a capability must not disable resource steering. These are heuristics,
+not a proven global optimum, and need no provider preflight request.
 
 Diffundo owns the subsequent provider call and its fallback behavior. Keep task
 assignment and call-time lease evidence distinct: an initial assignment does

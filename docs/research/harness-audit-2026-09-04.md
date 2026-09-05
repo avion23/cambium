@@ -347,3 +347,23 @@ The GEPA dry run resolved all eight historical/derived cases with automatic
 candidate deployment enabled. No optimizer search ran and no prompt artifact
 was promoted. These cases are a development regression corpus; reserve new
 cases before claiming generalization from an eventual hill climb.
+
+### Parallel publication integrated at the final boundary
+
+`origin/main` advanced to `ed095ca` during publication. Its overlapping fixes and
+additional redaction regression were merged normally. The regression checks that
+registered credentials still redact even under the benign pressure-metric key.
+Repeated metadata and documentation were consolidated rather than duplicated.
+
+The parallel audit recorded 1,910 non-acceptance passes and one skip in 104.72
+seconds, plus two live frontend passes in 51.84 seconds. Its earlier ZAI
+self-fix and blocking-child reports, under `.cambium/finalize-self-exact` in
+`cambium-8e3fdca5`, recorded respectively 21.713 seconds/5 calls/47,182 tokens and
+20.194 seconds/7 calls/26,226 tokens, both with zero summaries. Its correction
+report is the same 139.396-second run discussed above, not an additional trial.
+Six malformed actions occurred across those three recorded runs.
+
+The earlier `.cambium/finalize-corrected` attempt ended after the connector wait
+with two completed turns but no final result. That interrupted attempt is not a
+pass; it motivated the whole-rollout deadline. Neither set of live runs proves
+simultaneous multi-provider speedup or long-run quota efficiency.

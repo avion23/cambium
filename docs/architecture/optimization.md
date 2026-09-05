@@ -58,7 +58,7 @@ estimate does not make subscription tokens unlimited.
 
 `--max-wall-s` covers one complete harness rollout across all of its operator
 turns, child joins and reconnects. It is not restarted for every follow-up.
-Timeout cancels the rollout and retains its report; the checker still examines
+Timeout cancels owned work and retains a failed report; the checker still examines
 only accepted code. Fixture setup and the independent artifact check are outside
 that harness deadline, and cleanup can extend the reported elapsed time.
 
