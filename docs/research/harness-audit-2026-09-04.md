@@ -167,3 +167,34 @@ from deterministic K0 rollover and explicitly states K0's text-identity/open-ite
 limitations. The TUI retains its native-input geometry-refresh tradeoff. Future
 SituationFrame/WorkLedger/resource-ranking proposals remain in the open plan;
 this continuation does not claim to have completed them.
+
+### September 5 isolated integration: live lanes and CAST precision
+
+Further edits were isolated in `cast-tui-final-20260905` after concurrent writes
+were detected in the earlier worktree. Its changes were captured without changing
+that checkout's HEAD, index or files, then integrated with `origin/main` at
+`f8de134`. The separate SituationFrame checkout remains untouched.
+
+The rail now retains the selected parent and live children ahead of completed
+history, collapses detail before hiding lanes, and reports the omitted count.
+The duplicate footer usage row is hidden by default. CAST documentation now
+separates checkpoint epoch numbering from prefix replacement and explains fold
+break-even costs without claiming an implemented economic optimizer.
+
+The remaining finish-only parse-repair path and duplicate action normalization
+were removed. Recorded calls retain their natural name-before-arguments order.
+The module-deletion fixture no longer recursively copies top-level runtime
+sessions into its scratch repository. Behavioral checks replace assertions
+about fixed footer row counts or exact repair prose.
+
+The integrated tree at `8c76708` passed **1,879 non-acceptance tests, one skipped**
+in 96.26 seconds, including real-process/PTY cases. Ruff and whitespace checks
+passed. Before integration, the real CLI task passed in 27.94 seconds. One TUI
+trial failed after three repeated malformed batches; after feedback and call
+serialization changes, the two-turn TUI coding/history task passed in 34.44
+seconds with **11 calls and 34,887 reported tokens**. Its six tool calls succeeded,
+the accepted code passed external assertions, and the read-only turn created no
+empty commit. Captured terminal output was inspected, not just the model summary.
+An earlier pinned-provider TUI run had instead reached verification and then
+failed on ZAI quota; it was not a rendering failure. These individual trials do
+not establish a general prompt improvement or reliable multi-provider speedup.
