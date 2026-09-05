@@ -91,11 +91,16 @@ interleaved. Inspection includes running tasks with no terminal result yet.
 The CLI can print the full value; model/TUI inspection selects concise facts and
 leaves exact tool evidence to `branch_history`.
 
-This is an on-demand shared read, not a mandatory SituationFrame on every call.
-`observability.py` still provides incremental display counters. The complete
-SituationFrame proposal, evidence-linked WorkLedger and versioned ResultCapsule
-are not implied. Existing summary entries, child results and Git joins remain
-the owners of their data; there is no parallel state database.
+The worker also renders a bounded local SituationFrame into its final user-role
+loop-state message. It uses BranchState semantics over worker-local observations;
+its local watermark is not a durable event-store sequence. Persistence strips
+that transient frame. `inspect_state` explicitly reads the durable view shared
+with the operator. Neither path makes an extra provider request.
+
+`observability.py` still provides incremental display counters. An evidence-linked
+WorkLedger and versioned ResultCapsule remain proposals. Existing semantic
+entries, child results and Git joins own their data; there is no parallel state
+database.
 
 The current source/tests for a feature must land before its status changes from
 proposed to implemented. Architecture diagrams and data types alone do not
@@ -132,5 +137,5 @@ followed by exact historical retrieval. They use disposable repositories and
 configured provider credentials. Report model/provider failures as failures,
 not as evidence that the harness path passed.
 
-Open work belongs only in [implementation-plan.md](../../implementation-plan.md),
+Record open proposals in the owning document,
 not in another copy of the runtime map.

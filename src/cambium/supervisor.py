@@ -130,6 +130,7 @@ from .routing import (
     resolve_assignment,
     validate_requirements,
 )
+from .situation import SECTION_ORDER
 from .store import (
     CRITICAL_KINDS,
     EventStore,
@@ -563,10 +564,13 @@ def _load_epoch_checkpoint_messages(
                 not isinstance(message, dict)
                 or set(message) not in ({"role", "content"}, {"role", "content", "phase"})
                 or message.get("role") not in {"system", "user", "assistant", "tool"}
-                or ("phase" in message and (
-                    message.get("role") != "assistant"
-                    or message["phase"] not in {"commentary", "final_answer"}
-                ))
+                or (
+                    "phase" in message
+                    and (
+                        message.get("role") != "assistant"
+                        or message["phase"] not in {"commentary", "final_answer"}
+                    )
+                )
                 or not isinstance(message.get("content"), str)
             ):
                 raise ValueError(f"checkpoint {field} contains an invalid message")
@@ -706,8 +710,15 @@ _USAGE_EVENT_FORWARD_FIELDS = frozenset(
         "epoch",
         "fork_of",
         "quota_windows",
+        "situation_frame_version",
+        "situation_frame_source_watermark",
+        "situation_frame_sha256",
+        "situation_frame_bytes",
+        "situation_frame_truncated_sections",
     }
 )
+_MAX_TRUNCATED_SECTIONS = 16
+_SITUATION_SECTIONS = frozenset(SECTION_ORDER)
 
 
 def _invalid_tool_event_fields(msg: dict[str, Any]) -> list[str]:
@@ -785,11 +796,27 @@ def _invalid_usage_event_fields(msg: dict[str, Any]) -> list[str]:
         "summary_segments",
         "raw_tail_bytes",
         "epoch",
+        "situation_frame_version",
+        "situation_frame_source_watermark",
+        "situation_frame_bytes",
     ):
         if field in msg and not (type(msg[field]) is int and msg[field] >= 0):
             invalid.append(field)
     if "fork_of" in msg and not (type(msg["fork_of"]) is str and msg["fork_of"]):
         invalid.append("fork_of")
+    sha256 = msg.get("situation_frame_sha256")
+    if "situation_frame_sha256" in msg and not (
+        type(sha256) is str and _SHA256_HEX_RE.fullmatch(sha256)
+    ):
+        invalid.append("situation_frame_sha256")
+    truncated_sections = msg.get("situation_frame_truncated_sections")
+    if "situation_frame_truncated_sections" in msg and (
+        not isinstance(truncated_sections, list)
+        or len(truncated_sections) > _MAX_TRUNCATED_SECTIONS
+        or any(item not in _SITUATION_SECTIONS for item in truncated_sections)
+        or len(set(truncated_sections)) != len(truncated_sections)
+    ):
+        invalid.append("situation_frame_truncated_sections")
     if "call_kind" in msg and msg["call_kind"] not in {"agent", "summary"}:
         invalid.append("call_kind")
     for field in ("estimated_cost_usd", "latency_s", "retry_after_s"):
@@ -3811,7 +3838,8 @@ class _Runtime:
 
     async def _cancel_running_children(self, parent_task_id: str) -> None:
         children = [
-            task for task_id, task in self._child_runners.items()
+            task
+            for task_id, task in self._child_runners.items()
             if self._child_parent.get(task_id) == parent_task_id and not task.done()
         ]
         for task in children:
@@ -4432,7 +4460,8 @@ class _Runtime:
         if self._redactor is None:
             return dict(message)
         redacted = self._redactor.redact_protocol_record(
-            message, structural_fields=("role", "phase"),
+            message,
+            structural_fields=("role", "phase"),
         )
         return {**message, "content": cast(str, redacted["content"])}
 
@@ -4996,7 +5025,8 @@ class _Runtime:
                             return
                         leased_lane = (
                             self._lanes.get(spec.get("assigned_provider"))
-                            if spec.get("_lane_reserved") else None
+                            if spec.get("_lane_reserved")
+                            else None
                         )
                         _release_lane(self._lanes, spec)
                         self._lane_changed.set()
@@ -8299,7 +8329,8 @@ def _resolve_model_candidates(
     else:
         required = validate_requirements(requirements)
         request = RoutingRequest(
-            model="", allow_model_substitution=True,
+            model="",
+            allow_model_substitution=True,
             required_context_tokens=required.get("min_context_window", 0),
             quality=required.get("quality"),
             needs_python_tool=required.get("needs_python_tool", False),
@@ -8307,7 +8338,9 @@ def _resolve_model_candidates(
             allow_free=required.get("allow_free", True),
         )
         matching = [
-            p for p in providers if p.model in candidates
+            p
+            for p in providers
+            if p.model in candidates
             and (pinned_tier is None or p.tier.value == pinned_tier)
             and provider_satisfies_request(p, request)
         ]
@@ -8553,8 +8586,16 @@ def _child_spec(
     child_spec.setdefault("worktree_path", str(session_dir / "children" / component))
     child_spec.setdefault("branch", f"{parent_spec['branch']}--{component}")
     for field in (
-        "base_commit", "worker", "max_turns", "max_wall_s", "max_tokens", "max_restarts",
-        "write_marker", "model_candidates", "requirements", "fanout_config",
+        "base_commit",
+        "worker",
+        "max_turns",
+        "max_wall_s",
+        "max_tokens",
+        "max_restarts",
+        "write_marker",
+        "model_candidates",
+        "requirements",
+        "fanout_config",
     ):
         if field == "fanout_config" and (
             raw.get("worker", parent_spec.get("worker")) != parent_spec.get("worker")

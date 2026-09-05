@@ -1045,8 +1045,10 @@ def test_worker_context_reuse_fork_resume_is_byte_exact(tmp_path, monkeypatch) -
             assert isinstance(state_content, str)
             assert state_content.startswith("<cambium-loop-state>")
             assert state_content.endswith("</cambium-loop-state>")
+            assert "<cambium-situation " in state_content
             state_fields = (
-                state_content.removeprefix("<cambium-loop-state>")
+                worker._strip_situation_frame_content(state_content)
+                .removeprefix("<cambium-loop-state>")
                 .removesuffix("</cambium-loop-state>")
                 .split()
             )

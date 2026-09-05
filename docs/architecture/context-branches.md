@@ -97,5 +97,5 @@ trials or claim a speedup from one successful run.
 
 The ordinary defaults need no additional flags. Runtime observations belong in
 the existing events/checkpoints, and real rollouts in the benchmark reports.
-Keep open state/optimization proposals in [the plan](../../implementation-plan.md),
+Keep open state/optimization proposals marked explicitly,
 not in a second worker hierarchy or duplicate scheduler.

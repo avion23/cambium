@@ -98,7 +98,6 @@ actual effects, data loss, cancellation, replay and publication.
 
 Give each contract one owner: architecture for rationale/ownership, reference
 for exact shapes, how-to for sequences, research for measurements. Link rather
-than copy. Mark proposals explicitly. Keep only open work in
-[implementation-plan.md](implementation-plan.md). Update the owning document
+than copy. Mark proposals explicitly. Update the owning document
 when behavior changes; do not require a documentation or certification ritual
 before a normal tool call.

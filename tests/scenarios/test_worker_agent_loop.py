@@ -633,7 +633,8 @@ def test_agent_status_bar_is_last_context_tail_message(tmp_path: Path) -> None:
     second_messages = action_prompts[1]["messages"]
     assert first_messages[:2] == second_messages[:2]
     assert first_messages[-1]["role"] == "user"
-    assert first_messages[-1]["content"] == (
+    assert "<cambium-situation " in first_messages[-1]["content"]
+    assert worker._strip_situation_frame_content(first_messages[-1]["content"]) == (
         "<cambium-loop-state>budget=100% turn=1 epoch=0 code_changed=false "
         "verified_after_change=false verification_failed=false no_progress=0 "
         "budget_new_tokens=0 previous_prompt_tokens=0"
@@ -1152,13 +1153,10 @@ def test_tool_call_batch_cap_rejects_text_and_native_actions(tmp_path: Path) -> 
 def test_finish_does_not_require_a_ritual_shell_command(tmp_path: Path, shell_check: bool) -> None:
     worktree = _make_worktree(tmp_path / "repo")
     actions = [
-        '{"name":"write_file","arguments":'
-        '{"path":"note.txt","content":"hello\\n"}}',
+        '{"name":"write_file","arguments":{"path":"note.txt","content":"hello\\n"}}',
     ]
     if shell_check:
-        actions.append(
-            '{"type":"tool_call","name":"run_shell","arguments":{"cmd":["false"]}}'
-        )
+        actions.append('{"type":"tool_call","name":"run_shell","arguments":{"cmd":["false"]}}')
     actions.append('{"type":"finish","summary":"updated note","objective_met":true}')
     router = _ScriptedRouter(actions)
     outcome = asyncio.run(_drive_loop(_agent_config(worktree), worktree, router))

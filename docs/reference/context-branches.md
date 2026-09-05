@@ -137,11 +137,11 @@ artifact; see [prompt optimization](../architecture/optimization.md). A small
 task may start with a tool or a valid finish; a plan is optional.
 
 `branch_state.py` and CLI `inspect-state` provide current inspection. A
-model-facing `inspect_state` now shares the operator's recorded-state reader;
+model-facing `inspect_state` shares the operator's recorded-state reader;
 see [agent-state inspection](agent-state.md#9-inspect_state-tool--implemented).
-A mandatory SituationFrame, typed WorkLedger and richer ResultCapsule remain in
-[the implementation plan](../../implementation-plan.md); do not infer their wire
-support from target names in [agent-state](agent-state.md).
+The worker's bounded local SituationFrame is also implemented. Typed WorkLedger
+and richer ResultCapsule remain proposals; do not infer wire support merely
+from their target names in [agent-state](agent-state.md).
 
 ## Executable anchors
 

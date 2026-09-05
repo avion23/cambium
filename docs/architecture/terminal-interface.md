@@ -46,7 +46,7 @@ a free/subscription label. Neither label describes remaining token quota.
 
 ## Input and controls
 
-A resize keeps the native editor's live input line intact. Unicode wide and
+A resize keeps the unfinished input draft intact. Unicode wide and
 combining characters count by terminal cells, not Python string length.
 Bracketed paste and multi-line input must not accidentally execute embedded
 control sequences as commands.

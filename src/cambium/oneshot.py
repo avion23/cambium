@@ -821,9 +821,13 @@ def _resolve_provider(
     if config.provider is None and config.provider_env_keys:
         environment = {}
         env_store = auth_store if auth_store is not None else AuthStore()
-        for candidate in load_providers(config.provider_config_path):
-            if candidate.api_key_env not in config.provider_env_keys:
-                continue
+        candidates = [
+            p for p in load_providers(config.provider_config_path)
+            if p.api_key_env in config.provider_env_keys
+        ]
+        if set(config.provider_env_keys) - {p.api_key_env for p in candidates}:
+            raise ValueError("provider credential is not configured")
+        for candidate in candidates:
             environment.update(_stored_provider_environment(
                 candidate.name, env_store, provider_config_path=config.provider_config_path,
             ))

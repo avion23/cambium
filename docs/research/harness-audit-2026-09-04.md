@@ -78,8 +78,8 @@ useful-work ranking remain open integration work. Existing BranchState/CLI
 inspection, summaries, checkpoints, joins, provider accounting, and navigation
 are their starting points, not evidence that every proposed layer is complete.
 
-The single [implementation plan](../../implementation-plan.md) lists the remaining
-work. Current [runtime architecture](../architecture/architecture.md),
+At that revision, `implementation-plan.md` listed remaining work; that duplicate
+plan has since been removed. Current [runtime architecture](../architecture/architecture.md),
 [provider accounting](../architecture/provider-routing.md),
 [terminal contract](../architecture/terminal-interface.md), and
 [offline optimization](../architecture/optimization.md) own the implementation
@@ -198,3 +198,87 @@ empty commit. Captured terminal output was inspected, not just the model summary
 An earlier pinned-provider TUI run had instead reached verification and then
 failed on ZAI quota; it was not a rendering failure. These individual trials do
 not establish a general prompt improvement or reliable multi-provider speedup.
+
+## Selected runtime follow-up — September 5
+
+Started at fetched `origin/main` `20bf89c` in isolated worktree
+`cambium-19b38f89`, branch `streamline-runtime-20260905`. Integrated the subsequently
+published `d17db3b` SituationFrame work without modifying its parallel checkout.
+Kept its bounded local frame and removed the duplicate single-tool execution
+branch rather than restoring two implementations. Kept the parallel deletion
+of `implementation-plan.md`; contracts and remaining limits live with their owners.
+
+### Changes checked through their consumers
+
+- Codex Responses function-call items and argument completion events now reach
+  normal native-tool dispatch. Coding prompts no longer repeat the complete
+  summary schema/policy; the summary control carries it when needed.
+- Finish and exact/fresh delegation checkpoint without a mandatory summary.
+  Semantic batches fold once. One execution path owns tool observations,
+  cancellation and checkpointing; identical batch checkpoints are not rewritten
+  once per tool.
+- CAST uses existing D/F IDs plus O/V IDs for obligation closure and stale-check
+  invalidation. Replacements follow invalidations in a delta; previous entries
+  remain immutable. Manual K0 retains the raw tail and resets the prompt baseline.
+- Admission consumes observed quota/reset times and persisted Retry-After,
+  respects configured concurrency, and waits for capacity without occupying a
+  worker-process slot. Successful fallback moves the existing reservation once.
+- POSIX terminal input is owned by the event loop. PTY tests exercise immediate
+  resize, pasted newlines, F6 focus with an unfinished draft, cancellation and
+  terminal restoration. The input viewport is not a full multirow editor.
+- Model `inspect_state`, CLI `inspect-state` and TUI `/inspect` use one durable
+  BranchState reader. The worker-local SituationFrame has a different source
+  watermark; it is not falsely labelled as an event-store snapshot.
+- Eight historic/derived benchmark cases record provenance and keep task families
+  within one split. Interactive cases use the real session path, accepted Git
+  checks, history retrieval, reconnect and K0. Reports count malformed actions,
+  summary requests, failed provider attempts and actual serving providers.
+
+### Failures retained
+
+The first navigation/history benchmark failed before execution because a
+re-resolved automatic configuration treated credential environment-variable
+names as provider names. The resolver now maps them correctly and preserves the
+original provider/model pool across reconnects, including when other providers
+become available later. An unknown requested credential still fails explicitly.
+
+The first corrected-history trial exhausted its 75-second turn budget after
+five malformed model responses. A longer run completed the artifact checks but
+failed the required `inspect_state` trace: a running task's absent result was
+treated as a mapping. The reader now represents that pending result without an
+exception. The following trial passed, with one semantic summary and one K0.
+
+The merge check exposed obsolete terminal-summary accounting and a checkpoint
+fixture duplicating the producer's schema. The fixture now uses the real
+checkpoint writer; the assertions still check accepted events and exact persisted
+content. No malformed provider response or incomplete task is converted to success.
+
+### Executed checks
+
+On the final merged runtime:
+
+```sh
+PYTHONPATH=src python -m pytest -o addopts='' -n 2 -m 'not acceptance' -q
+PYTHONPATH=src python -m pytest -o addopts='' -m acceptance tests/acceptance/test_live_frontends.py -q
+PYTHONPATH=src python -m cambium optimize prompts --optimizer zero --case corrected-history --max-turns 16 --max-wall-s 90 --max-calls 45 --max-tokens 250000 --budget-usd 2 --output .cambium/integrated-corrected-history
+```
+
+The non-acceptance suite passed **1,906 tests with one skipped** (118.66 seconds).
+Both real CLI/TUI frontend tests passed (38.07 seconds). The final three-turn
+correction/child/K0/reconnect benchmark passed in **93.718 seconds**, using
+**22 calls and 102,243 reported tokens**, including one summary, one K0 rollover,
+four malformed actions and no tool failures. Only the requested file changed;
+the final read-only turn left its accepted head unchanged.
+
+Earlier in this work, navigation/history passed with nine calls and 25,069
+reported tokens; the frozen Cambium self-fix passed with four calls and 20,680
+tokens; a blocking exact child passed with six calls and 13,699 tokens. The latter
+two made **zero summary calls**. These are individual development runs, not a
+controlled speed comparison against the prior release.
+
+Reports remain in the worktree's `.cambium` benchmark directories; early failed
+trials are also under `/tmp/cambium-selected-*`. The final continuation run was
+served by ZAI, not a demonstrated simultaneous multi-provider speedup. Quota and
+lane behavior have deterministic runtime regressions; population-wide resource
+efficiency and prompt-quality gains still require the operator's GEPA experiment
+and fresh evaluation cases. No hill-climbing result was promoted in this work.

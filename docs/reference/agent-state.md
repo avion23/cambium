@@ -1,16 +1,17 @@
 # Agent state reference
 
-**Status:** current inspection/navigation interfaces plus explicitly proposed
-state shapes. `BranchState` and CLI replay inspection exist:
+**Status:** current inspection/navigation interfaces plus a landed Phase 2
+SituationFrame worker slice. `BranchState` and CLI replay inspection exist:
 
 ```sh
 cambium inspect-state /path/to/session
 ```
 
 `repo_query` below and `branch_history` in the [context-branch reference](context-branches.md)
-and `inspect_state` below are active worker tools. The full SituationFrame,
-WorkLedger, ResourceEnvelope and ResultCapsule-v2 sections remain proposals,
-not current worker wire contracts.
+and `inspect_state` below are active worker tools. The bounded local
+SituationFrame slice is implemented in `situation.py` and `worker.py`; shared
+durable inspection uses `state_view.py`. WorkLedger, ResourceEnvelope and
+ResultCapsule-v2 sections remain proposals, not current worker wire contracts.
 
 Rationale is in
 [`../architecture/agent-operating-model.md`](../architecture/agent-operating-model.md).
@@ -177,6 +178,15 @@ projections should use the same public vocabulary.
 
 The SituationFrame is a bounded text rendering of `BranchState`, appended as a
 normal late request message.
+
+### Current worker slice
+
+`src/cambium/worker.py` builds a bounded frame immediately before each normal
+worker provider call inside the existing `<cambium-loop-state>` user message.
+Epoch checkpoints persist the exact provider-sent messages including the transient
+frame. The forced-finalization terminal checkpoint excludes the harness
+`FINAL_SYNTHESIS_DIRECTIVE` by design. This slice does not yet provide the
+canonical supervisor/model/TUI projection or a durable `situation_frame_built` event.
 
 Canonical section order:
 

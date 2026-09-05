@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import subprocess
 from pathlib import Path
@@ -13,11 +12,10 @@ import pytest
 
 from cambium import worker
 from cambium.conversations import ConversationStore
-from cambium.diffundo import prompt_prefix_bytes
 from cambium.redact import build_session_redactor
 from cambium.store import CRITICAL_KINDS
 from cambium.supervisor import WorkerHandle, _Runtime
-from cambium.worker import CHECKPOINT_EPOCH_SCHEMA, _provider_task_tools_hash
+from cambium.worker import _provider_task_tools_hash
 
 pytestmark = pytest.mark.slow
 
@@ -171,52 +169,27 @@ def _write_checkpoint_file(session_dir: Path, event: dict[str, Any]) -> None:
 
 
 def _write_advanced_checkpoint(session_dir: Path) -> dict[str, Any]:
-    provider_messages = [
-        {"role": "system", "content": "system"},
-        {"role": "user", "content": "question"},
-    ]
-    continuation_suffix = [{"role": "assistant", "content": "folded"}]
-    cache_key = {
-        "provider": "fake-provider",
-        "model": "fake-model",
-        "protocol": "loopback",
-        "reasoning_effort": None,
-        "system_sha256": hashlib.sha256(b"system").hexdigest(),
-        "tools_sha256": _provider_task_tools_hash(),
-        "prefix_sha256": worker._messages_sha256(provider_messages),
-        "suffix_sha256": worker._messages_sha256(continuation_suffix),
-        "full_sha256": worker._messages_sha256([*provider_messages, *continuation_suffix]),
-        "prefix_bytes": prompt_prefix_bytes({"messages": provider_messages}) or 0,
-        "message_count": len(provider_messages),
-        "redacted": False,
-        "provider_boundary": _provider_boundary(),
-    }
-    payload: dict[str, Any] = {
-        "schema": CHECKPOINT_EPOCH_SCHEMA,
-        "task_id": "task",
-        "generation": 1,
-        "epoch": 2,
-        "turn": 2,
-        "created_at": 1.0,
-        "cache_key": cache_key,
-        "provider_messages": provider_messages,
-        "continuation_suffix": continuation_suffix,
-        "checkpoint_ref": "",
-        "code_changed": False,
-        "verified_after_change": False,
-        "verification_failed": False,
-        "no_progress_actions": 0,
-        "budget_new_tokens": 0,
-        "previous_prompt_tokens": 0,
-        "cumulative_usage": {},
-        "wall_deadline": 10.0,
-    }
-    persisted_address = worker._checkpoint_address(payload)
-    checkpoint_ref = f"task/epoch-002-{'a' * 16}-{persisted_address}.json"
-    payload["checkpoint_ref"] = checkpoint_ref
-    path = session_dir / ".cambium" / "checkpoints" / checkpoint_ref
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, sort_keys=True, indent=2), encoding="utf-8")
+    from dataclasses import asdict, replace
+
+    config = replace(
+        worker._PROVIDER_TOOLS_CONFIG, task_id="task",
+        checkpoint_root=session_dir / ".cambium" / "checkpoints",
+    )
+    checkpoint = worker._write_epoch_checkpoint(
+        config, turn=2, epoch=2,
+        provider_messages=[
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "question"},
+        ],
+        continuation_suffix=[{"role": "assistant", "content": "folded"}],
+        provider="fake-provider", model="fake-model",
+        tools_sha256=_provider_task_tools_hash(),
+        provider_compat={"fake-provider": ("loopback", None)},
+        provider_boundary=_provider_boundary(), created_at=1.0, wall_deadline=10.0,
+    )
+    assert checkpoint is not None
+    cache_key = asdict(checkpoint.cache_key)
+    checkpoint_ref = checkpoint.checkpoint_ref
     return {
         "type": "context_epoch_advanced",
         "request_id": "epoch-request",

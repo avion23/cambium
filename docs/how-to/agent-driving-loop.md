@@ -1,7 +1,8 @@
 # Drive Cambium as an agent
 
-**Status:** guide to the current coding loop. Proposed SituationFrame and
-`inspect_state` model interfaces are not prerequisites for this path.
+**Status:** guide to the current coding loop. The worker appends a bounded
+local SituationFrame. Model `inspect_state` and TUI `/inspect` read the same
+recorded branch state on demand; neither adds a separate classifier call.
 
 ## Orient and locate
 

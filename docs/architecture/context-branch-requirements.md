@@ -5,8 +5,8 @@ collects checks that protect actual state; it is not a specification for a
 second approval or policy framework.
 
 Rationale belongs in [context branches](context-branches.md), exact public
-shapes in [the reference](../reference/context-branches.md), and future work in
-[the implementation plan](../../implementation-plan.md).
+shapes in [the reference](../reference/context-branches.md); future work is
+marked explicitly in the owning document.
 
 ## Ownership
 
@@ -79,14 +79,16 @@ replaced with persuasive invented values.
 ## Known gaps, not implemented contracts
 
 `BranchState` and CLI inspection exist, but the TUI and model do not yet share
-all of its semantics. The full SituationFrame, WorkLedger and ResultCapsule-v2
+all of its semantics. The worker injects a bounded local `SituationFrame` into
+its final loop-state message and strips it before durable checkpointing; the
+full SituationFrame, WorkLedger and ResultCapsule-v2
 shapes in [agent-state reference](../reference/agent-state.md) remain proposals.
 Their existence in a document is not evidence of model tool support.
 
-Routing's default token-window normalizer is a load-spreading heuristic, not a
-real weekly entitlement. Root lease migration, unified resource-aware ranking,
-and evidence-linked verification across all projections remain open. See
-[provider routing](provider-routing.md) and the single open implementation plan.
+Routing uses observed quota/reset times and Retry-After when available; its
+unknown-quota normalizer remains a heuristic, not weekly entitlement. General
+throughput gains and evidence-linked verification across every projection still
+need measurement. See [provider routing](provider-routing.md).
 
 ## Representative executable regressions
 

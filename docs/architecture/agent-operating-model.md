@@ -1,7 +1,7 @@
 # Agent operating model
 
 **Status:** design rationale. The [runtime map](architecture.md) states what is
-implemented; the [open plan](../../implementation-plan.md) lists the gaps.
+implemented; gaps are marked explicitly where they are described.
 
 ## Purpose
 
@@ -110,9 +110,12 @@ real decision or helps diagnose a failure. Keep exact evidence available on
 request rather than copying it into every call.
 
 `SituationFrame`, structured obligations, and richer result capsules are useful
-proposals where they solve observed long-session failures. They are not a
-prerequisite for navigation, delegation, or a usable TUI. Their unimplemented
-parts remain proposals, not a list of compulsory infrastructure to build.
+proposals where they solve observed long-session failures. The base worker now
+injects a bounded local `SituationFrame` into its final loop-state message and
+strips it before durable checkpointing. The `inspect_state` tool now shares
+the durable BranchState reader with CLI/TUI inspection; its event-store watermark
+is distinct from the local frame's watermark. Richer capsules and full knowledge
+projection remain proposals, not compulsory infrastructure.
 
 ## How to improve it
 

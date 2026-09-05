@@ -508,10 +508,10 @@ def _provider_task(
 
 @pytest.mark.slow
 def test_debt_aware_selection_balances_across_tasks_and_feeds_ledger(tmp_path, monkeypatch) -> None:
-    """Two providers serve two candidate models; the ledger favours B, so the
-    batch pre-assignment pass (H1) assigns every task in the wave to A (the
-    lowest-utilization provider) in one pass from the persisted snapshot, and
-    the workers' usage still folds into the durable ledger."""
+    """Use the less-consumed provider first, then the other available lane.
+
+    Each real call updates its own provider's existing durable usage once.
+    """
     server_a = FakeServer(
         [(200, _finish_payload("done on A", model="m1", total_tokens=2_000_000), 0.0)]
     )
@@ -527,8 +527,7 @@ def test_debt_aware_selection_balances_across_tasks_and_feeds_ledger(tmp_path, m
             ],
         )
         state_path = tmp_path / "routing-state.json"
-        # ledger favours B: B already consumed 1M tokens (5% of the default
-        # 20M window) while A has none
+        # A has lower debt: B consumed 1M tokens while A has none.
         state_path.write_text(
             json.dumps(
                 {
@@ -574,9 +573,7 @@ def test_debt_aware_selection_balances_across_tasks_and_feeds_ledger(tmp_path, m
                 ),
             ]
         }
-        # the batch pass resolves the whole wave against the persisted
-        # snapshot in one go (H1): B's seeded 1M tokens make it 5% utilized,
-        # so every task in the wave is pre-assigned to A
+        # A gets the first task; its configured capacity leaves B for the second.
         result = asyncio.run(
             run_plan(
                 session_dir,
