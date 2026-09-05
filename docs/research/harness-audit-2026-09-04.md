@@ -282,3 +282,68 @@ served by ZAI, not a demonstrated simultaneous multi-provider speedup. Quota and
 lane behavior have deterministic runtime regressions; population-wide resource
 efficiency and prompt-quality gains still require the operator's GEPA experiment
 and fresh evaluation cases. No hill-climbing result was promoted in this work.
+
+## Reconnect finalization — September 5
+
+Reconnected after the connector restart at `origin/main` `be6190e`. No local or
+remote `dev` ref existed. Preserved the pending `finalize-cast-runtime-20260905`
+checkout, then isolated a snapshot in `cambium-ece9baf5` when concurrent edits
+appeared. Runtime changes were committed as `f08ab8e` and `b06ac1a`; unrelated
+working trees were not reset or cleaned.
+
+The historical correction transcript showed `tool inspect_state ok=True` with
+its body missing. Turn-checkpoint cleanup removed every embedded SituationFrame,
+including an explicit tool observation. Cleanup now recognizes only the generated
+loop-state message. A real checkpoint regression retains the explicit read while
+removing the transient frame. It also exposed `uncached_token_pressure` being
+redacted as a credential; that known metric now uses the existing metadata rule.
+
+Model and operator inspection now share the bounded SituationFrame renderer
+rather than separate JSON/text projections. It includes results and provider
+identity, keeps active children visible ahead of completed ones, and names real
+history operations for omitted detail instead of nonexistent inspection arguments.
+
+Requirement-constrained routing now consumes the same quota/cooldown evidence as
+ordinary assignment. An additional regression showed that even expired or
+unrelated windows switched the quality ranking to resource order. Only current
+observations for eligible providers now enable that preference. Existing quality
+ordering remains the tie-breaker; no synthetic weekly allowance was introduced.
+
+One benchmark wall deadline now covers follow-ups, children and reconnects.
+Timed-out rollouts retain reports and check accepted code, never salvage or an
+uncommitted worker tree. Paste handling inserts chunks rather than repeatedly
+copying the entire draft per character. PTY coverage retains Unicode, split
+framing and large multiline paste; the obsolete libedit-only fixture and a
+duplicated GEPA exercise were removed.
+
+### Final checks
+
+On code commit `b06ac1a`, the complete non-acceptance suite passed **1,910 tests,
+one skipped**, in **104.32 seconds**. It includes process, checkpoint/replay,
+provider-routing, real PTY input/resize/focus/paste and cancellation scenarios.
+Ruff and the whitespace check passed. Both real-provider CLI/TUI frontend tests
+passed in **48.36 seconds** after the routing correction.
+
+Two fresh historical rollouts ran through the public optimizer baseline command:
+
+| Case | Result | Seconds | Calls | Reported tokens | Summary calls |
+| --- | --- | --- | --- | --- | --- |
+| Frozen Cambium self-fix | Pass; only `src/cambium/render.py` changed | 35.762 | 10 | 106,920 | 0 |
+| Blocking trunk child | Pass; no code change; parent and child on ZAI | 25.551 | 6 | 22,919 | 0 |
+
+Reports are under `.cambium/final-small-tasks/` in the isolated worktree. These
+are individual runs, not a speed or prompt-quality comparison. The self-fix had
+three malformed actions and one failed exact-text edit; the blocking-child run
+had one malformed action. The plain-text action path still needs evaluation.
+
+The preserved pre-finalization three-turn correction run passed artifact and
+trace checks in 139.396 seconds, with 19 calls, 91,868 tokens, one summary and
+one K0. Its empty inspection observation prompted the persistence regression
+above: a passing artifact check did not prove intact history. A fresh correction
+benchmark launch was blocked by the connector/tool layer, so it is not reported
+as another live pass. No simultaneous multi-provider speedup is claimed.
+
+The GEPA dry run resolved all eight historical/derived cases with automatic
+candidate deployment enabled. No optimizer search ran and no prompt artifact
+was promoted. These cases are a development regression corpus; reserve new
+cases before claiming generalization from an eventual hill climb.
