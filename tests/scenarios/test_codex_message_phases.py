@@ -75,5 +75,3 @@ def test_phase_survives_context_and_is_part_of_its_identity() -> None:
     message = {"role": "assistant", "content": "{}", "phase": "commentary"}
     assert _context_message(message, "test") == message
     assert raw_tail_sha256([message]) != raw_tail_sha256([{**message, "phase": "final_answer"}])
-
-

@@ -136,7 +136,11 @@ The non-acceptance suite, including slow process and PTY tests, passed 1,876 tes
 with one skipped in `.cambium/continue-suite-03`. A later repair-feedback change
 passed all 67 affected loop/budget tests; one intervening full run exposed only
 an obsolete assertion pinning the old feedback wording, which was corrected.
-Lint and whitespace checks passed.
+Lint and whitespace checks passed. After merging the latest `origin/main`, the
+final integration run in `.cambium/continue-integration` passed **1,876 tests,
+one skipped**, in 103.55 seconds. This run includes the consolidated PTY stress
+and the final shared repair path; Ruff and the complete change's whitespace
+check passed as well.
 
 Real-provider results were mixed, and the failures are retained:
 
