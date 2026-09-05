@@ -6148,12 +6148,9 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                 phase = getattr(result, "assistant_phase", None)
                 if phase in {"commentary", "final_answer"}:
                     invalid_messages[0]["phase"] = phase
-                if base_messages is None:
-                    transcript.extend(invalid_messages)
-                else:
-                    context_continuation.extend(invalid_messages)
-                    transcript = _sync_context_transcript(
-                        base_messages, context_continuation, transcript
+                for invalid_message in invalid_messages:
+                    context_continuation, transcript = _append_context_message(
+                        invalid_message, base_messages, context_continuation, transcript, config,
                     )
                 base_messages, context_continuation, transcript = await _maybe_restore_turn_context(
                     turn_checkpoint_resumed=turn_checkpoint_resumed,

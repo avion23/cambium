@@ -63,7 +63,6 @@ this frontend retains a checkpoint.
 
 - [Interactive lifecycle](../../src/cambium/interactive.py),
   [TUI controller](../../src/cambium/tui.py)
-- [Real two-turn coding and read-only history retrieval](../../tests/acceptance/test_live_frontends.py)
-- [Live frontend history inspection](../../tests/acceptance/test_live_frontends.py),
+- [Real coding, read-only continuation and history inspection](../../tests/acceptance/test_live_frontends.py),
   [PTY input/resize/cancel tests](../../tests/scenarios/test_tui_live_pty.py),
   [live usage projection tests](../../tests/scenarios/test_tui_live_usage.py)

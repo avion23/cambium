@@ -1823,7 +1823,7 @@ def test_three_invalid_actions_fail_fast_with_no_progress(tmp_path: Path) -> Non
     assert [m["turn"] for m in checkpoints] == [1, 2, 3]
     recorded = json.loads(Path(checkpoints[-1]["state_ref"]).read_text())["transcript"]
     assert recorded[-2] == {"role": "assistant", "content": "not-json-three"}
-    assert "JSON-escape" in recorded[-1]["content"]
+    assert "invalid action: action is not valid JSON" in recorded[-1]["content"]
 
 
 def test_valid_action_resets_consecutive_invalid_action_bound(tmp_path: Path) -> None:
