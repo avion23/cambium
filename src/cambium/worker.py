@@ -3167,7 +3167,9 @@ def _strip_finalization_directive(messages: Sequence[dict[str, Any]]) -> list[di
 
 
 def _strip_situation_frame_content(content: str) -> str:
-    """Remove the transient frame while retaining its loop-state message."""
+    """Remove generated loop-state frames, never recorded tool or user evidence."""
+    if not content.startswith("<cambium-loop-state>"):
+        return content
     frame_start = content.find("\n<cambium-situation ")
     if frame_start < 0:
         return content

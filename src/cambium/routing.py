@@ -708,7 +708,8 @@ def resolve_assignment(
     try:
         if requirements:
             provider_name, model, _score = score_providers(
-                pool, candidates, debt, lanes, requirements=requirements
+                pool, candidates, debt, lanes, requirements=requirements,
+                quota_windows=quota_windows,
             )[0]
         else:
             provider_name, model = select_lane(
@@ -1059,16 +1060,26 @@ def select_lane(
 
     def rank(item: tuple[int, Any]) -> tuple[float, int, float, int, int]:
         index, provider = item
-        lane = lanes.get(provider.name)
-        current = debt.get(provider.name) if debt is not None else None
-        requests = current.requests if current is not None else 0
-        in_flight = lane.in_flight if lane is not None else 0
-        measured, _blocked, reset = quota_status(provider.name, quota_windows)
-        utilization = measured if measured is not None else _normalized_utilization(provider, debt)
-        return (utilization, in_flight, reset, requests, index)
+        return (*_resource_rank(provider, debt, lanes, quota_windows), index)
 
     _, winner = min(serving, key=rank)
     return winner.name, winner.model
+
+
+def _resource_rank(
+    provider: Any, debt: Mapping[str, ProviderDebt] | None,
+    lanes: Mapping[str, LaneState], quota_windows: Sequence[Any],
+) -> tuple[float, int, float, int]:
+    """Shared resource ordering after each caller's capability filtering."""
+    lane = lanes.get(provider.name)
+    current = debt.get(provider.name) if debt is not None else None
+    measured, _blocked, reset = quota_status(provider.name, quota_windows)
+    return (
+        measured if measured is not None else _normalized_utilization(provider, debt),
+        lane.in_flight if lane is not None else 0,
+        reset,
+        current.requests if current is not None else 0,
+    )
 
 
 def context_window_satisfies(provider: Any, required_context_tokens: int) -> bool:
@@ -1175,6 +1186,7 @@ def score_providers(
     lanes: Mapping[str, LaneState] | None = None,
     *,
     requirements: Mapping[str, Any] | None = None,
+    quota_windows: Sequence[Any] = (),
 ) -> list[tuple[str, str, float]]:
     """Capability-constrained scoring of providers serving a candidate model (H2).
 
@@ -1196,7 +1208,9 @@ def score_providers(
     lexicographic quality key is success confidence, latency-SLO compliance,
     expected cost per successful turn, then a normalized latency/cache
     tie-break. Missing evidence preserves config position. H1 lane filtering
-    applies when ``lanes`` is passed. Returns eligible
+    applies when ``lanes`` is passed. With observed quota windows, shared
+    resource ordering takes precedence and quality breaks resource ties.
+    Returns eligible
     ``(provider_name, model, score)`` triples, where the float score is the
     zero-based rank retained for API compatibility.
     """
@@ -1221,6 +1235,7 @@ def score_providers(
     )
     eligible: list[Any] = []
     capability_matches = 0
+    timestamp = time.time()
     for provider in providers:
         if not getattr(provider, "enabled", True):
             continue
@@ -1230,7 +1245,12 @@ def score_providers(
         if not provider_satisfies_request(provider, capability_request):
             continue
         capability_matches += 1
-        if _provider_is_quarantined(provider.name, debt):
+        current = (debt or {}).get(provider.name)
+        if (
+            _provider_is_quarantined(provider.name, debt)
+            or (getattr(current, "retry_at", None) or 0) > timestamp
+            or quota_status(provider.name, quota_windows, now=timestamp)[1] is not None
+        ):
             continue
         if lanes is not None:
             lane = lanes.get(provider.name)
@@ -1263,6 +1283,11 @@ def score_providers(
         now=time.time(),
         weights=DEFAULT_WEIGHTS,
     )
+    if quota_windows:
+        # Stable sorting retains quality order when resource pressure is equal.
+        ordered.sort(
+            key=lambda provider: _resource_rank(provider, debt, lanes or {}, quota_windows)
+        )
     return [(provider.name, provider.model, float(rank)) for rank, provider in enumerate(ordered)]
 
 

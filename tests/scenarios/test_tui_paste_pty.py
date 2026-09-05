@@ -1,13 +1,4 @@
-"""PTY regression: a bracketed-paste payload stays one prompt with its newlines.
-
-The fake-stream tests in test_tui_usability.py cover the app-side framing
-parser (the non-native ``source.readline()`` path).  These drive the real
-native readline path over a real PTY with ``\\x1b[200~`` / ``\\x1b[201~``
-framing.  The ``simulate_missing_paste_key`` case reproduces runtimes whose
-readline does not bind the paste-begin key (libedit, GNU readline < 8.0) by
-remapping it in INPUTRC; without the fix every newline inside the paste
-submits its own prompt.
-"""
+"""Real PTY paste framing keeps Unicode and large multiline payloads in one turn."""
 
 from __future__ import annotations
 
@@ -29,12 +20,6 @@ from test_tui_live_pty import (
 
 pytestmark = pytest.mark.slow
 
-# Two-line TOML snippet, framed as a real terminal paste, terminated by Enter.
-_PASTE = b'\x1b[200~[tool]\nname = "x"\x1b[201~\r'
-_ONE_PROMPT = '<cambium-task>\nTask: [tool]\nname = "x"\n</cambium-task>'
-_SWALLOW_INPUTRC = '"\\e[200~": abort\n"\\e[201~": abort\n'
-
-
 def _submitted_prompts(server: _CannedOpenAIServer) -> set[str]:
     """Distinct user prompts the TUI turned into provider requests."""
     prompts = set()
@@ -46,11 +31,9 @@ def _submitted_prompts(server: _CannedOpenAIServer) -> set[str]:
     return prompts
 
 
-def test_bracketed_paste_submits_one_prompt_with_newlines(tmp_path: Path, monkeypatch) -> None:
-    inputrc = tmp_path / "swallow-paste.inputrc"
-    inputrc.write_text(_SWALLOW_INPUTRC, encoding="utf-8")
-    monkeypatch.setenv("INPUTRC", str(inputrc))
-
+@pytest.mark.parametrize("text", ['[tool]\nname = "界é"', 'line = "value"\n' * 2048],
+                         ids=["unicode", "large"])
+def test_bracketed_paste_submits_one_prompt_with_newlines(tmp_path: Path, text: str) -> None:
     server = _CannedOpenAIServer()
     process = None
     master_fd = -1
@@ -62,7 +45,10 @@ def test_bracketed_paste_submits_one_prompt_with_newlines(tmp_path: Path, monkey
         process, master_fd = _spawn_tui(repo, providers)
         _read_until(master_fd, output, _PROMPT_REPAINT, 5.0)
 
-        os.write(master_fd, _PASTE)
+        wire = b'\x1b[200~' + text.replace('\n', '\r\n').encode() + b'\x1b[201~\r'
+        while wire:
+            sent = os.write(master_fd, wire[:4096])
+            wire = wire[sent:]
         assert server.request_started.wait(5.0)
         server.release.set()
         _read_until(master_fd, output, b"canned response", 8.0)
@@ -70,7 +56,7 @@ def test_bracketed_paste_submits_one_prompt_with_newlines(tmp_path: Path, monkey
         # give any queued turn time to reach the provider before asserting.
         _read_into(master_fd, output, 2.0)
 
-        assert _submitted_prompts(server) == {_ONE_PROMPT}
+        assert _submitted_prompts(server) == {f'<cambium-task>\nTask: {text}\n</cambium-task>'}
 
         os.write(master_fd, b"/exit\n")
         assert _wait_exit(process, master_fd, output, 3.0) == 0

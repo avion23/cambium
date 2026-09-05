@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from .branch_state import BranchState, Child
+from .branch_state import _TERMINAL_LIFECYCLES, BranchState, Child
 
 SITUATION_PROJECTION_VERSION = 1
 SECTION_ORDER = (
@@ -228,10 +228,14 @@ def _accepted_rows(state: BranchState) -> list[str]:
 
 
 def _delta_rows(state: BranchState) -> list[str]:
+    result = state.result
     return [
         _scalar("last_meaningful_delta", state.control.last_meaningful_delta),
         _scalar("last_event", state.last_event_kind),
         _scalar("current_tool", state.current_tool),
+        _scalar("result", result.status if result is not None else None),
+        _scalar("failure_reason", result.failure_reason if result is not None else None),
+        _scalar("summary", result.summary if result is not None else None),
     ]
 
 
@@ -252,6 +256,8 @@ def _child_row(child: Child) -> str:
         f"context_mode={_text(child.context_mode)}",
         f"placement={_text(child.placement)}",
         f"artifact_status={_text(child.artifact_status)}",
+        f"provider={_text(child.provider)}",
+        f"model={_text(child.model)}",
     ]
     if child.current_tool is not None:
         values.append(f"current_tool={_text(child.current_tool)}")
@@ -261,7 +267,9 @@ def _child_row(child: Child) -> str:
 
 
 def _children_rows(state: BranchState) -> list[str]:
-    children = sorted(state.children, key=lambda child: (child.admission_index, child.branch_id))
+    children = sorted(state.children, key=lambda child: (
+        child.lifecycle in _TERMINAL_LIFECYCLES, child.admission_index, child.branch_id,
+    ))
     return [_child_row(child) for child in children]
 
 
@@ -306,11 +314,9 @@ _ROW_BUILDERS = {
 }
 
 
-def _continuation_marker(section: str, state: BranchState) -> str:
-    return (
-        f"  [truncated {section}; inspect_state(section={section}, "
-        f"source_watermark={state.source_watermark})]"
-    )
+def _continuation_marker(section: str) -> str:
+    action = "branches" if section == "CHILDREN" else "tools"
+    return f"  [truncated {section}; branch_history(action={action}) for recorded evidence]"
 
 
 def _line_bytes(lines: list[str]) -> int:
@@ -327,12 +333,12 @@ def _bounded_section(
     body = [section, *selected]
     if not truncated and _line_bytes(body) <= byte_cap:
         return body
-    marker = _continuation_marker(section, state)
+    marker = _continuation_marker(section)
     while selected and _line_bytes([section, *selected, marker]) > byte_cap:
         selected.pop()
     if _line_bytes([section, marker]) > byte_cap:
         raise ValueError(
-            f"section byte cap for {section} is too small for its inspect_state anchor"
+            f"section byte cap for {section} is too small for its history anchor"
         )
     return [section, *selected, marker]
 
@@ -374,8 +380,8 @@ def render_situation_frame(
     The renderer reads only immutable ``BranchState`` values.  It preserves all
     mandatory section headers, applies per-section item/byte caps first, then
     removes lower-priority section rows when the whole-frame cap requires it.
-    Every omitted section carries its name and a bounded ``inspect_state``
-    continuation anchor.
+    Every omitted section names an existing ``branch_history`` operation for
+    retrieving recorded evidence; local watermarks are not tool arguments.
     """
 
     if not isinstance(state, BranchState):
@@ -387,7 +393,7 @@ def render_situation_frame(
     }
     if _frame_bytes(state, sections) > frame_limits.max_frame_bytes:
         for section in reversed(SECTION_ORDER):
-            marker = _continuation_marker(section, state)
+            marker = _continuation_marker(section)
             if sections[section][1:] == [marker]:
                 continue
             if len(sections[section]) <= 1:
@@ -397,9 +403,7 @@ def render_situation_frame(
                 break
     if _frame_bytes(state, sections) > frame_limits.max_frame_bytes:
         raise ValueError("whole-frame byte cap is too small for the mandatory frame structure")
-    return (
-        "\n".join(line for section in _frame_lines(state, sections) for line in (section,)) + "\n"
-    )
+    return "\n".join(_frame_lines(state, sections)) + "\n"
 
 
 __all__ = [

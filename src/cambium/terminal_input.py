@@ -176,10 +176,20 @@ class TerminalInput:
                 return
             self.pending += self.decoder.decode(data)
             while self.pending:
-                if self.pasting and self.pending == "\r":
-                    break
-                if self.pasting and self.pending.startswith("\r\n"):
-                    self.pending = "\n" + self.pending[2:]
+                if self.pasting and not self.pending.startswith("\x1b"):
+                    # Insert a paste chunk once, not by repeatedly copying the
+                    # whole draft for each character. Leave split CRLF intact.
+                    end = self.pending.find("\x1b")
+                    if end < 0:
+                        end = len(self.pending) - int(self.pending.endswith("\r"))
+                    if not end:
+                        break
+                    text, self.pending = self.pending[:end], self.pending[end:]
+                    text = text.replace("\r\n", "\n").replace("\r", "\n")
+                    self._insert("".join(
+                        char for char in text if char.isprintable() or char in "\n\t"
+                    ))
+                    continue
                 if self.pending.startswith("\x1b"):
                     # CSI sequences can arrive across reads; never execute a
                     # newline inside a pasted payload as an operator command.

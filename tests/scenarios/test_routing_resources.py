@@ -6,6 +6,8 @@ import json
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from cambium.diffundo import ProviderConfig, ProviderTier
 from cambium.provider_scheduler import QuotaWindowSnapshot
 from cambium.routing import DebtStore, LaneState, resolve_assignment
@@ -19,15 +21,20 @@ def _provider(name):
     )
 
 
-def test_quota_expiry_and_cooldown_use_observations_not_decayed_debt(tmp_path):
+@pytest.mark.parametrize("requirements", [None, {"needs_python_tool": True}])
+def test_quota_expiry_and_cooldown_use_observations_not_decayed_debt(tmp_path, requirements):
     now = time.time()
     providers = [_provider("a"), _provider("b")]
     lanes = {p.name: LaneState.from_provider(p) for p in providers}
     windows = [QuotaWindowSnapshot("a", "week", now + 300, 1000, 1000, 0, 0, 0.0)]
-    assignment = resolve_assignment(providers, ["a", "b"], {}, lanes, quota_windows=windows)
+    assignment = resolve_assignment(
+        providers, ["a", "b"], {}, lanes, quota_windows=windows, requirements=requirements,
+    )
     assert assignment.provider == "b"
     expired = [QuotaWindowSnapshot("a", "week", now - 1, 1000, 1000, 0, 0, 0.0)]
-    assignment = resolve_assignment(providers, ["a", "b"], {}, lanes, quota_windows=expired)
+    assignment = resolve_assignment(
+        providers, ["a", "b"], {}, lanes, quota_windows=expired, requirements=requirements,
+    )
     assert assignment.provider == "a"
     store = DebtStore(tmp_path / "debt.json")
     store.record({"provider": "a", "failure_reason": "quota: HTTP 429", "retry_after_s": 30})
@@ -35,13 +42,19 @@ def test_quota_expiry_and_cooldown_use_observations_not_decayed_debt(tmp_path):
     reloaded = DebtStore(tmp_path / "debt.json")
     reloaded.load()
     assert reloaded.as_mapping()["a"].retry_at > now
-    assert resolve_assignment(providers, ["a", "b"], reloaded.as_mapping(), lanes).provider == "b"
+    assert resolve_assignment(
+        providers, ["a", "b"], reloaded.as_mapping(), lanes, requirements=requirements,
+    ).provider == "b"
     # A zero-price provider is still unavailable while its actual token window is exhausted.
-    assert resolve_assignment(providers[:1], ["a"], {}, lanes, quota_windows=windows) is None
+    assert resolve_assignment(
+        providers[:1], ["a"], {}, lanes, quota_windows=windows, requirements=requirements,
+    ) is None
     # With comparable pressure, consume allowance that renews sooner.
     windows = [QuotaWindowSnapshot(p.name, "week", now + seconds, 1000, 100, 0, 0, 0.0)
                for p, seconds in zip(providers, [600, 60], strict=True)]
-    assignment = resolve_assignment(providers, ["a", "b"], {}, lanes, quota_windows=windows)
+    assignment = resolve_assignment(
+        providers, ["a", "b"], {}, lanes, quota_windows=windows, requirements=requirements,
+    )
     assert assignment.provider == "b"
 
 

@@ -208,9 +208,17 @@ def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact che
             turn_heads.append(_git(repo, "rev-parse", "main"))
         return result.exit_code, "; ".join(r.reason for r in result.results if r.reason)
 
+    async def bounded_execute() -> tuple[int, str]:
+        # One existing wall budget covers the whole case, including follow-ups,
+        # child joins and reconnects; it must not restart on each operator turn.
+        async with asyncio.timeout(max_wall_s):
+            return await execute()
+
     error = ""
     try:
-        exit_code, error = asyncio.run(execute())
+        exit_code, error = asyncio.run(bounded_execute())
+    except TimeoutError:
+        exit_code, error = 1, f"rollout wall budget exhausted ({max_wall_s:g}s)"
     except asyncio.CancelledError:
         exit_code, error = 1, "experiment budget exhausted; rollout cancelled"
     elapsed = time.monotonic() - started

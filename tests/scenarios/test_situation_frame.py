@@ -132,8 +132,8 @@ def test_section_and_whole_caps_name_omissions_and_anchor_inspection() -> None:
     assert [line for line in frame.splitlines() if line in SECTION_ORDER] == list(SECTION_ORDER)
     assert "truncated MISSION" in frame
     assert "truncated CHILDREN" in frame
-    assert "inspect_state(section=MISSION, source_watermark=6)" in frame
-    assert "inspect_state(section=CHILDREN, source_watermark=6)" in frame
+    assert "truncated MISSION; branch_history(action=tools)" in frame
+    assert "truncated CHILDREN; branch_history(action=branches)" in frame
 
 
 def test_equivalent_arrival_orders_render_byte_identical_under_truncation() -> None:
@@ -309,7 +309,7 @@ def test_worker_loop_injects_bounded_ordered_situation_frame(
         assert len(content_lines) <= limits.items_for(section)
 
     assert "truncated AUTHORITY" in frame
-    assert "inspect_state(section=AUTHORITY, source_watermark=2)" in frame
+    assert "truncated AUTHORITY; branch_history(action=tools)" in frame
     payload = "\n".join(lines[1:-1])
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
     assert f'frame_sha256="{digest}"' in lines[0]

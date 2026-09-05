@@ -40,33 +40,32 @@ def test_shipped_benchmark_has_disjoint_splits_and_self_change() -> None:
     assert len({case["id"] for case in cases}) == len(cases)
 
 
-def test_real_gepa_updates_the_policy_used_by_rollouts() -> None:
-    dspy = pytest.importorskip("dspy")
-    from cambium.prompt_optimize import make_program, metric
+def test_rollout_timeout_retains_report_and_checks_only_accepted_code(tmp_path, monkeypatch):
+    import asyncio
+    import json
 
-    seen = []
+    from cambium import benchmark
 
-    def rollout(case, policy):
-        seen.append(policy["coding"])
-        return {"score": 1.0 if policy["coding"] == "improved" else 0.0, "feedback": "check failed"}
+    async def blocked_provider(*args, **kwargs):
+        await asyncio.Event().wait()
 
-    student = make_program("coding", {"coding": "baseline", "summary": "keep facts"}, rollout)
-
-    def propose(candidate, reflective_dataset, components_to_update):
-        return {name: "improved" for name in components_to_update}
-
-    optimizer = dspy.GEPA(
-        metric=metric, instruction_proposer=propose, max_metric_calls=8,
-        reflection_minibatch_size=1, candidate_selection_strategy="current_best",
-        use_merge=False, num_threads=1, seed=0,
+    monkeypatch.setattr(benchmark, "run_plan", blocked_provider)
+    monkeypatch.setattr(benchmark, "_resolve_provider", lambda config, repo: (config, {}))
+    row = benchmark.run_case(
+        {
+            "id": "timeout", "split": "train", "task": "Read the file without edits",
+            "files": {"note.txt": "unchanged"}, "read_only": True,
+            "check": ["{python}", "-c", "from pathlib import Path; "
+                      "assert Path('note.txt').read_text() == 'unchanged'"],
+        },
+        {"coding": "Read only.", "summary": "Keep facts."}, output=tmp_path,
+        budget=ExperimentBudget(10, 1000, 1), max_wall_s=0.02,
     )
-    compiled = optimizer.compile(
-        student, trainset=[dspy.Example(case={"id": "train"}).with_inputs("case")],
-        valset=[dspy.Example(case={"id": "val"}).with_inputs("case")],
-    )
-    assert compiled.policy.signature.instructions == "improved"
-    assert compiled(case={"id": "heldout"}).score == 1.0
-    assert "baseline" in seen and "improved" in seen
+    assert not row["passed"]
+    assert "rollout wall budget exhausted" in row["feedback"]
+    assert "check=True" in row["feedback"]
+    assert row["head"] == row["base"]
+    assert json.loads((Path(row["directory"]) / "report.json").read_text()) == row
 
 
 @pytest.mark.parametrize("no_deploy", [False, True])

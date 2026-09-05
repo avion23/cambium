@@ -197,6 +197,21 @@ def test_epoch_checkpoint_persists_exact_provider_request_including_frame(
     assert "<cambium-situation " in persisted["content"]["provider_messages"][1]["content"]
 
 
+def test_turn_checkpoint_preserves_explicit_inspection(tmp_path: Path) -> None:
+    repo = _git_repo(tmp_path)
+    config = _config(repo, checkpoint_root=tmp_path / "checkpoints")
+    transient = _framed_request()[1]
+    observation = {
+        "role": "user",
+        "content": "tool inspect_state ok=True\n" + worker.render_situation_frame(worker.BranchState()),
+    }
+    path = worker._write_checkpoint_file(config, 1, [transient, observation], {}, [])
+    recorded = json.loads(path.read_text())["transcript"]
+    assert "<cambium-situation " not in recorded[0]["content"]
+    assert recorded[1] == observation
+    assert transient == _framed_request()[1]
+
+
 def test_forced_finalization_terminal_checkpoint_excludes_directive(tmp_path: Path) -> None:
     """Driving _run_agent_loop: the forced-final call carries the harness
     directive and the frame, but the durable terminal epoch checkpoint
