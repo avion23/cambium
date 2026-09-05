@@ -370,3 +370,55 @@ The earlier `.cambium/finalize-corrected` attempt ended after the connector wait
 with two completed turns but no final result. That interrupted attempt is not a
 pass; it motivated the whole-rollout deadline. Neither set of live runs proves
 simultaneous multi-provider speedup or long-run quota efficiency.
+
+## Restarted-connector verification and parallel-repair fix — September 5
+
+Reopened the project at fetched `origin/main` `6895ee8`; neither local nor remote
+`dev` existed. The selected runtime work was already integrated. Continued in a
+new isolated worktree, `cambium-94301724`, without changing the other checkouts.
+Code changes are in `35f025b`.
+
+A fresh historical parallel-utilities run produced correct artifacts but used
+two sequential child suspensions. Its first malformed delegation batch received
+our generic advice to retry one call, which made the model serialize the work.
+Repair feedback now preserves independent delegates in one batch. The benchmark
+requires overlapping unfinished siblings for this specific parallel task;
+admitted-but-queued work counts, so it does not invent a provider-concurrency
+or speedup claim. Successful serving providers are distinct from failed attempts.
+One provider-response normalizer also replaces the duplicated action parsing.
+
+A fresh correction/K0/reconnect run retained the explicit `inspect_state` body
+and reopened both the old and new checks through history. Its K0 still listed
+work pending at the earlier summary boundary, while the retained raw tail
+contained completion. K0 now explicitly states that scope instead of implying
+that its summarized state includes later observations. No extra summary request
+or inferred obligation closure was added.
+
+The POSIX input editor now keeps Up/Down inside multiline drafts, uses
+line-local Home/End and Ctrl-A/E, and displays the current line number. The
+existing real PTY test now checks editing both pasted lines, focus changes,
+immediate resize and the exact submitted draft. A benchmark presence-only test
+was replaced with a regression distinguishing overlapping, serial and nested
+children; the suite did not acquire another copy of the same frontend fixture.
+
+| Fresh case | Result | Seconds | Calls | Reported tokens | Summaries |
+| --- | --- | --- | --- | --- | --- |
+| Corrected history, K0 and reconnect | Pass; explicit inspection/evidence retained | 105.597 | 20 | 91,949 | 1 |
+| Parallel utilities before repair | Artifact pass, but only one pending child at a time | 157.782 | 32 | 177,709 | 2 |
+| Parallel utilities after repair | Pass; two overlapping siblings, accepted combined code | 95.238 | 15 | 79,842 | 1 |
+| Blocking trunk child | Pass; same provider, no code change | 18.126 | 6 | 22,701 | 0 |
+
+These runs are under `.cambium/restart-*` in the isolated worktree. All successful
+calls in these runs were served by ZAI. They are individual trials, not a
+controlled speed comparison or evidence of simultaneous distinct providers.
+The corrected-history run had five malformed actions. The repaired parallel run
+had three malformed actions and two tool failures before successful completion;
+the blocking-child run had one malformed action. Negative evidence is retained.
+
+The final code passed **1,910 non-acceptance tests, one skipped**, in 105.47 seconds,
+including slow process, quota, CAST, inspection and real PTY cases. Both actual
+CLI/TUI frontend tests passed in 39.82 seconds. The captured TUI was inspected;
+its edit/history continuation used eight calls, 28,199 tokens and zero summaries.
+Ruff and whitespace checks passed. GEPA dry-run resolved all eight historical or
+derived cases with automatic deployment enabled; no optimizer search ran and no
+candidate prompt was promoted.
