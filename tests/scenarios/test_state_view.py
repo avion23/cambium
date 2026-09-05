@@ -27,6 +27,9 @@ def test_inspection_does_not_interleave_turns_and_can_focus_a_child(tmp_path, mo
             store.append({"kind": "task_assigned", "task_id": "review", "payload": {
                 "parent_task_id": "root", "task": "review one commit",
             }})
+            active = json.loads(state_text(root, "review"))
+            assert active["objective"] == "review one commit"
+            assert active["result"]["status"] is None
             store.append({"kind": "result", "task_id": "review", "payload": {
                 "status": "succeeded", "summary": f"reviewed {objective}",
             }})

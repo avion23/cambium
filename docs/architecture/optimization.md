@@ -14,7 +14,9 @@ runs the existing supervisor and worker against an isolated repository.
 The checker runs against the accepted Git head, not an uncommitted worker tree
 or a model's claim of success. Reports retain changed paths, outcomes, elapsed
 time, calls, reported tokens, estimated cost, child policies and actual serving
-providers. Execution artifacts remain in each rollout directory.
+providers. They also distinguish summary requests, malformed actions, failed
+provider attempts, tool failures, output/cache tokens and accepted heads after
+each interactive turn. Execution artifacts remain in each rollout directory.
 
 DSPy format is useful at this optimization boundary, not everywhere. Tools,
 Git effects, provider configuration and the normal action protocol stay ordinary
@@ -75,6 +77,34 @@ The output directory contains `candidate.json` when produced, `report.json`,
 and individual rollout repositories, events and checkpoints. Copy a previously
 retained policy artifact back to the configured prompt path to revert it.
 
+## Historical corpus
+
+`src/cambium/benchmarks/prompts.jsonl` contains eight frozen cases adapted from
+recorded Cambium sessions. Each records its source session and a task family.
+The loader rejects a family split across training and final evaluation. Derived
+variants are labelled as variants, not claimed to be transcripts that occurred.
+
+| Split | Cases | Historical basis |
+| --- | --- | --- |
+| Train | `arithmetic`, `parallel-modules` | Small repair and failed independent-module runs |
+| Train | `parallel-utilities` | The CSV/configuration join failure, with explicit semantic children |
+| Validation | `cambium-self-fix` | Repair `render_tokens_per_s(None)` at frozen Cambium commit `63034cc` |
+| Validation | `blocking-child` | One read-only child sharing the current trunk/provider |
+| Test | `navigation-history` | Actual edit, check, and exact tool-evidence retrieval |
+| Test | `history-reconnect` | Derived continuation across frontend reconnect |
+| Test | `corrected-history` | Derived requirement change, semantic review, K0, reconnect and stale-check recall |
+
+The interactive runner uses the same `InteractiveSession` as the frontends.
+Its check runs outside the agent's editable worktree against accepted code.
+Read-only follow-ups must leave the accepted head unchanged. Required tool,
+child or rollover evidence is checked only in cases specifically testing those
+behaviors; ordinary coding cases do not reward extra children or extra calls.
+
+The raw source sessions are development artifacts under the earlier worktree's
+`.cambium` directories. The fixtures contain the minimum task/input/check,
+not credentials or entire private transcripts. Source provenance and negative
+runs are described in [the audit](../research/harness-audit-2026-09-04.md).
+
 ## Metrics and limitations
 
 Correct accepted output is primary. A passing case receives a small bounded
@@ -84,9 +114,11 @@ score zero. This is an explicit heuristic, not a calibrated economic model.
 Keep train, validation and test cases disjoint. Do not repeatedly revise prompts
 against the final test cases and still call them held out. Repeat close
 comparisons and enlarge the corpus before treating small gains as general.
-The packaged cases are starter fixtures, not a representative coding benchmark.
-In particular, use long continuation/fold/recovery cases to evaluate summary
-quality rather than relying on tiny functions.
+The eight cases now exercise continuation, corrections, a semantic fold and K0,
+but remain a small development corpus, not a representative coding benchmark.
+Once a test case is used to repair the harness, it is a regression case, not
+independent evidence of generalization. Reserve fresh cases before making that
+claim after a GEPA search.
 
 Freeze repository revision, provider pool and runtime behavior during a prompt
 comparison. Provider failure and malformed model output remain failures in the

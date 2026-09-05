@@ -1495,13 +1495,15 @@ async def _run_interactive(
             cockpit_stream.flush()
         except (BrokenPipeError, OSError, ValueError):
             pass
-        await _close_input_reader()
-        if editor is not None:
-            editor.close()
-        elif native_input:
-            _save_history(history_path)
-        if lock_acquired:
-            session.release()
+        try:
+            await _close_input_reader()
+            if editor is not None:
+                editor.close()
+            elif native_input:
+                _save_history(history_path)
+        finally:
+            if lock_acquired:
+                session.release()
 
 
 async def run_tui(

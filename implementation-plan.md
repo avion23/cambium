@@ -1,60 +1,60 @@
 # Open work
 
-Implemented behavior belongs in the [runtime map](docs/architecture/architecture.md),
-[CAST model](docs/architecture/context-engine.md),
-[delegation contract](docs/architecture/context-branches.md) and
-[prompt experiments](docs/architecture/optimization.md). Do not duplicate those
-contracts here or add a prerequisite framework before useful work can run.
+Current contracts have one owner: [runtime](docs/architecture/architecture.md),
+[CAST](docs/architecture/context-engine.md),
+[delegation](docs/architecture/context-branches.md),
+[provider resources](docs/architecture/provider-routing.md),
+[terminal interaction](docs/architecture/terminal-interface.md) and
+[prompt experiments](docs/architecture/optimization.md).
 
-## Improve measured completion
+## Measure completion rather than adding control layers
 
-The normal model chooses delegation. The worker completes policy defaults and
-the supervisor supplies child workspaces and provider placement. Real runs can
-still fail through malformed model actions, provider unavailability, expensive
-coordination or exhausted budgets. Use the existing benchmark reports and
-transcripts to distinguish these causes. Do not count requested or assigned
-providers as proof of actual multi-provider execution.
+The model chooses decomposition in its ordinary action call. The supervisor
+supplies child workspaces, provider placement and capacity waiting. Native
+Codex tool output is consumed when the provider uses it, but text-only providers
+can still emit malformed JSON. Fix demonstrated transport defects; do not guess
+ambiguous actions or add a paid classifier before every tool.
 
-Build a broader frozen task corpus and run the prepared GEPA experiment. The
-coding and summary policies now deploy automatically for new sessions, but no
-population-wide quality or efficiency gain has been established. Starter cases
-are insufficient for claims about long-session memory or general coding.
+The historical benchmark contains eight cases, with source provenance and
+explicitly derived continuation variants. Run the prepared GEPA experiment and
+extend it with fresh cases before claiming general improvement. Cases used to
+repair the runtime are regression evidence, not independent final evaluation.
+Keep failures and the cost of retries, summaries and joins in the comparison.
 
 ## Context quality
 
-CAST appends semantic deltas and retains raw history. K0's text-based compiler
-cannot infer arbitrary semantic contradictions or automatically close every
-old open item. Improve the smallest observed lost-obligation or stale-fact
-case before introducing a typed WorkLedger or richer ResultCapsule.
+Ordinary completion and exact/fresh delegation save checkpoints without forced
+summaries. Semantic delegation and working-set thresholds still fold new raw
+evidence. K0 supports explicit replacement, obligation closure and stale-check
+invalidation through existing semantic entries. It does not infer truth or
+completion from arbitrary prose. Reproduce an actual lost obligation before
+adding a richer WorkLedger or ResultCapsule.
 
-`BranchState` and CLI inspection exist. Shared model/operator state and the
-complete SituationFrame remain separate integration work, including the
-parallel checkout. Do not absorb its uncommitted changes. Reuse the existing
-sources and reducer rather than introducing another memory store.
+Model, CLI and TUI inspection now share the recorded BranchState reader. A
+mandatory per-turn SituationFrame and full knowledge projection remain separate
+proposals. Preserve the unfinished parallel checkout; do not absorb it merely
+to declare the diagram complete.
 
-## Provider resources
+## Resource measurements
 
-Admission, call-time fallback and actual serving usage are distinct. Measure
-accepted work and quota consumption over real account windows. Current decayed
-routing debt is a balancing heuristic, not a weekly-entitlement model. Keep
-request rate, concurrent capacity, context/cache affinity and cash separate.
-Do not add speculative preflight calls or permanent quarantine rules to hide
-ordinary provider failures.
+Known quota windows, reset times, Retry-After and configured concurrent capacity
+now affect admission. Unknown allowances still use balancing heuristics, not
+invented weekly entitlement. Compare repeated accepted tasks/hour and quota per
+accepted task across providers; no optimal or generally faster ranking has been
+demonstrated. Keep task assignment distinct from the provider that actually
+served a call after fallback.
 
 ## Terminal usability
 
-Compact lane/provider state, CAST context and resource rows are implemented.
-Input editing still uses the native line editor; full geometry repaint can be
-deferred while editing to avoid cross-thread native buffer access. Replacing
-that ownership boundary requires real PTY resize/paste/cancel/reconnect checks,
-not more flags or another frontend state store. Do not describe the current
-interface as universally best-in-class on the basis of passing render tests.
+POSIX input is event-loop-owned; resize, paste and F6 focus preserve its draft.
+The draft uses a horizontal viewport with newline markers, not a full multirow
+editor. The conversation remains a combined transcript rather than independent
+per-child transcript tabs. Non-POSIX input still uses the line-reader path and
+needs separate platform verification.
 
-## Completion discipline
+## Change discipline
 
-Fix a reproduced cause, retain one useful regression, run affected checks and
-commit/integrate the result. Remove repeated fixtures and source-pinning tests,
-not checks for meaningful failures. A shell command returning zero does not
-certify a whole task. A budget ending without a finish verdict is incomplete.
-Report live-provider failures alongside passing runs rather than rerunning
-until only favorable evidence remains.
+Fix the owning path, retain a useful regression, run affected checks, and commit
+and integrate the result. Remove repeated fixtures and implementation pinning,
+not meaningful effect checks. Keep source and operator documentation accurate;
+do not replace useful implementation with gates, receipts or another scheduler.

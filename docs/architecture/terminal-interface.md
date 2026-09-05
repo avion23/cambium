@@ -55,16 +55,23 @@ Ctrl-C cancels a running turn and exits when idle. `/cancel` also works while a
 turn is active. Operator commands must not be deferred behind a queued model
 prompt when they are intended to interrupt or inspect running work.
 
-Native line editing owns its resize signal on the input thread. On POSIX the
-controller masks SIGWINCH outside that owner and restores the original mask at
-exit; the asyncio wakeup path still updates the cockpit. This avoids libedit
-resizing global editor buffers concurrently with character insertion. The
-renderer also never reads another thread's live libedit buffer: even its string
-conversion can race with typing. Conversation and status cells update in place;
-destructive full-frame/input repaint waits for the line to complete. This can
-defer the full geometry refresh while editing, but preserves native input and
-keeps cancellation/results visible. The PTY suite stresses typing and repeated
-resizes, not just idle repaint.
+On POSIX, `terminal_input.py` owns input on the same asyncio loop as the cockpit.
+It keeps the draft and cursor in Python data, reads terminal keys with
+`add_reader`, and restores the saved terminal mode on exit. No libedit buffer or
+resize signal is shared with a background input thread. A resize can redraw
+immediately while preserving the unfinished draft and cursor.
+
+Enter submits the draft; Alt-Enter inserts a newline. Bracketed paste retains
+pasted newlines in one prompt. Arrow/Home/End keys, deletion, history navigation,
+and Ctrl-A/E/U/K/W editing work on that same buffer. Long drafts use a horizontal
+viewport; embedded newlines are shown as `↵`, not a full multirow editor. Explicit
+`<<<`/`>>>` blocks and backslash continuation also remain available.
+
+F6 cycles agent focus without submitting or clearing the draft. `/focus TASK`
+selects a known task; `/inspect` reads its latest recorded state and bounded tool
+output. The conversation still contains the session's combined transcript.
+Injected streams and non-POSIX terminals keep the existing line-reader path;
+POSIX PTY results are not evidence of equal behavior on every platform.
 
 Output synchronization prevents concurrent status, tool, and input writes from
 interleaving escape sequences. Provider/tool text is sanitized before reaching
@@ -84,6 +91,8 @@ readable without cockpit escape sequences.
 | `/status` | Session, branch, context, agents, and usage |
 | `/usage` | Cumulative usage including the live turn, without double counting |
 | `/agents` | Agent lifecycle, provider/model, and per-task counts |
+| `/focus TASK` | Select a task; F6 cycles focus while retaining the draft |
+| `/inspect [TASK]` | Shared recorded state for a task, defaulting to the focused task |
 | `/context` | Current context, checkpoint, epoch, and trunk/raw sizes |
 | `/quota` | Explicit read-only account-wide quota inspection |
 | `/session` | Persistent session identity |
@@ -113,8 +122,8 @@ unbounded. The same read-only path serves `cambium quota status`.
 ## Test the terminal, not only strings
 
 Pure row tests cover cell width, terminal states, resource visibility, and
-replay. PTY tests cover input, resize, Ctrl-C, and active `/cancel` through a real
-process boundary. Provider-backed tests run actual coding and read-only
+replay. PTY tests cover input, immediate resize while editing, paste, F6 with an
+unfinished draft, Ctrl-C, and active `/cancel` through a real process boundary. Provider-backed tests run actual coding and read-only
 follow-up tasks and check events plus Git artifacts. A canned provider is useful
 for deterministic rendering, not proof that the agent can code.
 

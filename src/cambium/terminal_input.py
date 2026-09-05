@@ -47,6 +47,7 @@ class TerminalInput:
             self.cockpit.stream.write("\x1b[?2004h")
             self.cockpit.stream.flush()
         except BaseException:
+            self.loop.remove_reader(fd)
             termios.tcsetattr(fd, termios.TCSANOW, self.saved)
             raise
 

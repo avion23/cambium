@@ -38,17 +38,31 @@ providers, unavailable credentials, explicit provider/model restrictions,
 required capabilities, and incompatible context leases. Provider request rate
 and in-flight capacity determine whether a lane can start work now.
 
-The simple routing path balances normalized token debt, current lane load, and
-request counts with stable configuration-order tie breaks. Requirement-aware
-selection additionally uses the existing capability/quality and measured
-cost/latency/throughput scoring. These paths are heuristics, not a single global
-optimizer with a proven optimum.
+The simple routing path uses current quota observations when available: the
+most constrained token/request window determines utilization. Expired windows
+do not constrain a new allowance. At comparable utilization and lane load, a
+sooner reset is preferred. With no observed window it uses normalized token debt
+as a balancing heuristic, not as a claim about weekly entitlement.
+
+Configured request rate and concurrent capacity are separate. When eligible
+lanes are busy, the supervisor queues the task without occupying a worker-process
+slot. It wakes on a lane release, new usage, or an observed reset/Retry-After time;
+there is no periodic admission polling. An exhausted wall budget remains a
+reported timeout, not indefinite waiting or fabricated completion.
+
+Requirement-aware selection retains capability/quality and measured
+cost/latency/throughput scoring after excluding exhausted quota and active
+cooldowns. These paths are heuristics, not a global optimizer with a proven
+optimum. No extra provider preflight request is required.
 
 Diffundo owns the subsequent provider call and its fallback behavior. Keep task
 assignment and call-time lease evidence distinct: an initial assignment does
 not prove which provider ultimately served every request. Summaries and child
 calls must pass through the same accounting rather than becoming invisible
-side traffic.
+side traffic. A successful fallback moves the task's lane reservation to the
+provider that actually served it; repeated calls do not reserve it again. A
+failed attempt does not move that reservation. Persisted Retry-After timestamps
+expire naturally; a past 429 is not a permanent ban.
 
 Child placement is described once in [context branches](context-branches.md).
 `spread` prefers another feasible provider; it is not permission to ignore
@@ -99,22 +113,20 @@ The rail may omit details at small terminal sizes; `/usage`, `/agents`, and
 
 ## Remaining optimization work
 
-Use traces to determine whether normalized debt should additionally account
-for **known remaining weekly capacity and time to reset**, rather than adding
-another scheduler. Compare decisions on held-out task mixes before changing
-ranking. Preserve exact-context affinity only when it pays for itself, and
-measure both critical-path completion time and quota consumed per accepted
-outcome.
+Observed remaining capacity and reset times now affect admission; a long-run
+improvement in accepted tasks/hour has not yet been established. Compare the
+ranking on repeated task mixes and real weekly windows, including fallback,
+summary cost and integration time. Context migration is not free cache transfer.
+Do not add another scheduler to compensate for missing measurements.
 
 Important measurements are accepted tasks/hour, end-to-end output tokens/s,
 uncached/cached input and output per task, retries and summaries, child overhead,
 and consumption against each provider's actual window. Latency distributions
 and errors matter more than an isolated fast sample.
 
-A bounded model-facing resource projection remains part of the
-[operating-model design](agent-operating-model.md). It should expose useful
-facts and unknowns, not raw scheduler internals or a mandatory policy decision
-on every turn.
+`inspect_state` and TUI `/inspect` expose the same recorded branch resource
+facts through `state_view.py`; unavailable facts remain unknown. This is an
+on-demand read, not a mandatory policy decision on every turn.
 
 ## Regression evidence
 
@@ -122,5 +134,8 @@ on every turn.
 cover output-only rates, deterministic multi-provider quota replay, read-only
 inspection, and a height-bounded resource rail.
 [Routing throughput tests](../../tests/scenarios/test_routing_throughput.py)
-cover lane capacity and measured provider scoring. Real coding/TUI tests cover
-accepted artifacts rather than self-reported success.
+cover lane capacity and measured provider scoring.
+[Observed-resource scenarios](../../tests/scenarios/test_routing_resources.py)
+check quota expiry, persisted cooldown, fallback reservation ownership, and a
+queued task waking on release. Real coding/TUI tests check accepted artifacts;
+these deterministic scenarios alone do not establish a throughput improvement.

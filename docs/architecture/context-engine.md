@@ -60,12 +60,18 @@ entry, removes its covered raw range from the active request, and publishes a
 successor epoch. Merely appending a summary after the entire transcript would
 not reduce the working set and is not CAST compaction.
 
-Normal work appends actions and observations to `R`. The current worker checks
-raw-tail thresholds between completed turns and requests a fold at delegation
-and root terminal boundaries. These boundary folds cost a provider request;
-they are not free bookkeeping. Forked exact children return their result rather
-than publishing a competing parent trunk. The actual conditions are in
+Normal work appends actions and observations to `R`. The worker folds when the
+raw working set crosses its threshold, or when a semantic child needs the new
+knowledge. Finishing a task, spawning an exact-trunk child, and spawning a fresh
+child do **not** force a summary. They save an exact checkpoint with its recent
+raw continuation; a later consumer can compact when necessary. One semantic
+batch shares one fold, not one summary request per child. The conditions live in
 `worker._bound_context_continuation` and `worker._run_agent_loop`.
+
+Checkpointing is local persistence. Summarizing is a paid model operation.
+Keeping them separate means a completed short task does not fail merely because
+an unnecessary summary provider is unavailable. Both a one-call finish and a
+blocking exact child can retain useful history without a single summary call.
 
 Malformed summary output leaves the prior trunk and raw tail intact while the
 existing bounded deferral path applies. A failed fold cannot erase its source.
@@ -109,16 +115,30 @@ new epoch    H M K0                 new cache lineage
 later        H M K0 S1' S2' ... R
 ```
 
-The current K0 compiler is deterministic Python, **not another model recursively
-summarizing summaries**. It folds the semantic entries, removes matching
-superseded/invalidated fact and decision strings, and deduplicates retained
-constraints, verification strings and open items. The original segment set is
-retained with rollover provenance.
+The K0 compiler is deterministic Python, **not a model recursively summarizing
+summaries**. Semantic entries can use stable labels: `D1` for a decision, `F1`
+for a fact, `O1` for an obligation, and `V1` for a check. Unlabelled items use
+exact text identity. These are identifiers within the existing string lists,
+not another ledger or database.
 
-There are real limits: identity is based on normalized text, not semantic
-entailment. Differently worded contradictions are not automatically resolved.
-Open items are deduplicated, not automatically marked completed. K0 is not a
-lossless transcript, a proof system, or the proposed typed WorkLedger.
+For example, a later delta can replace `F1: strings concatenate` with
+`F1: strings now raise TypeError`, put `O1` in `open_items_resolved`, and put
+`V1` in `verification_invalidated` when its earlier Git head is obsolete. K0
+removes those old active values and retains the replacement, unresolved work,
+and still-applicable checks. Invalidations apply before additions in the same
+delta, so a replacement is not accidentally deleted. Repeated closure of an
+already absent label is harmless; it must not block compaction.
+
+Original entries remain unchanged and accessible through history. The model
+must identify a correction or completion from actual evidence. K0 does not infer
+semantic contradiction, automatically prove an obligation complete, or turn a
+shell exit code into proof of task correctness. Its active state is only as good
+as those recorded deltas; it is not a lossless transcript or a proof system.
+
+Manual `/compact` materializes available semantic entries into K0 and keeps any
+recent raw tail unchanged. With no semantic entries it reports that fact rather
+than inventing a model-free summary. Both manual and automatic rollover reset
+the prompt-accounting baseline because the active prefix changed.
 
 `context_policy.CastPolicy` currently rolls over after more than 16 segments by
 default. Its optional trunk-token bound is disabled at zero. The economic
@@ -174,9 +194,9 @@ summary call + cache-disruption cost
 This is a decision model, not an implemented optimizer or exact token formula.
 Use the provider's actual cache tariff and account accounting when known.
 Measure cold and warm requests separately. A final fold with no future consumer
-cannot repay itself through replay savings alone; its purpose may instead be
-preparing a reusable checkpoint. The current boundary policy does not forecast
-`N`, so short tasks can still spend an avoidable extra summary call.
+cannot repay itself through replay savings alone, which is why ordinary finish
+only checkpoints. The current threshold policy does not forecast `N`; further
+changes need task-level measurements, not a compulsory economic-model call.
 
 Cached input still consumes some provider resources and may consume account
 quota. A provider's cash tariff, request limit, weekly allowance and generation
@@ -209,8 +229,9 @@ expanding the schema or adding more prompt instructions.
 
 Coding and summary policies can be replaced by an offline GEPA run. A session
 pins its chosen text; replacement affects new sessions or `/new`, not a live
-prefix. Protocol/schema mechanics remain code-owned. See
-[optimization](optimization.md) for deployment and experiment commands.
+prefix. Summary policy and its response schema are supplied only in the summary
+control message, not repeated in every coding request. Protocol/schema mechanics
+remain code-owned. See [optimization](optimization.md) for experiment commands.
 
 Compare prompt candidates on accepted artifacts and held-out tasks, including
 corrections, long sessions, history recall and joins. A shorter summary that

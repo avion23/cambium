@@ -48,7 +48,7 @@ def state_text(session_dir: str | Path, task_id: str | None = None) -> str:
     state = load_state(session_dir, task_id)
     data = state.to_dict()
     context = data["context"]
-    result = data["result"]
+    result = data["result"] or {}
     view: dict[str, Any] = {
         "identity": data["identity"],
         "source_watermark": state.source_watermark,

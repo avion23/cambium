@@ -34,10 +34,10 @@ The supervisor owns these transitions and their ordering.
 | `provider_scheduler.py` | Lease/cache values and quota reservations; not another task scheduler |
 | `store.py` | Durable execution records |
 | `summary_trunk.py` | Immutable summary entries and their content contract |
-| `branch_state.py` | Replay-derived branch state and `inspect-state` support |
+| `branch_state.py`, `state_view.py` | Shared replay-derived state for model, CLI and TUI inspection |
 | `branch_history.py` | Read-only historical tool/transcript retrieval |
 | `code_index.py`, `lsp_query.py` | Bounded source scans and optional configured LSP queries |
-| `observability.py`, `tui.py`, `tui_screen.py` | Incremental operator projection, input handling and rendering |
+| `observability.py`, `tui.py`, `tui_screen.py`, `terminal_input.py` | Incremental display, event-loop-owned POSIX input and rendering |
 | `prompts.py` | Versioned coding and summary instructions |
 | `optimize.py`, `prompt_optimize.py`, `benchmark.py` | Offline DSPy experiments, real rollouts and automatic policy replacement |
 
@@ -51,7 +51,7 @@ The active schema and dispatch contain:
 
 ```text
 read_batch   write_file   edit_file   git_op   run_shell   delegate
-repo_query   branch_history
+repo_query   branch_history   inspect_state
 ```
 
 Permissions still determine which effects a worker may perform. Navigation and
@@ -84,16 +84,18 @@ history and delegation formats are in
 
 ## State: implemented versus proposed
 
-`BranchState` and the `cambium inspect-state` command are implemented. It was
-incorrect for earlier docs to describe their existence as future work.
-`observability.py` still owns the TUI's separate event projection; adding
-`BranchState` did not automatically make every consumer share one reducer.
+`state_view.py` uses the existing `BranchState` reducer for model `inspect_state`,
+CLI `inspect-state DIR [TASK]`, and TUI `/inspect [TASK]`. It replays the latest
+relevant turn separately: sequence numbers from different turns must never be
+interleaved. Inspection includes running tasks with no terminal result yet.
+The CLI can print the full value; model/TUI inspection selects concise facts and
+leaves exact tool evidence to `branch_history`.
 
-The base runtime does not yet implement the complete model-facing
-`SituationFrame`/`inspect_state` proposal, an evidence-linked WorkLedger, or a
-new versioned ResultCapsule protocol. The existing summary entries, child
-result envelope, verification state and Git joins already work. Extend those
-paths where needed rather than introducing parallel mutable stores.
+This is an on-demand shared read, not a mandatory SituationFrame on every call.
+`observability.py` still provides incremental display counters. The complete
+SituationFrame proposal, evidence-linked WorkLedger and versioned ResultCapsule
+are not implied. Existing summary entries, child results and Git joins remain
+the owners of their data; there is no parallel state database.
 
 The current source/tests for a feature must land before its status changes from
 proposed to implemented. Architecture diagrams and data types alone do not

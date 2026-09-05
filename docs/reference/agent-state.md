@@ -8,9 +8,9 @@ cambium inspect-state /path/to/session
 ```
 
 `repo_query` below and `branch_history` in the [context-branch reference](context-branches.md)
-are active worker tools. The SituationFrame, WorkLedger, ResourceEnvelope,
-ResultCapsule-v2 and model `inspect_state` sections are proposals, not current
-worker wire contracts.
+and `inspect_state` below are active worker tools. The full SituationFrame,
+WorkLedger, ResourceEnvelope and ResultCapsule-v2 sections remain proposals,
+not current worker wire contracts.
 
 Rationale is in
 [`../architecture/agent-operating-model.md`](../architecture/agent-operating-model.md).
@@ -384,25 +384,28 @@ The capsule is bounded, immutable once admitted, and linked to branch history.
 It does not carry the complete child transcript. `artifacts.changed=true` does
 not mean the parent accepted the artifact; join state remains supervisor-owned.
 
-## 9. inspect_state tool
-
-Target model-facing schema:
+## 9. inspect_state tool — implemented
 
 ```json
-{
-  "name": "inspect_state",
-  "arguments": {
-    "section": "mission|authority|accepted|open|children|resources|knowledge|anchors|all",
-    "branch_id": "optional task branch",
-    "cursor": "optional opaque continuation",
-    "limit": 20
-  }
-}
+{"name":"inspect_state","arguments":{"task_id":"review-routing"}}
 ```
 
-The tool reads the current canonical projection only. It does not read raw
-transcripts, execute tools, or mutate state. Historical detail remains in
-`branch_history`.
+`task_id` is optional and defaults to the current worker. The shared reader in
+`state_view.py` selects the latest recorded turn containing that task and uses
+`BranchState` to replay its state and children. It returns identity and source
+watermark, objective, artifact state, control/resource facts, usage, context,
+children, result and recent tool output. A running task's result is unknown,
+not an error. No section/cursor/filter vocabulary is implemented.
+
+The TUI uses the same reader for `/inspect [TASK]`, defaulting to its focused
+task. CLI `cambium inspect-state DIR [TASK]` emits the full BranchState JSON.
+Turn-local sequence numbers are never sorted together across several turns.
+The view is derived from recorded evidence, not a new mutable state store or a
+claim that every proposed knowledge field has a populated producer.
+
+Inspection does not execute historical tools or mutate the session. Use
+`branch_history` to reopen exact earlier action/observation evidence. No large
+state frame or additional classifier request is required before ordinary work.
 
 ## 10. repo_query tool — implemented
 
