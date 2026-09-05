@@ -11,6 +11,8 @@ EXPECTED_WORKER_TOOLS = (
     "git_op",
     "run_shell",
     "read_batch",
+    "repo_query",
+    "branch_history",
     "delegate",
 )
 EXPECTED_PROMPT_EXPORTS = frozenset(
