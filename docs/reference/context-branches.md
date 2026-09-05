@@ -138,8 +138,7 @@ task may start with a tool or a valid finish; a plan is optional.
 
 `branch_state.py` and CLI `inspect-state` provide current inspection. A
 model-facing `inspect_state`, unified SituationFrame/operator projection, typed
-WorkLedger, and richer ResultCapsule are separate work tracked in
-[the implementation plan](../../implementation-plan.md); do not infer their wire
+WorkLedger, and richer ResultCapsule are separate future work; do not infer their wire
 support from target names in [agent-state](agent-state.md).
 
 ## Executable anchors

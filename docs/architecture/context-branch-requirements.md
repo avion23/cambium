@@ -5,8 +5,8 @@ collects checks that protect actual state; it is not a specification for a
 second approval or policy framework.
 
 Rationale belongs in [context branches](context-branches.md), exact public
-shapes in [the reference](../reference/context-branches.md), and future work in
-[the implementation plan](../../implementation-plan.md).
+shapes in [the reference](../reference/context-branches.md); future work is
+marked explicitly in the owning document.
 
 ## Ownership
 

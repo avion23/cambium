@@ -35,7 +35,6 @@ CLI `--help`, schemas, and source own exact command arguments and configuration
 defaults.
 
 The contributor contract is [agents.md](../agents.md).
-[The implementation plan](../implementation-plan.md) contains open work only.
 
 ## Design proposals and experiments
 

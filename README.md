@@ -1,99 +1,53 @@
 # Cambium
 
-Cambium is a local multi-provider coding-agent runtime built around durable,
-cache-friendly context and isolated Git execution.
+Cambium is a local multi-provider coding-agent runtime. Its unit of work is a
+branch: a task running in an isolated Git worktree with a provider lease,
+cache-friendly context, durable checkpoints, and supervised Git publication.
 
-Its unit of work is a branch:
-
-```text
-task contract
-+ CAST context
-+ provider/model lease
-+ fenced worker and isolated worktree
-+ durable events/checkpoints
-+ child branches
-+ verification
-+ semantic result
-+ accepted artifact head
-```
-
-The model proposes plans, tool calls, children, and finish verdicts. Cambium owns
-credentials, provider admission, process lifecycle, budgets, checkpoints,
+The model proposes plans, tool calls, child tasks, and finish verdicts. Cambium
+owns credentials, provider admission, process lifecycle, budgets, checkpoints,
 context forks, child joins, Git publication, cancellation, and recovery.
 
 ## Current capabilities
 
-- **Durable execution:** JSON-lines supervisor/worker protocol, generation
-  fencing, immutable checkpoints, worktree salvage, restart, and ref-only Git
-  publication.
-- **CAST context:** stable system/tool head, append-only semantic deltas, bounded
-  raw tail, deterministic K0 rollover, and exact versus semantic cache lineage.
+- **Durable execution:** line-based supervisor/worker protocol, generation
+  fencing, restart budget, immutable checkpoints, worktree salvage, and
+  ref-only Git publication (`supervisor.py`, `worker.py`, `store.py`).
+- **CAST context:** stable system/tool head, append-only semantic trunk,
+  bounded raw tail, deterministic K0 rollover, and exact versus semantic cache
+  lineage (`summary_trunk.py`, `context_policy.py`).
 - **Multi-provider operation:** capability/credential admission, provider/model
-  leases, usage debt, quota reservations, effort-aware deadlines, typed failure,
-  and bounded call-time failover.
-- **Recursive branches:** static and dynamic task trees, isolated child
-  worktrees, explicit context/placement behavior when declared, deterministic
-  join barriers, and conflict-resolver support.
-- **Persistent terminal session:** one interactive semantic branch across
-  prompts, reconnect, queued follow-up, event replay, model/tool activity,
-  context, usage, quota, and child-agent projection.
-- **Optimization path:** reviewed trajectory extraction, split discipline, DSPy
-  evaluation, canaries, and promotion gates.
+  leases, durable quota reservations, usage accounting, effort-aware deadlines,
+  and bounded call-time failover (`routing.py`, `provider_scheduler.py`,
+  `diffundo.py`).
+- **Recursive branches:** task trees bounded at width 8 and depth 3, isolated
+  child worktrees, per-child context/placement with deterministic defaults,
+  serialized integration, and conflict-resolver support.
+- **Worker tools:** the active schema and dispatch expose `write_file`,
+  `edit_file`, `git_op`, `run_shell`, `read_batch`, `repo_query`,
+  `branch_history`, and `delegate` (`schemas.py`, `tools.py`).
+- **Persistent terminal cockpit:** one interactive branch across prompts,
+  reconnect, queued follow-up, cancellation, live usage/quota projection, and
+  child-agent lanes (`interactive.py`, `tui.py`, `tui_screen.py`).
+- **Branch state inspection:** replay-derived `BranchState` and the
+  `cambium inspect-state` command (`branch_state.py`).
+- **Optimization path:** `cambium optimize prompts` runs real repository
+  benchmarks with GEPA or a zero baseline and installs a measurably better
+  coding/summary policy automatically (`optimize.py`, `prompt_optimize.py`).
 
-## Architecture direction
+The model-facing `SituationFrame`, evidence-linked WorkLedger, and versioned
+ResultCapsule remain design proposals, not shipped behavior.
 
-Cambium is being made agent-intuitive around one rule:
+## Delegation model
 
-```text
-one canonical branch state, many projections
-```
-
-The target system derives a compact current operating picture from events,
-checkpoints, Git, and provider records. The model receives it as a bounded
-`SituationFrame`; the human sees the same semantics in the TUI; precise current
-state, historical evidence, and repository location use separate inspection
-surfaces.
-
-```text
-durable events + checkpoints + Git + quota
-                    |
-                    v
-              canonical BranchState
-             /          |           \
-    SituationFrame      TUI      supervisor policy
-          |
-          v
-orient -> locate -> act -> observe -> verify -> accrete -> finish
-```
-
-See
-[`docs/architecture/agent-operating-model.md`](docs/architecture/agent-operating-model.md)
-and the ordered [`implementation-plan.md`](implementation-plan.md).
-
-## Current truth and target gaps
-
-Current source consumes declared child `context_mode` and `placement`: the
-model schema rejects omission before admission. A supervisor-side automatic
-exact/semantic resolution remains only for harness-originated specs that reach
-it without a declared policy; it is a current compatibility gap, not a public
-contract.
-
-The repository also contains implementations of branch-history projection,
-bounded code indexing, and optional one-shot LSP queries. They are not yet part
-of the active worker tool roster, which currently exposes:
-
-```text
-write_file
-edit_file
-git_op
-run_shell
-read_batch
-delegate
-```
-
-The automatic SituationFrame, shared BranchState reducer, `inspect_state`,
-evidence-linked WorkLedger, versioned ResultCapsule, and model-visible
-ResourceEnvelope are target work, not current implementation claims.
+There is one worker implementation; a child is an ordinary worker task owned by
+its parent. The model decides to delegate inside its ordinary action call, and
+each delegate spec declares `context_mode` (`trunk`, `semantic`, `fresh`) and
+`placement` (`inherit`, `spread`), with deterministic defaults when omitted: a
+single child defaults to `trunk+inherit`, an independent batch to
+`semantic+spread`. `trunk+spread` is rejected. Children run in isolated
+worktrees; the supervisor integrates accepted child commits into the parent
+before the parent resumes.
 
 ## Quick start
 
@@ -132,6 +86,7 @@ Inspect provider and session state:
 uv run cambium doctor
 uv run cambium quota status
 uv run cambium monitor /path/to/session
+uv run cambium inspect-state /path/to/session
 ```
 
 ## Verification
@@ -149,25 +104,36 @@ are intentionally separate from hermetic CI.
 
 Start with:
 
-1. [`docs/architecture/agent-operating-model.md`](docs/architecture/agent-operating-model.md)
-   — synthetic agent control model and linked abstraction tower.
-2. [`docs/architecture/architecture.md`](docs/architecture/architecture.md) —
-   current runtime map and ownership.
-3. [`implementation-plan.md`](implementation-plan.md) — ordered open work.
-4. [`agents.md`](agents.md) — coding-agent/contributor operating contract.
-5. [`docs/README.md`](docs/README.md) — complete documentation map and status
+1. [`docs/architecture/architecture.md`](docs/architecture/architecture.md) —
+   current runtime map, module ownership, and executable checks.
+2. [`docs/architecture/agent-operating-model.md`](docs/architecture/agent-operating-model.md)
+   — design rationale for the harness and its unit of work.
+3. [`agents.md`](agents.md) — coding-agent/contributor operating contract.
+4. [`docs/README.md`](docs/README.md) — complete documentation map and status
    language.
 
 Focused documents:
 
 - [`docs/architecture/context-engine.md`](docs/architecture/context-engine.md)
+  — CAST trunking, folds, and K0 rollover.
 - [`docs/architecture/context-branches.md`](docs/architecture/context-branches.md)
-- [`docs/architecture/subagents.md`](docs/architecture/subagents.md)
+  — delegation decisions and context/placement defaults.
+- [`docs/architecture/subagents.md`](docs/architecture/subagents.md) — child
+  lifecycle, admission, joins, and failure recovery.
 - [`docs/architecture/provider-routing.md`](docs/architecture/provider-routing.md)
+  — admission, routing, quota, and usage semantics.
 - [`docs/architecture/terminal-interface.md`](docs/architecture/terminal-interface.md)
-- [`docs/reference/agent-state.md`](docs/reference/agent-state.md)
-- [`docs/how-to/agent-driving-loop.md`](docs/how-to/agent-driving-loop.md)
+  — cockpit layout, input handling, and commands.
+- [`docs/architecture/interactive-tui.md`](docs/architecture/interactive-tui.md)
+  — durable interactive turns, reconnect, and replay.
+- [`docs/architecture/events.md`](docs/architecture/events.md) — event-kind
+  glossary for the durable event store.
+- [`docs/reference/agent-state.md`](docs/reference/agent-state.md) — branch
+  state inspection and proposed state shapes.
+- [`docs/how-to/agent-driving-loop.md`](docs/how-to/agent-driving-loop.md) —
+  driving sessions from another coding agent.
 - [`docs/research/agent-system-evaluation.md`](docs/research/agent-system-evaluation.md)
+  — evaluating the runtime end to end.
 
 ## License
 

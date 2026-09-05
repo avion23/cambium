@@ -130,5 +130,5 @@ followed by exact historical retrieval. They use disposable repositories and
 configured provider credentials. Report model/provider failures as failures,
 not as evidence that the harness path passed.
 
-Open work belongs only in [implementation-plan.md](../../implementation-plan.md),
+Record open proposals in the owning document,
 not in another copy of the runtime map.

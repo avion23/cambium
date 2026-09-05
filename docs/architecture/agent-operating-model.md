@@ -1,7 +1,7 @@
 # Agent operating model
 
 **Status:** design rationale. The [runtime map](architecture.md) states what is
-implemented; the [open plan](../../implementation-plan.md) lists the gaps.
+implemented; gaps are marked explicitly where they are described.
 
 ## Purpose
 
