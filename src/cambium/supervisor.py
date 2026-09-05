@@ -705,8 +705,15 @@ _USAGE_EVENT_FORWARD_FIELDS = frozenset(
         "epoch",
         "fork_of",
         "quota_windows",
+        "situation_frame_version",
+        "situation_frame_source_watermark",
+        "situation_frame_sha256",
+        "situation_frame_bytes",
+        "situation_frame_truncated_sections",
     }
 )
+_SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
+_MAX_TRUNCATED_SECTIONS = 16
 
 
 def _invalid_tool_event_fields(msg: dict[str, Any]) -> list[str]:
@@ -784,11 +791,26 @@ def _invalid_usage_event_fields(msg: dict[str, Any]) -> list[str]:
         "summary_segments",
         "raw_tail_bytes",
         "epoch",
+        "situation_frame_version",
+        "situation_frame_source_watermark",
+        "situation_frame_bytes",
     ):
         if field in msg and not (type(msg[field]) is int and msg[field] >= 0):
             invalid.append(field)
     if "fork_of" in msg and not (type(msg["fork_of"]) is str and msg["fork_of"]):
         invalid.append("fork_of")
+    sha256 = msg.get("situation_frame_sha256")
+    if "situation_frame_sha256" in msg and not (
+        type(sha256) is str and _SHA256_HEX_RE.fullmatch(sha256)
+    ):
+        invalid.append("situation_frame_sha256")
+    truncated_sections = msg.get("situation_frame_truncated_sections")
+    if "situation_frame_truncated_sections" in msg and (
+        not isinstance(truncated_sections, list)
+        or len(truncated_sections) > _MAX_TRUNCATED_SECTIONS
+        or any(not isinstance(item, str) or not item for item in truncated_sections)
+    ):
+        invalid.append("situation_frame_truncated_sections")
     if "call_kind" in msg and msg["call_kind"] not in {"agent", "summary"}:
         invalid.append("call_kind")
     for field in ("estimated_cost_usd", "latency_s", "retry_after_s"):

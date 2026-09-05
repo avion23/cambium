@@ -89,11 +89,14 @@ incorrect for earlier docs to describe their existence as future work.
 `observability.py` still owns the TUI's separate event projection; adding
 `BranchState` did not automatically make every consumer share one reducer.
 
-The base runtime does not yet implement the complete model-facing
-`SituationFrame`/`inspect_state` proposal, an evidence-linked WorkLedger, or a
-new versioned ResultCapsule protocol. The existing summary entries, child
-result envelope, verification state and Git joins already work. Extend those
-paths where needed rather than introducing parallel mutable stores.
+The base runtime now injects a bounded local `SituationFrame` into the final
+user-role loop-state message of each normal worker provider call; checkpoint
+persistence strips this transient frame. Not yet implemented: the full
+model-facing `SituationFrame`/`inspect_state` proposal (shared operator
+projection, `inspect_state` tool), an evidence-linked WorkLedger, or a new
+versioned ResultCapsule protocol. The existing summary entries, child result
+envelope, verification state and Git joins already work. Extend those paths
+where needed rather than introducing parallel mutable stores.
 
 The current source/tests for a feature must land before its status changes from
 proposed to implemented. Architecture diagrams and data types alone do not

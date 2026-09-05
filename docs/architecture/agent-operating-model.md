@@ -110,9 +110,12 @@ real decision or helps diagnose a failure. Keep exact evidence available on
 request rather than copying it into every call.
 
 `SituationFrame`, structured obligations, and richer result capsules are useful
-proposals where they solve observed long-session failures. They are not a
-prerequisite for navigation, delegation, or a usable TUI. Their unimplemented
-parts remain proposals, not a list of compulsory infrastructure to build.
+proposals where they solve observed long-session failures. The base worker now
+injects a bounded local `SituationFrame` into its final loop-state message and
+strips it before durable checkpointing, but the shared operator projection,
+`inspect_state` tool, durable `situation_frame_built` accounting, and richer
+capsules remain unimplemented proposals, not a list of compulsory
+infrastructure to build.
 
 ## How to improve it
 
@@ -125,3 +128,4 @@ provider usage, wall time and failures. GEPA can automatically replace coding
 or summary policy for new sessions; it does not run inside normal actions.
 A saved candidate alone is not a demonstrated general gain. See
 [optimization](optimization.md).
+

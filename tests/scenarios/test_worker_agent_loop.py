@@ -640,7 +640,8 @@ def test_agent_status_bar_is_last_context_tail_message(tmp_path: Path) -> None:
     second_messages = action_prompts[1]["messages"]
     assert first_messages[:2] == second_messages[:2]
     assert first_messages[-1]["role"] == "user"
-    assert first_messages[-1]["content"] == (
+    assert "<cambium-situation " in first_messages[-1]["content"]
+    assert worker._strip_situation_frame_content(first_messages[-1]["content"]) == (
         "<cambium-loop-state>budget=100% turn=1 epoch=0 code_changed=false "
         "verified_after_change=false verification_failed=false no_progress=0 "
         "budget_new_tokens=0 previous_prompt_tokens=0"
