@@ -79,7 +79,9 @@ replaced with persuasive invented values.
 ## Known gaps, not implemented contracts
 
 `BranchState` and CLI inspection exist, but the TUI and model do not yet share
-all of its semantics. The full SituationFrame, WorkLedger and ResultCapsule-v2
+all of its semantics. The worker injects a bounded local `SituationFrame` into
+its final loop-state message and strips it before durable checkpointing; the
+full SituationFrame, WorkLedger and ResultCapsule-v2
 shapes in [agent-state reference](../reference/agent-state.md) remain proposals.
 Their existence in a document is not evidence of model tool support.
 
@@ -104,3 +106,4 @@ Relevant tests are under `tests/scenarios/`; real-provider CLI/TUI exercises are
 in `tests/acceptance/test_live_frontends.py`. Use additional fault/replay tests
 for the owner being changed, not a mandatory unrelated suite before every tool
 call.
+

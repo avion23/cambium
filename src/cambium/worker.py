@@ -131,6 +131,7 @@ from typing import Any, TypeGuard, cast
 
 from cambium import diffundo as _diffundo_module
 from cambium.auth import oauth_env_suffix, scrub_environment
+from cambium.branch_state import BranchState, inspect_state
 from cambium.context_policy import CastPolicy
 from cambium.diffundo import (
     AllProvidersFailed,
@@ -156,6 +157,12 @@ from cambium.prompts import coding_prompt, validate_policy
 from cambium.provider_config import AuthMode, load_providers
 from cambium.redact import Redactor, build_session_redactor
 from cambium.schemas import FINISH_ACTION_SCHEMA, TOOL_SCHEMAS, validate_tool_call
+from cambium.situation import (
+    SECTION_ORDER,
+    SITUATION_PROJECTION_VERSION,
+    SituationFrameLimits,
+    render_situation_frame,
+)
 from cambium.summary_trunk import (
     SUMMARY_CONTROL_OPEN,
     SummaryEntry,
@@ -218,6 +225,7 @@ MAX_CONTEXT_MESSAGES = 512
 CHECKPOINT_EPOCH_SCHEMA = 5
 _LEGACY_CHECKPOINT_EPOCH_SCHEMA = 4
 _CHECKPOINT_CONTENT_KEYS = frozenset({"provider_messages", "continuation_suffix"})
+SITUATION_FRAME_LIMITS = SituationFrameLimits()
 
 
 def _split_checkpoint_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -353,6 +361,7 @@ class ContextCheckpoint:
     cache_key: CacheKeyDescriptor
     provider_messages: list[dict[str, Any]]
     continuation_suffix: list[dict[str, Any]]
+    admitted_child_task_ids: list[str]
     checkpoint_ref: str
     code_changed: bool
     verified_after_change: bool
@@ -3089,7 +3098,8 @@ def _first_action_response(result: CallResult) -> CallResult:
             continue
         phase = message.get("phase")
         return replace(
-            result, content=message["content"],
+            result,
+            content=message["content"],
             assistant_phase=phase if phase in {"commentary", "final_answer"} else None,
         )
     return result
@@ -3149,6 +3159,34 @@ def _final_synthesis_message() -> dict[str, str]:
 def _strip_finalization_directive(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     """Keep the transient directive out of durable epoch messages."""
     return [message for message in messages if message.get("content") != FINAL_SYNTHESIS_DIRECTIVE]
+
+
+def _strip_situation_frame_content(content: str) -> str:
+    """Remove the transient frame while retaining its loop-state message."""
+    frame_start = content.find("\n<cambium-situation ")
+    if frame_start < 0:
+        return content
+    frame_end = content.find("</cambium-situation>", frame_start)
+    if frame_end < 0:
+        return content
+    frame_end += len("</cambium-situation>")
+    if content.startswith("\n", frame_end):
+        frame_end += 1
+    return content[:frame_start] + content[frame_end:]
+
+
+def _strip_situation_frame(
+    messages: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Copy messages with embedded transient situation frames removed."""
+    stripped: list[dict[str, Any]] = []
+    for message in messages:
+        copied = dict(message)
+        content = copied.get("content")
+        if isinstance(content, str):
+            copied["content"] = _strip_situation_frame_content(content)
+        stripped.append(copied)
+    return stripped
 
 
 def _phase_failure(reason: str, *, final_synthesis: bool) -> str:
@@ -3333,24 +3371,318 @@ def _context_state_message(
     turn: int,
     context_epoch: int = 0,
     max_tokens: int = 1,
+    situation_frame: str | None = None,
 ) -> dict[str, str]:
     """Render one deterministic loop-status line as user-role tail data."""
     budget_remaining_pct = (
         max(0, 100 - min(100, budget_new_tokens * 100 // max_tokens)) if max_tokens > 0 else 0
     )
-    return {
-        "role": "user",
-        "content": (
-            "<cambium-loop-state>"
-            f"budget={budget_remaining_pct}% turn={turn} epoch={context_epoch} "
-            f"code_changed={str(code_changed).lower()} "
-            f"verified_after_change={str(verified_after_change).lower()} "
-            f"verification_failed={str(verification_failed).lower()} "
-            f"no_progress={no_progress_actions} budget_new_tokens={budget_new_tokens} "
-            f"previous_prompt_tokens={previous_prompt_tokens}"
-            "</cambium-loop-state>"
+    content = (
+        "<cambium-loop-state>"
+        f"budget={budget_remaining_pct}% turn={turn} epoch={context_epoch} "
+        f"code_changed={str(code_changed).lower()} "
+        f"verified_after_change={str(verified_after_change).lower()} "
+        f"verification_failed={str(verification_failed).lower()} "
+        f"no_progress={no_progress_actions} budget_new_tokens={budget_new_tokens} "
+        f"previous_prompt_tokens={previous_prompt_tokens}"
+    )
+    if situation_frame:
+        frame = situation_frame.rstrip("\n")
+        content += f"\n{frame}\n"
+    return {"role": "user", "content": content + "</cambium-loop-state>"}
+
+
+def _situation_git_snapshot(worktree: Path) -> tuple[str | None, bool | None]:
+    """Read the validated Git facts used by the worker's current projection."""
+    head_rc, head, _head_error = git("rev-parse", "--verify", "HEAD^{commit}", cwd=worktree)
+    status_rc, status, _status_error = git(
+        "status", "--porcelain=v1", "--untracked-files=all", cwd=worktree
+    )
+    return (head if head_rc == 0 else None, bool(status) if status_rc == 0 else None)
+
+
+def _situation_git_identity(worktree: Path) -> tuple[Path | None, str | None]:
+    """Read the repository root and branch once at the worker boundary."""
+    repo_rc, repository, _repo_error = git("rev-parse", "--show-toplevel", cwd=worktree)
+    branch_rc, branch, _branch_error = git("symbolic-ref", "--short", "HEAD", cwd=worktree)
+    return (
+        Path(repository) if repo_rc == 0 and repository else None,
+        branch if branch_rc == 0 and branch else None,
+    )
+
+
+def _append_situation_event(
+    events: list[dict[str, Any]], kind: str, task_id: str, **payload: Any
+) -> None:
+    """Append one bounded local prefix record with deterministic sequence order."""
+    events.append(
+        {
+            "seq": len(events) + 1,
+            "kind": kind,
+            "task_id": task_id,
+            "payload": payload,
+        }
+    )
+
+
+def _initial_situation_events(
+    config: AgentConfig,
+    worktree: Path,
+    repository: Path | None,
+    branch: str | None,
+    tools: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Seed the worker projection with the admitted task and ready boundary."""
+    events: list[dict[str, Any]] = []
+    _append_situation_event(
+        events,
+        "task_assigned",
+        config.task_id,
+        session_id=os.environ.get("CAMBIUM_SESSION_ID"),
+        task=config.task,
+        repo=str(repository) if repository is not None else None,
+        worktree=str(worktree),
+        branch=branch,
+        base_commit=config.base_commit,
+        tools=[tool["name"] for tool in tools if isinstance(tool.get("name"), str)],
+        authorized_providers=list(config.authorized_providers),
+    )
+    _append_situation_event(
+        events,
+        "ready",
+        config.task_id,
+        generation=config.generation,
+        turn=0,
+    )
+    return events
+
+
+def _resume_child_task_ids(messages: Sequence[Mapping[str, Any]]) -> list[str]:
+    """Recover admitted child identities from the immutable delegate actions."""
+    child_ids: list[str] = []
+    for message in messages:
+        if message.get("role") != "assistant" or not isinstance(message.get("content"), str):
+            continue
+        try:
+            action = _parse_agent_action(message["content"])
+            calls = _normalize_tool_calls(action) if action.get("type") == "tool_call" else []
+        except ValueError:
+            continue
+        for call in calls:
+            if call["name"] != "delegate":
+                continue
+            child_task_id = call["arguments"].get("child_task_id")
+            if isinstance(child_task_id, str) and child_task_id:
+                child_ids.append(child_task_id)
+    return child_ids
+
+
+def _append_resume_situation_events(
+    events: list[dict[str, Any]],
+    config: AgentConfig,
+    child_results: Sequence[Mapping[str, Any]],
+    checkpoint_messages: Sequence[Mapping[str, Any]],
+    admitted_child_task_ids: Sequence[str] = (),
+) -> None:
+    """Project bounded resume results into the local child-state event prefix."""
+    child_ids = list(admitted_child_task_ids) or _resume_child_task_ids(checkpoint_messages)
+    for index, child_result in enumerate(child_results):
+        child_id = (
+            child_ids[index]
+            if index < len(child_ids)
+            else f"{config.task_id}:resume-child-{index + 1}"
+        )
+        _append_situation_event(
+            events,
+            "child_admitted",
+            config.task_id,
+            parent_task_id=config.task_id,
+            child_task_id=child_id,
+            child_kind="resumed",
+        )
+        _append_situation_event(
+            events,
+            "child_result",
+            child_id,
+            **{
+                **dict(child_result),
+                "parent_task_id": config.task_id,
+            },
+        )
+
+
+def _worker_situation_state(
+    *,
+    config: AgentConfig,
+    worktree: Path,
+    repository: Path | None,
+    branch: str | None,
+    tools: Sequence[Mapping[str, Any]],
+    events: list[dict[str, Any]],
+    model: str,
+    last_provider: str | None,
+    turn: int,
+    epoch_count: int,
+    current_epoch_checkpoint: ContextCheckpoint | None,
+    base_messages: tuple[dict[str, Any], ...] | None,
+    context_continuation: Sequence[Mapping[str, Any]],
+    wall_deadline: float,
+) -> BranchState:
+    """Project the latest local event prefix plus the validated Git snapshot."""
+    state = inspect_state(events)
+    head, dirty = _situation_git_snapshot(worktree)
+    checkpoint_ref = (
+        current_epoch_checkpoint.checkpoint_ref if current_epoch_checkpoint is not None else None
+    )
+    lineage = "exact" if current_epoch_checkpoint is not None else state.context.lineage
+    tool_names = tuple(
+        tool["name"] for tool in tools if isinstance(tool.get("name"), str) and tool["name"]
+    )
+    provider_lease = (
+        f"{last_provider}/{model}" if last_provider is not None else state.resources.provider_lease
+    )
+    anchors = list(state.anchors)
+    if head is not None:
+        anchors.append(f"commit:{head}")
+    if current_epoch_checkpoint is not None:
+        anchors.append(f"checkpoint:{config.task_id}:{epoch_count}")
+    anchors = list(dict.fromkeys(anchors))
+    summary_segment_count: int | None = None
+    raw_tail = list(context_continuation)
+    if base_messages is not None:
+        summary_trunk, checkpoint_raw_tail = partition_summary_trunk(base_messages)
+        summary_segment_count = len(summary_trunk) - 2
+        raw_tail = [*checkpoint_raw_tail, *raw_tail]
+    context = replace(
+        state.context,
+        epoch=epoch_count,
+        checkpoint_ref=checkpoint_ref,
+        lineage=lineage,
+        summary_segments=summary_segment_count,
+        raw_tail_messages=len(raw_tail),
+        raw_tail_bytes=_canonical_message_list_bytes(raw_tail),
+    )
+    authority = replace(
+        state.authority,
+        repo=str(repository) if repository is not None else state.authority.repo,
+        worktree=str(worktree),
+        branch=branch or state.authority.branch,
+        tools=tool_names,
+        authorized_providers=config.authorized_providers,
+    )
+    artifacts = replace(
+        state.artifacts,
+        base_head=config.base_commit or state.artifacts.base_head,
+        worktree_head=head if head is not None else state.artifacts.worktree_head,
+        accepted_integration_head=(config.base_commit or state.artifacts.accepted_integration_head),
+        dirty=dirty if dirty is not None else state.artifacts.dirty,
+    )
+    resources = replace(
+        state.resources,
+        remaining_turns=max(0, config.max_turns - turn + 1),
+        remaining_wall_s=max(0.0, wall_deadline - time.monotonic()),
+        provider=last_provider or state.resources.provider,
+        model=model,
+        provider_lease=provider_lease,
+    )
+    return replace(
+        state,
+        identity=replace(
+            state.identity,
+            session_id=os.environ.get("CAMBIUM_SESSION_ID") or state.identity.session_id,
+            branch_id=config.task_id,
+            generation=config.generation,
+            lifecycle=state.lifecycle,
+            turn=turn,
         ),
+        mission=replace(state.mission, objective=config.task),
+        authority=authority,
+        context=context,
+        artifacts=artifacts,
+        resources=resources,
+        anchors=tuple(anchors),
+    )
+
+
+def _situation_message(state: BranchState, config: AgentConfig) -> dict[str, str]:
+    frame = render_situation_frame(state, SITUATION_FRAME_LIMITS)
+    if config.redactor is not None:
+        frame = config.redactor.redact(frame)
+        lines = frame.rstrip("\n").splitlines()
+        payload_digest = _sha256_hex("\n".join(lines[1:-1]).encode("utf-8"))
+        lines[0], replacements = re.subn(
+            r'frame_sha256="[0-9a-f]{64}"',
+            f'frame_sha256="{payload_digest}"',
+            lines[0],
+            count=1,
+        )
+        if replacements != 1:
+            raise ValueError("redacted situation frame has an invalid digest header")
+        frame = "\n".join(lines) + "\n"
+    return {"role": "user", "content": frame}
+
+
+def _situation_frame_provenance(state: BranchState, frame: str) -> dict[str, Any]:
+    """Return bounded identity facts for the frame delivered to the provider."""
+    frame = frame.rstrip("\n")
+    lines = frame.splitlines()
+    payload_lines = lines[1:-1] if len(lines) >= 2 else []
+    truncated_sections = [
+        section
+        for section in SECTION_ORDER
+        if any(line.startswith(f"  [truncated {section};") for line in payload_lines)
+    ]
+    return {
+        "situation_frame_version": SITUATION_PROJECTION_VERSION,
+        "situation_frame_source_watermark": state.source_watermark,
+        "situation_frame_sha256": _sha256_hex("\n".join(payload_lines).encode("utf-8")),
+        "situation_frame_bytes": len(frame.encode("utf-8")),
+        "situation_frame_truncated_sections": truncated_sections,
     }
+
+
+def _record_situation_usage(
+    events: list[dict[str, Any]],
+    config: AgentConfig,
+    result: Any,
+    turn: int,
+    situation_provenance: Mapping[str, Any] | None = None,
+) -> None:
+    usage = result.usage if isinstance(result.usage, Mapping) else {}
+    _append_situation_event(
+        events,
+        "usage_event",
+        config.task_id,
+        turn=turn,
+        provider=result.provider,
+        model=result.model,
+        usage=dict(usage),
+        estimated_cost_usd=max(0.0, float(result.estimated_cost_usd)),
+        latency_s=max(0.0, float(result.latency_s)),
+        provider_cache_hit=result.provider_cache_hit,
+        call_kind="agent",
+        **(dict(situation_provenance) if situation_provenance is not None else {}),
+    )
+
+
+def _record_situation_tool(
+    events: list[dict[str, Any]],
+    config: AgentConfig,
+    name: str,
+    result: ToolResult,
+    turn: int,
+    batch_index: int = 0,
+) -> None:
+    _append_situation_event(
+        events,
+        "tool_event",
+        config.task_id,
+        tool=name,
+        turn=turn,
+        batch_index=batch_index,
+        ok=result.ok,
+        duration_ms=result.duration_ms,
+    )
 
 
 def _safe_cmd(name: str, args: dict[str, Any]) -> str:
@@ -3499,6 +3831,7 @@ def _success_usage_event(
     *,
     prompt: Mapping[str, Any] | None = None,
     call_kind: str = "agent",
+    situation_provenance: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """One redacted durable usage event for a completed router call.
 
@@ -3517,6 +3850,8 @@ def _success_usage_event(
         "latency_s": max(0.0, latency),
         **_prompt_context_usage_fields(prompt or {}, call_kind=call_kind),
     }
+    if situation_provenance is not None:
+        event.update(dict(situation_provenance))
     usage = _usage_counts(result.usage)
     if usage:
         event["usage"] = usage
@@ -3547,6 +3882,7 @@ def _failure_usage_event(
     router: Diffundo,
     prompt: dict[str, Any],
     call_kind: str = "agent",
+    situation_provenance: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """One redacted durable usage event for a failed router call.
 
@@ -3557,6 +3893,8 @@ def _failure_usage_event(
         "turn": turn,
         **_prompt_context_usage_fields(prompt, call_kind=call_kind),
     }
+    if situation_provenance is not None:
+        event.update(dict(situation_provenance))
     if isinstance(model, str) and model:
         event["model"] = model
     explicit_reason = getattr(exc, "reason", None)
@@ -3647,7 +3985,7 @@ def _write_checkpoint_file(
         "task": config.task,
         "generation": config.generation,
         "turn": turn,
-        "transcript": _strip_finalization_directive(transcript),
+        "transcript": _strip_situation_frame(_strip_finalization_directive(transcript)),
         "usage": usage,
         "commits_so_far": commits_so_far,
         "workspace_hash": _workspace_hash(config.worktree),
@@ -3780,7 +4118,8 @@ def _provider_boundary(
 
 def _context_message(value: Any, location: str) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) not in (
-        {"role", "content"}, {"role", "content", "phase"},
+        {"role", "content"},
+        {"role", "content", "phase"},
     ):
         raise ContextForkError(f"checkpoint {location} must have role/content and optional phase")
     role = value.get("role")
@@ -3945,6 +4284,7 @@ def _write_epoch_checkpoint(
     messages: list[dict[str, Any]] | None = None,
     provider_messages: list[dict[str, Any]] | None = None,
     continuation_suffix: list[dict[str, Any]] | None = None,
+    admitted_child_task_ids: Sequence[str] | None = None,
     provider: str | None,
     model: str,
     tools_sha256: str,
@@ -4023,6 +4363,16 @@ def _write_epoch_checkpoint(
     )
     boundary = _validate_provider_boundary(boundary)
     full_messages = [*provider_messages, *continuation_suffix]
+    if admitted_child_task_ids is None:
+        admitted_child_task_ids = _resume_child_task_ids(full_messages)
+    if isinstance(admitted_child_task_ids, str) or any(
+        not isinstance(child_task_id, str) or not child_task_id
+        for child_task_id in admitted_child_task_ids
+    ):
+        raise ContextForkError("checkpoint admitted_child_task_ids invalid")
+    admitted_child_task_ids = list(admitted_child_task_ids)
+    if len(admitted_child_task_ids) > MAX_ENVELOPE_ITEMS:
+        raise ContextForkError("checkpoint admitted_child_task_ids exceeds the item cap")
     prefix_sha256 = _messages_sha256(provider_messages)
     suffix_sha256 = _messages_sha256(continuation_suffix)
     full_sha256 = _messages_sha256(full_messages)
@@ -4051,6 +4401,7 @@ def _write_epoch_checkpoint(
         cache_key=cache_key,
         provider_messages=copy.deepcopy(provider_messages),
         continuation_suffix=copy.deepcopy(continuation_suffix),
+        admitted_child_task_ids=admitted_child_task_ids,
         checkpoint_ref="",
         code_changed=code_changed,
         verified_after_change=verified_after_change,
@@ -4304,6 +4655,7 @@ def _validate_epoch_checkpoint_data(
             "cache_key",
             "provider_messages",
             "continuation_suffix",
+            "admitted_child_task_ids",
             "checkpoint_ref",
             "code_changed",
             "verified_after_change",
@@ -4338,10 +4690,20 @@ def _validate_epoch_checkpoint_data(
         raise ContextForkError("checkpoint turn invalid")
     provider_messages_raw = data.get("provider_messages")
     suffix_raw = data.get("continuation_suffix")
+    admitted_child_task_ids_raw = data.get("admitted_child_task_ids")
     if not isinstance(provider_messages_raw, list) or not provider_messages_raw:
         raise ContextForkError("checkpoint provider_messages invalid")
     if not isinstance(suffix_raw, list):
         raise ContextForkError("checkpoint continuation_suffix invalid")
+    if (
+        not isinstance(admitted_child_task_ids_raw, list)
+        or len(admitted_child_task_ids_raw) > MAX_ENVELOPE_ITEMS
+        or any(
+            not isinstance(child_task_id, str) or not child_task_id
+            for child_task_id in admitted_child_task_ids_raw
+        )
+    ):
+        raise ContextForkError("checkpoint admitted_child_task_ids invalid")
     provider_messages = [
         _context_message(message, f"provider_messages[{index}]")
         for index, message in enumerate(provider_messages_raw)
@@ -4468,6 +4830,7 @@ def _validate_epoch_checkpoint_data(
         cache_key=cache_key_descriptor,
         provider_messages=provider_messages,
         continuation_suffix=continuation_suffix,
+        admitted_child_task_ids=list(admitted_child_task_ids_raw),
         checkpoint_ref=checkpoint_ref,
         code_changed=data["code_changed"],
         verified_after_change=data["verified_after_change"],
@@ -5433,6 +5796,7 @@ async def _bound_context_continuation(
             epoch=prior_epoch + 1,
             provider_messages=copy.deepcopy(new_trunk),
             continuation_suffix=[],
+            admitted_child_task_ids=_resume_child_task_ids(raw_tail),
             provider=summary_result.provider,
             model=model,
             tools_sha256=_sha256_hex(json.dumps(tools, sort_keys=True).encode("utf-8")),
@@ -5594,6 +5958,8 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
     finalization_grace_used = False
     transcript: list[dict[str, Any]] = []
     tools = _exposed_tool_schemas(config)
+    repository, branch = _situation_git_identity(worktree)
+    situation_events = _initial_situation_events(config, worktree, repository, branch, tools)
     lint_diag = LintDiag()
     budget_usd = _fanout_budget_usd(config.fanout_config)
     progress_detector = _ProgressDetector(
@@ -5655,6 +6021,12 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
             progress_detector.restore(transcript)
             first_turn = turn_checkpoint["turn"] + 1
             turn_checkpoint_resumed = True
+            _append_resume_situation_events(
+                situation_events,
+                config,
+                resume["child_results"],
+                transcript,
+            )
             for child_result in resume["child_results"]:
                 transcript.append({"role": "user", "content": _child_result_lines(child_result)})
             compaction_deferred = turn_checkpoint["compaction_deferred"]
@@ -5721,6 +6093,13 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
         epoch_count = resume_checkpoint.epoch
         usage_epoch = resume_checkpoint.epoch
         transcript = _sync_context_transcript(base_messages, context_continuation, transcript)
+        _append_resume_situation_events(
+            situation_events,
+            config,
+            resume["child_results"],
+            resume_checkpoint.full_messages,
+            resume_checkpoint.admitted_child_task_ids,
+        )
     elif config.context_fork is not None:
         fork_messages, fork_skip = _resolve_fork_prefix(config, tools, model)
         if fork_messages is not None:
@@ -5942,17 +6321,6 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                 forced_finalization=forced_finalization,
                 finalization_grace_used=finalization_grace_used,
             )
-            state_message = _context_state_message(
-                code_changed=code_changed,
-                verified_after_change=verified_after_change,
-                verification_failed=verification_failed,
-                no_progress_actions=no_progress_actions,
-                budget_new_tokens=budget_new_tokens,
-                previous_prompt_tokens=previous_prompt_tokens,
-                turn=turn,
-                context_epoch=epoch_count,
-                max_tokens=config.max_tokens,
-            )
             if base_messages is None:
                 prompt = _build_agent_prompt(
                     config.task,
@@ -5964,6 +6332,36 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                 )
             else:
                 prompt = _fork_prompt(base_messages, context_continuation, tools)
+            situation_state = _worker_situation_state(
+                config=config,
+                worktree=worktree,
+                repository=repository,
+                branch=branch,
+                tools=tools,
+                events=situation_events,
+                model=model,
+                last_provider=last_provider,
+                turn=turn,
+                epoch_count=epoch_count,
+                current_epoch_checkpoint=current_epoch_checkpoint,
+                base_messages=base_messages,
+                context_continuation=context_continuation,
+                wall_deadline=wall_deadline,
+            )
+            situation_frame = _situation_message(situation_state, config)["content"]
+            situation_provenance = _situation_frame_provenance(situation_state, situation_frame)
+            state_message = _context_state_message(
+                code_changed=code_changed,
+                verified_after_change=verified_after_change,
+                verification_failed=verification_failed,
+                no_progress_actions=no_progress_actions,
+                budget_new_tokens=budget_new_tokens,
+                previous_prompt_tokens=previous_prompt_tokens,
+                turn=turn,
+                context_epoch=epoch_count,
+                max_tokens=config.max_tokens,
+                situation_frame=situation_frame,
+            )
             prompt["messages"].append(state_message)
             final_synthesis_call = finalized
             # Keep the object handed to the router immutable for checkpointing.
@@ -5987,6 +6385,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                     router=router,
                     prompt=sent_prompt,
                     call_kind="agent",
+                    situation_provenance=situation_provenance,
                 )
                 budget_failure = final_synthesis_call and budget_new_tokens >= soft_cap
                 failure_reason = (
@@ -6009,6 +6408,12 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                         epoch=usage_epoch,
                         fork_of=usage_fork_of,
                     )
+                _append_situation_event(
+                    situation_events,
+                    "usage_event",
+                    config.task_id,
+                    **failure_event,
+                )
                 return _loop_result(
                     outcome,
                     "failed",
@@ -6097,10 +6502,23 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                 await _emit_usage_event(
                     writer,
                     config,
-                    _success_usage_event(result, turn, prompt=sent_prompt, call_kind="agent"),
+                    _success_usage_event(
+                        result,
+                        turn,
+                        prompt=sent_prompt,
+                        call_kind="agent",
+                        situation_provenance=situation_provenance,
+                    ),
                     epoch=usage_epoch,
                     fork_of=usage_fork_of,
                 )
+            _record_situation_usage(
+                situation_events,
+                config,
+                result,
+                turn,
+                situation_provenance=situation_provenance,
+            )
             cumulative_usage = _accumulate_usage(cumulative_usage, result.usage)
             usage_source = (result.provider, result.model)
             if previous_usage_source != usage_source:
@@ -6150,7 +6568,11 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                     invalid_messages[0]["phase"] = phase
                 for invalid_message in invalid_messages:
                     context_continuation, transcript = _append_context_message(
-                        invalid_message, base_messages, context_continuation, transcript, config,
+                        invalid_message,
+                        base_messages,
+                        context_continuation,
+                        transcript,
+                        config,
                     )
                 base_messages, context_continuation, transcript = await _maybe_restore_turn_context(
                     turn_checkpoint_resumed=turn_checkpoint_resumed,
@@ -6186,7 +6608,12 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                     # only the last valid tool call. This is existing history,
                     # not a new trace store or another model request.
                     await _persist_checkpoint(
-                        writer, config, turn, transcript, cumulative_usage, [],
+                        writer,
+                        config,
+                        turn,
+                        transcript,
+                        cumulative_usage,
+                        [],
                         compaction_deferred=compaction_deferred,
                         consecutive_compaction_deferrals=consecutive_compaction_deferrals,
                         code_changed=code_changed,
@@ -6676,6 +7103,15 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                             tool_result = cast(ToolResult, gathered_result)
                         batch_results.append((name, arguments, tool_result))
 
+                for batch_index, (name, _arguments, tool_result) in enumerate(batch_results):
+                    _record_situation_tool(
+                        situation_events,
+                        config,
+                        name,
+                        tool_result,
+                        turn,
+                        batch_index=batch_index,
+                    )
                 batch_messages = [action_message]
                 if trailing:
                     batch_messages.append({"role": "user", "content": _TRAILING_ACTION_NOTE})
@@ -7033,6 +7469,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
             elif name == "run_shell":
                 verification_failed = True
                 verified_after_change = False
+            _record_situation_tool(situation_events, config, name, tool_result, turn)
             result_content = (
                 tool_result.output
                 if tool_result.ok
