@@ -137,14 +137,15 @@ def test_rejected_provenance_drops_event_and_skips_ledger(tmp_path: Path) -> Non
         {"situation_frame_truncated_sections": "OPEN"},
         {"situation_frame_truncated_sections": [""]},
         {"situation_frame_truncated_sections": [7]},
+        {"situation_frame_truncated_sections": ["BOGUS_SECTION"]},
+        {"situation_frame_truncated_sections": ["OPEN", "OPEN"]},
+        {"situation_frame_truncated_sections": ["OPEN" * 100]},
     ]
 
     async def scenario() -> None:
         state = _generation_state("parent", 3)
         for bad in bad_values:
-            await runtime._handle_usage_event_message(
-                state, {**_worker_usage_event(), **bad}
-            )
+            await runtime._handle_usage_event_message(state, {**_worker_usage_event(), **bad})
 
     asyncio.run(scenario())
 
@@ -157,6 +158,9 @@ def test_rejected_provenance_drops_event_and_skips_ledger(tmp_path: Path) -> Non
     assert rejected_fields[4] == ["situation_frame_sha256"]
     assert rejected_fields[6] == ["situation_frame_bytes"]
     assert rejected_fields[8] == ["situation_frame_truncated_sections"]
+    assert rejected_fields[9] == ["situation_frame_truncated_sections"]
+    assert rejected_fields[10] == ["situation_frame_truncated_sections"]
+    assert rejected_fields[11] == ["situation_frame_truncated_sections"]
     # No durable usage_event and no ledger fold for any rejected variant.
     assert runtime._debt_store.as_mapping() == {}
 

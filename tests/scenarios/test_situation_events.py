@@ -315,8 +315,9 @@ def test_usage_event_carries_situation_frame_provenance(
     ]
     assert usage["situation_frame_version"] == 1
     assert usage["situation_frame_source_watermark"] == 2
-    assert usage["situation_frame_sha256"] == hashlib.sha256(
-        "\n".join(payload_lines).encode("utf-8")
-    ).hexdigest()
+    assert (
+        usage["situation_frame_sha256"]
+        == hashlib.sha256("\n".join(payload_lines).encode("utf-8")).hexdigest()
+    )
     assert usage["situation_frame_bytes"] == len(frame.encode("utf-8"))
     assert usage["situation_frame_truncated_sections"] == truncated

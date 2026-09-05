@@ -3098,7 +3098,8 @@ def _first_action_response(result: CallResult) -> CallResult:
             continue
         phase = message.get("phase")
         return replace(
-            result, content=message["content"],
+            result,
+            content=message["content"],
             assistant_phase=phase if phase in {"commentary", "final_answer"} else None,
         )
     return result
@@ -3573,9 +3574,7 @@ def _worker_situation_state(
         state.artifacts,
         base_head=config.base_commit or state.artifacts.base_head,
         worktree_head=head if head is not None else state.artifacts.worktree_head,
-        accepted_integration_head=(
-            config.base_commit or state.artifacts.accepted_integration_head
-        ),
+        accepted_integration_head=(config.base_commit or state.artifacts.accepted_integration_head),
         dirty=dirty if dirty is not None else state.artifacts.dirty,
     )
     resources = replace(
@@ -4119,7 +4118,8 @@ def _provider_boundary(
 
 def _context_message(value: Any, location: str) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) not in (
-        {"role", "content"}, {"role", "content", "phase"},
+        {"role", "content"},
+        {"role", "content", "phase"},
     ):
         raise ContextForkError(f"checkpoint {location} must have role/content and optional phase")
     role = value.get("role")
@@ -5959,9 +5959,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
     transcript: list[dict[str, Any]] = []
     tools = _exposed_tool_schemas(config)
     repository, branch = _situation_git_identity(worktree)
-    situation_events = _initial_situation_events(
-        config, worktree, repository, branch, tools
-    )
+    situation_events = _initial_situation_events(config, worktree, repository, branch, tools)
     lint_diag = LintDiag()
     budget_usd = _fanout_budget_usd(config.fanout_config)
     progress_detector = _ProgressDetector(
@@ -6351,9 +6349,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                 wall_deadline=wall_deadline,
             )
             situation_frame = _situation_message(situation_state, config)["content"]
-            situation_provenance = _situation_frame_provenance(
-                situation_state, situation_frame
-            )
+            situation_provenance = _situation_frame_provenance(situation_state, situation_frame)
             state_message = _context_state_message(
                 code_changed=code_changed,
                 verified_after_change=verified_after_change,
@@ -6572,7 +6568,11 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                     invalid_messages[0]["phase"] = phase
                 for invalid_message in invalid_messages:
                     context_continuation, transcript = _append_context_message(
-                        invalid_message, base_messages, context_continuation, transcript, config,
+                        invalid_message,
+                        base_messages,
+                        context_continuation,
+                        transcript,
+                        config,
                     )
                 base_messages, context_continuation, transcript = await _maybe_restore_turn_context(
                     turn_checkpoint_resumed=turn_checkpoint_resumed,
@@ -6608,7 +6608,12 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                     # only the last valid tool call. This is existing history,
                     # not a new trace store or another model request.
                     await _persist_checkpoint(
-                        writer, config, turn, transcript, cumulative_usage, [],
+                        writer,
+                        config,
+                        turn,
+                        transcript,
+                        cumulative_usage,
+                        [],
                         compaction_deferred=compaction_deferred,
                         consecutive_compaction_deferrals=consecutive_compaction_deferrals,
                         code_changed=code_changed,

@@ -1159,13 +1159,10 @@ def test_tool_call_batch_cap_rejects_text_and_native_actions(tmp_path: Path) -> 
 def test_finish_does_not_require_a_ritual_shell_command(tmp_path: Path, shell_check: bool) -> None:
     worktree = _make_worktree(tmp_path / "repo")
     actions = [
-        '{"name":"write_file","arguments":'
-        '{"path":"note.txt","content":"hello\\n"}}',
+        '{"name":"write_file","arguments":{"path":"note.txt","content":"hello\\n"}}',
     ]
     if shell_check:
-        actions.append(
-            '{"type":"tool_call","name":"run_shell","arguments":{"cmd":["false"]}}'
-        )
+        actions.append('{"type":"tool_call","name":"run_shell","arguments":{"cmd":["false"]}}')
     actions.append('{"type":"finish","summary":"updated note","objective_met":true}')
     router = _ScriptedRouter(actions)
     outcome = asyncio.run(_drive_loop(_agent_config(worktree), worktree, router))

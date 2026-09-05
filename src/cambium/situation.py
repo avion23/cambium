@@ -398,8 +398,7 @@ def render_situation_frame(
     if _frame_bytes(state, sections) > frame_limits.max_frame_bytes:
         raise ValueError("whole-frame byte cap is too small for the mandatory frame structure")
     return (
-        "\n".join(line for section in _frame_lines(state, sections) for line in (section,))
-        + "\n"
+        "\n".join(line for section in _frame_lines(state, sections) for line in (section,)) + "\n"
     )
 
 

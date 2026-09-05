@@ -304,9 +304,7 @@ def test_worker_loop_injects_bounded_ordered_situation_frame(
         start = section_starts[index]
         end = section_starts[index + 1] if index + 1 < len(section_starts) else len(lines) - 1
         section_lines = lines[start:end]
-        assert len(("\n".join(section_lines) + "\n").encode("utf-8")) <= limits.bytes_for(
-            section
-        )
+        assert len(("\n".join(section_lines) + "\n").encode("utf-8")) <= limits.bytes_for(section)
         content_lines = [line for line in section_lines[1:] if not line.startswith("  [truncated ")]
         assert len(content_lines) <= limits.items_for(section)
 

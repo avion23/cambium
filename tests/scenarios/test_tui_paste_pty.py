@@ -15,10 +15,9 @@ import os
 from pathlib import Path
 
 import pytest
-
 from test_tui_live_pty import (
-    _CannedOpenAIServer,
     _PROMPT_REPAINT,
+    _CannedOpenAIServer,
     _init_repo,
     _kill_child,
     _provider_file,
@@ -31,7 +30,7 @@ from test_tui_live_pty import (
 pytestmark = pytest.mark.slow
 
 # Two-line TOML snippet, framed as a real terminal paste, terminated by Enter.
-_PASTE = b"\x1b[200~[tool]\nname = \"x\"\x1b[201~\r"
+_PASTE = b'\x1b[200~[tool]\nname = "x"\x1b[201~\r'
 _ONE_PROMPT = '<cambium-task>\nTask: [tool]\nname = "x"\n</cambium-task>'
 _SWALLOW_INPUTRC = '"\\e[200~": abort\n"\\e[201~": abort\n'
 
