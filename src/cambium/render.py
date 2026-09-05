@@ -678,6 +678,8 @@ def render_tokens_per_s(events: Any) -> str:
     the prompt and cannot measure generation speed. Missing evidence stays
     unknown; this is not a measurement of decoder-only throughput.
     """
+    if events is None:
+        return ""
     rate: float | None = None
     for event in events:
         if not isinstance(event, Mapping):
