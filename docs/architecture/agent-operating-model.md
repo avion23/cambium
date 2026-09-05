@@ -36,8 +36,8 @@ another layer of interfaces.
 ordinary name for an agent doing delegated work. Neither names a separate
 runtime class, a provider tier, or a context policy. In particular, a child does
 not necessarily get the complete parent context and a subagent is not
-necessarily stateless. Choose context and placement explicitly; see
-[context branches](context-branches.md).
+necessarily stateless. Context and placement are separate choices with ordinary
+defaults; see [context branches](context-branches.md).
 
 ## What belongs in the harness
 
@@ -76,8 +76,8 @@ Continue locally when work is small, tightly coupled, or likely to require
 several clarification round trips. Delegate when independent work can shorten
 the critical path or provide genuinely independent evidence.
 
-Each child needs an objective, ownership boundary, completion check, and
-explicit context/placement. The parent owns its lifetime and integrates its
+Each child needs an objective, ownership boundary and completion check.
+The worker supplies context/placement defaults; explicit intent can override them. The parent owns its lifetime and integrates its
 result. A shared provider lane can make delegation slower even when there are
 many worker slots. A different provider can help only when the work is separable
 and its capabilities and available quota fit.
@@ -120,7 +120,8 @@ Start with a real task or trace. Fix the owning path, add a focused executable
 regression, and rerun the relevant frontend. Keep unsuccessful trials: a model
 syntax error, provider outage, and harness bug require different fixes.
 
-For prompt experiments compare accepted outcomes, total provider usage, cache
-usage, wall time, malformed actions, and repair work on held-out tasks. DSPy can
-help with an explicit program and metric; installing it or optimizing an unused
-module does not improve the coding agent. See [optimization](optimization.md).
+Prompt experiments run the actual harness and compare accepted artifacts,
+provider usage, wall time and failures. GEPA can automatically replace coding
+or summary policy for new sessions; it does not run inside normal actions.
+A saved candidate alone is not a demonstrated general gain. See
+[optimization](optimization.md).

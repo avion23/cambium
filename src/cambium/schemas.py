@@ -298,8 +298,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "is a full Cambium worker in an isolated git worktree. This call only proposes; "
             "the supervisor validates and durably admits or rejects the child. With context "
             "reuse, a successful proposal may suspend this task until the child result is "
-            "joined. Make spec.task self-contained and always declare context_mode plus "
-            "placement. Valid pairs are trunk+inherit, semantic+inherit, semantic+spread, "
+            "joined. Make spec.task self-contained. One child defaults to trunk+inherit; "
+            "several in one batch default to semantic+spread. Explicit pairs include "
+            "trunk+inherit, semantic+inherit, semantic+spread, "
             "fresh+inherit, and fresh+spread. trunk+spread is rejected. The child never "
             "receives sibling context or hidden reasoning."
         ),
@@ -314,8 +315,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "type": "string",
                     "minLength": 1,
                     "description": (
-                        "Structural task-tree kind; it does not select a prompt. "
-                        "The supervisor validates it against TaskKind."
+                        "Structural task-tree kind, default feature. It does not select a prompt. "
+                        "Use feature, investigation, bugfix, refactor, or docs."
                     ),
                 },
                 "spec": {
@@ -340,7 +341,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                             "type": "string",
                             "enum": ["trunk", "semantic", "fresh"],
                             "description": (
-                                "Required parent-context representation. trunk = exact "
+                                "Optional parent-context representation. trunk = exact "
                                 "same-provider checkpoint prefix and requires inherit; "
                                 "semantic = immutable summary trunk under a fresh head; "
                                 "fresh = task contract only."
@@ -350,7 +351,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                             "type": "string",
                             "enum": ["inherit", "spread"],
                             "description": (
-                                "Required provider-affinity choice. inherit preserves parent "
+                                "Optional provider-affinity choice. inherit preserves parent "
                                 "affinity; spread prefers another hard-feasible lane, then "
                                 "falls back to the complete feasible set."
                             ),
@@ -391,11 +392,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                             ),
                         },
                     },
-                    "required": ["task", "context_mode", "placement"],
+                    "required": ["task"],
                     "additionalProperties": True,
                 },
             },
-            ["child_task_id", "kind", "spec"],
+            ["child_task_id", "spec"],
         ),
     },
 ]

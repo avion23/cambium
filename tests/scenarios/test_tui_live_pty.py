@@ -174,8 +174,10 @@ def _spawn_tui(
 
 def _read_into(fd: int, output: bytearray, timeout: float) -> None:
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+    while True:
         remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
         ready, _, _ = select.select([fd], [], [], min(0.05, remaining))
         if not ready:
             continue
@@ -293,16 +295,14 @@ def test_live_tui_resize_preserves_one_input_prompt(tmp_path: Path) -> None:
             os.close(master_fd)
 
 
-@pytest.mark.parametrize("attempt", range(3))
-def test_resize_while_readline_is_editing_does_not_crash(tmp_path: Path, attempt: int) -> None:
-    del attempt
+def test_resize_while_readline_is_editing_does_not_crash(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     _init_repo(repo)
     process, fd = _spawn_tui(repo, tmp_path / "missing-providers.json")
     output = bytearray()
     try:
         _read_until(fd, output, _PROMPT_REPAINT, 5)
-        for index in range(40):
+        for index in range(120):
             os.write(fd, b"typing while the terminal resizes ")
             _set_size(fd, 90 if index % 2 else 110)
             _read_into(fd, output, 0.01)

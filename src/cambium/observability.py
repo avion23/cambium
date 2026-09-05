@@ -274,6 +274,13 @@ def _event_detail(kind: str, payload: Mapping[str, Any]) -> str:
 
 
 def _set_state(agent: _Agent, state: str) -> None:
+    if agent.state == "suspended" and state in {"starting", "active", "merging"}:
+        agent.state = state
+        return
+    if state == "suspended" and agent.state not in _TERMINAL_STATES:
+        agent.state = state
+        agent.tool = None
+        return
     if agent.state in _TERMINAL_STATES:
         if agent.state == "failed" and state == "starting":
             agent.state = state
@@ -294,6 +301,8 @@ def _context_lineage(kind: str, payload: Mapping[str, Any]) -> str | None:
         return "exact"
     if payload.get("semantic_reuse") is True:
         return "semantic"
+    if payload.get("resolved_context_mode", payload.get("context_mode")) == "fresh":
+        return "fresh"
     return ""
 
 
@@ -527,7 +536,8 @@ class ObservabilityState:
                 "context_resume",
                 "context_fork",
             }:
-                _set_state(agent, "active")
+                if kind != "context_fork" or child_id in {None, task_id}:
+                    _set_state(agent, "active")
             elif kind in {"merge_progress", "merge_started"}:
                 _set_state(agent, "merging")
             elif kind in {
@@ -539,9 +549,9 @@ class ObservabilityState:
                 _set_state(agent, "failed")
             elif kind == "result":
                 status = _string(payload.get("status"))
-                if status in {"succeeded", "failed", "cancelled"}:
+                if status in {"succeeded", "failed", "cancelled", "suspended"}:
                     _set_state(agent, status)
-            elif kind == "exit":
+            elif kind == "exit" and agent.state != "suspended":
                 _set_state(agent, "exited")
             elif kind == "reuse_ready" and agent.state not in _TERMINAL_STATES:
                 _set_state(agent, "succeeded")

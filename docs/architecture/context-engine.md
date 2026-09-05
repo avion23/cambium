@@ -1,144 +1,196 @@
-# Cache-first context engine
+# CAST: Cache-Aligned Semantic Trunking
 
-**Status:** implemented CAST summaries, checkpoints, context forks, and
-configured K0 rollover. Richer work-ledger/result-capsule proposals are not
-implied by those mechanisms.
+**Status:** current context model and implementation. The worker and
+`summary_trunk.py` implement normal folds, checkpoint forks and K0 rollover.
+A typed work ledger and a globally optimized rollover schedule are not implied.
 
-## Durable history, disposable projection
+## The model
 
-The reusable object is an immutable context projection, not a stateful API
-model. Provider prompt/KV cache is an acceleration of sending that projection;
-it is never the authority for task correctness or recovery.
+CAST keeps a compact working context without repeatedly rewriting its useful
+past. The model is stateless; the harness owns context and history. A provider
+cache makes an unchanged prefix cheaper to process, but losing that cache must
+not lose the task.
 
-The ordinary active request is:
+A branch's active request has this shape:
 
 ```text
-stable system/tool head + S1 + S2 + ... + Sn + small raw working tail
+H  M  S1  S2  ...  Sn  R
+│  │  └──────┬──────┘  └─ recent raw actions and observations
+│  │         └─ immutable semantic entries
+│  └─ branch task message
+└─ stable system instructions and tool definitions
 ```
 
-Each `Si` is a published semantic summary of one new disjoint raw range. A flush
-appends one summary entry and removes only its covered raw tail from the active
-request. Earlier summary bytes remain unchanged. Appending a summary after the
-entire old transcript without removing the covered raw region is not compaction.
+`H + M` is the stable two-message head in the current implementation. The
+system message includes the model identity and tool catalogue. `M` is task
+data, not an instruction interpolated into the system head. An exact child
+keeps that head and appends its own task in the continuation.
 
-Events and checkpoints retain the raw evidence outside the active prompt.
-`branch_history` can reopen a recorded tool action/observation without executing
-it again. A summary is lossy and may be wrong; its conclusions do not turn into
-verified tool results merely by surviving several turns.
+The semantic trunk is an **accumulation of useful changes in knowledge**, not a
+running prose summary rewritten on every turn. Preserve decisions, findings,
+changed artifacts, check outcomes, relevant failed approaches and open work.
+Discard routine noise from the working prompt, not from durable history.
 
-## Separate identities
+## One ordinary fold
 
-| Object | Identity / purpose |
+Suppose the branch has accumulated raw range `R1`:
+
+```text
+before       H M S1 S2 R1
+summary call H M S1 S2 R1 <summary-control>
+after        H M S1 S2 S3
+next work    H M S1 S2 S3 R2
+```
+
+The summary call sees the existing trunk for background, but **only `R1` is the
+new source range**. `S3` records its semantic delta. Neither `S1` nor `S2` is
+rewritten or treated as new raw evidence. The next fold covers `R2`, not `R1`.
+The published prefix through `S2` therefore remains byte-identical.
+
+The worker supplies sequence, source digest, source-message count and covered
+turn; the model supplies the semantic fields. A successful fold appends one
+entry, removes its covered raw range from the active request, and publishes a
+successor epoch. Merely appending a summary after the entire transcript would
+not reduce the working set and is not CAST compaction.
+
+Normal work appends actions and observations to `R`. The current worker checks
+raw-tail thresholds between completed turns and requests a fold at delegation
+and root terminal boundaries. These boundary folds cost a provider request;
+they are not free bookkeeping. Forked exact children return their result rather
+than publishing a competing parent trunk. The actual conditions are in
+`worker._bound_context_continuation` and `worker._run_agent_loop`.
+
+Malformed summary output leaves the prior trunk and raw tail intact while the
+existing bounded deferral path applies. A failed fold cannot erase its source.
+The current worker can still fail a task on an unrecoverable compaction error;
+CAST does not yet make every summary failure transparent.
+
+## What remains outside the prompt
+
+Events and checkpoints retain the exact evidence. `branch_history` lists calls
+and reopens one action/observation or a bounded transcript window. Reading
+history produces a new observation; it never re-executes the old command or
+rewrites an old summary.
+
+Distinguish the storage objects:
+
+| Object | Purpose |
 | --- | --- |
-| Provider cache | Provider-owned prefix reuse; performance evidence only |
-| Checkpoint | Immutable request/continuation and metadata for recovery |
-| Active context epoch | The current projection and its lineage |
-| Worker generation | A particular process attempt, including restart fencing |
-| Git head | The actual code artifact being edited or accepted |
+| Event log | Ordered execution and usage observations |
+| Ordinary turn checkpoint | Resumable transcript/workspace snapshot; may be updated while a batch finishes |
+| Immutable epoch checkpoint | Published provider prefix, continuation and compatibility identity |
+| Git commit/worktree | Actual artifact state, separate from remembered conclusions |
+| Provider cache | Optional reuse of request processing, not durable agent memory |
 
-A warm worker does not prove a warm provider cache. Equal context hashes do not
-prove a hit. A code merge does not automatically update a remembered conclusion.
-These identities must be carried explicitly where they affect a transition.
+A retained summary is not proof that a check passed. A passing check describes
+the code it ran against, not a later merged tree. The current runtime retains
+check observations but does not claim that a successful shell command proves
+arbitrary task correctness. Repository benchmarks check the accepted artifact
+with an external executable criterion.
 
-## Checkpoint and prefix contract
+## Corrections and K0 are different
 
-Epoch files contain provider messages and a continuation suffix, with metadata
-for task/generation, usage, deadlines, and context compatibility. The cache key
-includes provider/model/protocol/reasoning identity, system/tool hashes, exact
-prefix/suffix/full hashes, prefix bytes, and the provider boundary.
+Within an ordinary trunk, corrections append `decisions_superseded` or
+`facts_invalidated` together with new conclusions. Old entries stay intact.
 
-Loaders verify the stored content against its descriptor. Redacted or
-incompatible state cannot be treated as an exact byte-identical fork. A cold
-provider must still receive a correct request; cache availability cannot change
-semantic request content.
+Eventually even semantic entries can fill the working set. K0 is the separate
+rollover operation:
 
-An exact child deliberately receives the complete compatible parent prefix,
-including its raw tail. A semantic child receives immutable summary state under
-a fresh provider head. A fresh child receives neither. The same distinction
-applies to continuation across provider changes; see
-[context policy](context-branches.md).
+```text
+old epoch    H M S1 S2 ... Sn       retained unchanged in history
+new epoch    H M K0                 new cache lineage
+later        H M K0 S1' S2' ... R
+```
 
-## Summary flush
+The current K0 compiler is deterministic Python, **not another model recursively
+summarizing summaries**. It folds the semantic entries, removes matching
+superseded/invalidated fact and decision strings, and deduplicates retained
+constraints, verification strings and open items. The original segment set is
+retained with rollover provenance.
 
-At an eligible completed-turn boundary, the worker freezes the new raw range,
-computes source identity, and asks for a bounded summary. The model supplies
-semantic fields; the harness supplies sequence, digest, count, and covered-turn
-metadata. Publication validates the result and creates an immutable successor
-checkpoint before advancing the active projection.
+There are real limits: identity is based on normalized text, not semantic
+entailment. Differently worded contradictions are not automatically resolved.
+Open items are deduplicated, not automatically marked completed. K0 is not a
+lossless transcript, a proof system, or the proposed typed WorkLedger.
 
-The semantic fields preserve objective/outcome, decisions and supersessions,
-facts and invalidations, changed files/symbols, verification results, relevant
-failed approaches, and open work. These are the current `SummaryEntry` fields,
-not a separately persisted WorkLedger. The canonical schema and limits live in
-[summary_trunk.py](../../src/cambium/summary_trunk.py); the prompt should not
-repeat the same long schema in several places.
+`context_policy.CastPolicy` currently rolls over after more than 16 segments by
+default. Its optional trunk-token bound is disabled at zero. The economic
+helpers are not the live policy owner. A rollover must restore the configured
+bounds; large irreducible semantic state can still exceed them.
 
-A malformed summary can be deferred within the existing bounded allowance,
-leaving the raw tail and accepted checkpoint intact. Other errors follow the
-worker's explicit compaction-failure path. A failed fold must not destroy the
-only copy of the evidence. Summary calls consume real provider requests,
-tokens, latency, wall budget, and quota, just like action calls.
+Because K0 replaces the active semantic prefix, the next request can be cold.
+The worker resets the prompt-accounting baseline rather than pretending it is
+another append to the previous cached prefix. Earlier epoch files remain
+unchanged. This is why "append-only within an epoch" and "bounded across
+rollovers" are compatible statements.
 
-## K0 rollover
+## Branches and provider placement
 
-A configured `CastPolicy` can trigger rollover by segment/token thresholds.
-The worker compiles the active semantic state into a bounded K0 entry, records
-rollover provenance, and publishes a new epoch. Old source entries remain in
-durable history. This starts a **new cache lineage**: prompt accounting resets
-rather than subtracting the old prefix's length.
+Context representation and execution placement answer different questions:
 
-Normal append-only folds and K0 rollover are different operations. Do not call
-rollover a free append to the old prefix, or silently rewrite old epoch files.
-The library's economic decision helpers do not mean a measured global
-cache/throughput optimizer already controls every rollover.
+| Mode | Context at child start | Default placement |
+| --- | --- | --- |
+| `trunk` | Complete compatible parent checkpoint prefix and private continuation | Same provider/model (`inherit`) |
+| `semantic` | Published semantic entries under a fresh branch/provider head | Another usable lane (`spread`) |
+| `fresh` | Self-contained task, no parent checkpoint or semantic entries | `spread` |
 
-## Child results and artifacts
+Exact reuse needs matching provider/model/protocol/reasoning, instructions,
+tools and checkpoint bytes. It is a correctness requirement for an exact fork,
+not proof of a cache hit. An explicit impossible exact fork does not silently
+become semantic. A semantic child on another provider transfers knowledge, not
+KV-cache state. A fresh child deliberately transfers neither.
 
-The current supervisor joins bounded worker results and validated Git artifacts
-using the [child lifecycle](subagents.md). It does not currently expose every
-field of the proposed versioned, evidence-linked `ResultCapsule` in
-[agent-state reference](../reference/agent-state.md).
+A child returns a bounded result. The supervisor separately integrates its code
+and resumes the parent at the accepted artifact head. The parent adds new
+observations and conclusions to its own continuation; it does not concatenate
+complete sibling transcripts into its trunk.
 
-The parent must distinguish accepting a child's conclusion from accepting its
-commit. Its worktree must match the accepted integration head before resuming
-from a code join. Checks run on the child alone are not automatically checks of
-the combined tree. Do not invent an additional merge authority or memory store
-to express this distinction.
+[Context branches](context-branches.md) owns automatic delegation decisions and
+placement defaults. [Child lifecycle](subagents.md) owns suspension and joins.
+[The reference](../reference/context-branches.md) owns exact tool arguments.
 
-## Resource consequences
+## Resource economics
 
-An exact warm prefix can save repeated prompt processing, but retaining every
-old token also has a cost. Use raw-tail limits and bounded summaries; measure
-uncached input, cache reads, generated output, summary overhead, and wall time.
-Provider capability/TTL describes what may be cached; provider usage supplies
-actual hit evidence. Cache savings never turn an incompatible checkpoint into
-a valid one.
+CAST optimizes a working set, not the number of tokens produced. Measure the
+whole task: action calls, summary calls, retries, input/cache/output usage,
+child startup, provider queues, integration, verification and elapsed time.
 
-Routing and quota ownership are described in
-[providers as resources](provider-routing.md). Context code supplies compatibility
-and affinity; it does not run a second provider scheduler. Different providers
-are useful parallel resources when the task can use semantic or fresh context.
+A useful comparison for a fold is:
 
-## Verification proportional to the change
+```text
+cost of one summary + changed-prefix processing
+versus
+cost of replaying the covered raw range on the remaining calls
+```
 
-Checkpoint/fold changes need focused identity, raw-tail retention, and recovery
-regressions. Branch changes need exact/semantic/fresh and ordered-join checks.
-A rendering change should not require a new model approval layer.
+Cached input still consumes some provider resources and may consume account
+quota. A provider's cash tariff, request limit, weekly allowance and generation
+rate are separate quantities. Unknown quota is not unlimited quota; output
+rate must not count prompt tokens. Only provider-reported usage establishes
+cache hits. The TUI labels byte-derived context sizes as estimates.
 
-Claims of better cache economics require repeated provider-reported warm/cold
-measurements, not one matching hash or a single cached call. Claims of better
-summaries require held-out tasks that retain obligations, reopen exact evidence,
-and verify the final artifact. Keep negative results and resource use visible.
+Small local work often costs less than spawn, fold, join and re-verification.
+Independent work can justify another provider when it shortens the critical
+path or uses otherwise idle capacity. Exact same-trunk blocking work keeps the
+parent provider. These are policies to evaluate, not a promise that every
+additional child makes a task faster.
 
-## Source and related design
+## Prompts and experiments
 
-[Worker context loop](../../src/cambium/worker.py),
-[summary/K0 projection](../../src/cambium/summary_trunk.py),
-[cache policy and quota values](../../src/cambium/provider_scheduler.py),
-[provider calls](../../src/cambium/diffundo.py),
-[history](../../src/cambium/branch_history.py).
+Coding and summary policies can be replaced by an offline GEPA run. A session
+pins its chosen text; replacement affects new sessions or `/new`, not a live
+prefix. Protocol/schema mechanics remain code-owned. See
+[optimization](optimization.md) for deployment and experiment commands.
 
-The broader [operating model](agent-operating-model.md) and
-[evaluation proposals](../research/agent-system-evaluation.md) preserve future
-ideas. They are not evidence that a canonical model/operator state projection,
-typed work ledger, or optimized prompt deployment is already complete.
+Compare prompt candidates on accepted artifacts and held-out tasks, including
+corrections, long sessions, history recall and joins. A shorter summary that
+loses an obligation is not a win. Neither one cache hit nor one passing task
+establishes a general resource improvement.
+
+## Implementation anchors
+
+`worker._bound_context_continuation`, `worker._write_epoch_checkpoint`,
+`summary_trunk.partition_summary_trunk`, `append_summary_entry`,
+`compile_k0_projection`, `rollover_summary_trunk`, and `context_policy.CastPolicy`
+own this path. They use existing events, checkpoints and Git; CAST needs no
+vector database, second memory service, or permanent planner/reviewer hierarchy.

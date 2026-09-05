@@ -24,8 +24,9 @@ needs that slot.
 
 ## From proposal to running child
 
-1. The model calls `delegate` with a stable child id, task kind, self-contained
-   objective, and explicit context/placement policy.
+1. The model calls `delegate` with a stable child id, task kind and self-contained
+   objective. The worker fills omitted context/placement using the
+   [automatic delegation defaults](context-branches.md); explicit policy wins.
 2. Tool validation checks the shape. A successful tool response means
    **proposed**, not admitted or completed.
 3. The supervisor validates parent identity, tree limits, provider feasibility,

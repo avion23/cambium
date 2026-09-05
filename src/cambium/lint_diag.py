@@ -147,7 +147,7 @@ class LintDiag:
             # represented by its JSON list. Other failures (and status 1 with
             # no findings) must not look like a clean lint run.
             stderr = result.stderr.strip()
-            if result.returncode != 1 or not diagnostics or stderr:
+            if result.returncode != 1 or not diagnostics:
                 detail = stderr or f"lint command exited with status {result.returncode}"
                 diagnostics.insert(
                     0,

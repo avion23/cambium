@@ -169,7 +169,7 @@ def _delta(text: str) -> dict[str, Any]:
     }
 
 
-def _completed(model: str = "gpt-5.6-luna") -> dict[str, Any]:
+def _completed(model: str = "gpt-5.6-luna", text: str = "Hello, world") -> dict[str, Any]:
     return {
         "type": "response.completed",
         "response": {
@@ -181,7 +181,7 @@ def _completed(model: str = "gpt-5.6-luna") -> dict[str, Any]:
                     "id": "it_1",
                     "type": "message",
                     "role": "assistant",
-                    "content": [{"type": "output_text", "text": "Hello, world"}],
+                    "content": [{"type": "output_text", "text": text}],
                 }
             ],
             "usage": {
@@ -232,7 +232,7 @@ def _ok_stream(model: str = "gpt-5.6-luna", text: str = "Hello, world") -> str:
                 }
             ],
         },
-        _completed(model),
+        _completed(model, text),
     )
 
 

@@ -124,6 +124,8 @@ from .routing import (
     LaneCapacityExhausted,
     LaneState,
     ProviderDebt,
+    RoutingRequest,
+    provider_satisfies_request,
     resolve_assignment,
     validate_requirements,
 )
@@ -558,17 +560,16 @@ def _load_epoch_checkpoint_messages(
         for message in raw_messages:
             if (
                 not isinstance(message, dict)
-                or set(message) != {"role", "content"}
+                or set(message) not in ({"role", "content"}, {"role", "content", "phase"})
                 or message.get("role") not in {"system", "user", "assistant", "tool"}
+                or ("phase" in message and (
+                    message.get("role") != "assistant"
+                    or message["phase"] not in {"commentary", "final_answer"}
+                ))
                 or not isinstance(message.get("content"), str)
             ):
                 raise ValueError(f"checkpoint {field} contains an invalid message")
-            messages.append(
-                {
-                    "role": message["role"],
-                    "content": message["content"],
-                }
-            )
+            messages.append(dict(message))
         loaded[field] = messages
     if not loaded["provider_messages"]:
         raise ValueError("checkpoint provider_messages is empty")
@@ -2396,6 +2397,7 @@ class _Runtime:
         # post-spawn task lookup, so a child cannot finish between admission
         # and registration.
         self._child_tasks: dict[str, list[asyncio.Future[dict[str, Any]]]] = {}
+        self._child_runners: dict[str, asyncio.Task[None]] = {}
         self._child_completion: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._child_parent: dict[str, str] = {}
         self._admitted_children: dict[str, list[str]] = {}
@@ -3678,7 +3680,7 @@ class _Runtime:
         self._child_parent[child_task_id] = parent_task_id
         child_coroutine = self.supervise_task(child_spec)
         try:
-            self._task_group.create_task(child_coroutine)
+            self._child_runners[child_task_id] = self._task_group.create_task(child_coroutine)
         except BaseException as create_error:
             child_coroutine.close()
             self._rollback_child_admission(parent_task_id, child_task_id, child_spec)
@@ -3795,25 +3797,24 @@ class _Runtime:
         }
 
     async def _await_suspend_children(self, parent_task_id: str, remaining: float) -> None:
-        """Await the suspended parent's children, bounded by the wall budget.
-
-        Each child is awaited under a shield so a resume-timeout never cancels
-        the child's own supervision; the bounded wait prevents one hung child
-        from consuming the parent's entire remaining budget.
-        """
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + max(0.0, remaining)
+        """Wait within the parent budget; its terminal path owns cancellation."""
         pending = [
             future
             for future in self._child_tasks.get(parent_task_id, ())
             if future is not None and not future.done()
         ]
-        for future in pending:
-            timeout = max(0.0, deadline - loop.time())
-            try:
-                await asyncio.wait_for(asyncio.shield(future), timeout=timeout)
-            except TimeoutError:
-                pass
+        if pending:
+            await asyncio.wait(pending, timeout=max(0.0, remaining))
+
+    async def _cancel_running_children(self, parent_task_id: str) -> None:
+        children = [
+            task for task_id, task in self._child_runners.items()
+            if self._child_parent.get(task_id) == parent_task_id and not task.done()
+        ]
+        for task in children:
+            task.cancel()
+        if children:
+            await asyncio.gather(*children, return_exceptions=True)
 
     async def _pin_fork_child(
         self,
@@ -4401,11 +4402,10 @@ class _Runtime:
         """Redact one provider message before it enters or leaves recovery."""
         if self._redactor is None:
             return dict(message)
-        redacted = self._redactor.redact_protocol_record(message, structural_fields=("role",))
-        return {
-            "role": cast(str, redacted["role"]),
-            "content": cast(str, redacted["content"]),
-        }
+        redacted = self._redactor.redact_protocol_record(
+            message, structural_fields=("role", "phase"),
+        )
+        return {**message, "content": cast(str, redacted["content"])}
 
     async def _record_context_checkpoint_conversation(
         self, task_id: str, checkpoint_ref: str, epoch: int
@@ -4674,6 +4674,9 @@ class _Runtime:
                 # ownership.
                 _release_lane(self._lanes, spec)
                 result = self._results.get(task_id)
+                if cancelled or (result is not None and result.status != "succeeded"):
+                    await self._cancel_running_children(task_id)
+                self._child_runners.pop(task_id, None)
                 retain_resolver_worktree = spec.get("_retain_worktree") is True
                 if result is not None and not retain_resolver_worktree:
                     try:
@@ -4838,7 +4841,9 @@ class _Runtime:
             await self._emit_provider_infeasible(spec)
             assigned_payload: dict[str, Any] = {
                 "task_id": task_id,
+                "parent_task_id": spec.get("parent_task_id"),
                 "repo": str(repo),
+                "worktree_path": str(worktree),
                 "branch": spec["branch"],
                 "base_commit": spec["base_commit"],
                 "task": spec.get("task", ""),
@@ -4960,6 +4965,11 @@ class _Runtime:
                                 summary=worker_summary,
                             )
                             return
+                        leased_lane = (
+                            self._lanes.get(spec.get("assigned_provider"))
+                            if spec.get("_lane_reserved") else None
+                        )
+                        _release_lane(self._lanes, spec)
                         child_ids = await self._admit_generation_children(
                             spec,
                             parent_envelope,
@@ -4968,6 +4978,9 @@ class _Runtime:
                             private_integration_base=snapshot_head,
                         )
                         remaining = deadline - time.monotonic()
+                        if remaining > 0:
+                            await self._await_suspend_children(task_id, remaining)
+                            remaining = deadline - time.monotonic()
                         if remaining <= 0:
                             detail = _wall_timeout_detail(wall_budget, deadline, restarts)
                             reason = f"wall ({detail})"
@@ -4986,7 +4999,6 @@ class _Runtime:
                                 summary=worker_summary,
                             )
                             return
-                        await self._await_suspend_children(task_id, remaining)
                         if not await self._assert_parent_join_invariant(
                             spec, child_ids, generation
                         ):
@@ -5029,6 +5041,9 @@ class _Runtime:
                             child_count=len(child_ids),
                             workspace_changed=resume_payload["workspace_changed"],
                         )
+                        if leased_lane is not None:
+                            leased_lane.in_flight += 1
+                            spec["_lane_reserved"] = True
                         spec["resume"] = resume_payload
                         spec.pop("context_fork", None)
                         continue
@@ -5429,6 +5444,8 @@ class _Runtime:
             "authorized_providers": list(spec.get("authorized_providers", ())),
             "authorized_providers_explicit": bool(spec.get("authorized_providers_explicit")),
         }
+        if spec.get("prompt_policy") is not None:
+            init_msg["prompt_policy"] = spec["prompt_policy"]
         if isinstance(spec.get("requirements"), dict) and spec["requirements"]:
             # Keep the validated task contract on the worker init message; the
             # worker owns the live Diffundo instance and must rebuild the same
@@ -8233,9 +8250,31 @@ def _resolve_model_candidates(
     if spread_providers is providers:
         assignment = _resolve(providers)
     else:
-        assignment = _resolve(spread_providers)
-        if assignment is None:
-            assignment = _resolve(providers)
+        required = validate_requirements(requirements)
+        request = RoutingRequest(
+            model="", allow_model_substitution=True,
+            required_context_tokens=required.get("min_context_window", 0),
+            quality=required.get("quality"),
+            needs_python_tool=required.get("needs_python_tool", False),
+            allow_paid=required.get("allow_paid", True),
+            allow_free=required.get("allow_free", True),
+        )
+        matching = [
+            p for p in providers if p.model in candidates
+            and (pinned_tier is None or p.tier.value == pinned_tier)
+            and provider_satisfies_request(p, request)
+        ]
+        other = [p for p in matching if p.name != spread_from]
+        idle_other = [p for p in other if lanes[p.name].in_flight == 0]
+        idle = [p for p in matching if lanes[p.name].in_flight == 0]
+        # Prefer unused capacity, not several siblings piled onto the one
+        # non-parent lane while the suspended parent's lane sits idle.
+        assignment = None
+        for pool in (idle_other, idle, other, providers):
+            if pool:
+                assignment = _resolve(pool)
+            if assignment is not None:
+                break
     if assignment is None:
         return False
     # The (provider, model, tier) assignment is one atomic unit: the worker
@@ -8443,6 +8482,29 @@ def _child_spec(
     child_spec["task_id"] = proposal["child_task_id"]
     child_spec["kind"] = proposal["kind"]
     child_spec["parent_task_id"] = parent_spec["task_id"]
+    component = _safe_task_id(proposal["child_task_id"])
+    child_spec.setdefault("repo", parent_spec["repo"])
+    child_spec.setdefault("worktree_path", str(session_dir / "children" / component))
+    child_spec.setdefault("branch", f"{parent_spec['branch']}--{component}")
+    for field in (
+        "base_commit", "worker", "max_turns", "max_wall_s", "max_tokens", "max_restarts",
+        "write_marker", "model_candidates", "requirements", "fanout_config",
+    ):
+        if field == "fanout_config" and (
+            raw.get("worker", parent_spec.get("worker")) != parent_spec.get("worker")
+        ):
+            continue
+        if field in parent_spec and field not in child_spec:
+            child_spec[field] = copy.deepcopy(parent_spec[field])
+    # An independent branch may use a different model/tier. Preserve explicit
+    # child constraints, not the parent's incidental admission assignment.
+    if child_spec.get("placement") == "spread":
+        fanout = child_spec.get("fanout_config")
+        explicit = raw.get("fanout_config", {})
+        if isinstance(fanout, dict) and isinstance(explicit, dict):
+            for field in ("model", "tier", "provider", "assigned_provider"):
+                if field not in explicit:
+                    fanout.pop(field, None)
 
     # Children inherit, never exceed, the parent's environment and provider
     # authorization.  Reject a widening request instead of silently trimming
@@ -8581,6 +8643,11 @@ def _child_spec(
         and child_spec["assigned_provider"] not in parent_authorized
     ):
         raise ValueError("child assigned_provider is not authorized by the parent")
+    # Children cannot mutate a session's selected prompt, including exact forks.
+    if "prompt_policy" in parent_spec:
+        child_spec["prompt_policy"] = copy.deepcopy(parent_spec["prompt_policy"])
+    else:
+        child_spec.pop("prompt_policy", None)
     child_spec["parent_envelope"] = parent_envelope
     validated = _validate_plan_task(session_dir, child_spec)
     parent_worktree = Path(parent_spec["worktree_path"]).resolve()
@@ -8985,6 +9052,18 @@ async def run_plan(
     tasks = _plan_tasks(plan)
     _reject_duplicate_task_ids(tasks)
     specs = [_validate_plan_task(session_dir, t) for t in tasks]
+    from .prompts import load_policy, validate_policy
+
+    policy = None
+    for spec in specs:
+        if spec.get("fanout_config") is None:
+            continue
+        selected = spec.get("prompt_policy")
+        if selected is None:
+            if policy is None:
+                policy = load_policy()
+            selected = policy
+        spec["prompt_policy"] = validate_policy(selected)
     if not specs:
         raise ValueError("plan contains no tasks")
     _reject_duplicate_task_ownership(specs)

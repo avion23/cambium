@@ -1,112 +1,106 @@
-# Offline prompt optimization
+# Prompt experiments and automatic replacement
 
-**Status:** DSPy experiments and artifact evaluation are implemented for two
-small decision modules. **The coding worker does not load these optimized
-artifacts, and its system prompt is not automatically improved by running
-`optimize`.**
+**Status:** `cambium optimize prompts` runs real repository-task benchmarks and
+GEPA over coding or summary policy text. A better evaluated candidate replaces
+the prompt artifact automatically. Ordinary worker turns do not import DSPy.
 
-## What exists
+## One runtime, an offline optimizer
 
-The `should_decompose` and `should_review` modules have rule implementations,
-module-owned train/eval/canary datasets, metrics, and optional DSPy predictors.
-The decomposition implementation lives in the physical `example` package;
-`should_decompose` is its logical optimizer name.
+`prompts.py` separates fixed action/summary protocol from two tunable strings:
+`coding` and `summary`. `prompt_optimize.py` presents an actual Cambium rollout
+as a DSPy predictor. GEPA changes the selected policy string; `benchmark.py`
+runs the existing supervisor and worker against an isolated repository.
 
-The optimizer supports zero-shot evaluation and the configured bootstrap/GEPA
-paths through Cambium's LM adapter. It records usage and estimated spend,
-evaluates dataset splits, and saves program/report artifacts. Saved state can
-be loaded by the optimizer's evaluation path. It is not silently promoted into
-the worker, supervisor, or default rule engine.
+The checker runs against the accepted Git head, not an uncommitted worker tree
+or a model's claim of success. Reports retain changed paths, outcomes, elapsed
+time, calls, reported tokens, estimated cost, child policies and actual serving
+providers. Execution artifacts remain in each rollout directory.
 
-The optional [DSPy base](../../src/cambium/modules/dspy_module.py) is an ordinary
-`dspy.Module` with one predictor. Only DSPy program modules import it. The
-shared [rule-module base](../../src/cambium/modules/base.py) remains importable
-without DSPy; constructing a program does not mutate class inheritance.
+DSPy format is useful at this optimization boundary, not everywhere. Tools,
+Git effects, provider configuration and the normal action protocol stay ordinary
+code. There is no additional classification or approval request per action.
+The separate `should_decompose` and `should_review` optimizers still exist for
+small decision experiments; they are not the coding worker's runtime policy.
 
-## Commands and what they prove
+## Run it
 
-Run from the checkout with the appropriate environment installed:
+From a checkout with the optional DSPy environment installed:
 
 ```sh
-python -m cambium module-test example
-python -m cambium module-test should_review
-python -m cambium optimize should_decompose --dry-run
-python -m cambium optimize should_review --dry-run
-python -m cambium optimize --help
-python -m cambium optimize eval --help
+# Inspect cases and budgets without constructing an LM.
+python -m cambium optimize prompts --optimizer gepa --dry-run
+
+# Baseline only; no prompt replacement.
+python -m cambium optimize prompts --optimizer zero --provider zai \
+  --output .cambium/prompt-baseline
+
+# Hill climb coding/delegation policy and automatically install an improvement.
+python -m cambium optimize prompts --optimizer gepa --component coding \
+  --provider zai --reflection-provider zai \
+  --max-evals 12 --max-calls 200 --max-tokens 500000 --budget-usd 2 \
+  --max-wall-s 300 --output .cambium/gepa-coding
 ```
 
-`module-test` uses the physical package name. It checks the isolated module and
-its fixtures; it is not a provider-backed coding benchmark. `--dry-run` resolves
-the experiment without constructing an LM, so a passing dry run proves neither
-provider connectivity nor useful optimization.
+Provider names above refer to the operator's configuration. `--component
+summary` runs the same experiment over summary policy. Use `--dataset PATH`
+for your own task distribution and `--case ID` for a baseline reproduction.
+`--no-deploy` keeps a GEPA candidate as an experiment rather than replacing the
+runtime artifact. These are experiment controls, not prerequisites for normal
+coding or delegation.
 
-A real predictor call through `CambiumLM` verifies the adapter and structured
-output path. A successful compile additionally verifies optimizer execution.
-Only a held-out comparison establishes whether the resulting program improves
-the chosen metric. None of these alone proves that the complete coding agent
-gets better.
+GEPA uses `current_best` candidate selection, no candidate merging, and one
+rollout at a time. The experiment budget includes reflection requests and
+reported task usage. Concurrent in-flight requests can finish after a limit is
+observed; these limits are not a provider-enforced account quota. A zero cash
+estimate does not make subscription tokens unlimited.
 
-## Does DSPy make sense here?
+## Replacement semantics
 
-Yes, as an **offline experiment tool** for a bounded decision with reproducible
-inputs, executable outcomes, and a baseline. It is not a reason to insert another
-model call or classification gate before each small edit, delegation, or finish.
-For a decision a small rule already gets right cheaply, keep the rule unless
-held-out results justify the added request, latency, and maintenance cost.
+The normal artifact is `~/.config/cambium/prompts.json` (or the corresponding
+`XDG_CONFIG_HOME` path). `CAMBIUM_PROMPTS` selects another artifact. It contains
+versioned JSON with plain `coding` and `summary` text, not an executable pickle.
 
-For coding-prompt experiments, use whole tasks in disposable repositories:
-check the resulting code, relevant tests, and publication. Labels should come
-from those outcomes, not the agent saying it succeeded. Record the prompt
-version, repository state, tool schema, provider/model, budgets, and task case
-so the comparison can be repeated.
+A changed candidate is installed when validation completion count does not
+regress, average validation score improves, and the held-out checks pass.
+Replacement is atomic. This is experiment selection, not an online agent gate.
+A failed or interrupted experiment does not replace the current policy.
 
-Train only on the training split. Select candidates using held-out evidence
-without repeatedly tuning against the final test set. Retain difficult cases
-and negative results; a smaller prompt that fixes one sample can still lose
-important behavior elsewhere.
+New sessions load the artifact automatically; a missing default artifact uses
+the built-in policy. An interactive session pins its policy in its durable
+manifest. Reconnect and child work retain that text. `/new` loads the current
+policy for a fresh branch. Replacing a file never rewrites an active CAST
+prefix. See [CAST](context-engine.md).
 
-## Optimize the resource objective, not only classification accuracy
+The output directory contains `candidate.json` when produced, `report.json`,
+and individual rollout repositories, events and checkpoints. Copy a previously
+retained policy artifact back to the configured prompt path to revert it.
 
-Correct accepted outcome comes first. Then compare wall time, provider calls,
-generated output, uncached/cached input, summary/retrieval overhead, and actual
-quota-window consumption. A subscription's zero incremental cash price does
-not make an unlimited optimization run free of opportunity cost.
+## Metrics and limitations
 
-The current monetary budget and usage ledger do not by themselves bound a
-zero-tariff experiment's weekly token consumption. Choose finite case counts
-and optimizer settings; include a token/call budget in any expansion of the
-experiment runner. Do not introduce an online gate to solve an offline budget
-problem.
+Correct accepted output is primary. A passing case receives a small bounded
+efficiency contribution from elapsed time, token usage and calls; failed cases
+score zero. This is an explicit heuristic, not a calibrated economic model.
 
-A useful experiment can compare a short hand-written prompt with an optimized
-candidate under the same tool/runtime contract. Freeze that contract during the
-comparison. Do not let an optimizer “win” by weakening checks, broadening tool
-access, or replacing executable labels with self-evaluation.
+Keep train, validation and test cases disjoint. Do not repeatedly revise prompts
+against the final test cases and still call them held out. Repeat close
+comparisons and enlarge the corpus before treating small gains as general.
+The packaged cases are starter fixtures, not a representative coding benchmark.
+In particular, use long continuation/fold/recovery cases to evaluate summary
+quality rather than relying on tiny functions.
 
-## Promotion is a separate engineering decision
+Freeze repository revision, provider pool and runtime behavior during a prompt
+comparison. Provider failure and malformed model output remain failures in the
+report. Distinguish assigned provider from actual serving provider after
+fallback. Inspect traces before adding another prompt rule: often the defect
+is a missing integration or redundant protocol requirement instead.
 
-The current coding prompt is a versioned static value in
-[prompts.py](../../src/cambium/prompts.py). Changes must be checked on real coding
-and continuation cases as well as parsing tests. Do not add automatic artifact
-loading to the worker merely because an experiment saved `program.json`.
+## Focused checks
 
-Before adding an optimized component to the runtime, establish a measured
-benefit, define where it is called and what it replaces, and preserve a simple
-failure path. Prefer replacing one demonstrated weak decision over layering an
-additional planner, reviewer, and policy model around the existing loop.
+`test_prompt_replacement.py` exercises policy pinning, artifact loading and the
+GEPA deployment path with controlled outcomes. It does not establish a real
+prompt quality gain. Live frontend tests exercise actual provider calls, tools,
+publication and continuation. `cambium optimize prompts --optimizer zero`
+provides the repeatable real-task path; the larger GEPA search is operator-run.
 
-The larger experiments in
-[agent-system evaluation](../research/agent-system-evaluation.md) are proposals,
-not claims that learning or deployment already runs in production.
-
-## Executable anchors
-
-- [Optimizer and cost/usage ledger](../../src/cambium/optimize.py),
-  [LM adapter](../../src/cambium/lm.py)
-- [Decomposition predictor](../../src/cambium/modules/example/dspy_program.py),
-  [review predictor](../../src/cambium/modules/should_review/dspy_program.py)
-- [Optimizer scenarios](../../tests/scenarios/test_optimize.py),
-  [stable program identity/save-load](../../tests/scenarios/test_dspy_module_identity.py)
-- [Real coding publication](../../tests/acceptance/test_live_coding_gate.py),
-  [real frontend navigation](../../tests/acceptance/test_live_frontends.py)
+No successful dry run, saved artifact or green classifier suite proves that
+Cambium's coding prompt became better. Use the report's actual accepted results.

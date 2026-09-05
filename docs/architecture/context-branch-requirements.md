@@ -31,9 +31,9 @@ as if they were fresh evidence. Keep the raw source outside the working prompt.
 
 An exact child gets the validated parent prefix. A semantic child gets summaries
 under a fresh provider head. A fresh child gets its task without the parent
-checkpoint or result envelope. Model-originated proposals declare both context
-and placement; contradictory or incompatible explicit requests do not silently
-change meaning.
+checkpoint or result envelope. The worker completes omitted context/placement
+before recording proposals. Contradictory or incompatible explicit requests do
+not silently change meaning.
 
 All five supported combinations and the internal harness-originated compatibility
 path are documented once in the [reference](../reference/context-branches.md).
@@ -58,9 +58,12 @@ system prompt.
 
 ## Results and resources
 
-A finish verdict must agree with the task and current verification evidence.
-Read-only completion needs no edit. Changed code needs the relevant checks;
-passing a check before the last edit does not prove the edited state.
+The worker records tool observations and the model's finish verdict. It does
+not certify correctness merely because a shell command returned zero, or demand
+an unrelated shell call before completion. Read-only completion needs no edit.
+Actual correctness claims require checks against the relevant artifact; passing
+a check before the last edit does not prove the edited state. Budget exhaustion
+without a finish verdict is incomplete, not fabricated success.
 
 The parent owns child lifetime and joins results in a defined order. Resuming
 from a child code change requires the accepted Git integration, not merely the

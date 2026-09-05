@@ -1,4 +1,7 @@
-# Harness audit — 2026-09-04
+# Harness audit — 2026-09-04, continued 2026-09-05
+
+The first record describes the September 4 revision. The continuation below
+supersedes its runtime-status claims; earlier measurements remain historical.
 
 ## Scope and evidence
 
@@ -81,3 +84,82 @@ work. Current [runtime architecture](../architecture/architecture.md),
 [terminal contract](../architecture/terminal-interface.md), and
 [offline optimization](../architecture/optimization.md) own the implementation
 claims. This record does not introduce a new runtime gate or policy layer.
+
+## September 5 continuation: prompt deployment, delegation and simplification
+
+Continued the isolated `gepa-delegation-20260905` worktree rather than editing
+other checkouts. The self-fix for `render_tokens_per_s(None)` came from a real
+Cambium task and was already committed. The parallel SituationFrame checkout
+was not incorporated.
+
+### What changed
+
+Coding and summary policy are now separate plain-text components. The offline
+GEPA runner executes normal Cambium rollouts, checks accepted artifacts and
+atomically replaces an improved policy for new sessions. Interactive sessions
+pin their policy; `/new` picks up replacement text. This is not a DSPy import or
+classification call on every worker turn. The actual hill climb remains an
+operator-run experiment; no general quality gain is claimed.
+
+The normal model decides whether to delegate. The worker fills context/placement
+from the current delegate batch; the supervisor supplies child workspace and
+execution settings. A single child defaults to trunk/inherit; independent
+siblings default to semantic/spread. Placement is a preference subject to actual
+provider availability and call-time fallback.
+
+Transcript-driven corrections:
+
+| Observation | Change |
+| --- | --- |
+| Valid name/arguments requests were rejected just for missing the redundant type tag | Accept the unambiguous tool shape; validate the actual tool and arguments |
+| Repeated malformed batch brackets received the same generic escaping advice | One repair path with a single-tool example; no separate finish-only repair policy |
+| Arbitrary successful shell commands counted as verification, but valid completion could be blocked | Remove the ritual shell-success finish gate; retain observations and external artifact checks |
+| Budget pressure discarded useful tool calls and could fabricate success without a finish verdict | Keep tools available within the bounded run; no terminal verdict means incomplete |
+| One fallback notice was appended again on every subsequent model call | Append it only on provider change |
+| A provider quota failure was visible in usage but hidden behind a generic final exception | Include the provider and typed failure category in the final reason |
+| A Python-version linter warning was counted as an extra source error beside valid findings | Do not turn warning stderr into another error when Ruff returned ordinary diagnostics |
+| Suspended parents looked terminal and the rail reserved empty detail rows | Keep suspension nonterminal; compact provider/status rows for each lane and three CAST context rows |
+| PTY helper could pass a negative timeout after two clock reads | Compute the remaining wait once; keep the real resize/typing stress |
+
+Removed the newly added JSON-mode feature flag and its wiring. Earlier probes
+showed provider-side text corruption under that mode; ordinary action JSON does
+not need it. Removed source-catalogue pinning tests, repeated finish-gate variants
+and duplicated live-TUI setup. The consolidated real frontend test checks code,
+read-only continuation, history retrieval, resizing and absence of empty commits.
+The resize stress uses 120 edits/resizes in one process instead of three repeated
+startups. Checkpoint identity, child lifetime, actual Git effects and malformed
+argument checks remain covered.
+
+### Executed evidence and limitations
+
+The non-acceptance suite, including slow process and PTY tests, passed 1,876 tests
+with one skipped in `.cambium/continue-suite-03`. A later repair-feedback change
+passed all 67 affected loop/budget tests; one intervening full run exposed only
+an obsolete assertion pinning the old feedback wording, which was corrected.
+Lint and whitespace checks passed.
+
+Real-provider results were mixed, and the failures are retained:
+
+* `.cambium/continue-live-01`: both CLI and TUI frontend tasks passed. The TUI
+  transcript exposed the missing-type repair calls that drove the parser change.
+* `.cambium/continue-live-final`: CLI passed; TUI stopped on three malformed batch
+  objects. Both were assigned Codex but served by ZAI after fallback.
+* `.cambium/continue-live-repair`: the consolidated TUI task passed after repair
+  feedback was simplified, including exact historical retrieval and a read-only
+  turn without an empty commit. One passing rerun is not a success-rate estimate.
+* `.cambium/continue-parallel-01`: the model admitted two semantic/spread children,
+  but both ultimately used ZAI. The task failed after 254.813 seconds, 35 calls
+  and 177,747 reported tokens. This is not successful multi-provider evidence.
+* `.cambium/continue-parallel-02`: a subsequent attempt failed on a ZAI HTTP 429
+  request-rate limit before child execution. No artifact was published.
+
+The larger automatic multi-provider task is still not a demonstrated reliable
+completion path under these provider conditions. Earlier runs did execute
+children on different providers and a single blocking child on the parent trunk,
+but do not turn those observations into a performance or reliability guarantee.
+
+CAST documentation now distinguishes ordinary immutable semantic-delta folds
+from deterministic K0 rollover and explicitly states K0's text-identity/open-item
+limitations. The TUI retains its native-input geometry-refresh tradeoff. Future
+SituationFrame/WorkLedger/resource-ranking proposals remain in the open plan;
+this continuation does not claim to have completed them.

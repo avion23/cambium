@@ -1277,7 +1277,7 @@ def test_worker_endless_tool_calls_stop_at_max_turns(tmp_path) -> None:
     server = _FakeOpenAIServer()
     try:
         config_path = _provider_config(tmp_path / "providers.json", server.base_url)
-        for _ in range(2):
+        for _ in range(4):
             _enqueue(
                 '{"type":"tool_call","name":"read_batch","arguments":{"paths":["target.txt"]}}'
             )
@@ -1293,22 +1293,12 @@ def test_worker_endless_tool_calls_stop_at_max_turns(tmp_path) -> None:
             )
         )
 
-        assert result["status"] == "succeeded"
-        assert result["failure_reason"] is None
-        assert result["summary"] == (
-            "best partial answer: work completed before final synthesis was content-flagged"
-        )
-        graceful_events = [
-            message
-            for message in messages
-            if message["type"] == "usage_event"
-            and "graceful stop" in message.get("failure_reason", "")
-        ]
-        assert len(graceful_events) == 1
-        assert graceful_events[0]["turn"] == 2
-        assert rc == 0  # graceful verdict delivered in the result envelope
+        assert result["status"] == "failed"
+        assert "turn limit" in result["failure_reason"]
+        assert not any("graceful stop" in message.get("failure_reason", "") for message in messages)
+        assert rc == 0  # Transport completed; the task verdict is in its envelope.
         with REQUEST_LOCK:
-            assert len(REQUESTS) == 2
+            assert len(REQUESTS) == 4  # Two regular turns plus the existing completion reserve.
     finally:
         server.close()
 

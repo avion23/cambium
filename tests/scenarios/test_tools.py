@@ -363,9 +363,7 @@ def test_delegate_validates_kind_and_explicit_policy_at_call_time(tmp_path: Path
     assert invalid_policy.error == (
         "validation failed: child context_mode=trunk requires placement=inherit"
     )
-    assert missing_policy.error == (
-        "validation failed: missing 'spec.context_mode' (string)\n"
-        "validation failed: missing 'spec.placement' (string)"
-    )
+    assert missing_policy.ok
+    assert missing_policy.error is None
     assert valid.ok
     assert valid.output == "child child proposed; supervisor admission pending"

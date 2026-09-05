@@ -1154,66 +1154,27 @@ def test_tool_call_batch_cap_rejects_text_and_native_actions(tmp_path: Path) -> 
     )
 
 
-def test_finish_after_failed_verification_is_rejected(tmp_path: Path) -> None:
-    repo = tmp_path / "repo"
-    worktree = _make_worktree(repo)
-    config = _agent_config(worktree)
-    router = _ScriptedRouter(
-        [
-            '{"type":"plan","steps":["write note.txt"]}',
-            '{"type":"tool_call","name":"write_file","arguments":'
-            '{"path":"note.txt","content":"hello\\n"}}',
-            '{"type":"tool_call","name":"run_shell","arguments":{"cmd":["false"]}}',
-            '{"type":"finish","summary":"tests failed anyway","objective_met":true}',
-            '{"type":"finish","summary":"still unverified","objective_met":true}',
-            '{"type":"tool_call","name":"read_batch","arguments":{"paths":["note.txt"]}}',
-            '{"type":"tool_call","name":"run_shell","arguments":{"cmd":["true"]}}',
-            '{"type":"finish","summary":"verified","objective_met":true}',
-        ]
-    )
-
-    outcome = asyncio.run(_drive_loop(config, worktree, router))
-
-    assert outcome["status"] == "succeeded"
-    assert outcome["summary"] == "verified"
-    assert outcome["turn"] == 8
-    assert len(router.prompts) == 8
-    rejected = [
-        message["content"]
-        for message in outcome["transcript"]
-        if "finish rejected" in message["content"]
+@pytest.mark.parametrize("shell_check", [False, True])
+def test_finish_does_not_require_a_ritual_shell_command(tmp_path: Path, shell_check: bool) -> None:
+    worktree = _make_worktree(tmp_path / "repo")
+    actions = [
+        '{"name":"write_file","arguments":'
+        '{"path":"note.txt","content":"hello\\n"}}',
     ]
-    assert len(rejected) == 2
-    assert "verification command failed" in rejected[0]
-
-
-def test_finish_after_edit_without_verification_is_rejected(tmp_path: Path) -> None:
-    repo = tmp_path / "repo"
-    worktree = _make_worktree(repo)
-    config = _agent_config(worktree)
-    router = _ScriptedRouter(
-        [
-            '{"type":"plan","steps":["edit alpha.txt"]}',
-            '{"type":"tool_call","name":"edit_file","arguments":'
-            '{"path":"alpha.txt","old_string":"alpha-content","new_string":"ALPHA"}}',
-            '{"type":"finish","summary":"edited, no tests available","objective_met":true}',
-            '{"type":"tool_call","name":"run_shell","arguments":{"cmd":["true"]}}',
-            '{"type":"finish","summary":"edited and verified","objective_met":true}',
-        ]
-    )
-
-    outcome = asyncio.run(_drive_loop(config, worktree, router))
-
+    if shell_check:
+        actions.append(
+            '{"type":"tool_call","name":"run_shell","arguments":{"cmd":["false"]}}'
+        )
+    actions.append('{"type":"finish","summary":"updated note","objective_met":true}')
+    router = _ScriptedRouter(actions)
+    outcome = asyncio.run(_drive_loop(_agent_config(worktree), worktree, router))
     assert outcome["status"] == "succeeded"
-    assert outcome["summary"] == "edited and verified"
-    assert outcome["turn"] == 5
-    rejected = [
-        message["content"]
-        for message in outcome["transcript"]
-        if "finish rejected" in message["content"]
-    ]
-    assert len(rejected) == 1
-    assert "did not run a successful verification command" in rejected[0]
+    assert (worktree / "note.txt").read_text() == "hello\n"
+    assert len(router.prompts) == 2 + int(shell_check)
+    evidence = "\n".join(message["content"] for message in outcome["transcript"])
+    assert "finish rejected" not in evidence
+    if shell_check:
+        assert "tool run_shell ok=False" in evidence
 
 
 def test_finish_after_verified_change_succeeds(tmp_path: Path) -> None:
@@ -1862,7 +1823,7 @@ def test_three_invalid_actions_fail_fast_with_no_progress(tmp_path: Path) -> Non
     assert [m["turn"] for m in checkpoints] == [1, 2, 3]
     recorded = json.loads(Path(checkpoints[-1]["state_ref"]).read_text())["transcript"]
     assert recorded[-2] == {"role": "assistant", "content": "not-json-three"}
-    assert "JSON-escape" in recorded[-1]["content"]
+    assert "invalid action: action is not valid JSON" in recorded[-1]["content"]
 
 
 def test_valid_action_resets_consecutive_invalid_action_bound(tmp_path: Path) -> None:
@@ -1906,7 +1867,7 @@ def test_final_synthesis_retry_feedback_identifies_invalid_response(
 
     assert outcome["status"] == "succeeded"
     assert outcome["summary"] == "done"
-    assert len(router.prompts) == 3  # initial action plus one final-synthesis retry
+    assert len(router.prompts) == 3  # The same repair path applies near the budget edge.
     assert any(
         message.get("content") == worker.FINAL_SYNTHESIS_DIRECTIVE
         for message in router.prompts[1]["messages"]
@@ -1923,12 +1884,13 @@ def test_final_synthesis_retry_feedback_identifies_invalid_response(
     corrections = [
         message
         for message in retry_messages
-        if message.get("role") == "user" and "Parse defect:" in str(message.get("content", ""))
+        if message.get("role") == "user" and "invalid action:" in str(message.get("content", ""))
     ]
     assert len(corrections) == 1
     correction = corrections[0]["content"]
-    assert invalid_response in correction
-    assert 'your response was missing the required "type":"finish" field' in correction
+    assert "unknown agent action type: None" in correction
+    assert '"type":"finish"' in correction
+    assert "omit batch nesting" in correction
 
 
 def test_tool_schema_failure_does_not_increment_invalid_action_bound(tmp_path: Path) -> None:

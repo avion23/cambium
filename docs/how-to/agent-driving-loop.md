@@ -39,9 +39,10 @@ run `git commit`, `merge` or `push` from an agent tool call.
 
 ## Delegate and recall selectively
 
-Keep small or coupled work local. Delegate only an independent scope with its
-own completion check and explicit `context_mode`/`placement`. Child lifetime,
-result admission and Git integration remain supervisor-owned. Use
+Keep small or coupled work local. Delegate independent scopes with completion
+checks together in one action batch. Context/placement defaults are described
+in [context branches](../architecture/context-branches.md); override them only
+when needed. Child lifetime, admission and Git integration remain supervisor-owned. Use
 [the delegation guide](context-branches.md) for the handoff, rather than a second
 planner/reviewer hierarchy.
 
