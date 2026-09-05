@@ -50,10 +50,13 @@ slot. It wakes on a lane release, new usage, or an observed reset/Retry-After ti
 there is no periodic admission polling. An exhausted wall budget remains a
 reported timeout, not indefinite waiting or fabricated completion.
 
-Requirement-aware selection retains capability/quality and measured
-cost/latency/throughput scoring after excluding exhausted quota and active
-cooldowns. These paths are heuristics, not a global optimizer with a proven
-optimum. No extra provider preflight request is required.
+Requirement-aware selection first filters capabilities, exhausted quota and
+active cooldowns. When quota observations are available, it uses the same
+utilization, lane-load and reset ordering as ordinary admission; quality and
+cost/latency scoring break resource ties. Without observations, quality scoring
+retains its existing order. Declaring a capability must not silently disable
+resource steering. These are heuristics, not a proven global optimum; there is
+no extra provider preflight request.
 
 Diffundo owns the subsequent provider call and its fallback behavior. Keep task
 assignment and call-time lease evidence distinct: an initial assignment does

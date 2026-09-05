@@ -282,3 +282,64 @@ served by ZAI, not a demonstrated simultaneous multi-provider speedup. Quota and
 lane behavior have deterministic runtime regressions; population-wide resource
 efficiency and prompt-quality gains still require the operator's GEPA experiment
 and fresh evaluation cases. No hill-climbing result was promoted in this work.
+
+## Finalization after connector restart — September 5
+
+The original checkout was clean at fetched `origin/main` `be6190e`. No remote
+`dev` ref was advertised. Nety rejected the known project path; this continuation
+used instance2 and a fresh isolated worktree at
+`/home/ubuntu/worktrees/cambium-8e3fdca5`. Related parallel commit `f08ab8e` was
+integrated rather than duplicating its implementation. Other checkouts were not
+reset or cleaned.
+
+The newer baseline already contained the selected CAST, historical-corpus,
+provider, native-tool, terminal-input and shared-state work. This pass verified
+those consumers and repaired the remaining integration defects:
+
+| Observation | Repair |
+| --- | --- |
+| Capability-constrained selection ignored quota reset ordering | Share resource ranking after capability filtering; expired or unknown observations do not replace normal quality order |
+| Model/operator inspection maintained a separate, incompletely bounded JSON projection | Reuse the existing 12 KiB SituationFrame renderer; retain full CLI JSON and prioritize active children |
+| Truncation suggested unsupported section/watermark tool arguments | Point to supported history operations instead |
+| Checkpoint cleanup could remove explicit inspection tool evidence | Strip frames only from generated loop-state messages, not tool observations |
+| A checkpoint regression exposed ordinary pressure metadata being redacted | Recognize `uncached_token_pressure` in the existing benign-metadata set; registered secret values still redact |
+| Large bracketed paste repeatedly copied the whole draft per character | Insert chunks while retaining split framing, Unicode, CRLF and one-prompt semantics |
+| An interactive benchmark restarted its wall allowance on each turn | Apply one existing wall budget to the complete rollout and retain a failed report on expiry |
+
+Removed the duplicate state projection, a redundant standalone GEPA test already
+covered by the deployment test, and obsolete INPUTRC paste setup. Extended the
+existing quota and PTY scenarios rather than adding another test framework.
+Checkpoint retention is also verified through the actual checkpoint writer.
+
+### Verification and retained failures
+
+The final non-acceptance run passed **1,910 tests, one skipped**, in 104.72 seconds,
+including process, PTY, redaction, routing and persistence checks. Both real
+CLI/TUI frontend tests passed in 51.84 seconds. A preliminary full run caught
+the pressure-metadata false positive; it was fixed at the redaction owner,
+not hidden by weakening the checkpoint assertion.
+
+The following real historical rollouts used ZAI and checked accepted Git state:
+
+| Case | Result | Seconds | Calls | Reported tokens | Summary calls |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Frozen Cambium self-fix | Passed | 21.713 | 5 | 47,182 | 0 |
+| Blocking exact child | Passed | 20.194 | 7 | 26,226 | 0 |
+| Correction, semantic child, K0 and reconnect | Passed | 139.396 | 19 | 91,868 | 1 |
+
+Reports are in `.cambium/finalize-self-exact` and
+`.cambium/finalize-corrected-bounded` in the isolated worktree. The correction
+case performed one K0 rollover and kept the final read-only head unchanged.
+There were six malformed actions across these three passing runs, not zero.
+These are development regressions, not an unbiased speed or quality comparison.
+
+An earlier `.cambium/finalize-corrected` run exceeded the connector wait while
+using fresh per-turn wall budgets: two turns completed, but there was no final
+result. It is retained as interrupted evidence, not counted as a pass. The
+whole-rollout deadline now produces a bounded failure report; a focused test
+also verifies that its checker sees only accepted code after cancellation.
+
+No GEPA hill climb was run and no policy was promoted. The eight-case historical
+corpus and automatic replacement path remain ready for the operator's search.
+All live benchmark tokens here came from ZAI; these results do not establish
+simultaneous multi-provider speedup or week-long quota efficiency.

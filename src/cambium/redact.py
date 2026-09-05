@@ -186,6 +186,7 @@ _SAFE_METADATA_NAMES = frozenset(
         "prompt_tokens",
         "completion_tokens",
         "cached_tokens",
+        "uncached_token_pressure",
         "reasoning_tokens",
         "total_tokens",
         "max_tokens",

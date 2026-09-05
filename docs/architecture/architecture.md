@@ -88,14 +88,18 @@ history and delegation formats are in
 CLI `inspect-state DIR [TASK]`, and TUI `/inspect [TASK]`. It replays the latest
 relevant turn separately: sequence numbers from different turns must never be
 interleaved. Inspection includes running tasks with no terminal result yet.
-The CLI can print the full value; model/TUI inspection selects concise facts and
-leaves exact tool evidence to `branch_history`.
+The CLI prints the full JSON value. Model/TUI inspection uses the same bounded
+SituationFrame renderer as the worker, not a second hand-maintained projection.
+It keeps live children visible before completed ones; omitted details point to
+supported `branch_history` operations.
 
 The worker also renders a bounded local SituationFrame into its final user-role
 loop-state message. It uses BranchState semantics over worker-local observations;
-its local watermark is not a durable event-store sequence. Persistence strips
-that transient frame. `inspect_state` explicitly reads the durable view shared
-with the operator. Neither path makes an extra provider request.
+its local watermark is not a durable event-store sequence. Ordinary turn
+snapshots strip generated loop-state frames, but preserve tool observations,
+including explicit `inspect_state` output. Immutable epoch checkpoints retain
+exact provider-sent bytes for prefix identity. `inspect_state` reads the durable
+view shared with the operator. Neither path makes an extra provider request.
 
 `observability.py` still provides incremental display counters. An evidence-linked
 WorkLedger and versioned ResultCapsule remain proposals. Existing semantic

@@ -56,6 +56,11 @@ reported task usage. Concurrent in-flight requests can finish after a limit is
 observed; these limits are not a provider-enforced account quota. A zero cash
 estimate does not make subscription tokens unlimited.
 
+`--max-wall-s` covers one complete rollout, including interactive follow-ups,
+children and reconnects. It does not restart on each operator turn. On expiry,
+the runner cancels owned work, checks only the accepted artifact and saves a
+failed report; it must not silently run several fresh wall budgets in one case.
+
 ## Replacement semantics
 
 The normal artifact is `~/.config/cambium/prompts.json` (or the corresponding

@@ -203,7 +203,9 @@ def test_turn_checkpoint_preserves_explicit_inspection(tmp_path: Path) -> None:
     transient = _framed_request()[1]
     observation = {
         "role": "user",
-        "content": "tool inspect_state ok=True\n" + worker.render_situation_frame(worker.BranchState()),
+        "content": (
+            "tool inspect_state ok=True\n" + worker.render_situation_frame(worker.BranchState())
+        ),
     }
     path = worker._write_checkpoint_file(config, 1, [transient, observation], {}, [])
     recorded = json.loads(path.read_text())["transcript"]

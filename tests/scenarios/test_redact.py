@@ -112,6 +112,7 @@ def test_registered_values_are_exact_without_enabling_generic_context_redaction(
     assert "stderr=***" in output
     assert "ordinary=value" in output
     assert "api_key=***" in output
+    assert redactor.redact(f"uncached_token_pressure: {secret}") == "uncached_token_pressure: ***"
 
 
 def test_registered_values_are_redacted_in_nested_tool_payloads() -> None:
@@ -262,6 +263,7 @@ def test_benign_metrics_signatures_and_author_fields_survive() -> None:
     payload = {
         "token_count": 17,
         "token_metrics": {"prompt_tokens": 4, "completion_tokens": 7},
+        "uncached_token_pressure": "unknown",
         "signature": "deadbeef",
         "author": "Ada",
         "author_email": "alice@example.com",
@@ -273,6 +275,8 @@ def test_benign_metrics_signatures_and_author_fields_survive() -> None:
     output = cast(dict[object, object], R.redact_mapping(payload))
     token_metrics = cast(dict[object, object], output["token_metrics"])
     assert output["token_count"] == 17
+    assert output["uncached_token_pressure"] == "unknown"
+    assert R.redact("uncached_token_pressure: unknown") == "uncached_token_pressure: unknown"
     assert token_metrics == {"prompt_tokens": 4, "completion_tokens": 7}
     assert output["signature"] == "deadbeef"
     assert output["author"] == "Ada"
