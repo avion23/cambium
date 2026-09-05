@@ -28,7 +28,11 @@ estimated cost. Known provider windows appear under **QUOTA** when space allows.
 Resource rows retain space in a short full-width terminal; omitted detail points
 to `/agents`, `/context`, or `/quota`.
 
-Each full-width lane shows provider/model and one compact activity/status row.
+When space permits, each full-width lane shows provider/model and one compact
+activity/status row. Crowded rails keep the selected parent and live children
+before older terminal rows, collapse detail before hiding lanes, and show an
+explicit omitted count with `/agents`. The duplicate footer usage row is hidden
+by default; `/detail` reveals it without changing the agent state.
 A suspended parent says `waiting for children` and becomes active on resume.
 The rail does not repeat streamed response text or reserve empty phase/tail/tool/
 duration rows. CAST shows epoch, semantic-trunk estimate and raw-tail estimate;
@@ -119,11 +123,12 @@ Run focused checks before broader changes:
 ```sh
 python -m pytest -o addopts='' tests/scenarios/test_tui_screen.py tests/scenarios/test_tui_rail_detail.py tests/scenarios/test_resource_projection.py
 python -m pytest -o addopts='' tests/scenarios/test_tui_live_pty.py
-python -m pytest -o addopts='' -m acceptance tests/acceptance/test_live_tui_coding.py
+python -m pytest -o addopts='' -m acceptance tests/acceptance/test_live_frontends.py
 ```
 
 The last command uses configured provider credentials and consumes real tokens.
-Its scratch repository and session config are outside the project checkout.
+Its scratch repository is outside the project checkout. It uses ordinary
+provider selection and credential handling, not a copied single-provider store.
 
 ## Source
 

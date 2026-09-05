@@ -1848,48 +1848,26 @@ def test_valid_action_resets_consecutive_invalid_action_bound(tmp_path: Path) ->
     assert len(router.prompts) == 5
 
 
-def test_final_synthesis_retry_feedback_identifies_invalid_response(
-    tmp_path: Path,
-) -> None:
-    repo = tmp_path / "repo"
-    worktree = _make_worktree(repo)
-    config = _agent_config(worktree, max_turns=2)
-    invalid_response = '{"summary":"not finished","objective_met":false}'
+def test_parse_repair_near_budget_can_still_use_tools(tmp_path: Path) -> None:
+    worktree = _make_worktree(tmp_path / "repo")
+    config = _agent_config(worktree, max_turns=3)
     router = _ScriptedRouter(
         [
-            '{"type":"plan","steps":["review"]}',
-            invalid_response,
-            '{"type":"finish","summary":"done","objective_met":true}',
+            '{"type":"plan","steps":["read alpha"]}',
+            '{"name":"read_batch","arguments":[]}',
+            '{"name":"read_batch","arguments":{"paths":["alpha.txt"]}}',
+            '{"type":"finish","summary":"read alpha","objective_met":true}',
         ]
     )
 
     outcome = asyncio.run(_drive_loop(config, worktree, router))
 
     assert outcome["status"] == "succeeded"
-    assert outcome["summary"] == "done"
-    assert len(router.prompts) == 3  # initial action plus one final-synthesis retry
+    assert len(router.prompts) == 4
     assert any(
-        message.get("content") == worker.FINAL_SYNTHESIS_DIRECTIVE
-        for message in router.prompts[1]["messages"]
+        message.get("role") == "user" and "alpha-content" in message.get("content", "")
+        for message in router.prompts[-1]["messages"]
     )
-    assert (
-        sum(
-            message.get("content") == invalid_response
-            for prompt in router.prompts
-            for message in prompt["messages"]
-        )
-        == 1
-    )
-    retry_messages = router.prompts[2]["messages"]
-    corrections = [
-        message
-        for message in retry_messages
-        if message.get("role") == "user" and "Parse defect:" in str(message.get("content", ""))
-    ]
-    assert len(corrections) == 1
-    correction = corrections[0]["content"]
-    assert invalid_response in correction
-    assert 'your response was missing the required "type":"finish" field' in correction
 
 
 def test_tool_schema_failure_does_not_increment_invalid_action_bound(tmp_path: Path) -> None:

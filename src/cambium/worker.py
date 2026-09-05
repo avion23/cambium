@@ -3137,7 +3137,7 @@ def _canonical_action_message(action: dict[str, Any]) -> dict[str, str]:
     """Persist only the parsed action, never an optional scratchpad/thought."""
     return {
         "role": "assistant",
-        "content": json.dumps(action, sort_keys=True, separators=(",", ":")),
+        "content": json.dumps(action, separators=(",", ":")),
     }
 
 
@@ -5613,7 +5613,6 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
     compaction_deferred = False
     consecutive_compaction_deferrals = 0
     consecutive_invalid_actions = 0
-    final_synthesis_retry_used = False
     usage_epoch: int | None = None
     usage_fork_of: str | None = None
     first_turn = 1
@@ -6137,9 +6136,10 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                     {
                         "role": "user",
                         "content": _bounded_text(
-                            f"invalid action: {exc}. Return one JSON action with type "
-                            "plan, tool_call, or finish. Keep the intended action; JSON-escape "
-                            "quotes, backslashes, and newlines inside its string arguments. "
+                            f"invalid action: {exc}. Each tool call needs name and arguments "
+                            "at the same level. Retry one call, not a batch: "
+                            '{"name":"TOOL","arguments":{...}} using the actual tool name. '
+                            "JSON-escape string values. For completion, use the finish shape. "
                             "No prose or markdown.",
                             MAX_OBSERVATION_BYTES,
                         ),
@@ -6148,32 +6148,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                 phase = getattr(result, "assistant_phase", None)
                 if phase in {"commentary", "final_answer"}:
                     invalid_messages[0]["phase"] = phase
-                if final_synthesis_call:
-                    parse_error = str(exc)
-                    parse_defect = (
-                        'your response was missing the required "type":"finish" field'
-                        if parse_error == "unknown agent action type: None"
-                        else f"the parser reported: {parse_error}"
-                    )
-                    final_synthesis_excerpt = _cap_utf8(assistant_content, 200)
-                    invalid_messages[1]["content"] = _bounded_text(
-                        f"invalid action: {parse_error}. "
-                        f"Model response excerpt (first 200 characters): "
-                        f"{final_synthesis_excerpt!r}. Parse defect: {parse_defect}. "
-                        "Reply with exactly ONE JSON object of "
-                        "this shape, and nothing else (no prose, no markdown): "
-                        '{"type":"finish","summary":"...","objective_met":true}',
-                        MAX_OBSERVATION_BYTES,
-                    )
-                    for invalid_message in invalid_messages:
-                        context_continuation, transcript = _append_context_message(
-                            invalid_message,
-                            base_messages,
-                            context_continuation,
-                            transcript,
-                            config,
-                        )
-                elif base_messages is None:
+                if base_messages is None:
                     transcript.extend(invalid_messages)
                 else:
                     context_continuation.extend(invalid_messages)
@@ -6231,18 +6206,6 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                             "consecutive_invalid_actions": consecutive_invalid_actions,
                         },
                     )
-                if final_synthesis_call:
-                    if final_synthesis_retry_used:
-                        return _loop_result(
-                            outcome,
-                            "failed",
-                            _phase_failure(f"invalid action: {exc}", final_synthesis=True),
-                            turn,
-                            cumulative_usage,
-                            transcript,
-                        )
-                    final_synthesis_retry_used = True
-                    continue
                 if consecutive_invalid_actions >= MAX_CONSECUTIVE_INVALID_ACTIONS:
                     return _loop_result(
                         outcome,
@@ -6269,7 +6232,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                 action_message["phase"] = phase
             # Budget pressure is advice, not a finish-only tool gate. The
             # bounded loop and wall/token limits still own termination.
-            tool_calls = _normalize_tool_calls(action) if action["type"] == "tool_call" else []
+            tool_calls = action["calls"] if action["type"] == "tool_call" else []
             read_action = bool(tool_calls) and all(
                 call["name"] in _READ_TOOL_NAMES for call in tool_calls
             )

@@ -45,7 +45,14 @@ next work    H M S1 S2 S3 R2
 The summary call sees the existing trunk for background, but **only `R1` is the
 new source range**. `S3` records its semantic delta. Neither `S1` nor `S2` is
 rewritten or treated as new raw evidence. The next fold covers `R2`, not `R1`.
-The published prefix through `S2` therefore remains byte-identical.
+The published prefix through `S2` therefore remains byte-identical. The old
+request's raw suffix is replaced, so reuse is of that common prefix, not a
+promise that the entire next request is cached.
+
+An epoch number identifies a published checkpoint snapshot. Ordinary folds
+advance that number too; it does not mean that every epoch change rewrites the
+trunk. Distinguish an **append-only fold** from a **prefix-replacing K0 rollover**.
+Do not infer cache invalidation or a cache hit from the epoch counter alone.
 
 The worker supplies sequence, source digest, source-message count and covered
 turn; the model supplies the semantic fields. A successful fold appends one
@@ -121,8 +128,10 @@ bounds; large irreducible semantic state can still exceed them.
 Because K0 replaces the active semantic prefix, the next request can be cold.
 The worker resets the prompt-accounting baseline rather than pretending it is
 another append to the previous cached prefix. Earlier epoch files remain
-unchanged. This is why "append-only within an epoch" and "bounded across
-rollovers" are compatible statements.
+unchanged. The active trunk grows by immutable additions between rollovers; every
+published checkpoint remains immutable even after a rollover. These are the
+two meanings of append-only here, not a requirement to carry all old summaries
+in every future request.
 
 ## Branches and provider placement
 
@@ -155,13 +164,19 @@ CAST optimizes a working set, not the number of tokens produced. Measure the
 whole task: action calls, summary calls, retries, input/cache/output usage,
 child startup, provider queues, integration, verification and elapsed time.
 
-A useful comparison for a fold is:
+For an estimated `N` remaining calls, the break-even comparison is:
 
 ```text
-cost of one summary + changed-prefix processing
-versus
-cost of replaying the covered raw range on the remaining calls
+summary call + cache-disruption cost
+    < N × (cost of the raw range − cost of its semantic entry)
 ```
+
+This is a decision model, not an implemented optimizer or exact token formula.
+Use the provider's actual cache tariff and account accounting when known.
+Measure cold and warm requests separately. A final fold with no future consumer
+cannot repay itself through replay savings alone; its purpose may instead be
+preparing a reusable checkpoint. The current boundary policy does not forecast
+`N`, so short tasks can still spend an avoidable extra summary call.
 
 Cached input still consumes some provider resources and may consume account
 quota. A provider's cash tariff, request limit, weekly allowance and generation
@@ -174,6 +189,21 @@ Independent work can justify another provider when it shortens the critical
 path or uses otherwise idle capacity. Exact same-trunk blocking work keeps the
 parent provider. These are policies to evaluate, not a promise that every
 additional child makes a task faster.
+
+## Reading a trace
+
+Inspect `usage_event.call_kind` to separate action calls from summary calls.
+Inspect `context_checkpoint` and `context_epoch_advanced` for the published
+projection, and `branch_history` for the raw tool evidence it covers. A tool
+proposal, child admission, accepted child artifact and passing combined check
+are different events; do not fold them all into "the child finished".
+
+For example, a failed check followed by a corrected edit should retain the
+current result, the relevant failure constraint and any check still owed.
+A summary that says only "tests run" has lost that distinction. The model must
+supply useful evidence references today; the string-based K0 compiler cannot
+infer which obligation a later check discharged. Inspect such losses before
+expanding the schema or adding more prompt instructions.
 
 ## Prompts and experiments
 

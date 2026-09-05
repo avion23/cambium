@@ -3336,22 +3336,15 @@ def _rail_rows(
     panel_width = max(1, width)
     if panel_width <= _RAIL_COMPACT_WIDTH:
         return _compact_rail_rows(snapshot, panel_width, capacity)
-    lines = [_side_row("heading", " LANES", panel_width)]
     agents = _rail_tree_order(tuple(getattr(snapshot, "agents", ())))
-    if not agents:
-        lines.append(_side_row("dim", " no agents yet", panel_width))
-    lane_rows = _rail_lane_rows(agents, panel_width) if agents else []
     selected = _rail_selected_agent(snapshot, agents)
-    for agent, lane_row in zip(agents, lane_rows, strict=True):
-        lines.append(lane_row)
-        lines.extend(_rail_detail_rows(
-            agent, panel_width, activity_line=activity_line if agent is selected else "",
-        ))
-    lines.append(_side_row("heading", " CONTEXT", panel_width))
-    context_rows = _context_rows(snapshot, panel_width, compact_epoch=True)
+    context = [_side_row("heading", " CONTEXT", panel_width)]
     # Byte counts and checkpoint paths are available through /context.
-    lines.extend(row for index, row in enumerate(context_rows) if index in {0, 1, 3})
-    lines.extend(_rail_fold_rows(snapshot, panel_width))
+    context.extend(
+        row for index, row in enumerate(_context_rows(snapshot, panel_width, compact_epoch=True))
+        if index in {0, 1, 3}
+    )
+    context.extend(_rail_fold_rows(snapshot, panel_width))
     resources: list[tuple[str, str]] = []
     if capacity >= 8 and (cumulative_line or hasattr(snapshot, "calls")):
         resources.append(_side_row("heading", " RESOURCES", panel_width))
@@ -3363,10 +3356,40 @@ def _rail_rows(
             if len(quota) > 4:
                 resources.append(_side_row("dim", " more: /quota", panel_width))
     body_capacity = max(2, capacity - len(resources))
-    if resources and len(lines) > body_capacity:
-        lines = lines[: body_capacity - 1]
-        lines.append(_side_row("dim", " more: /agents /context", panel_width))
-    return (lines + resources)[: max(1, capacity)]
+    context = context[:max(0, body_capacity - 1 - min(4, len(agents)))]
+    if len(context) < 2:
+        context = []
+    lane_capacity = max(2, body_capacity - len(context))
+    terminal = {"succeeded", "failed", "cancelled", "exited", "rejected"}
+    # Preserve the selected parent and live children before historical rows.
+    slots = lane_capacity - 1
+    if len(agents) > slots:
+        slots = max(0, slots - 1)  # one row explains what is omitted
+    order = sorted(range(len(agents)), key=lambda i: (
+        agents[i] is not selected, getattr(agents[i], "state", "") in terminal, i,
+    ))
+    visible = set(order[:slots])
+    hidden = len(agents) - len(visible)
+    rows = _rail_lane_rows(agents, panel_width) if agents else []
+    lines = [_side_row("heading", " LANES", panel_width)]
+    remaining = len(visible)
+    crowded = len(agents) * 3 + 1 > lane_capacity
+    for index, (agent, row) in enumerate(zip(agents, rows, strict=True)):
+        if index not in visible:
+            continue
+        lines.append(row)
+        remaining -= 1
+        if crowded and agent is not selected and getattr(agent, "state", "") in terminal:
+            continue
+        room = max(0, lane_capacity - len(lines) - remaining - bool(hidden))
+        lines.extend(_rail_detail_rows(
+            agent, panel_width, activity_line=activity_line if agent is selected else "",
+        )[:room])
+    if not agents:
+        lines.append(_side_row("dim", " no agents yet", panel_width))
+    if hidden:
+        lines.append(_side_row("dim", f" {hidden} more: /agents", panel_width))
+    return (lines + context + resources)[:max(1, capacity)]
 
 
 def _recent_rows(event: Any, width: int) -> list[tuple[str, str]]:
@@ -4362,7 +4385,7 @@ class Cockpit:
         self._final_hold_conversation_rows: tuple[tuple[str, str], ...] | None = None
         self._activity_line = ""
         self._activity_only_update = False
-        self._show_detail = True
+        self._show_detail = False
 
     @property
     def size(self) -> os.terminal_size:

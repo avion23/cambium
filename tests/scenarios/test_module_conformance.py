@@ -415,6 +415,7 @@ def test_module_deletion_leaves_shared_scenarios_green(tmp_path: Path) -> None:
     copy = tmp_path / "repo"
     copy.mkdir()
     ignore = shutil.ignore_patterns(
+        ".git",
         "__pycache__",
         "*.pyc",
         ".pytest_cache",
@@ -426,7 +427,7 @@ def test_module_deletion_leaves_shared_scenarios_green(tmp_path: Path) -> None:
         "build",
     )
     for entry in sorted(os.scandir(module_conformance.REPO_ROOT), key=lambda e: e.name):
-        if entry.name == ".git":
+        if entry.name in ignore(module_conformance.REPO_ROOT, [entry.name]):
             continue
         source = Path(entry.path)
         destination = copy / entry.name
@@ -434,6 +435,7 @@ def test_module_deletion_leaves_shared_scenarios_green(tmp_path: Path) -> None:
             shutil.copytree(source, destination, symlinks=True, ignore=ignore)
         else:
             shutil.copy2(source, destination)
+    assert not (copy / ".cambium").exists(), "runtime sessions are not test inputs"
     git = ["git", "-c", "user.name=Cambium Test", "-c", "user.email=test@example.invalid"]
     subprocess.run([*git, "init", "-q"], cwd=copy, check=True, capture_output=True)
     subprocess.run([*git, "add", "-A"], cwd=copy, check=True, capture_output=True)

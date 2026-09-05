@@ -129,10 +129,12 @@ The active schema exposes `write_file`, `edit_file`, `git_op`, `run_shell`,
 `read_batch`, `repo_query`, `branch_history`, and `delegate`. A tool's internal
 implementation filename is not another public tool name.
 
-[prompts.py](../../src/cambium/prompts.py) exports `CODING_AGENT`,
-`SEMANTIC_SUMMARIZER`, `SUMMARY_PROTOCOL_LINES`, and `PROMPTS_VERSION`. It does
-not have separate branch-planner/history-policy prompt components. A small task
-may start with a tool or a valid finish; a plan is optional.
+[prompts.py](../../src/cambium/prompts.py) combines code-owned action/summary
+protocols with replaceable coding and summary policies. The coding policy also
+guides delegation; there is no separate online planner or history classifier.
+Sessions pin their policy text. New sessions and `/new` load the deployed
+artifact; see [prompt optimization](../architecture/optimization.md). A small
+task may start with a tool or a valid finish; a plan is optional.
 
 `branch_state.py` and CLI `inspect-state` provide current inspection. A
 model-facing `inspect_state`, unified SituationFrame/operator projection, typed

@@ -654,7 +654,7 @@ def test_status_phase_palette_follows_activity_state(
     assert f"{getattr(tui_screen, style)}{phase}{tui_screen._RESET}" in rendered
 
 
-def test_detail_command_hides_row_on_next_frame(monkeypatch) -> None:
+def test_detail_command_shows_optional_row_on_next_frame(monkeypatch) -> None:
     monkeypatch.setattr(
         tui_screen.shutil,
         "get_terminal_size",
@@ -677,7 +677,7 @@ def test_detail_command_hides_row_on_next_frame(monkeypatch) -> None:
             cumulative_line=cumulative_line,
         )
         first = stream.getvalue()
-        assert "summaries=2" in first
+        assert "summaries=2" not in first
         assert (
             _command_output(
                 "/detail",
@@ -686,7 +686,7 @@ def test_detail_command_hides_row_on_next_frame(monkeypatch) -> None:
                 snapshot=cast(Any, snapshot),
                 cockpit=cockpit,
             )
-            == "detail: hidden"
+            == "detail: shown"
         )
         cockpit.draw(
             snapshot,
@@ -696,7 +696,7 @@ def test_detail_command_hides_row_on_next_frame(monkeypatch) -> None:
             cumulative_line=cumulative_line,
         )
 
-    assert "summaries=" not in stream.getvalue()[len(first) :]
+    assert "summaries=2" in stream.getvalue()[len(first) :]
 
 
 def test_tool_row_counts_failures_and_uses_compact_last_duration() -> None:
@@ -1211,8 +1211,7 @@ def test_cockpit_replaces_failed_to_idle_status_in_place() -> None:
         cockpit.hide_cursor()
         cockpit.flush()
 
-    assert len(cockpit._last_status_rows) == 5
-    assert _visible(cockpit._last_status_rows[-2]).startswith(" ⠋ idle")
+    assert any(_visible(row).startswith(" ⠋ idle") for row in cockpit._last_status_rows)
     assert stream.getvalue().count("┌ Cambium · conversation") == 1
 
 
@@ -1378,6 +1377,7 @@ def test_status_counter_updates_repaint_in_place_without_stale_width(monkeypatch
     snapshot = _traffic_snapshot()
     snapshot.queued_agents = 123456
     cockpit = Cockpit(stream)
+    cockpit.toggle_detail()
 
     with cockpit:
         cockpit.draw(
@@ -1499,7 +1499,6 @@ def test_completed_response_moves_from_live_window_into_conversation() -> None:
     assert "┌ Cambium · conversation" in delta
     assert "CAMBIUM ▸ final" in delta
     assert "\n" in delta
-    assert len(cockpit._last_status_rows) == 5
     assert len(cockpit._last_status_rows[1:3]) == 2
     assert all(_display_width(row) <= 118 for row in cockpit._last_status_rows[1:3])
     assert stream.getvalue().count("┌ Cambium · conversation") == 2

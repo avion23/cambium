@@ -102,4 +102,4 @@ or evidence worth its context and coordination cost.
   [delegate schema](../../src/cambium/schemas.py)
 - [History scenarios](../../tests/scenarios/test_branch_history.py),
   [real coding publication](../../tests/acceptance/test_live_coding_gate.py),
-  [real TUI read-only continuation](../../tests/acceptance/test_live_tui_coding.py)
+  [real CLI/TUI coding and history](../../tests/acceptance/test_live_frontends.py)
