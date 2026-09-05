@@ -721,6 +721,7 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Read one session's durable event stores and print BranchState JSON.",
     )
     inspect_state.add_argument("session_dir", type=Path, metavar="DIR")
+    inspect_state.add_argument("task_id", nargs="?", metavar="TASK")
 
     architectus = commands.add_parser(
         "architectus",
@@ -1415,20 +1416,11 @@ def _run_session(args: argparse.Namespace) -> int:
 
 
 def _run_inspect_state(args: argparse.Namespace) -> int:
-    from .branch_state import inspect_state
-    from .store import StoreError, read_events_file
+    from .state_view import load_state
+    from .store import StoreError
 
-    session_dir = args.session_dir.expanduser().resolve()
-    event_dbs = [session_dir / ".cambium" / "events.db"]
-    event_dbs.extend(sorted(session_dir.glob("turn-*/.cambium/events.db")))
-    event_dbs = [path for path in event_dbs if path.is_file()]
-    if not event_dbs:
-        print(f"cambium inspect-state: no event stores under {session_dir}", file=sys.stderr)
-        return ExitCode.FAILURE
     try:
-        events = [event for path in event_dbs for event in read_events_file(path)]
-        events.sort(key=lambda event: event["seq"])
-        state = inspect_state(events)
+        state = load_state(args.session_dir, getattr(args, "task_id", None))
     except (OSError, StoreError, ValueError, sqlite3.Error) as exc:
         print(f"cambium inspect-state: {exc}", file=sys.stderr)
         return ExitCode.FAILURE

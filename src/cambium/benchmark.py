@@ -62,7 +62,14 @@ def load_cases(path: Path) -> list[dict[str, Any]]:
         or len({case["id"] for case in cases}) != len(cases)
     ):
         raise ValueError("benchmark cases need unique ids")
+    families: dict[str, str] = {}
     for case in cases:
+        family = case.get("family", case["id"])
+        if family in families and families[family] != case.get("split"):
+            raise ValueError(f"benchmark family {family} crosses search/evaluation splits")
+        families[family] = case.get("split")
+        if not all(isinstance(text, str) and text.strip() for text in case.get("followups", [])):
+            raise ValueError("benchmark followups must be non-empty task strings")
         if case.get("split") not in {"train", "val", "test"}:
             raise ValueError("benchmark split must be train, val, or test")
         if not isinstance(case.get("task"), str) or not case["task"].strip():
@@ -104,7 +111,7 @@ def _repository(case: dict, root: Path) -> Path:
     return repo
 
 
-def run_case(
+def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact checking
     case: dict, policy: dict[str, str], *, output: Path, budget: ExperimentBudget,
     provider: str | None = None, max_turns: int = 12, max_wall_s: float = 300,
     max_workers: int = 3,
@@ -117,6 +124,7 @@ def run_case(
     repo = _repository(case, root)
     base = _git(repo, "rev-parse", "HEAD")
     events: list[dict] = []
+    turn_heads: list[str] = []
     started = time.monotonic()
     before = (budget.calls, budget.tokens, budget.cost_usd)
     config = OneShotConfig(
@@ -157,12 +165,47 @@ def run_case(
                 resolved, authorized_providers=tuple(p.name for p in available),
                 model_candidates=tuple(sorted({p.model for p in available})),
             )
-        plan = build_plan(resolved, repo, root / "session")
-        result = await run_plan(
-            root / "session", plan, provider_environment=environment,
-            routing_state_path=root / "routing.json", on_event=observe,
-            max_concurrent_tasks=max_workers, context_reuse=True,
-        )
+        if case.get("followups"):
+            from .interactive import InteractiveSession
+
+            session = InteractiveSession(replace(
+                resolved, routing_state_path=root / "routing.json",
+            ))
+            session.acquire()
+            try:
+                for number, prompt in enumerate([case["task"], *case["followups"]], 1):
+                    budget.check()
+                    turn = session.prepare_turn(prompt)
+
+                    def live(event: dict, current=turn, owner=session) -> None:
+                        owner.observe_event(current, event)
+                        observe(event)
+
+                    result = await session.run_turn(
+                        turn, on_event=live, max_concurrent_tasks=max_workers,
+                    )
+                    session.complete_turn(turn, succeeded=result.exit_code == 0)
+                    turn_heads.append(_git(repo, "rev-parse", "main"))
+                    if result.exit_code:
+                        break
+                    if number in case.get("compact_after_turns", []):
+                        session.compact()
+                    if case.get("reconnect_between_turns"):
+                        session.release()
+                        session = InteractiveSession(replace(
+                            resolved, routing_state_path=root / "routing.json",
+                        ))
+                        session.acquire()
+            finally:
+                session.release()
+        else:
+            plan = build_plan(resolved, repo, root / "session")
+            result = await run_plan(
+                root / "session", plan, provider_environment=environment,
+                routing_state_path=root / "routing.json", on_event=observe,
+                max_concurrent_tasks=max_workers, context_reuse=True,
+            )
+            turn_heads.append(_git(repo, "rev-parse", "main"))
         return result.exit_code, "; ".join(r.reason for r in result.results if r.reason)
 
     error = ""
@@ -171,6 +214,12 @@ def run_case(
     except asyncio.CancelledError:
         exit_code, error = 1, "experiment budget exhausted; rollout cancelled"
     elapsed = time.monotonic() - started
+    from .branch_history import _session_event_stores
+    from .store import read_events_file
+
+    stores = _session_event_stores(root / "session")
+    if stores:
+        events = [event for store in stores for event in read_events_file(store)]
     accepted = _git(repo, "rev-parse", "main")
     changed = _git(repo, "diff", "--name-only", base, accepted).splitlines()
     # The checker sees accepted code, never an uncommitted worker tree.
@@ -188,7 +237,21 @@ def run_case(
         checked, diagnostic = False, "verification timed out"
     allowed = case.get("allowed_files")
     scope_ok = allowed is None or set(changed) <= set(allowed)
-    passed = exit_code == 0 and checked and scope_ok
+    observed_tools = {e.get("payload", {}).get("tool") for e in events
+                      if e.get("kind") == "tool_event" and e.get("payload", {}).get("ok")}
+    missing_tools = set(case.get("required_tools", [])) - observed_tools
+    child_count = sum(e.get("kind") == "child_admitted" for e in events)
+    trace_ok = not missing_tools and child_count >= case.get("required_children", 0)
+    if case.get("read_only"):
+        trace_ok = trace_ok and accepted == base
+    if case.get("read_only_followups"):
+        trace_ok = trace_ok and bool(turn_heads) and all(h == turn_heads[0] for h in turn_heads)
+    rollovers = sum(
+        e.get("kind") == "context_epoch_advanced"
+        and e.get("payload", {}).get("reason") == "manual K0 rollover" for e in events
+    )
+    trace_ok = trace_ok and rollovers >= case.get("required_rollovers", 0)
+    passed = exit_code == 0 and checked and scope_ok and trace_ok
     calls, tokens = budget.calls - before[0], budget.tokens - before[1]
     # Correctness dominates. Small bounded efficiency reward breaks ties.
     score = 0.0 if not passed else 0.9 + 0.1 / (1 + elapsed / 60 + tokens / 10000 + calls / 10)
@@ -205,12 +268,32 @@ def run_case(
             task_providers.setdefault(event.get("task_id", "unknown"), set()).add(
                 event.get("payload", {}).get("provider", "unknown")
             )
+    def reported_tokens(key: str, alternate: str = "") -> int:
+        return sum(
+            (item.get("usage") or {}).get(key, (item.get("usage") or {}).get(alternate, 0)) or 0
+            for item in usage
+        )
+
     row = {
         "id": case["id"], "split": case["split"], "passed": passed, "score": score,
         "elapsed_s": round(elapsed, 3), "calls": calls, "tokens": tokens,
         "cost_usd": budget.cost_usd - before[2], "head": accepted, "base": base,
         "changed": changed, "providers": sorted({e.get("provider", "unknown") for e in usage}),
-        "children": len(children), "directory": str(root),
+        "children": len(children), "directory": str(root), "turn_heads": turn_heads,
+        "source": case.get("source"), "family": case.get("family"), "rollovers": rollovers,
+        "summary_calls": sum(e.get("call_kind") == "summary" for e in usage),
+        "failed_provider_calls": sum(bool(e.get("failure_reason")) for e in usage),
+        "malformed_actions": sum(
+            e.get("kind") == "log"
+            and str(e.get("payload", {}).get("message", "")).startswith("invalid_action:")
+            for e in events
+        ),
+        "tool_failures": sum(
+            e.get("kind") == "tool_event" and e.get("payload", {}).get("ok") is False
+            for e in events
+        ),
+        "output_tokens": reported_tokens("completion_tokens", "output_tokens"),
+        "cached_tokens": reported_tokens("cached_tokens", "cache_read_input_tokens"),
         "task_providers": {k: sorted(v) for k, v in task_providers.items()},
         "child_policies": [
             {k: e["payload"].get(k) for k in (
@@ -219,7 +302,8 @@ def run_case(
             for e in events if e.get("kind") == "context_fork"
         ],
         "feedback": (
-            f"exit={exit_code}; check={checked}; scope={scope_ok}; {error}\n"
+            f"exit={exit_code}; check={checked}; scope={scope_ok}; trace={trace_ok}; "
+            f"missing_tools={sorted(missing_tools)}; {error}\n"
             f"{diagnostic}\n{json.dumps(failures)[-3000:]}"
         ),
     }

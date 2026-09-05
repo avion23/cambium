@@ -189,11 +189,11 @@ def test_valid_summary_response_does_not_defer(tmp_path: Path) -> None:
     )
 
     assert outcome["status"] == "succeeded"
-    assert router.summary_calls == 2
+    assert router.summary_calls == 1  # Completion saves the raw tail without another fold.
     assert not [
         message for message in writer.messages() if message["type"] == "compaction_deferred"
     ]
-    assert any(message["type"] == "context_epoch_advanced" for message in writer.messages())
+    assert any(message["type"] == "context_checkpoint" for message in writer.messages())
 
 
 def test_compaction_deferral_count_survives_generation_boundary(tmp_path: Path) -> None:

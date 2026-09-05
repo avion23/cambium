@@ -4576,7 +4576,16 @@ class Cockpit:
         finally:
             self._draw_in_flight = False
 
+    def set_input(self, text: str, cursor: int, *, paint: bool = True) -> None:
+        """Update the event-loop-owned draft; resize never consults native memory."""
+        self._managed_input = (text, cursor)
+        if paint:
+            self._restore_input_line(text, force=True)
+            self.stream.flush()
+
     def _input_line_text(self) -> str | None:
+        if self._input_active and hasattr(self, "_managed_input"):
+            return self._managed_input[0]
         if not self._native_input or _readline is None or not self._input_active:
             return ""
         if getattr(self, "_input_owner", None) != threading.get_ident():
@@ -4597,15 +4606,32 @@ class Cockpit:
     def _restore_input_line(self, text: str, *, force: bool = False) -> None:
         if not self._input_active:
             return
-        text = _sanitize(text).replace("\r", " ").replace("\n", " ").replace("\t", " ")
+        managed = getattr(self, "_managed_input", None)
+        cursor = managed[1] if managed is not None else len(text)
+        def display(value: str) -> str:
+            return _sanitize(value).replace("\r", " ").replace("\n", "↵").replace("\t", " ")
+        before = display(text[:cursor])
+        text = display(text)
+        cursor = len(before)
         label = _sanitize(self._input_prompt_label)
+        room = max(1, self._last_size.columns - _display_width(label) - 3)
+        start, cells = cursor, 0
+        while start and cells + _display_width(text[start - 1]) < room - 1:
+            start -= 1
+            cells += _display_width(text[start])
+        marker = "‹" if start else ""
+        rendered = _clip(marker + text[start:], room)
+        cursor_cells = _display_width(marker + text[start:cursor])
         if (
             not force
             and self._last_restored_input_text == text
             and self._last_restored_input_label == label
         ):
             return
-        self.stream.write(f"\r{_CLEAR_LINE}{label} {text}")
+        self.stream.write(f"\r{_CLEAR_LINE}{label} {rendered}")
+        back = _display_width(rendered) - cursor_cells
+        if back > 0:
+            self.stream.write(f"\x1b[{back}D")
         self._last_restored_input_text = text
         self._last_restored_input_label = label
 

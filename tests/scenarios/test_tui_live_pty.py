@@ -31,6 +31,8 @@ class _CannedOpenAIServer:
     def __init__(self) -> None:
         self.request_started = threading.Event()
         self.release = threading.Event()
+        self.requests: list[dict] = []
+        requests = self.requests
         response = {
             "id": "chatcmpl-pty",
             "object": "chat.completion",
@@ -61,7 +63,7 @@ class _CannedOpenAIServer:
                     self.send_error(404)
                     return
                 length = int(self.headers.get("Content-Length") or 0)
-                self.rfile.read(length)
+                requests.append(json.loads(self.rfile.read(length)))
                 started.set()
                 release.wait(5.0)
                 self.send_response(200)
@@ -265,28 +267,29 @@ def test_live_tui_resize_preserves_one_input_prompt(tmp_path: Path) -> None:
         os.write(master_fd, b"hello\n")
         assert server.request_started.wait(5.0)
         _read_into(master_fd, output, 0.2)
-        echo_end = output.index(b"hello\r\n") + len(b"hello\r\n")
-        assert b"\x1b[1A\r\x1b[2K" in output[echo_end : echo_end + 100]
-        assert b"\r\x1b[2K\xe2\x80\xba hello " not in output[echo_end:]
-
+        # Paste one multiline draft, edit in its middle, and change focus.
+        # None of those operations may submit or lose the draft.
+        os.write(master_fd, b"\x1b[200~first\nsecond\x1b[201~\x1b[D!\x1b[17~")
+        _read_into(master_fd, output, 0.1)
+        frames = output.count("┌ Cambium".encode())
         _set_size(master_fd, 90)
-        _read_into(master_fd, output, 0.6)
-        _set_size(master_fd, 70)
-        _read_into(master_fd, output, 0.6)
-        server.release.set()
-
-        _read_until(master_fd, output, b"canned response", 8.0)
         _read_into(master_fd, output, 0.3)
-        # A native edit owns its line: full geometry repaint waits for input
-        # completion, while live result/status cells remain visible above it.
-        inspection = bytearray()
-        os.write(master_fd, b"/usage\n")
-        _read_until(master_fd, inspection, b"usage: calls=", 3.0)
-        _read_into(master_fd, inspection, 0.1)
-        output.extend(inspection)
-        assert output.count(_PROMPT_REPAINT) >= 2
-        final_frame = output.rsplit(b"\x1b[1A\r", 1)[-1]
-        assert final_frame.count(b"\r\x1b[2K\xe2\x80\xba ") <= 1
+        _set_size(master_fd, 70)
+        _read_into(master_fd, output, 0.3)
+        assert output.count("┌ Cambium".encode()) > frames  # Immediate, while editing.
+        assert len(server.requests) == 1
+        server.release.set()
+        _read_until(master_fd, output, b"canned response", 8.0)
+        _read_into(master_fd, output, 0.2)
+        os.write(master_fd, b"\n")
+        deadline = time.monotonic() + 5
+        while len(server.requests) < 2 and time.monotonic() < deadline:
+            _read_into(master_fd, output, 0.1)
+        assert len(server.requests) == 2
+        assert any("first\nsecon!d" in str(m.get("content", ""))
+                   for m in server.requests[-1]["messages"])
+        os.write(master_fd, b"/exit\n")
+        assert _wait_exit(process, master_fd, output, 5) == 0
     finally:
         server.close()
         if master_fd >= 0:
@@ -295,7 +298,7 @@ def test_live_tui_resize_preserves_one_input_prompt(tmp_path: Path) -> None:
             os.close(master_fd)
 
 
-def test_resize_while_readline_is_editing_does_not_crash(tmp_path: Path) -> None:
+def test_resize_while_editing_does_not_crash(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     _init_repo(repo)
     process, fd = _spawn_tui(repo, tmp_path / "missing-providers.json")

@@ -406,47 +406,45 @@ async def _drive_loop_with_heartbeats(
     return outcome, writer.messages()
 
 
-def test_summary_flush_authorizes_substitution_and_preserves_provenance(tmp_path: Path) -> None:
-    repo = tmp_path / "repo"
-    worktree = _make_worktree(repo)
+@pytest.mark.parametrize("all_dead", [False, True])
+def test_semantic_child_summary_substitution_and_failure(tmp_path: Path, all_dead: bool) -> None:
+    worktree = _make_worktree(tmp_path / "repo")
     config = _agent_config(
-        worktree,
-        context_reuse=True,
-        checkpoint_root=tmp_path / "checkpoints",
-        max_turns=1,
+        worktree, context_reuse=True, checkpoint_root=tmp_path / "checkpoints", max_turns=4,
     )
-    router = _SummaryFlushRouter()
+    router = _SummaryFlushRouter(all_providers_dead=all_dead, responses=[json.dumps({
+        "name": "delegate", "arguments": {
+            "child_task_id": "review", "kind": "investigation",
+            "spec": {"task": "Review alpha.txt", "context_mode": "semantic", "placement": "spread"},
+        },
+    })])
+    outcome = asyncio.run(_drive_loop(config, worktree, router))
+    assert router.allow_model_substitution == [False, True]
+    if all_dead:
+        assert outcome["status"] == "failed"
+        assert "summary provider call failed" in outcome["failure_reason"]
+    else:
+        assert outcome["status"] == "suspended"
+        assert outcome["provider"] == "healthy-substitute"
 
-    outcome = asyncio.run(_drive_loop(config, worktree, router))  # type: ignore[arg-type]
 
+def test_finish_keeps_raw_evidence_without_summary_call(tmp_path: Path) -> None:
+    worktree = _make_worktree(tmp_path / "repo")
+    config = _agent_config(
+        worktree, context_reuse=True, checkpoint_root=tmp_path / "checkpoints", max_turns=4,
+    )
+    router = _SummaryFlushRouter(all_providers_dead=True, responses=[
+        '{"name":"read_batch","arguments":{"paths":["alpha.txt"]}}',
+        '{"type":"finish","summary":"read alpha","objective_met":true}',
+    ])
+    writer = _FakeWriter()
+    outcome = asyncio.run(_drive_loop(config, worktree, router, writer))
     assert outcome["status"] == "succeeded"
-    assert outcome["provider"] == "healthy-substitute"
-    assert outcome["fell_back_from"] == "dead-primary"
-    assert router.allow_model_substitution == [False, True]
-    metadata = worker._cumulative_provider_metadata(outcome)
-    assert metadata is not None
-    assert metadata["provider"] == "healthy-substitute"
-    assert metadata["fell_back_from"] == "dead-primary"
-
-
-def test_summary_flush_all_providers_dead_fails_cleanly(tmp_path: Path) -> None:
-    repo = tmp_path / "repo"
-    worktree = _make_worktree(repo)
-    config = _agent_config(
-        worktree,
-        context_reuse=True,
-        checkpoint_root=tmp_path / "checkpoints",
-        max_turns=1,
-    )
-    router = _SummaryFlushRouter(all_providers_dead=True)
-
-    outcome = asyncio.run(_drive_loop(config, worktree, router))  # type: ignore[arg-type]
-
-    assert outcome["status"] == "failed"
-    assert outcome["failure_reason"] == (
-        "compaction_failed: summary provider call failed: RuntimeError"
-    )
-    assert router.allow_model_substitution == [False, True]
+    assert router.allow_model_substitution == [False, False]
+    event = next(e for e in writer.messages() if e["type"] == "context_checkpoint")
+    checkpoint = worker._load_epoch_checkpoint(config, event["checkpoint_ref"], expect_task_id=True)
+    text = json.dumps(checkpoint.full_messages)
+    assert "alpha-content" in text and "read alpha" in text
 
 
 def test_malformed_summary_defers_and_task_completes(tmp_path: Path) -> None:
@@ -524,18 +522,13 @@ def test_two_malformed_summaries_fail_on_the_third_fold_attempt(tmp_path: Path) 
     messages = writer.messages()
     assert len([message for message in messages if message["type"] == "compaction_deferred"]) == 2
     assert len([message for message in messages if message["type"] == "compaction_failed"]) == 1
-    assert (
-        len(
-            [
-                prompt
-                for prompt in router.prompts
-                if str(prompt["messages"][-1].get("content", "")).startswith(
-                    "<cambium-summary-control>\n"
-                )
-            ]
-        )
-        == 3
-    )
+    summary_prompts = [
+        p for p in router.prompts
+        if p["messages"][-1]["content"].startswith("<cambium-summary-control>\n")
+    ]
+    assert len(summary_prompts) == 6  # One ordinary repair per attempted fold.
+    assert all("Previous summary was invalid" in p["messages"][-1]["content"]
+               for p in summary_prompts[1::2])
 
 
 # ---------------------------------------------------------------------------
@@ -993,7 +986,8 @@ def test_batched_tool_calls_keep_order_and_deny_atomically(tmp_path: Path) -> No
     assert denied_outcome["status"] == "succeeded"
     assert not (denied_worktree / "blocked.txt").exists()
     denied_transcript = "\n".join(message["content"] for message in denied_outcome["transcript"])
-    assert "action rejected: git_op is restricted" in denied_transcript
+    assert "tool git_op ok=False" in denied_transcript
+    assert "git_op is restricted" in denied_transcript
     assert "not executed: batch contained a denied action" in denied_transcript
     assert worker._parse_agent_action(
         '{"type":"tool_call","name":"read_batch","arguments":{"paths":["legacy.txt"]}}'

@@ -1934,6 +1934,7 @@ def _reduce_child_failure(state: BranchState, values: Mapping[str, Any]) -> Bran
 def _reduce_generic_lifecycle(state: BranchState, values: Mapping[str, Any]) -> BranchState:
     kind = values.get("kind")
     desired = {
+        "task_queued": Lifecycle.QUEUED,
         "spawned": Lifecycle.STARTING,
         "init": Lifecycle.STARTING,
         "ready": Lifecycle.ACTIVE,
@@ -1996,6 +1997,7 @@ def _reduce_noop(state: BranchState, values: Mapping[str, Any]) -> BranchState:
 _GLOSSARY_KINDS = frozenset(
     {
         "task_assigned",
+        "task_queued",
         "child_admitted",
         "child_rejected",
         "child_result",
@@ -2074,6 +2076,8 @@ _GLOSSARY_KINDS = frozenset(
 
 
 def _handler_for(kind: str) -> Callable[[BranchState, Mapping[str, Any]], BranchState]:
+    if kind == "task_queued":
+        return _reduce_generic_lifecycle
     if kind == "task_assigned":
         return _reduce_task_assigned
     if kind == "child_admitted":

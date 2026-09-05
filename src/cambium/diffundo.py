@@ -1305,6 +1305,17 @@ class _CodexRawResponse(_RawResponse):
                 for item in (response.get("output", []) if isinstance(response, dict) else [])
                 if isinstance(item, dict) and item.get("type") == "message"
             )
+            calls = tuple(
+                {"id": item.get("call_id", item.get("id")), "type": "function", "function": {
+                    "name": item.get("name"), "arguments": item.get("arguments"),
+                }}
+                for item in (response.get("output", []) if isinstance(response, dict) else [])
+                if isinstance(item, dict) and item.get("type") == "function_call"
+            )
+            for call in calls:
+                if _tool_call_name(call) is None:
+                    raise ValueError("function call has no name")
+                _tool_call_arguments(call)
             model = provider.model
             if isinstance(response, dict) and isinstance(response.get("model"), str):
                 model = response["model"]
@@ -1315,6 +1326,7 @@ class _CodexRawResponse(_RawResponse):
                 content=self.text,
                 assistant_phase=phase if phase in {"commentary", "final_answer"} else None,
                 assistant_messages=messages,
+                tool_calls=calls or None,
                 latency_s=self.latency_s,
                 usage=usage,
                 estimated_cost_usd=_estimate_cost(provider, usage),
@@ -1848,9 +1860,13 @@ def _parse_codex_sse(
                 text_parts.setdefault(key, []).append(delta)
         elif event_type in {"response.output_item.added", "response.output_item.done"}:
             item = event.get("item")
-            if isinstance(item, dict) and item.get("type") == "message":
+            if isinstance(item, dict) and item.get("type") in {"message", "function_call"}:
                 key = str(item.get("id", event.get("output_index", 0)))
                 output_items[key] = item
+        elif event_type == "response.function_call_arguments.done":
+            key = str(event.get("item_id", event.get("output_index", 0)))
+            if key in output_items:
+                output_items[key] = {**output_items[key], "arguments": event.get("arguments")}
         elif event_type == "response.completed":
             completed = event
         elif event_type == "error":
@@ -1883,7 +1899,7 @@ def _parse_codex_sse(
     response = completed.get("response")
     if isinstance(response, dict) and not response.get("output") and output_items:
         response["output"] = [
-            item if item.get("content") else {
+            item if item.get("content") or item.get("type") == "function_call" else {
                 **item, "content": [{
                     "type": "output_text", "text": "".join(text_parts.get(key, [])),
                 }],

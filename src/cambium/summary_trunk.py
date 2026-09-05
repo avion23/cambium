@@ -56,6 +56,8 @@ SUMMARY_LIST_FIELDS = (
     "verification_results",
     "relevant_failed_approaches",
     "open_items",
+    "open_items_resolved",
+    "verification_invalidated",
 )
 SUMMARY_ENTRY_FIELDS = frozenset(
     {
@@ -94,6 +96,8 @@ class SummaryEntry:
     verification_results: tuple[str, ...]
     relevant_failed_approaches: tuple[str, ...]
     open_items: tuple[str, ...]
+    open_items_resolved: tuple[str, ...] = ()
+    verification_invalidated: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,6 +207,8 @@ _SUMMARY_LIST_TRIM_ORDER = (
     "facts_added",
     "decisions_superseded",
     "decisions_added",
+    "open_items_resolved",
+    "verification_invalidated",
     "open_items",
 )
 _SUMMARY_TEXT_TRIM_ORDER = (
@@ -333,9 +339,9 @@ def _positive_int(value: Any, field: str, *, allow_zero: bool = False) -> int:
 def _entry_from_mapping(value: Any) -> SummaryEntry:
     if not isinstance(value, Mapping):
         raise SummaryTrunkError("summary entry must be a JSON object")
-    if set(value) != SUMMARY_ENTRY_FIELDS:
-        missing = sorted(SUMMARY_ENTRY_FIELDS - set(value))
-        unknown = sorted(set(value) - SUMMARY_ENTRY_FIELDS)
+    missing = sorted(SUMMARY_ENTRY_FIELDS - set(SUMMARY_LIST_FIELDS) - set(value))
+    unknown = sorted(set(value) - SUMMARY_ENTRY_FIELDS)
+    if missing or unknown:
         details: list[str] = []
         if missing:
             details.append(f"missing={missing}")
@@ -365,7 +371,7 @@ def _entry_from_mapping(value: Any) -> SummaryEntry:
         "outcome": _bounded_text(value.get("outcome"), "outcome"),
     }
     for field in SUMMARY_LIST_FIELDS:
-        kwargs[field] = _bounded_items(value.get(field), field)
+        kwargs[field] = _bounded_items(value.get(field, []), field)
     entry = SummaryEntry(**kwargs)
     return _fit_entry_size(entry)
 
@@ -533,42 +539,7 @@ def parse_summary_message(message: Mapping[str, Any]) -> SummaryEntry | None:
     return _entry_from_mapping(decoded)
 
 
-_SEMANTIC_ID_RE = re.compile(r"^([DF]\d+)(?:\b|:)")
-
-
-def _entry_id_sets(
-    entry: SummaryEntry,
-) -> tuple[set[str], set[str]]:
-    """Split ID-shaped items into (added, referenced) sets; prose passes through."""
-    added: set[str] = set()
-    for item in (*entry.decisions_added, *entry.facts_added):
-        match = _SEMANTIC_ID_RE.match(item)
-        if match is not None:
-            added.add(match.group(1))
-    referenced: set[str] = set()
-    for item in (*entry.decisions_superseded, *entry.facts_invalidated):
-        match = _SEMANTIC_ID_RE.match(item)
-        if match is not None:
-            referenced.add(match.group(1))
-    return added, referenced
-
-
-def _validate_entry_refs(entry: SummaryEntry, seen_added: set[str]) -> None:
-    """ID-shaped supersede/invalidation items must reference known earlier IDs.
-
-    Prose-style items are exempt so pre-existing trunks stay readable.  Added
-    IDs must be globally unique across segments.
-    """
-    added, referenced = _entry_id_sets(entry)
-    unknown = sorted(referenced - added - seen_added)
-    if unknown:
-        raise SummaryTrunkError(
-            "summary entry supersedes/invalidates unknown IDs: " + ", ".join(unknown)
-        )
-    duplicates = sorted(added & seen_added)
-    if duplicates:
-        raise SummaryTrunkError("summary entry re-adds existing IDs: " + ", ".join(duplicates))
-    seen_added.update(added)
+_SEMANTIC_ID_RE = re.compile(r"^([DFOV]\d+)(?:\b|:)")
 
 
 def partition_summary_trunk(
@@ -598,7 +569,6 @@ def partition_summary_trunk(
     trunk = list(copied[:stable_head_messages])
     expected_sequence = 1
     seen_digests: set[str] = set()
-    seen_semantic_ids: set[str] = set()
     previous_through_turn: int | None = None
     index = stable_head_messages
     while index < len(copied):
@@ -612,7 +582,6 @@ def partition_summary_trunk(
             )
         if entry.source_sha256 in seen_digests:
             raise SummaryTrunkError("summary entry source_sha256 must be unique")
-        _validate_entry_refs(entry, seen_semantic_ids)
         if previous_through_turn is not None and entry.through_turn <= previous_through_turn:
             raise SummaryTrunkError("summary entry through_turn must increase monotonically")
         seen_digests.add(entry.source_sha256)
@@ -671,7 +640,7 @@ def summary_trunk_tokens(
 
 def _semantic_item_key(item: str) -> str:
     """Use an explicit semantic ID when present, otherwise the item itself."""
-    match = re.match(r"^([DF]\d+)(?=\b|:)", item)
+    match = _SEMANTIC_ID_RE.match(item)
     return match.group(1) if match is not None else item
 
 
@@ -680,15 +649,15 @@ def _active_semantic_items(
     added_fields: tuple[str, ...],
     invalidated_fields: tuple[str, ...],
 ) -> tuple[str, ...]:
-    """Fold one add/invalidate pair without changing the summary schema."""
+    """Invalidate old values, then apply replacements from the same delta."""
     active: dict[str, str] = {}
     for entry in entries:
-        for field in added_fields:
-            for item in getattr(entry, field):
-                active[_semantic_item_key(item)] = item
         for field in invalidated_fields:
             for item in getattr(entry, field):
                 active.pop(_semantic_item_key(item), None)
+        for field in added_fields:
+            for item in getattr(entry, field):
+                active[_semantic_item_key(item)] = item
     return tuple(active.values())
 
 
@@ -704,10 +673,10 @@ def _unique_semantic_items(entries: Sequence[SummaryEntry], field: str) -> tuple
 def compile_k0_projection(entries: Sequence[SummaryEntry]) -> K0Projection:
     """Compile the active state of immutable summary segments into K0.
 
-    The fold is intentionally conservative.  Decisions and facts honor the
-    existing supersede/invalidation fields; constraints, verification state,
-    and open work are append-only fields in the current summary format and are
-    retained once.  No source entry is changed or discarded by this helper.
+    Corrections and resolved work refer to existing semantic IDs (D/F/O/V) or
+    exact text. Checks must explicitly be invalidated when their artifact is
+    obsolete; this reducer does not infer truth from prose or shell exit codes.
+    No source entry is changed or discarded.
     """
     normalized = tuple(
         entry if isinstance(entry, SummaryEntry) else _entry_from_mapping(entry)
@@ -727,8 +696,10 @@ def compile_k0_projection(entries: Sequence[SummaryEntry]) -> K0Projection:
             ("facts_invalidated",),
         ),
         constraints=_unique_semantic_items(normalized, "relevant_failed_approaches"),
-        verification_state=_unique_semantic_items(normalized, "verification_results"),
-        open_work=_unique_semantic_items(normalized, "open_items"),
+        verification_state=_active_semantic_items(
+            normalized, ("verification_results",), ("verification_invalidated",),
+        ),
+        open_work=_active_semantic_items(normalized, ("open_items",), ("open_items_resolved",)),
     )
 
 
@@ -879,6 +850,7 @@ def build_summary_request(
     *,
     through_turn: int,
     stable_head_messages: int = 2,
+    summary_policy: str | None = None,
 ) -> tuple[dict[str, Any], SummaryExpectation]:
     """Build a cache-friendly request that summarizes only ``raw_tail``."""
     trunk, unexpected_tail = partition_summary_trunk(
@@ -908,7 +880,21 @@ def build_summary_request(
         "source_sha256": expectation.source_sha256,
         "source_message_count": expectation.source_message_count,
         "through_turn": expectation.through_turn,
-        "finding_preservation_contract": SUMMARY_FINDING_PRESERVATION_CONTRACT,
+        "finding_preservation_contract": summary_policy or SUMMARY_FINDING_PRESERVATION_CONTRACT,
+        "response": {
+            "required": {"objective": "non-empty string", "outcome": "non-empty string"},
+            "optional_string_lists": list(SUMMARY_LIST_FIELDS),
+            "max_items_per_list": SUMMARY_MAX_ITEMS,
+            "instruction": (
+                "Return only summary JSON. Summarize the new raw range, not earlier entries."
+            ),
+        },
+        "corrections": (
+            "Use stable D1/F1/O1/V1 labels for decisions, facts, obligations and checks. "
+            "Keep the label when replacing an item. Close O labels in open_items_resolved; "
+            "retract stale V labels in verification_invalidated, naming the checked Git head. "
+            "An already absent label is harmless; do not invent completion evidence."
+        ),
     }
     control_message = {
         "role": "user",
@@ -994,10 +980,6 @@ def append_summary_entry(
         )
     if any(existing.source_sha256 == validated_entry.source_sha256 for existing in entries):
         raise SummaryTrunkError("summary append source_sha256 is a duplicate")
-    seen_semantic_ids: set[str] = set()
-    for existing in entries:
-        _validate_entry_refs(existing, seen_semantic_ids)
-    _validate_entry_refs(validated_entry, seen_semantic_ids)
     if entries and validated_entry.through_turn <= entries[-1].through_turn:
         raise SummaryTrunkError("summary append through_turn must increase monotonically")
     appended = [*trunk, render_summary_message(validated_entry)]

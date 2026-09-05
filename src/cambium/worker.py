@@ -157,6 +157,7 @@ from cambium.provider_config import AuthMode, load_providers
 from cambium.redact import Redactor, build_session_redactor
 from cambium.schemas import FINISH_ACTION_SCHEMA, TOOL_SCHEMAS, validate_tool_call
 from cambium.summary_trunk import (
+    SUMMARY_CONTROL_CLOSE,
     SUMMARY_CONTROL_OPEN,
     SummaryEntry,
     SummaryTrunkError,
@@ -2516,7 +2517,9 @@ _READ_TOOL_NAMES = frozenset({"read_file", "read_batch"})
 _EDIT_TOOL_NAMES = frozenset({"edit_file", "write_file"})
 # Allowlist, not a denylist: a batch runs concurrently only when EVERY call is
 # a known read-only tool. Anything new or unknown defaults to sequential.
-_CONCURRENT_TOOL_NAMES = frozenset({"read_file", "read_batch", "repo_query", "branch_history"})
+_CONCURRENT_TOOL_NAMES = frozenset({
+    "read_file", "read_batch", "repo_query", "branch_history", "inspect_state",
+})
 
 
 def _call_paths(name: str, arguments: dict[str, Any]) -> list[str]:
@@ -2675,17 +2678,19 @@ def _correct_summary_contract_prompt(
     messages = retry_prompt.get("messages")
     if not isinstance(messages, list) or not messages:
         return retry_prompt
-    messages.append(
-        {
-            "role": "user",
-            "content": _bounded_text(
-                f"Your previous response was rejected: {error}. "
-                "Emit exactly one summary_entry JSON object with only the "
-                "declared fields (summary, outcome, objective, open_items).",
-                MAX_OBSERVATION_BYTES,
-            ),
-        }
+    content = messages[-1]["content"]
+    control = json.loads(
+        content.removeprefix(SUMMARY_CONTROL_OPEN).removesuffix(SUMMARY_CONTROL_CLOSE)
     )
+    control["repair"] = (
+        f"Previous summary was invalid: {error}. Return only the requested summary JSON."
+    )
+    messages[-1] = {
+        "role": "user",
+        "content": (
+            SUMMARY_CONTROL_OPEN + json.dumps(control, sort_keys=True) + SUMMARY_CONTROL_CLOSE
+        ),
+    }
     return retry_prompt
 
 
@@ -5197,6 +5202,7 @@ async def _bound_context_continuation(
             trunk_messages,
             raw_tail,
             through_turn=summary_through_turn,
+            summary_policy=(config.prompt_policy or {}).get("summary"),
         )
         summary_result: CallResult | None = None
         sent_summary_prompt = copy.deepcopy(summary_prompt)
@@ -6331,104 +6337,8 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                         context_continuation, transcript, base_messages
                     )
 
-                # The root/parent performs one additional summary call at the
-                # terminal boundary. Forked children return their strict result
-                # envelope instead of publishing a competing parent trunk.
-                terminal_summary_flushed = False
-                terminal_had_local_checkpoint = (
-                    current_epoch_checkpoint is not None
-                    and current_epoch_checkpoint.task_id == config.task_id
-                    and current_epoch_checkpoint.generation == config.generation
-                )
-                if (
-                    config.context_reuse
-                    and usage_fork_of is None
-                    and base_messages is not None
-                    and config.checkpoint_root is not None
-                ):
-                    (
-                        _folded,
-                        compaction_failure,
-                        (
-                            base_messages,
-                            context_continuation,
-                            current_epoch_checkpoint,
-                            epoch_count,
-                            compaction_armed,
-                            compaction_deferred,
-                            usage_epoch,
-                            cumulative_usage,
-                            budget_new_tokens,
-                            previous_prompt_tokens,
-                            previous_usage_source,
-                            consecutive_compaction_deferrals,
-                            finalized,
-                            forced_finalization,
-                            finalization_grace_used,
-                            transcript,
-                        ),
-                    ) = await _bound_context_continuation(
-                        turn,
-                        force=True,
-                        config=config,
-                        router=router,
-                        tier=tier,
-                        model=model,
-                        writer=writer,
-                        progress=progress,
-                        run_request_id=run_request_id,
-                        outcome=outcome,
-                        tools=tools,
-                        budget_usd=budget_usd,
-                        absolute_wall_deadline=absolute_wall_deadline,
-                        wall_deadline=wall_deadline,
-                        base_messages=base_messages,
-                        context_continuation=context_continuation,
-                        current_epoch_checkpoint=current_epoch_checkpoint,
-                        epoch_count=epoch_count,
-                        compaction_armed=compaction_armed,
-                        compaction_deferred=compaction_deferred,
-                        consecutive_compaction_deferrals=consecutive_compaction_deferrals,
-                        usage_epoch=usage_epoch,
-                        usage_fork_of=usage_fork_of,
-                        cumulative_usage=cumulative_usage,
-                        budget_new_tokens=budget_new_tokens,
-                        previous_prompt_tokens=previous_prompt_tokens,
-                        previous_usage_source=previous_usage_source,
-                        no_progress_actions=no_progress_actions,
-                        code_changed=code_changed,
-                        verified_after_change=verified_after_change,
-                        verification_failed=verification_failed,
-                        provider_compat=provider_compat,
-                        provider_boundaries=provider_boundaries,
-                        finalization_cap=finalization_cap,
-                        soft_cap=soft_cap,
-                        finalized=finalized,
-                        forced_finalization=forced_finalization,
-                        finalization_grace_used=finalization_grace_used,
-                        last_turn_checkpoint=last_turn_checkpoint,
-                        transcript=transcript,
-                    )
-                    if compaction_failure is not None:
-                        return _loop_result(
-                            outcome,
-                            "failed",
-                            _phase_failure(
-                                f"compaction_failed: {compaction_failure}",
-                                final_synthesis=final_synthesis_call,
-                            ),
-                            turn,
-                            cumulative_usage,
-                            transcript,
-                        )
-                    terminal_summary_flushed = _folded
-                terminal_checkpoint_already_emitted = (
-                    terminal_summary_flushed and not terminal_had_local_checkpoint
-                )
-
-                # A fresh root flush emits its terminal context checkpoint
-                # directly. A resumed local trunk emits context_epoch_advanced,
-                # so retain the historical terminal checkpoint after that flush.
+                # Finishing saves an exact checkpoint, not another paid summary.
+                # The next consumer folds only if its working set needs it.
                 terminal_provider = result.provider
                 terminal_boundary = provider_boundaries.get(result.provider)
                 terminal_compat = provider_compat
@@ -6436,27 +6346,10 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                     copy.deepcopy(sent_prompt["messages"])
                 )
                 terminal_suffix = [copy.deepcopy(action_message)]
-                if base_messages is not None and current_epoch_checkpoint is not None:
-                    terminal_key = current_epoch_checkpoint.cache_key
-                    terminal_provider = terminal_key.provider or result.provider
-                    terminal_boundary = terminal_key.provider_boundary
-                    terminal_compat = (
-                        {
-                            terminal_provider: (
-                                terminal_key.protocol,
-                                terminal_key.reasoning_effort,
-                            )
-                        }
-                        if terminal_provider is not None
-                        else {}
-                    )
+                if base_messages is not None:
                     terminal_messages = copy.deepcopy(list(base_messages))
-                    terminal_suffix = []
-                if (
-                    config.context_reuse
-                    and usage_fork_of is None
-                    and not terminal_checkpoint_already_emitted
-                ):
+                    terminal_suffix = copy.deepcopy(context_continuation)
+                if config.context_reuse and usage_fork_of is None:
                     epoch_count += 1
                     terminal_epoch = {
                         "turn": turn,
@@ -6505,7 +6398,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                     "compaction_deferred": compaction_deferred,
                     "consecutive_compaction_deferrals": consecutive_compaction_deferrals,
                 }
-            if len(tool_calls) > 1:
+            if tool_calls:
                 if not final_synthesis_call and budget_new_tokens > config.max_tokens:
                     return _loop_result(
                         outcome,
@@ -6527,20 +6420,28 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                         denial = "permission_denied:shell"
                     denials.append(denial)
                 if any(denial is not None for denial in denials):
+                    if writer is not None:
+                        for index, (call, denial) in enumerate(
+                            zip(tool_calls, denials, strict=True)
+                        ):
+                            await _emit_tool_event(
+                                writer, config, call["name"], call["arguments"], turn,
+                                ToolResult(
+                                    ok=False, error=denial or "batch contained a denied action",
+                                ),
+                                batch_index=index,
+                            )
                     batch_messages: list[dict[str, Any]] = [action_message]
                     if trailing:
                         batch_messages.append({"role": "user", "content": _TRAILING_ACTION_NOTE})
-                    for denial in denials:
-                        batch_messages.append(
-                            {
-                                "role": "user",
-                                "content": (
-                                    f"action rejected: {denial}"
-                                    if denial is not None
-                                    else "not executed: batch contained a denied action"
-                                ),
-                            }
-                        )
+                    for call, denial in zip(tool_calls, denials, strict=True):
+                        batch_messages.append({
+                            "role": "user",
+                            "content": _tool_observation(call["name"], ToolResult(
+                                ok=False,
+                                error=denial or "not executed: batch contained a denied action",
+                            )),
+                        })
                     if base_messages is None:
                         transcript.extend(batch_messages)
                     else:
@@ -6759,18 +6660,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                             tool_result,
                             batch_index=batch_index,
                         )
-                        await _persist_checkpoint(
-                            writer,
-                            config,
-                            turn,
-                            transcript,
-                            cumulative_usage,
-                            [],
-                            compaction_deferred=compaction_deferred,
-                            consecutive_compaction_deferrals=consecutive_compaction_deferrals,
-                            code_changed=code_changed,
-                        )
-                    if batch_cancelled and not batch_results:
+                    if batch_results or batch_cancelled:
                         await _persist_checkpoint(
                             writer,
                             config,
@@ -6801,7 +6691,14 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                 if config.context_reuse and successful_delegate is not None and not finalized:
                     batch_checkpoint: ContextCheckpoint | None = None
                     batch_checkpoint_was_emitted = False
-                    if base_messages is not None and config.checkpoint_root is not None:
+                    if (
+                        base_messages is not None and config.checkpoint_root is not None
+                        and any(
+                            name == "delegate" and value.ok
+                            and args["spec"]["context_mode"] == "semantic"
+                            for name, args, value in batch_results
+                        )
+                    ):
                         (
                             _folded,
                             compaction_failure,
@@ -6898,10 +6795,16 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                             config,
                             turn=turn,
                             epoch=epoch_count,
-                            provider_messages=copy.deepcopy(sent_prompt["messages"]),
-                            continuation_suffix=continuation_suffix,
+                            provider_messages=copy.deepcopy(
+                                list(base_messages) if base_messages is not None
+                                else sent_prompt["messages"]
+                            ),
+                            continuation_suffix=copy.deepcopy(
+                                context_continuation if base_messages is not None
+                                else continuation_suffix
+                            ),
                             provider=result.provider,
-                            model=model,
+                            model=result.model,
                             tools_sha256=_sha256_hex(
                                 json.dumps(tools, sort_keys=True).encode("utf-8")
                             ),
@@ -6936,316 +6839,6 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                         }
                 continue
 
-            name, arguments = tool_calls[0]["name"], tool_calls[0]["arguments"]
-            if not final_synthesis_call and budget_new_tokens > config.max_tokens:
-                return _loop_result(
-                    outcome,
-                    "failed",
-                    _phase_failure("token budget exceeded", final_synthesis=final_synthesis_call),
-                    turn,
-                    cumulative_usage,
-                    transcript,
-                )
-            denial = _permission_denied(name, arguments, config)
-            if denial is not None:
-                denied_messages = [
-                    action_message,
-                    {"role": "user", "content": f"action rejected: {denial}"},
-                ]
-                if base_messages is None:
-                    transcript.extend(denied_messages)
-                else:
-                    context_continuation.extend(denied_messages)
-                    transcript = _sync_context_transcript(
-                        base_messages, context_continuation, transcript
-                    )
-                base_messages, context_continuation, transcript = await _maybe_restore_turn_context(
-                    turn_checkpoint_resumed=turn_checkpoint_resumed,
-                    compaction_deferred=compaction_deferred,
-                    base_messages=base_messages,
-                    context_continuation=context_continuation,
-                    transcript=transcript,
-                    config=config,
-                    tools=tools,
-                    model_identity=model_identity,
-                )
-                (
-                    finalized,
-                    forced_finalization,
-                    finalization_grace_used,
-                    context_continuation,
-                    transcript,
-                ) = _arm_finalization(
-                    turn,
-                    base_messages=base_messages,
-                    context_continuation=context_continuation,
-                    transcript=transcript,
-                    config=config,
-                    budget_new_tokens=budget_new_tokens,
-                    soft_cap=soft_cap,
-                    finalized=finalized,
-                    forced_finalization=forced_finalization,
-                    finalization_grace_used=finalization_grace_used,
-                )
-                progress.tool = name
-                continue
-            if stop.is_set():
-                return _loop_result(
-                    outcome, "cancelled", None, turn - 1, cumulative_usage, transcript
-                )
-            progress.tool = name
-            progress_sink = (
-                _tool_progress_callback(writer, config, name, turn)
-                if writer is not None and name in {"run_shell", "git_op"}
-                else None
-            )
-            with ToolContext(
-                worktree,
-                lint=lint_diag,
-                policy=ToolPermissionPolicy(
-                    shell=config.shell_permission,
-                    network=config.network_permission,
-                ),
-                progress=progress_sink,
-            ) as ctx:
-                try:
-                    tool_result = await run_tool(name, arguments, ctx)
-                finally:
-                    # The next heartbeat belongs to the provider turn, not
-                    # the completed tool. Do not carry its name into that
-                    # operation's live window.
-                    progress.tool = None
-                    if progress_sink is not None:
-                        # Deliver any pending (throttled) tail before the
-                        # tool's completion event so the newest process
-                        # output is the last emitted delta.
-                        await cast(Any, progress_sink).flush()
-            if name == "delegate" and tool_result.ok and writer is not None:
-                await _emit_delegated_child(writer, config, arguments, request_id=run_request_id)
-            if tool_result.ok:
-                if name in ("write_file", "edit_file"):
-                    code_changed = True
-                    verified_after_change = False
-                    verification_failed = False
-                elif name == "run_shell":
-                    verified_after_change = True
-                    verification_failed = False
-            elif name == "run_shell":
-                verification_failed = True
-                verified_after_change = False
-            result_content = (
-                tool_result.output
-                if tool_result.ok
-                else (tool_result.error or tool_result.output or "")
-            )
-            observation = {"role": "user", "content": _tool_observation(name, tool_result)}
-            if base_messages is None:
-                transcript.append(action_message)
-                if trailing:
-                    transcript.append({"role": "user", "content": _TRAILING_ACTION_NOTE})
-                transcript.append(observation)
-            else:
-                continuation_suffix = [action_message]
-                if trailing:
-                    continuation_suffix.append({"role": "user", "content": _TRAILING_ACTION_NOTE})
-                continuation_suffix.append(observation)
-                context_continuation.extend(copy.deepcopy(continuation_suffix))
-                transcript = _sync_context_transcript(
-                    base_messages, context_continuation, transcript
-                )
-            if read_action:
-                stalled = _observe_progress(
-                    progress_detector, action=action, result_content=result_content
-                )
-                no_progress_actions = progress_detector.no_progress_actions
-                if stalled and not _finalization_due(
-                    turn, finalized, budget_new_tokens, soft_cap, config
-                ):
-                    return _no_progress_failure(
-                        outcome, no_progress_actions, turn, cumulative_usage, transcript
-                    )
-            base_messages, context_continuation, transcript = await _maybe_restore_turn_context(
-                turn_checkpoint_resumed=turn_checkpoint_resumed,
-                compaction_deferred=compaction_deferred,
-                base_messages=base_messages,
-                context_continuation=context_continuation,
-                transcript=transcript,
-                config=config,
-                tools=tools,
-                model_identity=model_identity,
-            )
-            (
-                finalized,
-                forced_finalization,
-                finalization_grace_used,
-                context_continuation,
-                transcript,
-            ) = _arm_finalization(
-                turn,
-                base_messages=base_messages,
-                context_continuation=context_continuation,
-                transcript=transcript,
-                config=config,
-                budget_new_tokens=budget_new_tokens,
-                soft_cap=soft_cap,
-                finalized=finalized,
-                forced_finalization=forced_finalization,
-                finalization_grace_used=finalization_grace_used,
-            )
-            if writer is not None:
-                await _emit_tool_event(writer, config, name, arguments, turn, tool_result)
-                await _persist_checkpoint(
-                    writer,
-                    config,
-                    turn,
-                    transcript,
-                    cumulative_usage,
-                    [],
-                    compaction_deferred=compaction_deferred,
-                    consecutive_compaction_deferrals=consecutive_compaction_deferrals,
-                    code_changed=code_changed,
-                )
-                last_turn_checkpoint = turn
-            if config.context_reuse and name == "delegate" and tool_result.ok and not finalized:
-                checkpoint: ContextCheckpoint | None = None
-                checkpoint_was_emitted = False
-                if base_messages is not None and config.checkpoint_root is not None:
-                    (
-                        _folded,
-                        compaction_failure,
-                        (
-                            base_messages,
-                            context_continuation,
-                            current_epoch_checkpoint,
-                            epoch_count,
-                            compaction_armed,
-                            compaction_deferred,
-                            usage_epoch,
-                            cumulative_usage,
-                            budget_new_tokens,
-                            previous_prompt_tokens,
-                            previous_usage_source,
-                            consecutive_compaction_deferrals,
-                            finalized,
-                            forced_finalization,
-                            finalization_grace_used,
-                            transcript,
-                        ),
-                    ) = await _bound_context_continuation(
-                        turn,
-                        force=True,
-                        config=config,
-                        router=router,
-                        tier=tier,
-                        model=model,
-                        writer=writer,
-                        progress=progress,
-                        run_request_id=run_request_id,
-                        outcome=outcome,
-                        tools=tools,
-                        budget_usd=budget_usd,
-                        absolute_wall_deadline=absolute_wall_deadline,
-                        wall_deadline=wall_deadline,
-                        base_messages=base_messages,
-                        context_continuation=context_continuation,
-                        current_epoch_checkpoint=current_epoch_checkpoint,
-                        epoch_count=epoch_count,
-                        compaction_armed=compaction_armed,
-                        compaction_deferred=compaction_deferred,
-                        consecutive_compaction_deferrals=consecutive_compaction_deferrals,
-                        usage_epoch=usage_epoch,
-                        usage_fork_of=usage_fork_of,
-                        cumulative_usage=cumulative_usage,
-                        budget_new_tokens=budget_new_tokens,
-                        previous_prompt_tokens=previous_prompt_tokens,
-                        previous_usage_source=previous_usage_source,
-                        no_progress_actions=no_progress_actions,
-                        code_changed=code_changed,
-                        verified_after_change=verified_after_change,
-                        verification_failed=verification_failed,
-                        provider_compat=provider_compat,
-                        provider_boundaries=provider_boundaries,
-                        finalization_cap=finalization_cap,
-                        soft_cap=soft_cap,
-                        finalized=finalized,
-                        forced_finalization=forced_finalization,
-                        finalization_grace_used=finalization_grace_used,
-                        last_turn_checkpoint=last_turn_checkpoint,
-                        transcript=transcript,
-                    )
-                    if compaction_failure is not None:
-                        return _loop_result(
-                            outcome,
-                            "failed",
-                            f"compaction_failed: {compaction_failure}",
-                            turn,
-                            cumulative_usage,
-                            transcript,
-                        )
-                    checkpoint = current_epoch_checkpoint
-                    checkpoint_was_emitted = checkpoint is not None
-                if checkpoint is None:
-                    epoch_count += 1
-                    if base_messages is None:
-                        continuation_suffix = [
-                            _canonical_action_message(action),
-                            *(
-                                [{"role": "user", "content": _TRAILING_ACTION_NOTE}]
-                                if trailing
-                                else []
-                            ),
-                            observation,
-                            _context_state_message(
-                                code_changed=code_changed,
-                                verified_after_change=verified_after_change,
-                                verification_failed=verification_failed,
-                                no_progress_actions=no_progress_actions,
-                                budget_new_tokens=budget_new_tokens,
-                                previous_prompt_tokens=previous_prompt_tokens,
-                                turn=turn,
-                                context_epoch=epoch_count,
-                                max_tokens=config.max_tokens,
-                            ),
-                        ]
-                    checkpoint = await asyncio.to_thread(
-                        _write_epoch_checkpoint,
-                        config,
-                        turn=turn,
-                        epoch=epoch_count,
-                        provider_messages=copy.deepcopy(sent_prompt["messages"]),
-                        continuation_suffix=continuation_suffix,
-                        provider=result.provider,
-                        model=model,
-                        tools_sha256=_sha256_hex(json.dumps(tools, sort_keys=True).encode("utf-8")),
-                        provider_compat=provider_compat,
-                        provider_boundary=provider_boundaries.get(result.provider),
-                        code_changed=code_changed,
-                        verified_after_change=verified_after_change,
-                        verification_failed=verification_failed,
-                        no_progress_actions=no_progress_actions,
-                        budget_new_tokens=budget_new_tokens,
-                        previous_prompt_tokens=previous_prompt_tokens,
-                        cumulative_usage=cumulative_usage,
-                        wall_deadline=absolute_wall_deadline,
-                    )
-                if checkpoint is not None:
-                    if writer is not None and not checkpoint_was_emitted:
-                        await _emit_context_checkpoint(
-                            writer, config, checkpoint, request_id=run_request_id
-                        )
-                    return {
-                        **outcome,
-                        "status": TaskStatus.SUSPENDED.value,
-                        "turn": turn,
-                        "usage": cumulative_usage,
-                        "provider": checkpoint.cache_key.provider or result.provider,
-                        "latency_s": max(0.0, float(result.latency_s)),
-                        "transcript": transcript,
-                        "epoch": checkpoint.epoch,
-                        "checkpoint_ref": checkpoint.checkpoint_ref,
-                        "compaction_deferred": compaction_deferred,
-                        "consecutive_compaction_deferrals": consecutive_compaction_deferrals,
-                    }
         return _loop_result(
             outcome,
             "failed",

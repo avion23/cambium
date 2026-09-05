@@ -274,6 +274,14 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         ),
     },
     {
+        "name": "inspect_state",
+        "description": (
+            "Inspect recorded task state, children, accepted artifacts, context and resources. "
+            "Defaults to your task; supply task_id to inspect another branch. Read-only."
+        ),
+        "parameters": _parameters({"task_id": {"type": "string", "minLength": 1}}, []),
+    },
+    {
         "name": "branch_history",
         "description": (
             "Read this session's recorded branches, tools, or transcript without rerunning "

@@ -596,29 +596,27 @@ def test_debt_aware_selection_balances_across_tasks_and_feeds_ledger(tmp_path, m
             for event in events
             if event["kind"] == "task_assigned" and "assigned_provider" in event["payload"]
         ]
-        assert [payload["assigned_provider"] for payload in assigned] == [
-            "provider-a",
-            "provider-a",
+        # Concurrent workers may announce assignments in either order.
+        assert sorted(payload["assigned_provider"] for payload in assigned) == [
+            "provider-a", "provider-b",
         ]
-        assert {payload["model"] for payload in assigned} == {"m1"}
+        assert {payload["model"] for payload in assigned} == {"m1", "m2"}
 
-        # Both action calls use the assigned provider/model. Each task also
-        # makes one terminal summary call without consuming the action script.
-        assert len(server_a.calls) == 2
-        assert len(server_a.summary_calls) == 2
-        assert len(server_b.calls) == 0
+        # Both actions use their assignment; completion makes no extra call.
+        assert len(server_a.calls) == 1
+        assert len(server_a.summary_calls) == 0
+        assert len(server_b.calls) == 1
         assert len(server_b.summary_calls) == 0
         assert all(call["model"] == "m1" for call in server_a.calls)
 
-        # Usage fed the durable ledger: A folded both tasks' 2M action tokens
-        # and counted the two zero-token summary requests; B kept its seed.
+        # Each single-capacity lane did one task; B retains its earlier debt.
         ledger = DebtStore(state_path)
         ledger.load()
         debts = ledger.as_mapping()
-        assert debts["provider-a"].tokens == 4_000_000
-        assert debts["provider-a"].requests == 4
-        assert debts["provider-b"].tokens == 1_000_000
-        assert debts["provider-b"].requests == 10
+        assert debts["provider-a"].tokens == 2_000_000
+        assert debts["provider-a"].requests == 1
+        assert debts["provider-b"].tokens == 1_001_000
+        assert debts["provider-b"].requests == 11
     finally:
         server_a.close()
         server_b.close()

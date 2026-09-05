@@ -845,6 +845,16 @@ async def _branch_history(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
     return _Outcome(True, await asyncio.to_thread(query_branch_history, session_dir, args))
 
 
+async def _inspect_state(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
+    from .state_view import state_text
+
+    session_dir = os.environ.get("CAMBIUM_SESSION_ID")
+    if not session_dir:
+        raise _ToolFailure("state inspection requires a supervised session")
+    task_id = args.get("task_id") or os.environ.get("CAMBIUM_TASK_ID")
+    return _Outcome(True, await asyncio.to_thread(state_text, session_dir, task_id))
+
+
 async def _delegate(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
     """Validate and register one child proposal for supervisor admission.
 
@@ -877,6 +887,7 @@ async def _delegate(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
 TOOL_DISPATCH: dict[str, ToolImplementation] = {
     "repo_query": _repo_query,
     "branch_history": _branch_history,
+    "inspect_state": _inspect_state,
     "delegate": _delegate,
     "read_batch": _read_batch,
     "write_file": _write_file,

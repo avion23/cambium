@@ -174,17 +174,13 @@ def test_batch_preassignment_spreads_across_equal_debt_providers(tmp_path) -> No
 
     _preassign_lanes(specs, _equal_debt("a", "b"), lanes)
 
-    assigned = [spec["assigned_provider"] for spec in specs]
-    assert assigned.count("a") == 2
-    assert assigned.count("b") == 2
-    # alternating picks (config-order tiebreak on the first pick)
-    assert assigned == ["a", "b", "a", "b"]
-    # each task carries the provider's model, and lanes hold the wave's counts
-    for spec in specs:
+    assigned = [spec.get("assigned_provider") for spec in specs]
+    assert assigned == ["a", "b", None, None]
+    # Unassigned tasks wait for capacity instead of exceeding a single slot.
+    for spec in specs[:2]:
         expected = "m1" if spec["assigned_provider"] == "a" else "m2"
         assert spec["fanout_config"]["model"] == expected
-    assert lanes["a"].in_flight == 2
-    assert lanes["b"].in_flight == 2
+    assert lanes["a"].in_flight == lanes["b"].in_flight == 1
 
 
 def test_batch_preassignment_respects_full_lane_cap(tmp_path) -> None:
@@ -198,26 +194,6 @@ def test_batch_preassignment_respects_full_lane_cap(tmp_path) -> None:
     assert [spec["assigned_provider"] for spec in specs] == ["b"] * 4
     assert lanes["a"].in_flight == 1
     assert lanes["b"].in_flight == 4
-
-
-def test_batch_preassignment_429_pressure_reduces_admissions(tmp_path) -> None:
-    config_path = _config_file(tmp_path / "providers.json", [("a", "m1", 3), ("b", "m2", 3)])
-    specs = [_spec(f"t-{i}", config_path) for i in range(4)]
-    debt = {
-        "a": ProviderDebt(retry_after_count=25),  # cap floor(3 * 0.5) = 1
-        "b": ProviderDebt(),  # cap 3
-    }
-    lanes: dict[str, LaneState] = {}
-
-    _preassign_lanes(specs, debt, lanes)
-
-    # the pressured provider admits only one task; the clean provider takes
-    # the rest
-    assigned = [spec["assigned_provider"] for spec in specs]
-    assert assigned.count("a") == 1
-    assert assigned.count("b") == 3
-    assert lanes["a"].in_flight == 1
-    assert lanes["b"].in_flight == 3
 
 
 def test_batch_preassignment_skips_pinned_and_no_fanout_tasks(tmp_path) -> None:

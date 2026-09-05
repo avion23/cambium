@@ -105,6 +105,7 @@ def _summary_server(monkeypatch: pytest.MonkeyPatch, behaviors: list[Any]) -> Fa
 def _config_for(tmp_path: Path) -> worker.AgentConfig:
     worktree = tmp_path / "worktree"
     worktree.mkdir()
+    (worktree / "note.txt").write_text(_SECRET)
     write_generation(worktree, 1)
     return worker.AgentConfig(
         task_id="summary-content-flagged",
@@ -113,7 +114,10 @@ def _config_for(tmp_path: Path) -> worker.AgentConfig:
         worktree=worktree,
         base_commit=None,
         fanout_config={},
-        max_turns=1,
+        max_turns=4,
+        context_reuse=True,
+        rolling_compact_threshold_high=1,
+        rolling_compact_threshold_low=1,
         max_tokens=200_000,
         shell_permission=True,
         network_permission=False,
@@ -177,7 +181,7 @@ def test_content_flagged_summary_retries_once_with_redacted_tail(
             (
                 200,
                 _ok_payload(
-                    json.dumps({"type": "finish", "summary": _SECRET, "objective_met": True}),
+                    json.dumps({"name": "read_batch", "arguments": {"paths": ["note.txt"]}}),
                     model="loopback-model",
                     usage=_USAGE,
                 ),
@@ -185,6 +189,9 @@ def test_content_flagged_summary_retries_once_with_redacted_tail(
             ),
             (400, _FLAGGED, 0.0),
             (200, _ok_payload(_SUMMARY, model="loopback-model", usage=_USAGE), 0.0),
+            (200, _ok_payload(json.dumps({
+                "type": "finish", "summary": _SECRET, "objective_met": True,
+            }), model="loopback-model", usage=_USAGE), 0.0),
         ],
     )
     router = _router(server)
@@ -205,9 +212,9 @@ def test_content_flagged_summary_retries_once_with_redacted_tail(
         assert calls[1]["messages"] != calls[0]["messages"]
         assert calls[1]["messages"][:2] == calls[0]["messages"][:2]
         assert calls[1]["messages"][-1] == calls[0]["messages"][-1]
-        assert '"summary":"***' in calls[1]["messages"][-2]["content"]
+        assert "***" in calls[1]["messages"][-2]["content"]
         assert len(calls[1]["messages"][-2]["content"]) < len(calls[0]["messages"][-2]["content"])
-        assert len(server.calls) == 3
+        assert len(server.calls) == 4
         assert router.summary_failure_health == [HealthState.HEALTHY]
         assert router.health("p_summary") is HealthState.HEALTHY
         assert len(router.summary_failures) == 1
@@ -249,7 +256,7 @@ def test_content_flagged_summary_retry_fails_without_health_damage(
             (
                 200,
                 _ok_payload(
-                    json.dumps({"type": "finish", "summary": "done", "objective_met": True}),
+                    json.dumps({"type": "plan", "steps": ["inspect"]}),
                     model="loopback-model",
                     usage=_USAGE,
                 ),

@@ -326,7 +326,8 @@ def _write_providers(path: Path, *, pa_key: str = "secret-a", pb_key: str = "") 
     return path
 
 
-def test_auto_mode_candidates_and_plan_shape(tmp_path: Path) -> None:
+@pytest.mark.parametrize("auto", [False, True])
+def test_auto_mode_candidates_and_plan_shape(tmp_path: Path, auto: bool) -> None:
     """--auto builds model_candidates from providers with file-backed credentials
     and leaves the (provider, model, tier) to the supervisor resolution."""
     from cambium.oneshot import _resolve_provider
@@ -336,7 +337,7 @@ def test_auto_mode_candidates_and_plan_shape(tmp_path: Path) -> None:
     config = oneshot.OneShotConfig(
         prompt="run one auto task",
         repo=repo,
-        auto=True,
+        auto=auto,
         provider_config_path=config_path,
     )
     resolved, environment = _resolve_provider(config, repo)
@@ -345,6 +346,11 @@ def test_auto_mode_candidates_and_plan_shape(tmp_path: Path) -> None:
     assert resolved.fanout_config == {}  # resolution fills model + tier
     assert resolved.provider_env_keys == ("CAMBIUM_PROVIDER_PA_API_KEY",)
     assert environment == {"CAMBIUM_PROVIDER_PA_API_KEY": "secret-a"}
+    # Reconnecting re-resolves names, not environment keys, and keeps the pool.
+    _write_providers(config_path, pb_key="now-ready")
+    repeated, repeated_environment = _resolve_provider(resolved, repo)
+    assert repeated == resolved
+    assert repeated_environment == environment
     # the plan the supervisor sees carries the candidates for resolution
     plan = oneshot.build_plan(resolved, repo, tmp_path / "session")
     spec = plan["tasks"][0]

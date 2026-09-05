@@ -1098,10 +1098,9 @@ class InteractiveSession:
     def compact(self) -> str:
         """Roll the current summary-only checkpoint into a CAST K0 checkpoint.
 
-        Normal semantic summary flushing is performed by the provider-backed
-        worker at a successful turn boundary.  This operator path therefore
-        refuses a checkpoint that still has a raw tail rather than inventing a
-        model-free summary, then performs the local K0 rollover check.
+        This deterministic operation materializes semantic entries and retains
+        the recent raw tail unchanged. It never invents a model-free summary
+        or requires a paid terminal flush merely to save a usable checkpoint.
         """
         if self._seed is None:
             return "compact: no successful checkpoint is available"
@@ -1130,11 +1129,6 @@ class InteractiveSession:
             )
             checkpoint = _load_epoch_checkpoint(config, seed.checkpoint_ref, expect_task_id=False)
             trunk, raw_tail = partition_summary_trunk(checkpoint.full_messages)
-            if raw_tail:
-                return (
-                    "compact: semantic flush is pending; raw tail remains and "
-                    "requires a provider turn"
-                )
             entries = summary_entries(trunk)
             if not entries:
                 return "compact: no semantic summary segments are available"
@@ -1151,7 +1145,7 @@ class InteractiveSession:
                 turn=checkpoint.turn,
                 epoch=checkpoint.epoch + 1,
                 provider_messages=rolled_messages,
-                continuation_suffix=[],
+                continuation_suffix=raw_tail,
                 provider=provider,
                 model=cache_key.model,
                 tools_sha256=cache_key.tools_sha256,
@@ -1162,7 +1156,7 @@ class InteractiveSession:
                 verification_failed=checkpoint.verification_failed,
                 no_progress_actions=checkpoint.no_progress_actions,
                 budget_new_tokens=checkpoint.budget_new_tokens,
-                previous_prompt_tokens=checkpoint.previous_prompt_tokens,
+                previous_prompt_tokens=0,
                 cumulative_usage=checkpoint.cumulative_usage,
                 wall_deadline=checkpoint.wall_deadline,
             )

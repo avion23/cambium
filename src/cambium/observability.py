@@ -122,6 +122,7 @@ class SessionSnapshot:
     recent_events: tuple[RecentEvent, ...]
     last_seq: int
     quota_windows: tuple[QuotaWindowSnapshot, ...] = ()
+    selected_task_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -519,7 +520,7 @@ class ObservabilityState:
             agent.last_seq = seq
             agent.last_kind = kind
 
-            if kind in {"task_assigned", "child_admitted"}:
+            if kind in {"task_assigned", "child_admitted", "task_queued"}:
                 _set_state(agent, "queued")
             elif kind == "spawned":
                 _set_state(agent, "starting")

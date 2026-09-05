@@ -748,8 +748,10 @@ def _resolve_provider(
     cascade = config.routing_mode is RoutingMode.USAGE_BALANCED or (
         config.provider is None
         and config.model is None
-        and config.fanout_config is None
-        and not config.provider_env_keys
+        and (
+            (config.fanout_config is None and not config.provider_env_keys)
+            or bool(config.model_candidates)
+        )
     )
     if cascade:
         if config.provider is not None or config.model is not None:
@@ -762,6 +764,10 @@ def _resolve_provider(
         _report_provider_quarantine(providers)
         store = auth_store if auth_store is not None else AuthStore()
         authorized = _authorized_provider_names(providers, store)
+        if config.authorized_providers:
+            authorized = [p for p in authorized if p.name in config.authorized_providers]
+        if config.model_candidates:
+            authorized = [p for p in authorized if p.model in config.model_candidates]
         codex_authorized = [p for p in authorized if _is_codex_oauth_provider(p)]
         if len(codex_authorized) > 1:
             raise ValueError(
@@ -791,7 +797,7 @@ def _resolve_provider(
             # resolution so the ledger balances the pick; the worker requires
             # a concrete (tier, model) which admission always writes before
             # spawn.
-            fanout_config={},
+            fanout_config=dict(config.fanout_config or {}),
             provider_env_keys=tuple(
                 candidate.api_key_env
                 for candidate in authorized
@@ -815,12 +821,12 @@ def _resolve_provider(
     if config.provider is None and config.provider_env_keys:
         environment = {}
         env_store = auth_store if auth_store is not None else AuthStore()
-        for provider_name in config.provider_env_keys:
-            environment.update(
-                _stored_provider_environment(
-                    provider_name, env_store, provider_config_path=config.provider_config_path
-                )
-            )
+        for candidate in load_providers(config.provider_config_path):
+            if candidate.api_key_env not in config.provider_env_keys:
+                continue
+            environment.update(_stored_provider_environment(
+                candidate.name, env_store, provider_config_path=config.provider_config_path,
+            ))
         return _apply_interactive_wall_budget(config, ()), environment
 
     config_path = _provider_config_path(config, repo)

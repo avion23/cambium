@@ -71,6 +71,38 @@ def test_sparse_completion_keeps_per_message_output() -> None:
     assert text == "Second"
 
 
+def test_native_function_items_reach_the_existing_tool_dispatch(tmp_path) -> None:
+    import asyncio
+
+    from cambium.tools import ToolContext, run_tool
+    from cambium.worker import _native_tool_action
+
+    (tmp_path / "sample.txt").write_text("exact observed content")
+    item = {"type": "function_call", "id": "fc-1", "call_id": "call-1",
+            "name": "read_batch", "arguments": '{"paths":["sample.txt"]}'}
+    events = [
+        {"type": "response.output_item.done", "item": item},
+        {"type": "response.completed", "response": {"usage": {
+            "input_tokens": 2, "output_tokens": 3, "total_tokens": 5,
+        }}},
+    ]
+    payload, text, error = _parse_codex_sse(
+        _provider(), "\n".join("data: " + json.dumps(e) for e in events), "unused",
+    )
+    assert error is None
+    result = _CodexRawResponse(payload, 1.0, text).to_result(_provider(), {})
+    action = _native_tool_action(result)
+    assert action["calls"] == [{"name": "read_batch", "arguments": {"paths": ["sample.txt"]}}]
+
+    async def execute():
+        with ToolContext(tmp_path) as context:
+            return await run_tool("read_batch", action["calls"][0]["arguments"], context)
+
+    observed = asyncio.run(execute())
+    assert observed.ok and "exact observed content" in observed.output
+    assert result.usage["total_tokens"] == 5
+
+
 def test_phase_survives_context_and_is_part_of_its_identity() -> None:
     message = {"role": "assistant", "content": "{}", "phase": "commentary"}
     assert _context_message(message, "test") == message

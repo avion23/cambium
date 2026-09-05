@@ -50,6 +50,8 @@ _LIVE_COMMANDS = frozenset(
         "/status",
         "/usage",
         "/agents",
+        "/inspect",
+        "/focus",
         "/context",
         "/session",
         "/model",
@@ -199,6 +201,8 @@ _HELP = """Commands:
   /status     branch, context, agents, and usage in one view
   /usage      cumulative tokens, throughput, calls, and cost
   /agents     main/sub-agent lifecycle and provider/model rows
+  /inspect T  inspect shared recorded state for task T (focused task by default)
+  /focus T    select task T; F6 cycles lanes while preserving the input draft
   /context    current trunk, raw tail, checkpoint, and epoch
   /session    persistent interactive-session identity and provider lease
   /model      list eligible provider/model targets
@@ -206,7 +210,7 @@ _HELP = """Commands:
   /branches   list durable branch heads with epoch/checkpoint references
   /fork       fork a new branch from the current checkpoint
   /quota      show provider quota-window state
-  /compact    flush semantic context and check for a K0 rollover
+  /compact    materialize semantic entries into K0; retain recent raw evidence
   /dashboard  explain the visible live cockpit
   /detail     toggle the compact agents/usage/context detail row
   /events     recent durable event summaries
@@ -227,6 +231,7 @@ The last successfully published context checkpoint remains the branch head.
 
 Multiline input:
   bracketed paste keeps pasted newlines in one prompt.
+  Alt-Enter inserts a newline; Enter submits the complete draft.
   end a line with \\ to continue; a blank line submits the accumulated text.
   enter <<< on its own line, write the prompt, then enter >>> on its own line.
 """
@@ -776,6 +781,22 @@ def _command_output(
         return cumulative.line(snapshot=snapshot, active=active)
     if name == "/agents" and not argument:
         return "\n".join(render_agent_lines(snapshot))
+    if name == "/focus":
+        choices = [agent.task_id for agent in snapshot.agents]
+        if not argument:
+            return "focus: " + ", ".join(choices) + " (F6 cycles without submitting input)"
+        if argument not in choices:
+            return f"unknown task: {argument}"
+        cockpit.selected_task_id = argument
+        return f"focused: {argument}; /inspect shows its recorded state"
+    if name == "/inspect":
+        from .state_view import state_text
+        from .store import StoreError
+
+        try:
+            return state_text(session.root, argument or getattr(cockpit, "selected_task_id", None))
+        except (OSError, ValueError, StoreError) as exc:
+            return f"state unavailable: {exc}"
     if name == "/context" and not argument:
         return _context_line(snapshot)
     if name == "/session" and not argument:
@@ -928,6 +949,10 @@ async def _run_interactive(
             pass
 
     def _draw_cockpit(snapshot: Any, transcript_value: Transcript, **kwargs: Any) -> None:
+        if isinstance(snapshot, SessionSnapshot):
+            snapshot = replace(
+                snapshot, selected_task_id=getattr(cockpit, "selected_task_id", None),
+            )
         with cockpit_stream.frame():
             cockpit.draw(snapshot, transcript_value, **kwargs)
 
@@ -943,7 +968,7 @@ async def _run_interactive(
             cockpit.flush()
 
     history_path = _history_path(session)
-    if native_input:
+    if native_input and os.name != "posix":
         _load_history(history_path)
 
     loop = asyncio.get_running_loop()
@@ -1000,15 +1025,22 @@ async def _run_interactive(
         except (NotImplementedError, OSError, RuntimeError, ValueError):
             previous_sigwinch_handler = None
 
-    # libedit resizes global editor buffers in its SIGWINCH handler. Route
-    # that signal to the input owner, not a thread concurrently inserting text.
-    # The asyncio wakeup fd still delivers the cockpit resize callback.
-    resize_mask = None
-    if native_input and sigwinch_installed and hasattr(signal, "pthread_sigmask"):
-        resize_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {sigwinch})
+    editor = None
+
+    def focus_next() -> None:
+        snapshot = state.snapshot() if turn_active else last_snapshot
+        choices = [agent.task_id for agent in snapshot.agents]
+        if not choices:
+            return
+        selected = getattr(cockpit, "selected_task_id", None)
+        index = choices.index(selected) if selected in choices else 0
+        cockpit.selected_task_id = choices[(index + 1) % len(choices)]
+        _redraw_for_resize()
 
     async def _read_line_source() -> str | None:
         """Read a prompt without stopping live turn events or input steering."""
+        if editor is not None:
+            return await editor.read()
         result: asyncio.Future[str | None] = loop.create_future()
 
         def deliver(value: str | None = None, error: BaseException | None = None) -> None:
@@ -1020,9 +1052,6 @@ async def _run_interactive(
                 result.set_exception(error)
 
         def read() -> None:
-            previous_mask = None
-            if resize_mask is not None:
-                previous_mask = signal.pthread_sigmask(signal.SIG_UNBLOCK, {sigwinch})
             try:
                 value = _read_cockpit_prompt(source, cockpit, native=native_input)
             except BaseException as exc:
@@ -1036,8 +1065,6 @@ async def _run_interactive(
                 except RuntimeError:
                     pass
             finally:
-                if previous_mask is not None:
-                    signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
                 reader_threads.discard(threading.current_thread())
 
         reader = threading.Thread(target=read, name="cambium-tui-input", daemon=True)
@@ -1096,6 +1123,13 @@ async def _run_interactive(
         )
 
     try:
+        if native_input and os.name == "posix":
+            from .terminal_input import TerminalInput
+
+            editor = TerminalInput(
+                source.fileno(), cockpit, history_path,
+                interrupt=lambda: "/cancel" if turn_active else None, focus=focus_next,
+            )
         with cockpit:
             while True:
                 _draw_cockpit(
@@ -1314,7 +1348,8 @@ async def _run_interactive(
                                             cockpit=cockpit,
                                             active=True,
                                         )
-                                        if command in _LIVE_COMMANDS
+                                        if command
+                                        and command.split(maxsplit=1)[0] in _LIVE_COMMANDS
                                         else None
                                     )
                                     notice = inspection or _queued_prompt_notice(queued_prompt)
@@ -1461,9 +1496,9 @@ async def _run_interactive(
         except (BrokenPipeError, OSError, ValueError):
             pass
         await _close_input_reader()
-        if resize_mask is not None:
-            signal.pthread_sigmask(signal.SIG_SETMASK, resize_mask)
-        if native_input:
+        if editor is not None:
+            editor.close()
+        elif native_input:
             _save_history(history_path)
         if lock_acquired:
             session.release()

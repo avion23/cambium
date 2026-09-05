@@ -99,6 +99,36 @@ def test_consecutive_entries_never_resummarize_prior_entries() -> None:
     }
 
 
+def test_corrections_and_closed_work_survive_folds_and_k0() -> None:
+    trunk = list(HEAD)
+    deltas = [
+        {"facts_added": ["F1: old conclusion"], "decisions_added": ["D1: old design"],
+         "open_items": ["O1: recheck joined code", "O2: inspect quota reset"],
+         "verification_results": ["V1: check passed at head abc"]},
+        {"facts_invalidated": ["F1"], "facts_added": ["F1: corrected conclusion"],
+         "decisions_superseded": ["D1"], "decisions_added": ["D1: direct implementation"],
+         "open_items_resolved": ["O1"], "verification_invalidated": ["V1"]},
+        {"open_items_resolved": ["O1"], "verification_results": ["V2: joined check at head def"]},
+    ]
+    history = []
+    for turn, delta in enumerate(deltas, 1):
+        raw = [{"role": "user", "content": f"observed transition {turn}"}]
+        _, expected = build_summary_request(trunk, raw, through_turn=turn)
+        entry = parse_summary_response(json.dumps({
+            "objective": "complete review", "outcome": "recorded", **delta,
+        }), expected)
+        trunk = append_summary_entry(trunk, entry)
+        history.append(trunk[-1]["content"])
+    rolled, state, sources = summary_trunk.rollover_summary_trunk(trunk)
+    assert state.facts == ("F1: corrected conclusion",)
+    assert state.decisions == ("D1: direct implementation",)
+    assert state.open_work == ("O2: inspect quota reset",)
+    assert state.verification_state == ("V2: joined check at head def",)
+    assert [m["content"] for m in trunk[2:]] == history
+    assert len(sources) == 3
+    assert summary_trunk.compile_k0_projection(summary_entries(rolled)) == state
+
+
 def test_summary_request_keeps_existing_trunk_as_exact_prefix() -> None:
     trunk, _entry = _append(HEAD, TAIL_1, 3, "one")
     request, expectation = build_summary_request(trunk, TAIL_2, through_turn=7)

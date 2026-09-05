@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .summary_trunk import SUMMARY_FINDING_PRESERVATION_CONTRACT, SUMMARY_LIST_FIELDS
 
-PROMPTS_VERSION = 8
+PROMPTS_VERSION = 9
 
 CODING_POLICY = (
     "Complete the task with small direct changes. Locate code with repo_query, read relevant "
@@ -118,8 +118,10 @@ def save_policy(policy: Mapping[str, str], path: Path | None = None) -> Path:
 def coding_prompt(policy: Mapping[str, str] | None = None) -> str:
     selected = policy or {"coding": CODING_POLICY, "summary": SUMMARY_POLICY}
     return "\n".join((
-        _ACTION_PROTOCOL, selected["coding"], *_SUMMARY_PROTOCOL,
-        selected["summary"], "Available tools:",
+        _ACTION_PROTOCOL, selected["coding"],
+        "A final <cambium-summary-control> requests summary JSON instead of an action; "
+        "follow its response contract. Earlier summaries are background, not new source evidence.",
+        "Available tools:",
     ))
 
 

@@ -152,6 +152,7 @@ class ProviderDebt:
     # config_error/auth_error call, cleared by a later success.
     disable_reason: str | None = None
     disable_at: float | None = None
+    retry_at: float | None = None
 
     def record(self, event: Mapping[str, Any], *, now: float | None = None) -> None:
         """Fold one usage_event payload into this provider's debt."""
@@ -219,6 +220,11 @@ class ProviderDebt:
             isinstance(failure_reason, str) and "429" in failure_reason
         ):
             self.retry_after_count += 1
+            delay = event.get("retry_after_s")
+            if type(delay) in (int, float) and math.isfinite(delay) and delay >= 0:
+                self.retry_at = max(self.retry_at or 0.0, timestamp + delay)
+        elif not failure_reason:
+            self.retry_at = None
         if event.get("provider_cache_hit") is True:
             self.cache_hit_count += 1
         latency = event.get("latency_s")
@@ -280,6 +286,9 @@ def _debt_from_mapping(entry: Mapping[str, Any]) -> ProviderDebt:
     elif debt.tokens_per_s > 0:
         debt.tokens_per_s_total = debt.tokens_per_s
         debt.tokens_per_s_count = 1
+    retry_at = entry.get("retry_at")
+    if type(retry_at) in (int, float) and math.isfinite(retry_at) and retry_at >= 0:
+        debt.retry_at = float(retry_at)
     last_seen = entry.get("last_seen")
     if isinstance(last_seen, int | float) and not isinstance(last_seen, bool):
         try:
@@ -409,6 +418,10 @@ class DebtStore:
         if local.last_seen is not None and (last_seen is None or local.last_seen > last_seen):
             last_seen = local.last_seen
         updates["last_seen"] = last_seen
+        if local.last_seen is not None and (
+            base.last_seen is None or local.last_seen >= base.last_seen
+        ):
+            updates["retry_at"] = local.retry_at
         merged = replace(base, **updates)
         if merged.tokens_per_s_count > 0 and merged.tokens_per_s_total >= 0:
             merged.tokens_per_s = merged.tokens_per_s_total / merged.tokens_per_s_count
@@ -532,6 +545,8 @@ class DebtStore:
                         "tokens_per_s_count": debt.tokens_per_s_count,
                         "last_seen": debt.last_seen,
                     }
+                    if debt.retry_at is not None:
+                        entry["retry_at"] = debt.retry_at
                     if debt.disable_reason is not None:
                         entry["disable_reason"] = debt.disable_reason
                         if debt.disable_at is not None:
@@ -611,7 +626,45 @@ class ProviderAssignment:
 
 
 class LaneCapacityExhausted(ValueError):
-    """No eligible provider currently has a spare admission lane."""
+    """Capacity is temporary; an observed reset can wake admission without polling."""
+
+    def __init__(self, message: str, *, retry_at: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_at = retry_at
+
+
+def quota_status(
+    provider: str, windows: Sequence[Any], *, now: float | None = None,
+) -> tuple[float | None, float | None, float]:
+    """Return observed utilization, blocked-until time and next reset.
+
+    No observation means unknown, not an invented weekly allowance. Expired
+    snapshots cannot block work or bias a new quota window.
+    """
+    timestamp = time.time() if now is None else now
+    fractions: list[float] = []
+    exhausted: list[float] = []
+    resets: list[float] = []
+    for window in windows:
+        if window.provider != provider or window.reset_at <= timestamp:
+            continue
+        resets.append(window.reset_at)
+        for allowance, used in (
+            (window.allowance_tokens, window.used_tokens),
+            (window.allowance_requests, window.used_requests),
+        ):
+            if allowance <= 0:
+                continue
+            usable = allowance * (1.0 - window.reserve_fraction)
+            fraction = used / usable if usable > 0 else 1.0
+            fractions.append(fraction)
+            if fraction >= 1.0:
+                exhausted.append(window.reset_at)
+    return (
+        max(fractions) if fractions else None,
+        max(exhausted) if exhausted else None,
+        min(resets) if resets else math.inf,
+    )
 
 
 def resolve_assignment(
@@ -623,6 +676,7 @@ def resolve_assignment(
     requirements: Mapping[str, Any] | None = None,
     authorized: frozenset[str] | None = None,
     pinned_tier: str | None = None,
+    quota_windows: Sequence[Any] = (),
 ) -> ProviderAssignment | None:
     """Pure (provider, model, tier) selection for one un-pinned task.
 
@@ -644,6 +698,11 @@ def resolve_assignment(
         validate_requirements(requirements)
     if not candidates:
         raise ValueError("model_candidates must be a non-empty list of model ids")
+    timestamp = time.time()
+    pool = [p for p in pool if (
+        quota_status(p.name, quota_windows, now=timestamp)[1] is None
+        and not ((debt or {}).get(p.name, ProviderDebt()).retry_at or 0) > timestamp
+    )]
     if not pool:
         return None
     try:
@@ -652,7 +711,9 @@ def resolve_assignment(
                 pool, candidates, debt, lanes, requirements=requirements
             )[0]
         else:
-            provider_name, model = select_lane(pool, candidates, debt, lanes or {})
+            provider_name, model = select_lane(
+                pool, candidates, debt, lanes or {}, quota_windows=quota_windows,
+            )
     except LaneCapacityExhausted:
         return None
     tier = _assignment_tier(pool, provider_name, pinned_tier)
@@ -941,6 +1002,8 @@ def select_lane(
     candidates: Sequence[str],
     debt: Mapping[str, ProviderDebt] | None,
     lanes: Mapping[str, LaneState],
+    *,
+    quota_windows: Sequence[Any] = (),
 ) -> tuple[str, str]:
     """Max-min admission pick over per-provider lanes (H1).
 
@@ -965,7 +1028,12 @@ def select_lane(
         if not (isinstance(model, str) and model in candidates):
             continue
         matching = True
-        if _provider_is_quarantined(provider.name, debt):
+        current = debt.get(provider.name) if debt is not None else None
+        if (
+            _provider_is_quarantined(provider.name, debt)
+            or (getattr(current, "retry_at", None) or 0) > time.time()
+            or quota_status(provider.name, quota_windows)[1] is not None
+        ):
             continue
         lane = lanes.get(provider.name)
         if lanes and lane is None:
@@ -989,13 +1057,15 @@ def select_lane(
             "provider with a spare lane"
         )
 
-    def rank(item: tuple[int, Any]) -> tuple[float, int, int, int]:
+    def rank(item: tuple[int, Any]) -> tuple[float, int, float, int, int]:
         index, provider = item
         lane = lanes.get(provider.name)
         current = debt.get(provider.name) if debt is not None else None
         requests = current.requests if current is not None else 0
         in_flight = lane.in_flight if lane is not None else 0
-        return (_normalized_utilization(provider, debt), in_flight, requests, index)
+        measured, _blocked, reset = quota_status(provider.name, quota_windows)
+        utilization = measured if measured is not None else _normalized_utilization(provider, debt)
+        return (utilization, in_flight, reset, requests, index)
 
     _, winner = min(serving, key=rank)
     return winner.name, winner.model

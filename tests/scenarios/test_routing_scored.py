@@ -151,9 +151,9 @@ def test_score_providers_strict_filter_applies_in_batch_preassignment(
 
     _preassign_lanes(specs, debt, lanes)
 
-    # both tasks bind to the strong provider even though weak is idle
-    assert [spec["assigned_provider"] for spec in specs] == ["strong", "strong"]
-    assert lanes["strong"].in_flight == 2
+    # The second task queues rather than exceeding capacity or using weak.
+    assert [spec.get("assigned_provider") for spec in specs] == ["strong", None]
+    assert lanes["strong"].in_flight == 1
     # weak was never even considered (tier filter), so no lane exists for it
     assert "weak" not in lanes or lanes["weak"].in_flight == 0
 
@@ -253,29 +253,15 @@ def test_selector_rejects_unknown_requirement_keys() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_supervisor_resolution_without_requirements_uses_select_lane(
-    tmp_path,
-) -> None:
-    # a requirement-free task resolves exactly like H1 select_lane: idle lane
-    # wins config-order ties, and a capped lane is skipped
+@pytest.mark.parametrize("requirements", [None, {"quality": "normal"}])
+def test_scored_and_unscored_admission_respect_lane_capacity(tmp_path, requirements) -> None:
     config_path = _config_file(
         tmp_path / "providers.json", [("a", "m1", "fast", 60), ("b", "m2", "fast", 60)]
     )
-    specs = [_spec("t-0", config_path), _spec("t-1", config_path)]
+    specs = [_spec(f"t-{i}", config_path, requirements=requirements) for i in range(2)]
     lanes: dict[str, LaneState] = {}
     _preassign_lanes(specs, {"a": ProviderDebt(), "b": ProviderDebt()}, lanes)
     assert [spec["assigned_provider"] for spec in specs] == ["a", "b"]
-    # requirements={"quality": "normal"} is "present": the scoring path runs
-    # (no tier restriction), and with no usage evidence both providers score
-    # identically so the config-order tiebreak binds both tasks to a — this
-    # discriminates the scoring path from select_lane, which would spread the
-    # wave a, b, a, b across lanes
-    specs = [
-        _spec("t-0", config_path, requirements={"quality": "normal"}),
-        _spec("t-1", config_path, requirements={"quality": "normal"}),
-    ]
-    _preassign_lanes(specs, {"a": ProviderDebt(), "b": ProviderDebt()}, lanes)
-    assert [spec["assigned_provider"] for spec in specs] == ["a", "a"]
 
 
 # --------------------------------------------------------------------------- #

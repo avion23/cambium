@@ -1002,23 +1002,12 @@ def test_worker_context_reuse_fork_resume_is_byte_exact(tmp_path, monkeypatch) -
         prefix_length = len(checkpoint_prefix)
 
         assert len(requests) == 4
-        assert len(summary_requests) == 2
+        assert not summary_requests  # Exact delegation and finish need no semantic fold.
         assert all(request["model"] == "loopback-model" for request in requests)
-        assert all(request["model"] == "loopback-model" for request in summary_requests)
-        assert all(
-            str(request["messages"][-1].get("content", "")).startswith(
-                "<cambium-summary-control>\n"
-            )
-            for request in summary_requests
-        )
         assert authorizations == [f"Bearer {PROVIDER_SECRET}"] * 4
         child_messages = requests[2]["messages"]
         resumed_messages = requests[3]["messages"]
-        prefix_requests = (
-            child_messages,
-            resumed_messages,
-            summary_requests[1]["messages"],
-        )
+        prefix_requests = (child_messages, resumed_messages)
         checkpoint_prefix_bytes = json.dumps(
             checkpoint_prefix, ensure_ascii=False, separators=(",", ":"), sort_keys=True
         ).encode("utf-8")
@@ -1044,9 +1033,9 @@ def test_worker_context_reuse_fork_resume_is_byte_exact(tmp_path, monkeypatch) -
         assert not loop_state_indices(checkpoint_prefix)
         assert all(not loop_state_indices(request["messages"]) for request in summary_requests)
 
-        for messages, expected_turn, expected_budget in (
-            (child_messages, 1, 0),
-            (resumed_messages, 3, 35),
+        for messages, expected_turn, expected_budget, previous_prompt in (
+            (child_messages, 1, 0, 0),
+            (resumed_messages, 3, 35, 17),
         ):
             assert loop_state_indices(messages) == [prefix_length + 1]
             state_message = messages[prefix_length + 1]
@@ -1070,7 +1059,7 @@ def test_worker_context_reuse_fork_resume_is_byte_exact(tmp_path, monkeypatch) -
                 "verification_failed": "false",
                 "no_progress": "0",
                 "budget_new_tokens": str(expected_budget),
-                "previous_prompt_tokens": "0",
+                "previous_prompt_tokens": str(previous_prompt),
             }
 
         assert set(child_messages[prefix_length]) == {"role", "content"}
@@ -1109,24 +1098,21 @@ def test_worker_context_reuse_fork_resume_is_byte_exact(tmp_path, monkeypatch) -
             event["payload"] for event in usage_events if event["task_id"] == task["task_id"]
         ]
         assert len(child_usage) == 1
-        assert len(parent_usage) == 5
+        assert len(parent_usage) == 3
         assert child_usage[0]["epoch"] == 1
         assert child_usage[0]["fork_of"] == checkpoint_ref
         assert child_usage[0]["provider_cache_hit"] is True
         assert (
             child_usage[0]["prompt_prefix_bytes"] == checkpoint["meta"]["cache_key"]["prefix_bytes"]
         )
-        # The resumed action call is followed by the terminal summary call.
-        assert parent_usage[-2]["epoch"] == 1
-        assert "fork_of" not in parent_usage[-2]
-        assert parent_usage[-2]["provider_cache_hit"] is True
-        assert (
-            parent_usage[-2]["prompt_prefix_bytes"]
-            == checkpoint["meta"]["cache_key"]["prefix_bytes"]
-        )
         assert parent_usage[-1]["epoch"] == 1
         assert "fork_of" not in parent_usage[-1]
-        assert all("epoch" not in payload for payload in parent_usage[:3])
+        assert parent_usage[-1]["provider_cache_hit"] is True
+        assert (
+            parent_usage[-1]["prompt_prefix_bytes"]
+            == checkpoint["meta"]["cache_key"]["prefix_bytes"]
+        )
+        assert all("epoch" not in payload for payload in parent_usage[:2])
 
         assert result.exit_code == 0
         assert {item.task_id for item in result.results} == {task["task_id"], child_task_id}

@@ -126,6 +126,7 @@ from .routing import (
     ProviderDebt,
     RoutingRequest,
     provider_satisfies_request,
+    quota_status,
     resolve_assignment,
     validate_requirements,
 )
@@ -2366,6 +2367,7 @@ class _Runtime:
         # rpm-derived caps; incremented at admission, released in
         # ``supervise_task``'s finally on every exit path.
         self._lanes: dict[str, LaneState] = {}
+        self._lane_changed = asyncio.Event()
         # Eval-3 ADOPT warm pool: idle reuse-ready worker processes. The pool
         # is bounded by ``_warm_pool_size`` (0 disables) and never survives
         # this runtime (shutdown kills every pooled process).
@@ -3732,6 +3734,7 @@ class _Runtime:
                 future for future in futures if future is not completion
             ]
         _release_lane(self._lanes, child_spec)
+        self._lane_changed.set()
 
     def _child_results_for_resume(
         self,
@@ -4398,6 +4401,32 @@ class _Runtime:
             self._lanes[spec["assigned_provider"]].in_flight += 1
             spec["_lane_reserved"] = True
 
+    async def _await_assignment(self, spec: dict[str, Any], deadline: float) -> None:
+        """Queue on actual capacity; wake on release, usage, or a known reset."""
+        queued = False
+        while True:
+            self._lane_changed.clear()
+            try:
+                self._resolve_assignment(spec)
+                return
+            except LaneCapacityExhausted as exc:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("provider capacity wait exceeded task wall budget") from exc
+                if not queued:
+                    await self.emit("task_queued", task_id=spec["task_id"], reason=str(exc))
+                    queued = True
+                delay = remaining
+                if exc.retry_at is not None:
+                    delay = min(delay, max(0.001, exc.retry_at - time.time()))
+                try:
+                    await asyncio.wait_for(self._lane_changed.wait(), timeout=delay)
+                except TimeoutError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            "provider capacity wait exceeded task wall budget"
+                        ) from exc
+
     def _redact_checkpoint_message(self, message: dict[str, str]) -> dict[str, str]:
         """Redact one provider message before it enters or leaves recovery."""
         if self._redactor is None:
@@ -4673,6 +4702,7 @@ class _Runtime:
                 # decrement a lane.  Provider identity alone does not prove
                 # ownership.
                 _release_lane(self._lanes, spec)
+                self._lane_changed.set()
                 result = self._results.get(task_id)
                 if cancelled or (result is not None and result.status != "succeeded"):
                     await self._cancel_running_children(task_id)
@@ -4832,12 +4862,11 @@ class _Runtime:
                     semaphore.release()
 
         try:
-            # Admission-time balancing (solution C): resolve (provider, model)
-            # for un-pinned ``model_candidates`` tasks only now that the task
-            # owns an admission slot, so the usage-debt ledger reflects every
-            # usage event already folded by earlier admissions. The decision
-            # is idempotent across restarts (a resolved spec carries a model).
-            self._resolve_assignment(spec)
+            # Provider reservations and worker-process slots are separate.
+            # Wait without holding a process slot, then reuse the assignment
+            # across generations. Admission waiting is bounded too; the
+            # execution window still starts with the first worker generation.
+            await self._await_assignment(spec, time.monotonic() + wall_budget)
             await self._emit_provider_infeasible(spec)
             assigned_payload: dict[str, Any] = {
                 "task_id": task_id,
@@ -4970,6 +4999,7 @@ class _Runtime:
                             if spec.get("_lane_reserved") else None
                         )
                         _release_lane(self._lanes, spec)
+                        self._lane_changed.set()
                         child_ids = await self._admit_generation_children(
                             spec,
                             parent_envelope,
@@ -6301,11 +6331,27 @@ class _Runtime:
             generation=state.generation,
             **forwarded,
         )
-        # Admission balancing (solution C): fold the redacted usage event into
-        # the session debt ledger so later admissions in this session see
-        # updated utilization.
+        # Count the lane that actually served the task, including call-time
+        # fallback. Do not pretend the original assignment is still busy.
+        spec = getattr(state, "spec", None)
+        served = msg.get("provider")
+        if isinstance(spec, dict) and served in self._lanes and not msg.get("failure_reason"):
+            if served != spec.get("assigned_provider") or not spec.get("_lane_reserved"):
+                providers = load_providers(_provider_config_path(os.environ, spec))
+                configured = next((p for p in providers if p.name == served), None)
+                if configured is not None:
+                    _release_lane(self._lanes, spec)
+                    spec["assigned_provider"] = served
+                    spec["fanout_config"] = {
+                        **(spec.get("fanout_config") or {}),
+                        "model": msg.get("model", configured.model), "tier": configured.tier.value,
+                    }
+                    self._lanes[served].in_flight += 1
+                    spec["_lane_reserved"] = True
+                    self._lane_changed.set()
         if self._debt_store is not None:
             self._debt_store.record(msg)
+            self._lane_changed.set()
 
     async def _handle_tool_or_pong_message(
         self, state: _GenerationState, msg: dict[str, Any]
@@ -8118,17 +8164,10 @@ def _validate_task_repositories(specs: Sequence[Mapping[str, Any]]) -> None:
 
 
 def _ensure_lanes(lanes: dict[str, LaneState], providers: Sequence[Any]) -> None:
-    """Create a LaneState for every configured provider not yet tracked.
-
-    ``rpm_allowance`` comes from the provider's optional ``rpm`` field
-    (default 60.0); first config wins when multiple specs configure the same
-    provider name.
-    """
+    """Use configured rate and concurrent capacity as separate resources."""
     for provider in providers:
-        if provider.name in lanes:
-            continue
-        rpm = getattr(provider, "rpm", 60)
-        lanes[provider.name] = LaneState(rpm_allowance=float(rpm or 60))
+        if provider.name not in lanes:
+            lanes[provider.name] = LaneState.from_provider(provider)
 
 
 def _resolve_model_candidates(
@@ -8218,6 +8257,13 @@ def _resolve_model_candidates(
     raw_pinned_tier = fanout_config.get("tier")
     pinned_tier = raw_pinned_tier if isinstance(raw_pinned_tier, str) and raw_pinned_tier else None
     _ensure_lanes(lanes, providers)
+    from .provider_scheduler import QuotaLedgerError, read_quota_snapshots
+
+    try:
+        quota_windows = read_quota_snapshots()
+    except QuotaLedgerError:
+        # An unavailable observation is unknown; it must not become a gate.
+        quota_windows = ()
     requirements = spec.get("requirements")
     spread_from = spec.get("spread_from_provider")
     spread_providers = (
@@ -8236,6 +8282,7 @@ def _resolve_model_candidates(
                 requirements=requirements if requirements else None,
                 authorized=authorized,
                 pinned_tier=pinned_tier,
+                quota_windows=quota_windows,
             )
         except LaneCapacityExhausted:
             raise
@@ -8276,7 +8323,26 @@ def _resolve_model_candidates(
             if assignment is not None:
                 break
     if assignment is None:
-        return False
+        timestamp = time.time()
+        resets: list[float] = []
+        for provider in providers:
+            if provider.model not in candidates:
+                continue
+            current = debt.get(provider.name)
+            retry_at = getattr(current, "retry_at", None)
+            _pressure, blocked, _reset = quota_status(provider.name, quota_windows, now=timestamp)
+            ready = max(retry_at or 0.0, blocked or 0.0)
+            lane = lanes[provider.name]
+            if lane.request_slots is not None and lane.request_slots < 1:
+                ready = max(
+                    ready, timestamp + (1 - lane.request_slots) * 60 / lane.requests_per_minute,
+                )
+            if ready > timestamp:
+                resets.append(ready)
+        raise LaneCapacityExhausted(
+            "waiting for an eligible provider lane or quota reset",
+            retry_at=min(resets) if resets else None,
+        )
     # The (provider, model, tier) assignment is one atomic unit: the worker
     # routes calls by tier, so the assigned provider's tier must be the call
     # tier or the assignment is filtered out before any request is sent.

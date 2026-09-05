@@ -560,8 +560,11 @@ def test_finish_cuts_terminal_epoch_when_context_reuse_enabled(
     assert isinstance(checkpoint_ref, str) and checkpoint_ref
     checkpoint = worker._load_epoch_checkpoint(config, checkpoint_ref, expect_task_id=True)
     assert checkpoint.epoch == 1
-    assert checkpoint.continuation_suffix == []
-    assert "<cambium-summary-entry>" in checkpoint.provider_messages[-1]["content"]
+    assert checkpoint.continuation_suffix[-1]["content"] == (
+        '{"type":"finish","summary":"done","objective_met":true}'
+    )
+    assert not summary_entries(checkpoint.provider_messages)
+    assert len(router.prompts) == 1
     usage = [message for message in writer.messages() if message["type"] == "usage_event"]
     assert usage and all("epoch" not in message for message in usage)
 
@@ -581,6 +584,7 @@ def test_cast_rollover_is_durable_before_epoch_publication(tmp_path: Path) -> No
     router = _ScriptedRouter(
         [
             '{"type":"plan","steps":["inspect"]}',
+            '{"name":"read_batch","arguments":{"paths":["alpha.txt"]}}',
             '{"type":"finish","summary":"done","objective_met":true}',
         ]
     )
@@ -717,7 +721,7 @@ def test_resume_continuation_guard_preserves_checkpoint_prefix(
         if str(prompt["messages"][-1].get("content", "")).startswith("<cambium-summary-control>")
     ]
     assert len(action_prompts) == 3
-    assert len(summary_prompts) == 2
+    assert len(summary_prompts) == 1
     assert all(prompt["messages"][: len(prefix)] == prefix for prompt in action_prompts)
     assert all(
         len(prompt["messages"]) - len(prefix) <= worker.MAX_CONTEXT_MESSAGES
@@ -732,7 +736,7 @@ def test_resume_continuation_guard_preserves_checkpoint_prefix(
     assert any(message["type"] == "context_epoch_advanced" for message in writer.messages())
     terminal = [message for message in writer.messages() if message["type"] == "context_checkpoint"]
     assert len(terminal) == 1
-    assert terminal[0]["epoch"] == checkpoint.epoch + 3
+    assert terminal[0]["epoch"] == checkpoint.epoch + 2
 
 
 def test_resume_missing_checkpoint_fails_closed(tmp_path: Path) -> None:
