@@ -354,6 +354,9 @@ cases before claiming generalization from an eventual hill climb.
 additional redaction regression were merged normally. The regression checks that
 registered credentials still redact even under the benign pressure-metric key.
 Repeated metadata and documentation were consolidated rather than duplicated.
+The merged code at `ba95ad2` passed 1,910 tests with one skipped in 107.47 seconds;
+Ruff and whitespace checks passed. A loopback OAuth fixture printed a broken-pipe
+diagnostic during that successful suite; no test failed.
 
 The parallel audit recorded 1,910 non-acceptance passes and one skip in 104.72
 seconds, plus two live frontend passes in 51.84 seconds. Its earlier ZAI
