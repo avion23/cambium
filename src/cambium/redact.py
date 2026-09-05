@@ -180,6 +180,7 @@ _SAFE_METADATA_NAMES = frozenset(
         "token_rate",
         "token_type",
         "token_usage",
+        "uncached_token_pressure",
         "tokens",
         "input_tokens",
         "output_tokens",

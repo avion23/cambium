@@ -95,6 +95,13 @@ Distinguish the storage objects:
 | Git commit/worktree | Actual artifact state, separate from remembered conclusions |
 | Provider cache | Optional reuse of request processing, not durable agent memory |
 
+An automatically generated SituationFrame is a transient view, not new evidence.
+An explicit `inspect_state` call is different: its returned view is a recorded
+tool observation and remains in history and the raw tail. Checkpoint cleanup
+removes only the generated loop-state frame; it must not delete similarly
+formatted tool results or user text. The same bounded renderer serves model and
+operator inspection without creating a second state store.
+
 A retained summary is not proof that a check passed. A passing check describes
 the code it ran against, not a later merged tree. The current runtime retains
 check observations but does not claim that a successful shell command proves

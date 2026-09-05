@@ -56,6 +56,12 @@ reported task usage. Concurrent in-flight requests can finish after a limit is
 observed; these limits are not a provider-enforced account quota. A zero cash
 estimate does not make subscription tokens unlimited.
 
+`--max-wall-s` covers one complete harness rollout across all of its operator
+turns, child joins and reconnects. It is not restarted for every follow-up.
+Timeout cancels the rollout and retains its report; the checker still examines
+only accepted code. Fixture setup and the independent artifact check are outside
+that harness deadline, and cleanup can extend the reported elapsed time.
+
 ## Replacement semantics
 
 The normal artifact is `~/.config/cambium/prompts.json` (or the corresponding

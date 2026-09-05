@@ -1283,8 +1283,11 @@ def score_providers(
         now=time.time(),
         weights=DEFAULT_WEIGHTS,
     )
-    if quota_windows:
-        # Stable sorting retains quality order when resource pressure is equal.
+    if any(
+        quota_status(provider.name, quota_windows, now=timestamp)[0] is not None
+        for provider in ordered
+    ):
+        # Ignore expired/unrelated observations; quality breaks live resource ties.
         ordered.sort(
             key=lambda provider: _resource_rank(provider, debt, lanes or {}, quota_windows)
         )

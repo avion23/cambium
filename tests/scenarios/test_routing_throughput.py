@@ -11,6 +11,7 @@ import pytest
 
 from cambium.diffundo import ProviderConfig, ProviderTier
 from cambium.provider_config import load_providers
+from cambium.provider_scheduler import QuotaWindowSnapshot
 from cambium.routing import (
     DebtStore,
     LaneCapacityExhausted,
@@ -176,6 +177,7 @@ def test_equal_priority_and_cost_prefers_measured_faster_provider() -> None:
             last_seen=now,
         ),
         "fast": ProviderDebt(
+            tokens=1000,
             requests=10,
             cost=1.0,
             latency_total_s=20.0,
@@ -185,6 +187,10 @@ def test_equal_priority_and_cost_prefers_measured_faster_provider() -> None:
         ),
     }
 
-    scored = score_providers(providers, ["m1", "m2"], debt)
-
-    assert [name for name, _model, _rank in scored] == ["fast", "slow"]
+    for windows in (
+        (),
+        (QuotaWindowSnapshot("fast", "week", now - 1, 1000, 1000, 0, 0, 0.0),),
+        (QuotaWindowSnapshot("unrelated", "week", now + 60, 1000, 900, 0, 0, 0.0),),
+    ):
+        scored = score_providers(providers, ["m1", "m2"], debt, quota_windows=windows)
+        assert [name for name, _model, _rank in scored] == ["fast", "slow"]

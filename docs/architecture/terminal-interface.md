@@ -62,14 +62,18 @@ resize signal is shared with a background input thread. A resize can redraw
 immediately while preserving the unfinished draft and cursor.
 
 Enter submits the draft; Alt-Enter inserts a newline. Bracketed paste retains
-pasted newlines in one prompt. Arrow/Home/End keys, deletion, history navigation,
-and Ctrl-A/E/U/K/W editing work on that same buffer. Long drafts use a horizontal
+pasted newlines in one prompt, including CRLF split across input reads. Paste
+chunks are inserted together rather than recopying the growing draft for every
+character. Arrow/Home/End keys, deletion, history navigation, and Ctrl-A/E/U/K/W
+editing work on that same buffer. Long drafts use a horizontal
 viewport; embedded newlines are shown as `↵`, not a full multirow editor. Explicit
 `<<<`/`>>>` blocks and backslash continuation also remain available.
 
 F6 cycles agent focus without submitting or clearing the draft. `/focus TASK`
-selects a known task; `/inspect` reads its latest recorded state and bounded tool
-output. The conversation still contains the session's combined transcript.
+selects a known task; `/inspect` uses the same bounded recorded-state projection
+as the model's `inspect_state` tool. It prioritizes live children, shows actual
+provider/model and result information, and points to history for omitted detail.
+The conversation still contains the session's combined transcript.
 Injected streams and non-POSIX terminals keep the existing line-reader path;
 POSIX PTY results are not evidence of equal behavior on every platform.
 
