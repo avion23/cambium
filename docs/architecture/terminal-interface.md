@@ -64,10 +64,12 @@ immediately while preserving the unfinished draft and cursor.
 Enter submits the draft; Alt-Enter inserts a newline. Bracketed paste retains
 pasted newlines in one prompt, including CRLF split across input reads. Paste
 chunks are inserted together rather than recopying the growing draft for every
-character. Arrow/Home/End keys, deletion, history navigation, and Ctrl-A/E/U/K/W
-editing work on that same buffer. Long drafts use a horizontal
-viewport; embedded newlines are shown as `↵`, not a full multirow editor. Explicit
-`<<<`/`>>>` blocks and backslash continuation also remain available.
+character. In a multiline draft, Up/Down move between its lines rather than
+replace it with history. Home/End and Ctrl-A/E move within the current line;
+single-line Up/Down still navigate history. Deletion and Ctrl-U/K/W edit the
+same buffer. The horizontal viewport shows the current line with a `2/3`-style
+line indicator; it is not a full multirow editor. Explicit `<<<`/`>>>` blocks
+and backslash continuation also remain available.
 
 F6 cycles agent focus without submitting or clearing the draft. `/focus TASK`
 selects a known task; `/inspect` uses the same bounded recorded-state projection

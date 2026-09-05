@@ -727,7 +727,11 @@ def k0_entry(
         source_message_count=len(normalized),
         through_turn=max(item.through_turn for item in normalized),
         objective="CAST K0 active semantic projection",
-        outcome=f"compacted {len(normalized)} immutable semantic segment(s)",
+        outcome=(
+            f"compacted {len(normalized)} immutable semantic segment(s); "
+            "state covers these summaries only. Later raw observations may supersede "
+            "facts, complete open work, or invalidate checks listed here."
+        ),
         decisions_added=active.decisions,
         decisions_superseded=(),
         facts_added=active.facts,

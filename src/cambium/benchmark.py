@@ -111,6 +111,22 @@ def _repository(case: dict, root: Path) -> Path:
     return repo
 
 
+def _peak_pending_children(events: list[dict]) -> int:
+    """Count overlapping siblings, including queued work, not a lifetime total."""
+    pending: dict[str, set[str]] = {}
+    peak = 0
+    for event in events:
+        data = event.get("payload", {})
+        if event.get("kind") == "child_admitted":
+            parent = data.get("parent_task_id") or event.get("task_id")
+            children = pending.setdefault(parent, set())
+            children.add(data["child_task_id"])
+            peak = max(peak, len(children))
+        elif event.get("kind") == "child_result":
+            pending.get(data.get("parent_task_id"), set()).discard(event.get("task_id"))
+    return peak
+
+
 def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact checking
     case: dict, policy: dict[str, str], *, output: Path, budget: ExperimentBudget,
     provider: str | None = None, max_turns: int = 12, max_wall_s: float = 300,
@@ -248,8 +264,12 @@ def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact che
     observed_tools = {e.get("payload", {}).get("tool") for e in events
                       if e.get("kind") == "tool_event" and e.get("payload", {}).get("ok")}
     missing_tools = set(case.get("required_tools", [])) - observed_tools
-    child_count = sum(e.get("kind") == "child_admitted" for e in events)
-    trace_ok = not missing_tools and child_count >= case.get("required_children", 0)
+    children = [e.get("payload", {}) for e in events if e.get("kind") == "child_admitted"]
+    peak_children = _peak_pending_children(events)
+    trace_ok = (
+        not missing_tools and len(children) >= case.get("required_children", 0)
+        and peak_children >= case.get("required_parallel_children", 0)
+    )
     if case.get("read_only"):
         trace_ok = trace_ok and accepted == base
     if case.get("read_only_followups"):
@@ -264,7 +284,6 @@ def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact che
     # Correctness dominates. Small bounded efficiency reward breaks ties.
     score = 0.0 if not passed else 0.9 + 0.1 / (1 + elapsed / 60 + tokens / 10000 + calls / 10)
     usage = [e.get("payload", {}) for e in events if e.get("kind") == "usage_event"]
-    children = [e.get("payload", {}) for e in events if e.get("kind") == "child_admitted"]
     failures = [
         e.get("payload", {}) for e in events
         if e.get("kind") in {"child_rejected", "worker_failed", "merge_failed"}
@@ -272,7 +291,8 @@ def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact che
     ]
     task_providers: dict[str, set[str]] = {}
     for event in events:
-        if event.get("kind") == "usage_event":
+        if (event.get("kind") == "usage_event"
+                and not event.get("payload", {}).get("failure_reason")):
             task_providers.setdefault(event.get("task_id", "unknown"), set()).add(
                 event.get("payload", {}).get("provider", "unknown")
             )
@@ -286,8 +306,11 @@ def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact che
         "id": case["id"], "split": case["split"], "passed": passed, "score": score,
         "elapsed_s": round(elapsed, 3), "calls": calls, "tokens": tokens,
         "cost_usd": budget.cost_usd - before[2], "head": accepted, "base": base,
-        "changed": changed, "providers": sorted({e.get("provider", "unknown") for e in usage}),
-        "children": len(children), "directory": str(root), "turn_heads": turn_heads,
+        "changed": changed, "providers": sorted({
+            name for names in task_providers.values() for name in names
+        }),
+        "children": len(children), "peak_pending_children": peak_children,
+        "directory": str(root), "turn_heads": turn_heads,
         "source": case.get("source"), "family": case.get("family"), "rollovers": rollovers,
         "summary_calls": sum(e.get("call_kind") == "summary" for e in usage),
         "failed_provider_calls": sum(bool(e.get("failure_reason")) for e in usage),
@@ -311,7 +334,9 @@ def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact che
         ],
         "feedback": (
             f"exit={exit_code}; check={checked}; scope={scope_ok}; trace={trace_ok}; "
-            f"missing_tools={sorted(missing_tools)}; {error}\n"
+            f"missing_tools={sorted(missing_tools)}; "
+            f"parallel_children={peak_children}/{case.get('required_parallel_children', 0)}; "
+            f"{error}\n"
             f"{diagnostic}\n{json.dumps(failures)[-3000:]}"
         ),
     }

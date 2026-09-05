@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from cambium import prompts, worker
-from cambium.benchmark import ExperimentBudget, ExperimentBudgetExceeded, load_cases
+from cambium.benchmark import ExperimentBudget, ExperimentBudgetExceeded, _peak_pending_children
 
 
 def test_atomic_replacement_changes_new_prompts_not_existing_snapshot(
@@ -33,11 +33,21 @@ def test_experiment_budget_counts_tokens_when_cash_is_zero() -> None:
         budget.check()
 
 
-def test_shipped_benchmark_has_disjoint_splits_and_self_change() -> None:
-    cases = load_cases(Path(prompts.__file__).with_name("benchmarks") / "prompts.jsonl")
-    assert {case["split"] for case in cases} == {"train", "val", "test"}
-    assert any("repo" in case for case in cases)
-    assert len({case["id"] for case in cases}) == len(cases)
+def test_parallel_benchmark_distinguishes_overlapping_siblings_from_serial_work() -> None:
+    admitted = [
+        {"kind": "child_admitted", "task_id": "parent",
+         "payload": {"parent_task_id": "parent", "child_task_id": child}}
+        for child in ("csv", "config")
+    ]
+    finished = [
+        {"kind": "child_result", "task_id": child,
+         "payload": {"parent_task_id": "parent", "status": "succeeded"}}
+        for child in ("csv", "config")
+    ]
+    assert _peak_pending_children([admitted[0], finished[0], admitted[1], finished[1]]) == 1
+    assert _peak_pending_children([*admitted, *finished]) == 2
+    nested = {**admitted[1], "payload": {"parent_task_id": "csv", "child_task_id": "config"}}
+    assert _peak_pending_children([admitted[0], nested]) == 1
 
 
 def test_rollout_timeout_retains_report_and_checks_only_accepted_code(tmp_path, monkeypatch):

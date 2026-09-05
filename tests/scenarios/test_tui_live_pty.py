@@ -272,6 +272,10 @@ def test_live_tui_resize_preserves_one_input_prompt(tmp_path: Path) -> None:
         # None of those operations may submit or lose the draft.
         os.write(master_fd, b"\x1b[200~first\nsecond\x1b[201~\x1b[D!\x1b[17~")
         _read_into(master_fd, output, 0.1)
+        # Multiline navigation must edit lines, not recall a previous prompt.
+        os.write(master_fd, b"\x1b[A\x1b[H^\x1b[F!\x1b[B\x1b[H>\x1b[F?")
+        _read_into(master_fd, output, 0.1)
+        assert b"2/2" in output
         frames = output.count("┌ Cambium".encode())
         _set_size(master_fd, 90)
         _read_into(master_fd, output, 0.3)
@@ -287,7 +291,7 @@ def test_live_tui_resize_preserves_one_input_prompt(tmp_path: Path) -> None:
         while len(server.requests) < 2 and time.monotonic() < deadline:
             _read_into(master_fd, output, 0.1)
         assert len(server.requests) == 2
-        assert any("first\nsecon!d" in str(m.get("content", ""))
+        assert any("^first!\n>secon!d?" in str(m.get("content", ""))
                    for m in server.requests[-1]["messages"])
         os.write(master_fd, b"/exit\n")
         assert _wait_exit(process, master_fd, output, 5) == 0

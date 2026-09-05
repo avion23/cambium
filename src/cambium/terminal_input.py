@@ -126,9 +126,10 @@ class TerminalInput:
         elif key in {"\x1b[C", "\x06"}:
             self.cursor = min(len(self.text), self.cursor + 1)
         elif key in {"\x1b[H", "\x1bOH", "\x1b[1~", "\x01"}:
-            self.cursor = 0
+            self.cursor = self.text.rfind("\n", 0, self.cursor) + 1
         elif key in {"\x1b[F", "\x1bOF", "\x1b[4~", "\x05"}:
-            self.cursor = len(self.text)
+            end = self.text.find("\n", self.cursor)
+            self.cursor = len(self.text) if end < 0 else end
         elif key in {"\x7f", "\x08"} and self.cursor:
             self.text = self.text[:self.cursor - 1] + self.text[self.cursor:]
             self.cursor -= 1
@@ -144,6 +145,19 @@ class TerminalInput:
                 end -= 1
             self.text = self.text[:end] + self.text[self.cursor:]
             self.cursor = end
+        elif key in {"\x1b[A", "\x1b[B"} and "\n" in self.text:
+            # Arrow keys edit a multiline draft instead of replacing it with history.
+            start = self.text.rfind("\n", 0, self.cursor) + 1
+            column = self.cursor - start
+            if key == "\x1b[A" and start:
+                previous = self.text.rfind("\n", 0, start - 1) + 1
+                self.cursor = min(previous + column, start - 1)
+            elif key == "\x1b[B":
+                end = self.text.find("\n", self.cursor)
+                if end >= 0:
+                    following = self.text.find("\n", end + 1)
+                    self.cursor = min(end + 1 + column,
+                                      len(self.text) if following < 0 else following)
         elif key in {"\x1b[A", "\x1b[B"}:
             if self.history_index == len(self.history):
                 self.draft = self.text

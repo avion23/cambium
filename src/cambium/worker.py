@@ -3092,13 +3092,14 @@ def _tool_observation(name: str, result: ToolResult) -> str:
     return _bounded_text(f"tool {name} ok={result.ok}\n{body}", MAX_OBSERVATION_BYTES)
 
 
-def _first_action_response(result: CallResult) -> CallResult:
-    """Execute the first proposed action, not speculative later completion text."""
-    if getattr(result, "tool_calls", None):
-        return result
+def _parse_provider_action(result: CallResult) -> tuple[CallResult, dict[str, Any]]:
+    """Normalize one action once, not speculative later completion text."""
+    native = _native_tool_action(result)
+    if native is not None:
+        return result, native
     for message in getattr(result, "assistant_messages", ()):
         try:
-            _parse_agent_action(message["content"])
+            action = _parse_agent_action(message["content"])
         except ValueError:
             continue
         phase = message.get("phase")
@@ -3106,8 +3107,8 @@ def _first_action_response(result: CallResult) -> CallResult:
             result,
             content=message["content"],
             assistant_phase=phase if phase in {"commentary", "final_answer"} else None,
-        )
-    return result
+        ), action
+    return result, _parse_agent_action(result.content)
 
 
 def _native_tool_action(result: CallResult) -> dict[str, Any] | None:
@@ -6549,9 +6550,8 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                     transcript,
                 )
             last_provider = result.provider
-            result = _first_action_response(result)
             try:
-                action = _native_tool_action(result) or _parse_agent_action(result.content)
+                result, action = _parse_provider_action(result)
             except ValueError as exc:
                 response_content = result.content if isinstance(result.content, str) else ""
                 assistant_content = _bounded_text(response_content, MAX_ACTION_CONTENT_BYTES)
@@ -6563,7 +6563,9 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                         "role": "user",
                         "content": _bounded_text(
                             f"invalid action: {exc}. Each tool call needs name and arguments "
-                            "at the same level. Retry one call, not a batch: "
+                            "at the same level. Keep independent delegates in one calls array: "
+                            "the parent waits after each delegation batch. For ordinary tools, "
+                            "retry one call: "
                             '{"name":"TOOL","arguments":{...}} using the actual tool name. '
                             "JSON-escape string values. For completion, use the finish shape. "
                             "No prose or markdown.",

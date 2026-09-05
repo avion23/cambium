@@ -105,6 +105,11 @@ Its check runs outside the agent's editable worktree against accepted code.
 Read-only follow-ups must leave the accepted head unchanged. Required tool,
 child or rollover evidence is checked only in cases specifically testing those
 behaviors; ordinary coding cases do not reward extra children or extra calls.
+The parallel-utilities case also requires two overlapping sibling lifetimes
+(`required_parallel_children`): sequential one-child suspensions cannot pass as
+parallel work. `peak_pending_children` counts admitted, unfinished siblings,
+including queued work; it does not claim simultaneous provider calls or speedup.
+Provider lists report successful serving calls, not failed attempts alone.
 
 The raw source sessions are development artifacts under the earlier worktree's
 `.cambium` directories. The fixtures contain the minimum task/input/check,

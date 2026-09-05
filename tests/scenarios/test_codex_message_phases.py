@@ -10,7 +10,7 @@ from cambium.diffundo import (
     _parse_codex_sse,
 )
 from cambium.summary_trunk import raw_tail_sha256
-from cambium.worker import _context_message, _first_action_response, _parse_agent_action
+from cambium.worker import _context_message, _parse_provider_action
 
 
 def _provider() -> ProviderConfig:
@@ -43,8 +43,8 @@ def test_codex_selects_final_text_but_worker_executes_first_action() -> None:
     assert error is None
     assert text == finish  # General clients such as DSPy still get the final answer.
     result = _CodexRawResponse(payload, 1.0, text).to_result(provider, {})
-    selected = _first_action_response(result)
-    assert _parse_agent_action(selected.content)["type"] == "tool_call"
+    selected, parsed = _parse_provider_action(result)
+    assert parsed["type"] == "tool_call"
     assert selected.assistant_phase == "commentary"
     assert selected.usage == result.usage
     item = _codex_input_item({"role": "assistant", "content": action, "phase": "commentary"})

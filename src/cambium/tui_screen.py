@@ -4608,12 +4608,17 @@ class Cockpit:
             return
         managed = getattr(self, "_managed_input", None)
         cursor = managed[1] if managed is not None else len(text)
+        label = _sanitize(self._input_prompt_label)
+        if "\n" in text:
+            label += f" {text.count(chr(10), 0, cursor) + 1}/{text.count(chr(10)) + 1}"
+            start = text.rfind("\n", 0, cursor) + 1
+            end = text.find("\n", cursor)
+            text, cursor = text[start:len(text) if end < 0 else end], cursor - start
         def display(value: str) -> str:
             return _sanitize(value).replace("\r", " ").replace("\n", "↵").replace("\t", " ")
         before = display(text[:cursor])
         text = display(text)
         cursor = len(before)
-        label = _sanitize(self._input_prompt_label)
         room = max(1, self._last_size.columns - _display_width(label) - 3)
         start, cells = cursor, 0
         while start and cells + _display_width(text[start - 1]) < room - 1:

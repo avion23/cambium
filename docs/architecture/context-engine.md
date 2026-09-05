@@ -143,9 +143,14 @@ shell exit code into proof of task correctness. Its active state is only as good
 as those recorded deltas; it is not a lossless transcript or a proof system.
 
 Manual `/compact` materializes available semantic entries into K0 and keeps any
-recent raw tail unchanged. With no semantic entries it reports that fact rather
-than inventing a model-free summary. Both manual and automatic rollover reset
-the prompt-accounting baseline because the active prefix changed.
+recent raw tail unchanged. K0 describes the summarized range, not a claim that
+nothing has happened since: a child join or passing check in the later raw tail
+can already have resolved an item still listed there. Its outcome states that
+boundary explicitly. The next semantic fold records the corresponding closure;
+compaction does not guess it from arbitrary prose or add a paid summary call.
+With no semantic entries it reports that fact rather than inventing a model-free
+summary. Both manual and automatic rollover reset the prompt-accounting baseline
+because the active prefix changed.
 
 `context_policy.CastPolicy` currently rolls over after more than 16 segments by
 default. Its optional trunk-token bound is disabled at zero. The economic
