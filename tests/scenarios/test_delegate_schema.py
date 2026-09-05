@@ -31,7 +31,7 @@ def test_delegate_schema_requires_a_scoped_workload() -> None:
     assert errors == ["validation failed: missing 'spec.task' (string)"]
 
 
-def test_delegate_schema_requires_explicit_context_and_placement() -> None:
+def test_delegate_schema_accepts_automatic_context_and_placement() -> None:
     errors = validate_tool_call(
         _delegate_schema(),
         {
@@ -41,10 +41,7 @@ def test_delegate_schema_requires_explicit_context_and_placement() -> None:
         },
     )
 
-    assert errors == [
-        "validation failed: missing 'spec.context_mode' (string)",
-        "validation failed: missing 'spec.placement' (string)",
-    ]
+    assert errors == []
 
 
 def test_delegate_schema_accepts_explicit_provider_constraints() -> None:

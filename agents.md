@@ -1,378 +1,104 @@
-# agents.md — Cambium operating contract
+# Cambium contributor notes
 
-Read this before changing the repository. Use the task request, current source,
-executable tests, durable records, and accepted Git state as authority. A role
-name, README claim, design target, old review, branch name, or green test count
-is not proof that a runtime path is wired.
+Read the relevant source and follow one live path before editing. Start with
+[the runtime map](docs/architecture/architecture.md), then the owning subsystem
+document. Source describes what runs; a proposal or a green fixture is not
+proof that a feature is wired or correct.
 
-## 1. Orient before acting
+## Work style
 
-Start every task with a small situation note:
+Keep the harness small: ordinary functions, explicit data and ownership, local
+control flow, existing code and the standard library before new dependencies.
+Fix the cause at its owner. Do not add a planner, reviewer, approval gate,
+compatibility layer, fallback, memory database or scheduler merely to conceal
+a failed call or incomplete integration.
 
-```text
-objective       what observable outcome is requested
-done_when       exact completion and verification criteria
-authority       files/modules/branches you may change
-current_truth   current branch/head and relevant live entry points
-unknowns        facts that still require source or executable evidence
-next_evidence   cheapest action that can resolve the largest uncertainty
-```
+Use a short plan when the work needs one, not a mandatory template before every
+read. Make the smallest complete change and explain remaining uncertainty.
 
-Then trace one complete live path before editing:
+## Parallel work and publication
 
-```text
-public command/API/schema
-    -> dispatcher/caller
-    -> owning module
-    -> effect boundary
-    -> durable result/event
-    -> scenario tests
-```
+Work in an isolated worktree based on freshly fetched `origin/main`. Reuse it
+for continued work. Preserve other checkouts, uncommitted changes and active
+parallel branches. Do not reset, clean or force-push shared work.
 
-A failed name search is not proof of absence. Check imports, registries, schemas,
-entry points, and tests. When docs and source disagree, state the disagreement;
-do not silently choose the more attractive story.
+Inspect the diff, commit the actual changes, integrate with current `main`, and
+verify the remote ref after pushing. Do not claim a merge, publication or test
+run without observing it. A task handoff states the commit, checks performed
+and remaining limitations; it need not create another status ledger.
 
-For system-level work, read in this order:
-
-1. [`docs/architecture/agent-operating-model.md`](docs/architecture/agent-operating-model.md)
-2. [`docs/architecture/architecture.md`](docs/architecture/architecture.md)
-3. [`implementation-plan.md`](implementation-plan.md)
-4. the focused subsystem document and source/tests
-
-## 2. Authority order
+## Runtime owners
 
 ```text
-1. explicit user task and constraints
-2. this operating contract
-3. accepted current source and tests
-4. current architecture/reference documents
-5. implementation plan for open work
-6. research and historical reviews
+CLI / interactive session -> supervisor -> isolated worker -> provider/tools
+                                   |              |
+                                   |              +-> context checkpoints
+                                   +-> child lifetime, joins and publication
+
+events + checkpoints + Git + provider usage -> inspection and TUI
 ```
 
-Source is not automatically correct, but it is the current executable fact.
-Target documents explain where it should go. Do not report target behavior as
-landed.
+The root and children use one worker implementation. A model proposes actions;
+the harness executes them. A model saying a check passed or a child merged is
+not evidence that it happened. Keep task ancestry, context lineage, provider
+identity and accepted Git state separate.
 
-## 3. System model
+The active tools are defined once in `schemas.py` and dispatched in `tools.py`.
+Navigation and history are live read-only tools; do not duplicate their roster
+in a source-pinning test. A direct name/arguments tool request is unambiguous
+without an extra type tag. Actual arguments and tool ownership are validated
+at their execution boundary.
 
-Cambium is a direct execution loop with explicit owners:
+## Context and resources
 
-```text
-operator task -> supervisor -> isolated worker -> model action -> tool observation
-                    |                |
-                    |                +-> immutable context checkpoints
-                    +-> child lifetime, artifact joins and publication
+[CAST](docs/architecture/context-engine.md) owns the context model: stable head,
+append-only semantic entries, bounded raw tail, and a separate K0 rollover.
+Earlier evidence remains in history. Cache hits come from provider usage, not
+matching hashes or warm worker processes.
 
-provider usage + durable events + checkpoints + Git -> inspection and TUI
-```
+[Delegation](docs/architecture/context-branches.md) explains model-directed
+work splitting and automatic context/placement defaults. The supervisor owns
+child workspaces and provider selection. Parents join or cancel their children
+before releasing their integration workspace. Preserve unrelated local work.
 
-`BranchState` and CLI replay inspection exist. Sharing all state semantics with
-the model and TUI, including the proposed SituationFrame, is separate integration
-work. Do not treat a diagram or proposed type as an implemented consumer.
+Provider admission belongs to routing/supervisor; call-time attempts belong to
+Diffundo; account windows and cache capabilities have their existing owners.
+Unknown quota or tariff stays unknown. Prompt tokens are not output throughput.
+Keep credentials out of source, prompts, tool output and durable logs. Preserve
+redaction, terminal sanitization and Git ownership boundaries.
 
-Keep these identities separate:
+DSPy optimizes policy text offline. [Prompt replacement](docs/architecture/optimization.md)
+applies to new sessions; it does not rewrite an active prefix or add an online
+classifier call. Do not make the coding loop depend on DSPy imports.
 
-```text
-task tree
-conversation branch
-Git artifact graph
-provider-cache lineage
-semantic/epistemic projection
-```
+## Verification
 
-The root and every child use the same branch abstraction. The model proposes
-intent. The supervisor owns admission, provider lease, process lifecycle,
-children, budgets, join, publication, and recovery. Git owns artifact identity;
-provider responses own cache-hit evidence; tests own only the checks they
-actually ran at a particular artifact state.
+Run the smallest check that reproduces the changed behavior, then the affected
+suite. Use real PTYs for input/resize claims and real providers for model-loop
+claims. Check accepted Git artifacts, not only the model's summary. A successful
+shell command alone is not general verification.
 
-## 4. Development mode
-
-KISS is the default. Implement only the requested behavior and the minimum
-support needed to make it correct and reviewable.
-
-Unless the task explicitly requests it:
-
-- do not add gates, approvals, sandboxes, retries, fallbacks, readiness checks,
-  or production-hardening systems;
-- do not add hashes, attestations, evidence stores, accounting, or observability
-  merely because they might be useful;
-- do not add environment, dependency, credential, platform, configuration,
-  input, or schema validation beyond preserving an existing boundary;
-- do not add abstractions, compatibility layers, options, or modules when a
-  direct change is sufficient;
-- do not turn review findings into implementation scope;
-- do not add broad interface tests; prefer one scenario that proves the changed
-  behavior through its live path;
-- do not micro-optimize Python before measuring a local bottleneck;
-- do not refactor unrelated code while repairing a concrete defect.
-
-When the task explicitly changes an architectural boundary, add the smallest
-value object/reducer/interface that gives that boundary one owner. Avoid a
-second scheduler, memory database, frontend state machine, or worker hierarchy.
-
-## 5. Change workflow
-
-### 5.1 Pull and establish the baseline
+Useful commands, in the repository's installed environment:
 
 ```sh
-git status --short --branch
-git fetch --all --prune
-git rebase origin/main          # or the explicitly requested target branch
-git rev-parse HEAD
-git log -1 --oneline
-```
-
-Do not overwrite unrelated local work. Use an isolated branch/worktree for
-changes unless the task explicitly authorizes direct target-branch work.
-
-### 5.2 Reproduce or prove the gap
-
-For a bug, run the smallest real reproduction before editing. For a missing
-integration, trace the symbol from schema/entry point through dispatch and show
-where it stops. For documentation work, compare each implementation claim with
-the current source path.
-
-Record:
-
-```text
-command or source path
-working directory / branch / commit
-observed output or absence
-expected invariant
-```
-
-### 5.3 Change one owner
-
-Remove the cause at its owning boundary. Do not mask it with a default, catch-all,
-retry, duplicate state, or wrapper. Preserve protocol, schema, task-tree,
-worktree, provider, context, and publication ownership.
-
-### 5.4 Verify in layers
-
-```text
-syntax/static check
-    -> focused reproduction
-    -> affected scenario/module suite
-    -> combined integration check
-    -> full fast/slow gates when required
-```
-
-Inspect the diff before broad tests. A passing check is evidence only for the
-artifact/configuration it tested. Rerun overlapping checks after later edits.
-
-### 5.5 Commit and publish
-
-```sh
-git diff --check
-git status --short
-git diff --stat
-git diff --cached
-git commit -m "<focused message>"
-git push <remote> <requested-branch>
-git ls-remote <remote> refs/heads/<requested-branch>
-```
-
-Never claim a push, branch, tag, merge, or CI result without fetching the remote
-state. Do not force-push or rewrite shared history unless the user explicitly
-requires it and the expected old remote SHA is verified.
-
-## 6. Runtime entry points
-
-Prefer the public CLI over internal module entry points:
-
-```text
-auth
-supervisor
-doctor
-module-test
-version
-run
-repl
-tui
-monitor
-quota
-optimize
-session
-architectus
-```
-
-Typical development commands:
-
-```sh
-PYTHONPATH=src python3.14 -m cambium.cli --help
-PYTHONPATH=src python3.14 -m cambium.cli supervisor --session-dir demo --demo
-uv run cambium tui --repo . --auto
-uv run cambium doctor
-```
-
-Supervisor plans require a session directory and `--plan`, `--task-spec`, or
-`--demo`. Operator-facing context reuse is on by default.
-
-Current main flow:
-
-```text
-CLI/interactive/plan
-    -> supervisor.run_plan
-    -> task/provider admission
-    -> isolated worktree + worker process
-    -> worker provider/tool loop
-    -> checkpoint/result/exit events
-    -> integrity and join/publication
-    -> canonical result and cleanup/recovery
-```
-
-Current active model tools are:
-
-```text
-write_file
-edit_file
-git_op
-run_shell
-read_batch
-repo_query
-branch_history
-delegate
-```
-
-`repo_query` uses bounded source scans and an optional configured LSP adapter.
-`branch_history` reads recorded session evidence without re-executing tools.
-Their schemas, dispatch, prompts, and real frontend scenarios are wired. A
-model-facing `inspect_state` and shared SituationFrame remain separate work;
-CLI `inspect-state` and the BranchState inspection library already exist.
-
-## 7. Context and branch rules
-
-- The active context is a stable system/tool head, immutable CAST summary
-  entries, and a bounded raw tail.
-- A summary covers one disjoint raw range. Existing entries are immutable.
-- K0 is a bounded current-state materialization, not a second summary tier.
-- Exact cache reuse requires byte/identity compatibility; provider cache hits
-  come only from provider evidence.
-- Current supervisor source consumes declared child `context_mode` and
-  `placement`, and the model schema requires both fields (omission is
-  rejected before admission); treat any remaining automatic resolution as
-  a current compatibility gap, not an implicit normative default.
-- A child cannot widen parent filesystem, tool, credential, or provider
-  authority.
-- Admission is durable before spawn. Child completion order does not determine
-  join order.
-- Semantic child result and Git artifact acceptance are separate. A parent may
-  resume with write authority only when its worktree matches the accepted
-  integration head.
-
-Use [`docs/architecture/context-engine.md`](docs/architecture/context-engine.md),
-[`docs/architecture/context-branches.md`](docs/architecture/context-branches.md),
-and [`docs/architecture/subagents.md`](docs/architecture/subagents.md) for the
-focused contracts.
-
-## 8. Provider and credential rules
-
-- Provider admission belongs to `routing.py`/supervisor; call-time attempts
-  belong to `diffundo.py`; quota/cache/lease values belong to
-  `provider_scheduler.py`; configuration belongs to `provider_config.py`.
-- Do not create another scheduler or let prompt prose select credentials.
-- Hard feasibility precedes ranking.
-- Missing credentials fail before worker spawn where possible.
-- Request rate, in-flight capacity, token windows, cash, wall time, and cache
-  state are separate dimensions.
-- OAuth refresh tokens remain in the supervisor-side store. Workers receive
-  only the access token/account identity needed for the assigned provider.
-- Secrets stay in approved environment/store boundaries and never enter task
-  specs, prompts, events, logs, tests, fixtures, or commits.
-- Redaction and terminal sanitization are boundary contracts; preserve them.
-
-Focused references:
-
-- [`docs/architecture/provider-routing.md`](docs/architecture/provider-routing.md)
-- [`docs/research/codex-activation.md`](docs/research/codex-activation.md)
-- `src/cambium/provider_config.py`
-- `src/cambium/oauth.py`
-- `src/cambium/auth.py`
-- `src/cambium/diffundo.py`
-
-## 9. Process, Git, and persistence invariants
-
-- Worker stdout is bounded NDJSON; diagnostics use stderr/log events.
-- Request IDs correlate protocol messages; generation tokens own effects.
-- Blocking disk/subprocess work stays at existing thread/process boundaries.
-- One worker generation owns at most one fenced commit.
-- A provider-backed read-only task may succeed without a commit; no empty commit
-  or merge is created.
-- A dirty, detached, wrong-branch, stale-base, conflicted, quarantined, or
-  envelope-inconsistent worker result is not published.
-- Publication is expected-old and ref-only, except the one-shot CLI path,
-  which owns the ordinary clean primary checkout and may fast-forward it
-  to the published head after publication. Do not reset a caller-owned primary
-  checkout to make it visually match.
-- Recovery preserves salvage and the last safe checkpoint; resume requires a
-  matching workspace identity.
-- Frontends and monitors derive state from durable records and do not mutate the
-  runtime directly.
-
-## 10. Testing guidance
-
-Run the narrowest real check first. Useful commands from the repository root:
-
-```sh
-uv run ruff check src tests
-uv run pytest -q tests/scenarios/<focused-file>.py
-uv run pytest -m "not slow" -q
-uv run pytest -m slow -q
-python3.14 -m compileall -q src tests
+ruff check src tests
+python -m pytest -o addopts='' tests/scenarios/<affected-file>.py -q
+python -m pytest -o addopts='' -n 2 -m 'not acceptance' -q
+python -m pytest -o addopts='' -m acceptance tests/acceptance/test_live_frontends.py -q
 git diff --check
 ```
 
-Use the repository's locked/dev environment when available. Credential-gated
-acceptance tests may issue live calls and are separate from hermetic CI.
+Live tests use configured providers and consume quota. Report failed trials as
+well as passing reruns. Do not manufacture success when a budget ends, and do
+not delete a meaningful regression simply to get a green run. Consolidate
+repeated fixtures and tests that pin implementation trivia; retain checks for
+actual effects, data loss, cancellation, replay and publication.
 
-Scenario tests prove process, Git, persistence, concurrency, context, and
-provider boundaries. Module tests prove deterministic data-in/data-out logic.
-Do not test an interface merely for existing; test an externally meaningful
-state transition or invariant.
+## Documentation
 
-The live coding gate outranks synthetic suites: a task that changes the
-execution loop ends with `pytest -m acceptance tests/acceptance/test_live_coding_gate.py`
-run against a real provider, or the handoff is BLOCKED. A green marker-fixture
-or loopback run is never evidence that the harness codes.
-
-## 11. Documentation work
-
-Documentation categories have distinct purposes:
-
-```text
-architecture     rationale, ownership, invariants, current/target boundary
-reference        exact public or target values
-how-to           recommended workflow
-research         hypotheses and evaluation
-implementation-plan ordered open work only
-```
-
-For an implemented claim, name the live source/test path. For target behavior,
-label it target. Remove stale source line numbers and branch-ledger prose rather
-than preserving a misleading history in active docs.
-
-When changing an enum, tool, prompt component, event, public state, or command,
-update all executable and documentary consumers in the same change.
-
-## 12. Handoff
-
-Every handoff states:
-
-```text
-scope and ownership
-base branch and starting SHA
-entry points/source/tests inspected
-baseline or reproduction and observed result
-changes and preserved invariants
-verification commands, cwd, exit status, and evidence
-commit SHA and remote branch
-independent remote verification
-status: VERIFIED | UNVERIFIED | BLOCKED
-remaining exact next action
-```
-
-Do not say “all tests pass,” “merged,” “pushed,” or “implemented” when the
-corresponding command or remote state was not observed.
+Give each contract one owner: architecture for rationale/ownership, reference
+for exact shapes, how-to for sequences, research for measurements. Link rather
+than copy. Mark proposals explicitly. Keep only open work in
+[implementation-plan.md](implementation-plan.md). Update the owning document
+when behavior changes; do not require a documentation or certification ritual
+before a normal tool call.

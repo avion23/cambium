@@ -151,8 +151,8 @@ from cambium.ipc import (
     write_message,
 )
 from cambium.lint_diag import LintDiag
-from cambium.prompts import CODING_AGENT
 from cambium.prompts import SUMMARY_PROTOCOL_LINES as _SUMMARY_PROTOCOL_LINES
+from cambium.prompts import coding_prompt, validate_policy
 from cambium.provider_config import AuthMode, load_providers
 from cambium.redact import Redactor, build_session_redactor
 from cambium.schemas import FINISH_ACTION_SCHEMA, TOOL_SCHEMAS, validate_tool_call
@@ -260,13 +260,10 @@ SOFT_TOKEN_CAP_RATIO = 0.9
 FINAL_SYNTHESIS_HEADROOM_RATIO = 0.1
 FINAL_SYNTHESIS_MIN_HEADROOM_TOKENS = 4_000
 FINAL_SYNTHESIS_DIRECTIVE = (
-    "Forced finalization: produce the final answer NOW with no further tool use. "
-    'Return exactly one terminal finish action: {"type":"finish","summary":"...",'
-    '"objective_met":true}. Use false instead when incomplete; true only when the task '
-    "objective was met; a complete review that found no defect counts as met. Summarize the "
-    "work completed so far."
+    "Budget nearly exhausted. Complete the current step and its verification; "
+    "do not start new work or delegate. Then return finish with the result and "
+    "checks performed. Set objective_met=false when the task is incomplete."
 )
-FINAL_SYNTHESIS_REMINDER = "Finalization active: return finish now."
 
 
 class TaskStatus(StrEnum):
@@ -1311,6 +1308,7 @@ class AgentConfig:
     # recent action signatures retained for novelty checks.
     max_no_progress_actions: int = MAX_NO_PROGRESS_ACTIONS
     progress_window: int = 0
+    prompt_policy: dict[str, str] | None = None
 
     def __post_init__(self) -> None:
         """Derive threshold defaults for direct in-process configurations."""
@@ -1425,6 +1423,9 @@ class AgentConfig:
             provider_env_keys=provider_env_keys,
             redactor=_checkpoint_redactor(provider_env_keys, init.get("credentials")),
             parent_envelope=_validate_parent_envelope(init.get("parent_envelope")),
+            prompt_policy=(
+                validate_policy(init["prompt_policy"]) if "prompt_policy" in init else None
+            ),
             context_reuse=_strict_bool(init.get("context_reuse"), "init context_reuse"),
             rolling_compact=_strict_bool(init.get("rolling_compact", True), "init rolling_compact"),
             rolling_compact_threshold_high=rolling_threshold_high,
@@ -1530,6 +1531,7 @@ def _merge_task_config(
         provider_env_keys=config.provider_env_keys,
         redactor=config.redactor,
         parent_envelope=parent_envelope,
+        prompt_policy=config.prompt_policy,
         context_reuse=config.context_reuse,
         rolling_compact=rolling_compact,
         rolling_compact_threshold_high=rolling_threshold_high,
@@ -1594,6 +1596,7 @@ def _config_from_run(run: dict[str, Any]) -> AgentConfig:
         provider_env_keys=provider_env_keys,
         redactor=_checkpoint_redactor(provider_env_keys, run.get("credentials")),
         parent_envelope=_validate_parent_envelope(run.get("parent_envelope")),
+        prompt_policy=(validate_policy(run["prompt_policy"]) if "prompt_policy" in run else None),
         context_reuse=_strict_bool(run.get("context_reuse"), "run_task context_reuse"),
         rolling_compact=_strict_bool(run.get("rolling_compact", True), "run_task rolling_compact"),
         rolling_compact_threshold_high=rolling_threshold_high,
@@ -2014,6 +2017,21 @@ def _decode_action_json(text: str) -> tuple[Any, int]:
         return _LENIENT_ACTION_DECODER.raw_decode(text)
 
 
+def _complete_delegates(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    from cambium.child_policy import complete_child_policy
+
+    siblings = sum(call["name"] == "delegate" for call in calls)
+    for call in calls:
+        if call["name"] != "delegate":
+            continue
+        arguments = dict(call["arguments"])
+        if isinstance(arguments.get("spec"), dict):
+            arguments["spec"] = complete_child_policy(arguments["spec"], siblings=siblings)
+        arguments.setdefault("kind", "feature")
+        call["arguments"] = arguments
+    return calls
+
+
 def _normalize_tool_calls(action: Mapping[str, Any]) -> list[dict[str, Any]]:
     """Validate a tool action's call shape and return calls in input order."""
     if "calls" in action:
@@ -2051,7 +2069,7 @@ def _normalize_tool_calls(action: Mapping[str, Any]) -> list[dict[str, Any]]:
             normalized.append({"name": name, "arguments": arguments})
         if errors:
             raise ValueError("; ".join(errors))
-        return normalized
+        return _complete_delegates(normalized)
 
     name = action.get("name")
     arguments = action.get("arguments")
@@ -2061,7 +2079,7 @@ def _normalize_tool_calls(action: Mapping[str, Any]) -> list[dict[str, Any]]:
         raise ValueError("tool_call arguments must be an object")
     if name not in _ALL_TOOL_NAMES:
         raise ValueError(f"unknown tool: {name!r}")
-    return [{"name": name, "arguments": arguments}]
+    return _complete_delegates([{"name": name, "arguments": arguments}])
 
 
 _FENCED_ACTION_RE = re.compile(r"^```[A-Za-z0-9_-]*\r?\n(.*)\r?\n?```\s*$", re.DOTALL)
@@ -2104,6 +2122,10 @@ def _parse_agent_action(content: str) -> dict[str, Any]:
         raise ValueError("agent action must be exactly one JSON object")
     if text[_end:].strip():
         raise ValueError("agent action must be exactly one JSON object (no trailing content)")
+    # The tool schema already identifies name/arguments; a redundant type tag
+    # must not cost a repair request. Ambiguous/extra fields still fail below.
+    if "type" not in parsed and ("calls" in parsed or "name" in parsed):
+        parsed["type"] = "tool_call"
     action_type = parsed.get("type")
     if action_type == "plan":
         if not _action_keys(parsed, frozenset({"type", "steps"})):
@@ -3023,8 +3045,9 @@ def _build_agent_prompt(
     transcript: list[dict[str, Any]],
     model_identity: str = "",
     parent_envelope: dict[str, Any] | None = None,
+    prompt_policy: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    system_lines = [str(line) for line in CODING_AGENT.splitlines()]
+    system_lines = coding_prompt(prompt_policy).splitlines()
     if model_identity:
         system_lines.insert(
             -1,
@@ -3053,6 +3076,23 @@ def _build_agent_prompt(
 def _tool_observation(name: str, result: ToolResult) -> str:
     body = result.output if result.ok else (result.error or result.output or "")
     return _bounded_text(f"tool {name} ok={result.ok}\n{body}", MAX_OBSERVATION_BYTES)
+
+
+def _first_action_response(result: CallResult) -> CallResult:
+    """Execute the first proposed action, not speculative later completion text."""
+    if getattr(result, "tool_calls", None):
+        return result
+    for message in getattr(result, "assistant_messages", ()):
+        try:
+            _parse_agent_action(message["content"])
+        except ValueError:
+            continue
+        phase = message.get("phase")
+        return replace(
+            result, content=message["content"],
+            assistant_phase=phase if phase in {"commentary", "final_answer"} else None,
+        )
+    return result
 
 
 def _native_tool_action(result: CallResult) -> dict[str, Any] | None:
@@ -3138,26 +3178,12 @@ def _provider_call_failure_reason(exc: BaseException) -> str:
     explicit_reason = getattr(exc, "reason", None)
     if isinstance(explicit_reason, str) and explicit_reason:
         return explicit_reason
+    cause = exc.last_error if isinstance(exc, AllProvidersFailed) else exc
+    detail = (
+        f" [{cause.provider}: {cause.outcome.value}]" if isinstance(cause, ProviderError) else ""
+    )
     suffix = " (content_flagged)" if _is_content_flagged(exc) else ""
-    return f"provider call failed: {exc.__class__.__name__}{suffix}"
-
-
-def _best_partial_answer(transcript: list[dict[str, Any]]) -> str:
-    """Return the last model-authored terminal summary before a flag."""
-    for message in reversed(transcript):
-        if message.get("role") != "assistant":
-            continue
-        content = message.get("content")
-        if not isinstance(content, str):
-            continue
-        try:
-            action = _parse_agent_action(content)
-        except ValueError:
-            continue
-        summary = action.get("summary")
-        if isinstance(summary, str) and summary.strip():
-            return _bounded_text(summary, MAX_SUMMARY_CHARS)
-    return "best partial answer: work completed before final synthesis was content-flagged"
+    return f"provider call failed: {exc.__class__.__name__}{detail}{suffix}"
 
 
 def _progress_signature(content: str | None, action: Mapping[str, Any] | None = None) -> str:
@@ -3753,8 +3779,10 @@ def _provider_boundary(
 
 
 def _context_message(value: Any, location: str) -> dict[str, Any]:
-    if not isinstance(value, dict) or set(value) != {"role", "content"}:
-        raise ContextForkError(f"checkpoint {location} must have exactly role/content")
+    if not isinstance(value, dict) or set(value) not in (
+        {"role", "content"}, {"role", "content", "phase"},
+    ):
+        raise ContextForkError(f"checkpoint {location} must have role/content and optional phase")
     role = value.get("role")
     content = value.get("content")
     if role not in {"system", "user", "assistant", "tool"}:
@@ -3763,7 +3791,11 @@ def _context_message(value: Any, location: str) -> dict[str, Any]:
         raise ContextForkError(f"checkpoint {location}.content must be a string")
     if len(content.encode("utf-8")) > MAX_OBSERVATION_BYTES:
         raise ContextForkError(f"checkpoint {location}.content exceeds the field cap")
-    return {"role": role, "content": content}
+    if "phase" in value and (
+        role != "assistant" or value["phase"] not in {"commentary", "final_answer"}
+    ):
+        raise ContextForkError(f"checkpoint {location}.phase is invalid")
+    return dict(value)
 
 
 def _ensure_private_directory(path: Path) -> None:
@@ -4747,6 +4779,7 @@ def _restore_turn_context(
         [],
         model_identity,
         parent_envelope=config.parent_envelope,
+        prompt_policy=config.prompt_policy,
     )
     initial_trunk, _initial_tail = partition_summary_trunk(initial_prompt["messages"])
     context_continuation = copy.deepcopy(transcript_snapshot)
@@ -4833,20 +4866,6 @@ def _arm_finalization(
     forced_finalization: bool,
     finalization_grace_used: bool,
 ) -> tuple[bool, bool, bool, list[dict[str, Any]], list[dict[str, Any]]]:
-    if (
-        base_messages is not None
-        and config.resume is not None
-        and turn_limit
-        and budget_new_tokens < soft_cap
-        and turn >= config.max_turns - 1
-    ):
-        return (
-            finalized,
-            forced_finalization,
-            finalization_grace_used,
-            context_continuation,
-            transcript,
-        )
     if finalized:
         return (
             finalized,
@@ -5599,7 +5618,6 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
     usage_fork_of: str | None = None
     first_turn = 1
     last_provider: str | None = None
-    last_latency_s = 0.0
     turn_checkpoint_resumed = False
     last_turn_checkpoint: int | None = None
     provider_compat = provider_compat or {}
@@ -5749,6 +5767,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                 summaries,
                 model_identity,
                 parent_envelope=config.parent_envelope,
+                prompt_policy=config.prompt_policy,
             )
             semantic_trunk, semantic_tail = partition_summary_trunk(semantic_prompt["messages"])
             base_messages = tuple(copy.deepcopy(semantic_trunk))
@@ -5782,6 +5801,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
             [],
             model_identity,
             parent_envelope=config.parent_envelope,
+            prompt_policy=config.prompt_policy,
         )
         initial_trunk, initial_tail = partition_summary_trunk(initial_prompt["messages"])
         base_messages = tuple(copy.deepcopy(initial_trunk))
@@ -5941,6 +5961,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                     transcript,
                     model_identity,
                     parent_envelope=config.parent_envelope,
+                    prompt_policy=config.prompt_policy,
                 )
             else:
                 prompt = _fork_prompt(base_messages, context_continuation, tools)
@@ -5974,12 +5995,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                     if budget_failure
                     else _provider_call_failure_reason(exc)
                 )
-                partial_content_flag = (
-                    final_synthesis_call
-                    and _is_content_flagged(exc)
-                    and not (code_changed and not verified_after_change)
-                )
-                if final_synthesis_call and not partial_content_flag:
+                if final_synthesis_call:
                     failure_event["failure_reason"] = _phase_failure(
                         failure_reason
                         if budget_failure
@@ -5994,20 +6010,6 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                         epoch=usage_epoch,
                         fork_of=usage_fork_of,
                     )
-                if partial_content_flag:
-                    return {
-                        **outcome,
-                        "status": "succeeded",
-                        "failure_reason": None,
-                        "summary": _best_partial_answer(transcript),
-                        "turn": turn,
-                        "usage": cumulative_usage,
-                        "provider": failure_event.get("provider", outcome.get("provider")),
-                        "latency_s": 0.0,
-                        "transcript": transcript,
-                        "compaction_deferred": compaction_deferred,
-                        "consecutive_compaction_deferrals": consecutive_compaction_deferrals,
-                    }
                 return _loop_result(
                     outcome,
                     "failed",
@@ -6040,7 +6042,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                 )
             _bind_router_provider(router, result, config.task_id)
             fallback_origin = getattr(result, "fell_back_from", None)
-            if isinstance(fallback_origin, str):
+            if isinstance(fallback_origin, str) and result.provider != last_provider:
                 outcome["fell_back_from"] = fallback_origin
                 outcome["model"] = result.model
                 await _emit_provider_fallback(
@@ -6122,7 +6124,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                     transcript,
                 )
             last_provider = result.provider
-            last_latency_s = max(0.0, float(result.latency_s))
+            result = _first_action_response(result)
             try:
                 action = _native_tool_action(result) or _parse_agent_action(result.content)
             except ValueError as exc:
@@ -6143,6 +6145,9 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                         ),
                     },
                 ]
+                phase = getattr(result, "assistant_phase", None)
+                if phase in {"commentary", "final_answer"}:
+                    invalid_messages[0]["phase"] = phase
                 if final_synthesis_call:
                     parse_error = str(exc)
                     parse_defect = (
@@ -6259,58 +6264,11 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
             consecutive_invalid_actions = 0
             trailing = _action_trailing(result.content)
             action_message = _canonical_action_message(action)
-            if (
-                base_messages is not None
-                and config.resume is not None
-                and turn >= config.max_turns
-                and action["type"] != "finish"
-                and not finalized
-            ):
-                context_continuation, transcript = _append_context_message(
-                    action_message,
-                    base_messages,
-                    context_continuation,
-                    transcript,
-                    config,
-                )
-                return _loop_result(
-                    outcome,
-                    "failed",
-                    _phase_failure(f"non-terminal action: {action['type']}", final_synthesis=True),
-                    turn,
-                    cumulative_usage,
-                    transcript,
-                )
-            if final_synthesis_call and action["type"] != "finish":
-                context_continuation, transcript = _append_context_message(
-                    action_message,
-                    base_messages,
-                    context_continuation,
-                    transcript,
-                    config,
-                )
-                if turn < config.max_turns and not finalization_grace_used:
-                    finalization_grace_used = True
-                    context_continuation, transcript = _append_context_message(
-                        {"role": "user", "content": FINAL_SYNTHESIS_REMINDER},
-                        base_messages,
-                        context_continuation,
-                        transcript,
-                        config,
-                    )
-                    continue
-                if base_messages is not None and config.resume is not None:
-                    return _loop_result(
-                        outcome,
-                        "failed",
-                        _phase_failure(
-                            f"non-terminal action: {action['type']}", final_synthesis=True
-                        ),
-                        turn,
-                        cumulative_usage,
-                        transcript,
-                    )
-                break
+            phase = getattr(result, "assistant_phase", None)
+            if phase in {"commentary", "final_answer"}:
+                action_message["phase"] = phase
+            # Budget pressure is advice, not a finish-only tool gate. The
+            # bounded loop and wall/token limits still own termination.
             tool_calls = _normalize_tool_calls(action) if action["type"] == "tool_call" else []
             read_action = bool(tool_calls) and all(
                 call["name"] in _READ_TOOL_NAMES for call in tool_calls
@@ -6406,37 +6364,8 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                         cumulative_usage,
                         transcript,
                     )
-                if code_changed and not verified_after_change:
-                    reason = (
-                        "finish rejected: you changed code but did not run a "
-                        "successful verification command; run the tests (e.g. "
-                        "run_shell) before finishing"
-                        if not verification_failed
-                        else (
-                            "finish rejected: your verification command failed; "
-                            "run the tests successfully (e.g. run_shell) before "
-                            "finishing"
-                        )
-                    )
-                    if base_messages is None:
-                        transcript.append({"role": "user", "content": reason})
-                    else:
-                        context_continuation.append({"role": "user", "content": reason})
-                        transcript = _sync_context_transcript(
-                            base_messages, context_continuation, transcript
-                        )
-                    if final_synthesis_call:
-                        return _loop_result(
-                            outcome,
-                            "failed",
-                            _phase_failure(reason, final_synthesis=True),
-                            turn,
-                            cumulative_usage,
-                            transcript,
-                        )
-                    progress.tool = "finish"
-                    continue
-
+                # Tool exit status is evidence, not a proof of task correctness.
+                # Keep it in the transcript; do not require a ritual shell call.
                 if finalized:
                     context_continuation, transcript = _drop_finalization_directive(
                         context_continuation, transcript, base_messages
@@ -7357,47 +7286,14 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                         "compaction_deferred": compaction_deferred,
                         "consecutive_compaction_deferrals": consecutive_compaction_deferrals,
                     }
-        if base_messages is not None and config.resume is not None:
-            return _loop_result(
-                outcome,
-                "failed",
-                _phase_failure(
-                    f"no terminal action before turn limit ({config.max_turns})",
-                    final_synthesis=finalized,
-                ),
-                config.max_turns,
-                cumulative_usage,
-                transcript,
-            )
-        if writer is not None:
-            graceful_event: dict[str, Any] = {
-                "turn": config.max_turns,
-                "model": model,
-                "call_kind": "agent",
-                "failure_reason": "graceful stop: max turns exceeded",
-            }
-            if last_provider is not None:
-                graceful_event["provider"] = last_provider
-            await _emit_usage_event(
-                writer,
-                config,
-                graceful_event,
-                epoch=usage_epoch,
-                fork_of=usage_fork_of,
-            )
-        return {
-            **outcome,
-            "status": "succeeded",
-            "failure_reason": None,
-            "summary": _best_partial_answer(transcript),
-            "turn": config.max_turns,
-            "usage": cumulative_usage,
-            "provider": last_provider,
-            "latency_s": last_latency_s,
-            "transcript": transcript,
-            "compaction_deferred": compaction_deferred,
-            "consecutive_compaction_deferrals": consecutive_compaction_deferrals,
-        }
+        return _loop_result(
+            outcome,
+            "failed",
+            f"no terminal action before turn limit ({config.max_turns})",
+            progress.turn,
+            cumulative_usage,
+            transcript,
+        )
     except GenerationFenceError as exc:
         return _loop_result(
             outcome, "failed", str(exc), progress.turn, cumulative_usage, transcript

@@ -823,6 +823,8 @@ class CallResult:
     provider_cache_hit: bool | None = None
     quota_windows: tuple[dict[str, Any], ...] | None = None
     fell_back_from: str | None = None
+    assistant_phase: str | None = None
+    assistant_messages: tuple[dict[str, str], ...] = ()
 
 
 class DiffundoError(Exception):
@@ -1290,6 +1292,19 @@ class _CodexRawResponse(_RawResponse):
         try:
             usage = _codex_usage(self.payload)
             response = self.payload.get("response")
+            answer = _codex_answer(self.payload)
+            phase = answer.get("phase") if answer is not None else None
+            messages = tuple(
+                {
+                    "content": "".join(
+                        part.get("text", "") for part in item.get("content", [])
+                        if isinstance(part, dict) and part.get("type") == "output_text"
+                    ),
+                    **({"phase": item["phase"]} if "phase" in item else {}),
+                }
+                for item in (response.get("output", []) if isinstance(response, dict) else [])
+                if isinstance(item, dict) and item.get("type") == "message"
+            )
             model = provider.model
             if isinstance(response, dict) and isinstance(response.get("model"), str):
                 model = response["model"]
@@ -1298,6 +1313,8 @@ class _CodexRawResponse(_RawResponse):
                 model=model,
                 tier=provider.tier,
                 content=self.text,
+                assistant_phase=phase if phase in {"commentary", "final_answer"} else None,
+                assistant_messages=messages,
                 latency_s=self.latency_s,
                 usage=usage,
                 estimated_cost_usd=_estimate_cost(provider, usage),
@@ -1660,7 +1677,10 @@ def _codex_input_item(message: Mapping[str, Any]) -> dict[str, Any]:
                 parts.append(dict(part))
     else:
         parts = []
-    return {"role": role, "content": parts}
+    item = {"role": role, "content": parts}
+    if role == "assistant" and message.get("phase") in {"commentary", "final_answer"}:
+        item["phase"] = message["phase"]
+    return item
 
 
 def _codex_tools(tools: Any) -> list[dict[str, Any]]:
@@ -1784,6 +1804,15 @@ def _codex_stream_error(
     )
 
 
+def _codex_answer(payload: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Select the answer item, not a concatenation of commentary and answer."""
+    response = payload.get("response", {})
+    output = response.get("output", []) if isinstance(response, dict) else []
+    messages = [item for item in output if isinstance(item, dict) and item.get("type") == "message"]
+    final = [item for item in messages if item.get("phase") == "final_answer"]
+    return (final or messages)[-1] if messages else None
+
+
 def _parse_codex_sse(
     provider: ProviderConfig, stream: str, access_token: str
 ) -> tuple[dict[str, Any], str, ProviderError | None]:
@@ -1795,7 +1824,8 @@ def _parse_codex_sse(
     classified ``ProviderError``; a stream that ends without completion is
     malformed.
     """
-    text_parts: list[str] = []
+    text_parts: dict[str, list[str]] = {}
+    output_items: dict[str, dict[str, Any]] = {}
     completed: dict[str, Any] | None = None
     stream_error: ProviderError | None = None
     for line in stream.splitlines():
@@ -1814,7 +1844,13 @@ def _parse_codex_sse(
         if event_type == "response.output_text.delta":
             delta = event.get("delta")
             if isinstance(delta, str):
-                text_parts.append(delta)
+                key = str(event.get("item_id", event.get("output_index", 0)))
+                text_parts.setdefault(key, []).append(delta)
+        elif event_type in {"response.output_item.added", "response.output_item.done"}:
+            item = event.get("item")
+            if isinstance(item, dict) and item.get("type") == "message":
+                key = str(item.get("id", event.get("output_index", 0)))
+                output_items[key] = item
         elif event_type == "response.completed":
             completed = event
         elif event_type == "error":
@@ -1829,7 +1865,9 @@ def _parse_codex_sse(
                     stream_error = stream_error or _codex_stream_error(
                         provider, error, access_token
                     )
-    text = "".join(text_parts)
+    # A response can contain several assistant messages. Joining across item
+    # boundaries turns separate commentary/actions into malformed JSON.
+    text = "".join(next(reversed(text_parts.values()), []))
     if stream_error is not None:
         return {}, text, stream_error
     if completed is None:
@@ -1841,6 +1879,22 @@ def _parse_codex_sse(
                 ProviderOutcome.ERROR,
                 "malformed codex stream: no response.completed event",
             ),
+        )
+    response = completed.get("response")
+    if isinstance(response, dict) and not response.get("output") and output_items:
+        response["output"] = [
+            item if item.get("content") else {
+                **item, "content": [{
+                    "type": "output_text", "text": "".join(text_parts.get(key, [])),
+                }],
+            }
+            for key, item in output_items.items()
+        ]
+    answer = _codex_answer(completed)
+    if answer is not None:
+        text = "".join(
+            part.get("text", "") for part in answer.get("content", [])
+            if isinstance(part, dict) and part.get("type") == "output_text"
         )
     return completed, text, None
 
@@ -2024,6 +2078,12 @@ class _ChatCompletionsTransport:
             )
         url = f"{provider.base_url.rstrip('/')}/chat/completions"
         body = {**prompt, "model": provider.model}
+        if isinstance(body.get("messages"), list):
+            body["messages"] = [
+                {key: value for key, value in message.items() if key != "phase"}
+                if isinstance(message, dict) else message
+                for message in body["messages"]
+            ]
         if provider.supports_native_tools and isinstance(body.get("tools"), list):
             # Internal tool schemas carry {name, description, parameters}; the
             # chat-completions wire format requires the function wrapper. The

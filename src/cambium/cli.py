@@ -532,7 +532,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "or report an extracted dataset."
         ),
     )
-    optimize_command.add_argument("module_name", metavar="MODULE|extract|stats|eval")
+    optimize_command.add_argument("module_name", metavar="MODULE|prompts|extract|stats|eval")
     optimize_command.add_argument("source", nargs="?", type=Path, metavar="PATH")
     optimize_command.add_argument(
         "--optimizer", choices=("zero", "bootstrap", "gepa"), default="zero"
@@ -541,6 +541,27 @@ def _build_parser() -> argparse.ArgumentParser:
     optimize_command.add_argument("--seed", type=int, default=0)
     optimize_command.add_argument("--tier", default="fast")
     optimize_command.add_argument("--dry-run", action="store_true")
+    optimize_command.add_argument("--component", choices=("coding", "summary"), default="coding")
+    optimize_command.add_argument("--max-evals", type=int, default=12, help="GEPA rollout budget")
+    optimize_command.add_argument(
+        "--max-calls", type=int, default=200, help="total experiment provider calls",
+    )
+    optimize_command.add_argument(
+        "--max-tokens", type=int, default=500000, help="total experiment reported tokens",
+    )
+    optimize_command.add_argument("--max-turns", type=int, default=12, help="rollout turns")
+    optimize_command.add_argument(
+        "--max-wall-s", type=float, default=300, help="rollout wall budget",
+    )
+    optimize_command.add_argument("--max-workers", type=int, default=3, help="rollout worker limit")
+    optimize_command.add_argument("--provider", help="primary provider; children can spread")
+    optimize_command.add_argument("--reflection-provider", help="GEPA reflection provider")
+    optimize_command.add_argument(
+        "--case", action="append", default=[], help="case id (repeatable)",
+    )
+    optimize_command.add_argument(
+        "--no-deploy", action="store_true", help="save candidate without replacing active prompt",
+    )
     candidate_source = optimize_command.add_mutually_exclusive_group()
     candidate_source.add_argument(
         "--include-transcript-candidates",
@@ -1202,6 +1223,14 @@ def _run_quota(args: argparse.Namespace) -> int:
 
 
 def _run_optimize(args: argparse.Namespace) -> int:
+    if args.module_name == "prompts":
+        from . import prompt_optimize
+
+        try:
+            return prompt_optimize.run(args)
+        except (OSError, ValueError) as exc:
+            print(f"cambium optimize prompts: {exc}", file=sys.stderr)
+            return 2
     if args.module_name == "extract":
         from . import opencode
 

@@ -1,6 +1,6 @@
 """Pure policy types for recursive context branches.
 
-Model-originated child proposals must name two orthogonal properties:
+Child proposals resolve two orthogonal properties before admission:
 
 ``context_mode``
     Which parent context representation seeds the child.
@@ -11,8 +11,8 @@ Model-originated child proposals must name two orthogonal properties:
 
 The supervisor still accepts an undeclared policy from harness-originated
 ``proposed_children`` fixtures. That internal automatic-compatibility path is
-represented by ``None`` and is deliberately kept out of the model tool
-contract. Model boundaries must call :func:`require_child_policy`.
+represented by ``None``. Model calls use :func:`complete_child_policy`: one
+blocking child defaults to trunk/inherit; independent batches to semantic/spread.
 """
 
 from __future__ import annotations
@@ -87,7 +87,20 @@ def require_child_policy(spec: Mapping[str, Any]) -> ChildPolicy:
     return policy
 
 
+def complete_child_policy(spec: Mapping[str, Any], *, siblings: int = 1) -> dict[str, Any]:
+    """Resolve omitted model policy before recording the actual proposal."""
+    if not isinstance(spec, Mapping):
+        raise ChildPolicyError("child spec must be an object")
+    resolved = dict(spec)
+    mode = "semantic" if siblings > 1 or spec.get("placement") == "spread" else "trunk"
+    resolved.setdefault("context_mode", mode)
+    resolved.setdefault("placement", "inherit" if resolved["context_mode"] == "trunk" else "spread")
+    require_child_policy(resolved)
+    return resolved
+
+
 __all__ = [
+    "complete_child_policy",
     "ChildPolicy",
     "ChildPolicyError",
     "ContextMode",

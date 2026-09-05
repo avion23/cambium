@@ -374,6 +374,8 @@ class InteractiveSession:
         # construct ``InteractiveSession(OneShotConfig())`` directly (without
         # going through the CLI), and those turns must still receive the
         # throughput-aware default instead of the one-shot fallback.
+        from .prompts import load_policy, validate_policy
+
         self._base_config = replace(config, interactive=True)
         self.repo = oneshot.resolve_repo(config.repo)
         self._reconnected = False
@@ -403,6 +405,11 @@ class InteractiveSession:
         self._serving_turn: int | None = None
         self._lock_acquired = False
         self._load_manifest()
+        selected = self._base_config.prompt_policy
+        self._base_config = replace(
+            self._base_config,
+            prompt_policy=validate_policy(selected) if selected is not None else load_policy(),
+        )
         self._load_durable_head()
         self._reconcile_provider_preference()
 
@@ -636,6 +643,7 @@ class InteractiveSession:
             "turn": self._turn,
             "branch_generation": self._branch_generation,
             "branch_start_turn": self._branch_start_turn,
+            "prompt_policy": self._base_config.prompt_policy,
             "seed": seed,
             "provider_preference": self._provider_preference,
             "model_preference": self._model_preference,
@@ -697,6 +705,12 @@ class InteractiveSession:
         self._turn = turn
         self._branch_generation = generation
         self._branch_start_turn = branch_start
+        if "prompt_policy" in document:
+            from .prompts import validate_policy
+
+            self._base_config = replace(
+                self._base_config, prompt_policy=validate_policy(document["prompt_policy"])
+            )
         provider_preference = document.get("provider_preference")
         if provider_preference is not None and (
             not isinstance(provider_preference, str) or not provider_preference.strip()
@@ -798,6 +812,9 @@ class InteractiveSession:
 
     def reset(self) -> None:
         """Start a fresh semantic branch while retaining old turn artifacts."""
+        from .prompts import load_policy
+
+        self._base_config = replace(self._base_config, prompt_policy=load_policy())
         self._seed = None
         self._pending_seed = None
         self._last_epoch = 0

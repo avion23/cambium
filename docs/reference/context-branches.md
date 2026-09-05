@@ -22,7 +22,12 @@
 }
 ```
 
-Both policy fields are required in model-originated calls.
+Policy fields are optional. One delegate defaults to `trunk + inherit`; several
+in one action batch default to `semantic + spread`. Explicit semantic/fresh
+context defaults to spread; explicit spread defaults to semantic context.
+The worker records the resolved policy before admission. The supervisor derives
+repo, worktree, branch and inherited execution settings. See
+[automatic delegation](../architecture/context-branches.md).
 
 | `context_mode` | Meaning |
 | --- | --- |

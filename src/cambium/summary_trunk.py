@@ -162,15 +162,21 @@ def _canonical_json_bytes(value: Any) -> bytes:
 
 
 def _copy_message(value: Any, location: str) -> dict[str, str]:
-    if not isinstance(value, Mapping) or set(value) != {"role", "content"}:
-        raise SummaryTrunkError(f"{location} must have exactly role/content")
+    if not isinstance(value, Mapping) or set(value) not in (
+        {"role", "content"}, {"role", "content", "phase"},
+    ):
+        raise SummaryTrunkError(f"{location} must have role/content and optional phase")
     role = value.get("role")
     content = value.get("content")
     if role not in {"system", "user", "assistant", "tool"}:
         raise SummaryTrunkError(f"{location}.role is invalid")
     if not isinstance(content, str):
         raise SummaryTrunkError(f"{location}.content must be a string")
-    return {"role": role, "content": content}
+    if "phase" in value and (
+        role != "assistant" or value["phase"] not in {"commentary", "final_answer"}
+    ):
+        raise SummaryTrunkError(f"{location}.phase is invalid")
+    return dict(value)
 
 
 def raw_tail_sha256(messages: Sequence[Mapping[str, Any]]) -> str:

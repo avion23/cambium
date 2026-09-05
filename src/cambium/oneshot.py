@@ -170,6 +170,7 @@ class OneShotConfig:
     auto: bool | None = field(default=None)
     # Cache-first context reuse is enabled for operator-facing one-shot runs.
     context_reuse: bool = True
+    prompt_policy: Mapping[str, str] | None = None
 
     def __post_init__(self) -> None:
         if self.auto:
@@ -1015,6 +1016,8 @@ def build_plan(
         "routing_mode": config.routing_mode.value,
         "session_mode": config.session_mode.value,
     }
+    if config.prompt_policy is not None:
+        spec["prompt_policy"] = dict(config.prompt_policy)
     if config.authorized_providers:
         spec["authorized_providers"] = list(config.authorized_providers)
     if config.assigned_provider is not None:

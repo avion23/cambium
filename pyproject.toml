@@ -14,6 +14,9 @@ dependencies = []
 cambium = "cambium.cli:main"
 cambium-monitor = "cambium.monitor:main"
 
+[tool.setuptools.package-data]
+cambium = ["benchmarks/*.jsonl"]
+
 [project.optional-dependencies]
 dspy = ["dspy>=3.3.0,<3.4"]
 tui = ["rich>=14.3,<16"]

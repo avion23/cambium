@@ -230,10 +230,11 @@ def test_summary_flush_keeps_head_and_appends_entry_at_head_length(
             "child_results_truncated": False,
             "workspace_changed": False,
         },
-        max_turns=3,
+        max_turns=8,
     )
     plan = '{"type":"plan","steps":["continue"]}'
-    router = _ScriptedRouter([plan, plan])
+    finish = '{"type":"finish","summary":"fold inspected","objective_met":false}'
+    router = _ScriptedRouter([plan, finish])
     writer = _FakeWriter()
 
     outcome = asyncio.run(_drive_loop(config, worktree, router, writer))
@@ -308,11 +309,11 @@ def test_summary_flush_appends_second_entry_after_raw_tail_crosses_threshold(
             "child_results_truncated": False,
             "workspace_changed": False,
         },
-        max_turns=3,
+        max_turns=8,
     )
     read_call = '{"type":"tool_call","name":"read_batch","arguments":{"paths":["alpha.txt"]}}'
-    plan = '{"type":"plan","steps":["continue"]}'
-    router = _ScriptedRouter([read_call, plan])
+    finish = '{"type":"finish","summary":"folds inspected","objective_met":false}'
+    router = _ScriptedRouter([read_call, finish])
     writer = _FakeWriter()
 
     outcome = asyncio.run(_drive_loop(config, worktree, router, writer))

@@ -28,10 +28,12 @@ estimated cost. Known provider windows appear under **QUOTA** when space allows.
 Resource rows retain space in a short full-width terminal; omitted detail points
 to `/agents`, `/context`, or `/quota`.
 
-While an agent is active, selected-run detail keeps a stable row allocation so
-activity/tool changes do not make context jump around. Terminal states collapse
-the empty live-detail rows to one status line. Conversation history and narrow
-layouts must remain usable without color or the rail.
+Each full-width lane shows provider/model and one compact activity/status row.
+A suspended parent says `waiting for children` and becomes active on resume.
+The rail does not repeat streamed response text or reserve empty phase/tail/tool/
+duration rows. CAST shows epoch, semantic-trunk estimate and raw-tail estimate;
+byte counts and checkpoint paths are available through `/context`. Conversation
+history and narrow layouts remain usable without color or the rail.
 
 The output rate is generated output divided by call wall time, not total
 prompt-plus-output tokens. Missing output counts are unknown. Zero estimated

@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from .auth import scrub_environment
-from .child_policy import ChildPolicyError, require_child_policy
+from .child_policy import ChildPolicyError
 from .lint_diag import LintDiag
 from .schemas import TOOL_SCHEMAS, validate_tool_call
 from .tasktree import TaskKind
@@ -854,7 +854,7 @@ async def _delegate(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
     and spawn.
     """
     child_task_id = args["child_task_id"]
-    kind = args["kind"]
+    kind = args.get("kind", "feature")
     if kind not in _ALLOWED_TASK_KINDS:
         return _Outcome(
             ok=False,
@@ -862,8 +862,10 @@ async def _delegate(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
                 f"validation failed: unknown task kind {kind} (allowed: {_ALLOWED_TASK_KINDS_TEXT})"
             ),
         )
+    from .child_policy import complete_child_policy
+
     try:
-        require_child_policy(args["spec"])
+        complete_child_policy(args["spec"])
     except ChildPolicyError as exc:
         return _Outcome(ok=False, error=f"validation failed: {exc}")
     return _Outcome(

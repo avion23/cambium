@@ -5,7 +5,6 @@ from types import SimpleNamespace
 from typing import Any
 
 from cambium.supervisor import (
-    DEFAULT_MAX_TURNS,
     DEFAULT_WALL_BUDGET_S,
     _child_spec,
     _prepare_child_budget,
@@ -139,7 +138,7 @@ def test_child_budget_is_clamped_at_proposal_and_forwarded_to_spawn_config(tmp_p
     assert run_payload["max_wall_s"] == 100.0
 
 
-def test_absent_child_budget_keeps_global_inheritance(tmp_path, monkeypatch) -> None:
+def test_absent_child_budget_inherits_parent_limits(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("CAMBIUM_WALL_BUDGET_S", raising=False)
     session_dir = tmp_path / "session"
     parent = _parent(session_dir, tmp_path / "repo")
@@ -160,9 +159,9 @@ def test_absent_child_budget_keeps_global_inheritance(tmp_path, monkeypatch) -> 
     run_payload = runtime._run_payload(child_spec, DEFAULT_WALL_BUDGET_S, 1)
 
     assert decision is None
-    assert "max_turns" not in child_spec
-    assert "max_wall_s" not in child_spec
-    assert init["max_turns"] == DEFAULT_MAX_TURNS
+    assert child_spec["max_turns"] == parent["max_turns"]
+    assert child_spec["max_wall_s"] == parent["max_wall_s"]
+    assert init["max_turns"] == parent["max_turns"]
     assert init["budget"]["max_wall_s"] == DEFAULT_WALL_BUDGET_S
-    assert run_payload["max_turns"] == DEFAULT_MAX_TURNS
+    assert run_payload["max_turns"] == parent["max_turns"]
     assert run_payload["max_wall_s"] == DEFAULT_WALL_BUDGET_S

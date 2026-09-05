@@ -39,7 +39,7 @@ The supervisor owns these transitions and their ordering.
 | `code_index.py`, `lsp_query.py` | Bounded source scans and optional configured LSP queries |
 | `observability.py`, `tui.py`, `tui_screen.py` | Incremental operator projection, input handling and rendering |
 | `prompts.py` | Versioned coding and summary instructions |
-| `optimize.py`, `modules/*/dspy_program.py` | Offline DSPy experiments, not the worker's prompt loader |
+| `optimize.py`, `prompt_optimize.py`, `benchmark.py` | Offline DSPy experiments, real rollouts and automatic policy replacement |
 
 Paths in this table are relative to `src/cambium/`. Large ownership modules,
 especially worker and supervisor, still contain too much policy. Extract only a
@@ -55,7 +55,19 @@ repo_query   branch_history
 ```
 
 Permissions still determine which effects a worker may perform. Navigation and
-history are read-only and can share the independent-read batch path.
+history are read-only and can share the independent-read batch path. Tool calls
+can use direct `name`/`arguments` or a `calls` batch without a redundant type tag;
+actual tool arguments still follow their schema.
+
+The model chooses delegation in its ordinary action call. Omitted child policy
+and workspace fields are filled by the worker/supervisor; see
+[automatic delegation](context-branches.md). No separate classifier runs first.
+
+`prompts.py` loads the deployed coding/summary policies for new sessions.
+Interactive sessions pin that text, so replacement does not rewrite a live
+CAST prefix. [Optimization](optimization.md) describes GEPA and deployment.
+Budget pressure does not disable tools, and a successful shell command is not a
+universal completion certificate. A run without a terminal verdict is incomplete.
 
 `repo_query` exposes the existing tree/search/symbol/reference/window scans and
 optional LSP adapter. The portable reference scan is lexical, not a semantic

@@ -117,7 +117,7 @@ def test_completed_rail_does_not_reserve_empty_live_detail_rows() -> None:
     ])
     rows = _rail_rows(snapshot, 32, 24)
     assert all(line.strip() for _, line in rows)
-    assert any("status succeeded" in line for _, line in rows)
+    assert any(line.strip() == "succeeded" for _, line in rows)
 
 
 def test_renderer_does_not_read_another_threads_native_editor(monkeypatch) -> None:

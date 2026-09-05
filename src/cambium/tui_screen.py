@@ -523,7 +523,7 @@ def _stream_update(
         return None
     data = _event_data(record)
     if kind == "result":
-        if data.get("status") in _FAILURE_STATUSES:
+        if data.get("status") in _FAILURE_STATUSES or data.get("status") == "suspended":
             return None
         text = _result_text(data)
         if text is None:
@@ -1163,7 +1163,9 @@ class Transcript:
             active_bytes = data.get("active_context_bytes")
             if type(active_bytes) is int and active_bytes >= 0:
                 self._live_bytes = max(self._live_bytes, active_bytes)
-        self._live_final = self._live_final or kind == "result"
+        self._live_final = self._live_final or (
+            kind == "result" and data.get("status") != "suspended"
+        )
         self._live_revision += 1
 
     def _set_live_result(self, text: str | None) -> None:
@@ -3037,6 +3039,7 @@ _RAIL_FULL_WIDTH = 32
 _RAIL_COMPACT_WIDTH = 6
 _RAIL_DETAIL_MIN_WIDTH = 24
 _RAIL_STATE_GLYPHS = {
+    "suspended": "Ⅱ",
     "active": "●",
     "queued": "○",
     "admitted": "○",
@@ -3293,101 +3296,32 @@ def _rail_selected_agent(snapshot: Any, agents: tuple[Any, ...]) -> Any | None:
     )
 
 
-def _rail_non_negative(value: Any) -> float | None:
-    if type(value) not in (int, float) or not math.isfinite(float(value)) or value < 0:
-        return None
-    return float(value)
-
-
 def _rail_detail_rows(
     agent: Any,
     width: int,
     *,
     activity_line: str = "",
 ) -> list[tuple[str, str]]:
-    """Render the selected run's live details as bounded child rows."""
-    panel_width = max(1, width)
-    if panel_width < _RAIL_DETAIL_MIN_WIDTH:
+    """Two useful rows per lane; streamed text already has a live window."""
+    if width < _RAIL_DETAIL_MIN_WIDTH:
         return []
-    phase_match = _ACTIVITY_PHASE_RE.match(
-        sanitize_terminal_text(activity_line, single_line=True).strip()
-    )
-    phase = getattr(agent, "phase", None)
-    phase = _side_clean(phase).strip().casefold().replace("_", "-") if phase else ""
-    if phase not in _ACTIVITY_PHASE_GLYPHS:
-        phase = phase_match.group(1).casefold() if phase_match is not None else ""
-    agent_state = _side_clean(getattr(agent, "state", "")).strip().casefold()
-    if agent_state in {"succeeded", "failed", "cancelled", "exited", "rejected"}:
-        return [_side_row(agent_state, f"   status {agent_state}", panel_width)]
-    if phase == "waiting" and agent_state in {"starting", "active", "merging"}:
-        phase = "thinking"
-    tail = _activity_tail(getattr(agent, "tail", None))
-    if not tail and phase_match is not None:
-        tail = _activity_tail(phase_match.group(3)) if phase != "waiting" else ""
-
-    duration = next(
-        (
-            number
-            for key in ("duration_s", "elapsed_s", "turn_duration_s", "duration")
-            if (number := _rail_non_negative(getattr(agent, key, None))) is not None
-        ),
-        None,
-    )
-    if duration is None and phase_match is not None:
-        duration = max(0.0, _usage_float(phase_match.group(2)))
-
-    tool_value = getattr(agent, "current_tool", None) or getattr(agent, "tool", None)
-    tool = _side_clean(tool_value).strip() if tool_value is not None else ""
-    running = _running_tool(activity_line)
-    if running is not None:
-        tool = running[0]
-    tool_duration_ms = getattr(agent, "tool_duration_ms", None)
-    if tool_duration_ms is None:
-        tool_duration_ms = getattr(agent, "duration_ms", None)
-    tool_duration_ms = _rail_non_negative(tool_duration_ms)
-    if tool_duration_ms is not None and tool_duration_ms <= 0:
-        tool_duration_ms = None
-    tool_ok = getattr(agent, "tool_ok", None)
-    if type(tool_ok) is not bool:
-        tool_ok = None
-
-    status = _side_clean(getattr(agent, "status", None) or getattr(agent, "state", "")).strip()
-    prefix = "   "
-    blank = _side_row("dim", "", panel_width)
+    state = _side_clean(getattr(agent, "state", "unknown"))
     rows: list[tuple[str, str]] = []
-    rows.append(
-        _side_row(
-            "active" if phase else "dim",
-            f"{prefix}phase {_ACTIVITY_PHASE_GLYPHS[phase]} {phase}" if phase else "",
-            panel_width,
-        )
-    )
-    rows.append(_side_row("dim", f"{prefix}tail {tail}" if tail else "", panel_width))
-    if tool:
-        entry = TranscriptEntry(
-            role="tool",
-            text="",
-            tool_name=tool,
-            tool_ok=tool_ok,
-            duration_ms=tool_duration_ms,
-        )
-        rows.append(_side_row("active", prefix + _tool_line(entry), panel_width))
+    if getattr(agent, "provider", None) or getattr(agent, "model", None):
+        rows.append(_side_row("dim", "   " + _agent_model(agent), width))
+    if state == "suspended":
+        detail = "waiting for children"
+    elif state in {"succeeded", "failed", "cancelled", "exited", "rejected"}:
+        detail = state
     else:
-        rows.append(blank)
-    rows.append(
-        _side_row(
-            "dim",
-            f"{prefix}duration {_fmt_secs(duration)}" if duration is not None else "",
-            panel_width,
+        phase = _ACTIVITY_PHASE_RE.match(
+            sanitize_terminal_text(activity_line, single_line=True).strip()
         )
-    )
-    rows.append(
-        _side_row(
-            status.casefold() if status else "dim",
-            f"{prefix}status {status}" if status else "",
-            panel_width,
-        )
-    )
+        tool = getattr(agent, "tool", None)
+        detail = _side_clean(tool) if tool else (phase.group(1) if phase else state)
+        if phase is not None:
+            detail += " · " + _fmt_secs(_usage_float(phase.group(2)))
+    rows.append(_side_row(state, "   " + detail, width))
     return rows
 
 
@@ -3410,10 +3344,13 @@ def _rail_rows(
     selected = _rail_selected_agent(snapshot, agents)
     for agent, lane_row in zip(agents, lane_rows, strict=True):
         lines.append(lane_row)
-        if agent is selected and panel_width >= _RAIL_DETAIL_MIN_WIDTH:
-            lines.extend(_rail_detail_rows(agent, panel_width, activity_line=activity_line))
+        lines.extend(_rail_detail_rows(
+            agent, panel_width, activity_line=activity_line if agent is selected else "",
+        ))
     lines.append(_side_row("heading", " CONTEXT", panel_width))
-    lines.extend(_context_rows(snapshot, panel_width, compact_epoch=True))
+    context_rows = _context_rows(snapshot, panel_width, compact_epoch=True)
+    # Byte counts and checkpoint paths are available through /context.
+    lines.extend(row for index, row in enumerate(context_rows) if index in {0, 1, 3})
     lines.extend(_rail_fold_rows(snapshot, panel_width))
     resources: list[tuple[str, str]] = []
     if capacity >= 8 and (cumulative_line or hasattr(snapshot, "calls")):
