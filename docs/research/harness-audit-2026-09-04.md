@@ -422,3 +422,54 @@ its edit/history continuation used eight calls, 28,199 tokens and zero summaries
 Ruff and whitespace checks passed. GEPA dry-run resolved all eight historical or
 derived cases with automatic deployment enabled; no optimizer search ran and no
 candidate prompt was promoted.
+
+## Operator GEPA run — September 6
+
+The operator then ran `.cambium/gepa-coding-3` with 24 requested metric calls,
+a 600-call limit and a 2,000,000-token experiment limit. It completed 364 calls
+and recorded 2,004,810 provider-reported tokens. `improved=false` and
+`deployed=false`; the retained candidate's coding text was the prior built-in
+policy, so no prompt artifact was promoted.
+
+Both validation cases passed and two held-out cases passed. `corrected-history`
+was cancelled after the global experiment token budget was exhausted; its final
+artifact check still showed the obsolete behavior and its required
+`branch_history`/`inspect_state` trace was absent. This is a search-budget
+failure, not clean evidence that the candidate regressed. Prompt optimization
+now reserves measured call/token/cash capacity for validation plus held-out
+cases and reports a lower `effective_max_evals` when the requested search cannot
+fit. Rollout reports also include user-summary character/line counts so GEPA can
+penalize verbose operator output without rewarding terse incorrect answers.
+
+## Prompt and cockpit follow-up — September 6
+
+The retained GEPA candidate was not copied into runtime because the experiment
+did not pass its final evaluation. The built-in coding protocol was instead
+tightened at the user boundary: finish summaries default to one sentence, omit
+internal tool/command/checkpoint/lint narration, and name checks by outcome. The
+worker keeps a 420-character upper bound. GEPA reflection now flags aggregate
+operator output above roughly 320 characters or three lines per operator turn.
+
+A fresh zero-baseline run of this policy passed both sampled cases:
+
+| Case | Seconds | Calls | Tokens | User summary |
+| --- | ---: | ---: | ---: | ---: |
+| `cambium-self-fix` | 26.777 | 5 | 39,607 | 231 chars / 1 line |
+| `navigation-history` | 19.006 | 8 | 29,604 | 501 chars / 2 lines across 2 turns |
+
+Both used ZAI and made zero semantic-summary calls. This is evidence of concise
+output on two runs, not a population-wide prompt-quality comparison.
+
+The terminal path now publishes the concrete provider/model when each attempt
+starts, so failover is visible before the final usage record. Live state names
+routing, provider wait, thinking, streaming, tools, child wait, cooldown and
+stalls. Cache HIT/MISS is shown only after provider evidence and is cleared when
+a new attempt starts. Internal model-action JSON fragments and duplicate usage
+text are not copied into the live conversation window.
+
+One live CLI trial failed after ZAI repeated the same malformed single-tool batch
+closer three times. The exact historical structure is now normalized by one
+narrow parser rule; arbitrary malformed JSON remains rejected. The focused live
+CLI rerun passed with zero invalid-action logs. The final TUI acceptance also
+passed and its capture showed Codex-to-ZAI fallback, provider-owned thinking and
+streaming phases, cache state, tool activity, and the CAST H/S/R block strip.

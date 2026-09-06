@@ -1056,6 +1056,59 @@ def _read_provider_response(response: Any, provider: str) -> bytes:
     return body
 
 
+def _read_provider_sse(
+    response: Any,
+    provider: str,
+    on_event: Callable[[Mapping[str, Any]], None] | None = None,
+) -> tuple[bytes, tuple[dict[str, Any], ...]]:
+    """Read one bounded SSE body while exposing complete JSON events as they arrive."""
+    body = bytearray()
+    pending = bytearray()
+    events: list[dict[str, Any]] = []
+    reader = getattr(response, "read1", None)
+    if not callable(reader):
+        reader = response.read
+
+    def observe(line: bytes) -> None:
+        if not line.startswith(b"data:"):
+            return
+        data = line[len(b"data:") :].strip()
+        if not data or data == b"[DONE]":
+            return
+        try:
+            value = json.loads(data)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return
+        if not isinstance(value, dict):
+            return
+        events.append(value)
+        if on_event is not None:
+            try:
+                on_event(value)
+            except Exception:
+                pass  # Observability must not turn a valid provider response into failure.
+
+    while True:
+        chunk = cast(bytes, reader(min(16 * 1024, MAX_PROVIDER_RESPONSE_BYTES + 1 - len(body))))
+        if not chunk:
+            break
+        body.extend(chunk)
+        if len(body) > MAX_PROVIDER_RESPONSE_BYTES:
+            raise ProviderError(
+                provider,
+                ProviderOutcome.ERROR,
+                f"response exceeds {MAX_PROVIDER_RESPONSE_BYTES} byte limit",
+            )
+        pending.extend(chunk)
+        while b"\n" in pending:
+            index = pending.index(b"\n")
+            observe(bytes(pending[:index]).rstrip(b"\r"))
+            del pending[: index + 1]
+    if pending:
+        observe(bytes(pending).rstrip(b"\r"))
+    return bytes(body), tuple(events)
+
+
 # --------------------------------------------------------------------------- #
 # Per-provider runtime state
 # --------------------------------------------------------------------------- #
@@ -1928,6 +1981,156 @@ def _parse_codex_sse(
     return completed, text, None
 
 
+def _codex_stream_progress(
+    event: Mapping[str, Any], on_delta: Callable[[str, str], None] | None
+) -> None:
+    if on_delta is None:
+        return
+    event_type = str(event.get("type", "")).casefold().replace("-", "_")
+    delta = event.get("delta")
+    if not isinstance(delta, str) or not delta:
+        return
+    if "reason" in event_type or "think" in event_type:
+        on_delta("thinking", delta)
+    elif "text" in event_type and "delta" in event_type:
+        on_delta("streaming", delta)
+
+
+def _chat_stream_progress(
+    event: Mapping[str, Any], on_delta: Callable[[str, str], None] | None
+) -> None:
+    if on_delta is None:
+        return
+    choices = event.get("choices")
+    if not isinstance(choices, list):
+        return
+    for choice in choices:
+        if not isinstance(choice, Mapping):
+            continue
+        delta = choice.get("delta")
+        if not isinstance(delta, Mapping):
+            continue
+        reasoning = delta.get("reasoning_content", delta.get("reasoning"))
+        if isinstance(reasoning, str) and reasoning:
+            on_delta("thinking", reasoning)
+        content = delta.get("content")
+        if isinstance(content, str) and content:
+            on_delta("streaming", content)
+
+
+def _chat_stream_error(provider: ProviderConfig, error: Mapping[str, Any]) -> ProviderError:
+    outcome = _structured_http_outcome(error)
+    if outcome is None:
+        outcome = _structured_error_outcome(
+            error,
+            policy_outcome=ProviderOutcome.REFUSAL,
+            strict_prompt_flag=True,
+        )
+    return ProviderError(
+        provider.name,
+        outcome or ProviderOutcome.ERROR,
+        f"chat stream error: {_error_message_text(error)[:300] or 'unknown provider error'}",
+    )
+
+
+def _chat_stream_payload(
+    provider: ProviderConfig, events: Sequence[Mapping[str, Any]]
+) -> dict[str, Any]:
+    """Assemble OpenAI-compatible chat chunks into the ordinary response shape."""
+    content: list[str] = []
+    tool_calls: dict[int, dict[str, Any]] = {}
+    usage: dict[str, Any] | None = None
+    model: str | None = None
+    finish_reason: str | None = None
+    refusal: str | None = None
+    saw_choice = False
+
+    for event in events:
+        error = event.get("error")
+        if isinstance(error, Mapping):
+            raise _chat_stream_error(provider, error)
+        if isinstance(event.get("model"), str):
+            model = cast(str, event["model"])
+        if isinstance(event.get("usage"), dict):
+            usage = dict(cast(dict[str, Any], event["usage"]))
+        choices = event.get("choices")
+        if not isinstance(choices, list):
+            continue
+        for choice in choices:
+            if not isinstance(choice, Mapping):
+                continue
+            saw_choice = True
+            if isinstance(choice.get("finish_reason"), str):
+                finish_reason = cast(str, choice["finish_reason"])
+            delta = choice.get("delta")
+            if not isinstance(delta, Mapping):
+                continue
+            piece = delta.get("content")
+            if isinstance(piece, str):
+                content.append(piece)
+            refusal_piece = delta.get("refusal")
+            if isinstance(refusal_piece, str) and refusal_piece:
+                refusal = (refusal or "") + refusal_piece
+            raw_calls = delta.get("tool_calls")
+            if not isinstance(raw_calls, list):
+                continue
+            for position, raw_call in enumerate(raw_calls):
+                if not isinstance(raw_call, Mapping):
+                    continue
+                index = raw_call.get("index")
+                index = index if type(index) is int and index >= 0 else position
+                call = tool_calls.setdefault(
+                    index,
+                    {
+                        "id": raw_call.get("id"),
+                        "type": raw_call.get("type", "function"),
+                        "function": {"name": "", "arguments": ""},
+                    },
+                )
+                if raw_call.get("id"):
+                    call["id"] = raw_call["id"]
+                function = raw_call.get("function")
+                if not isinstance(function, Mapping):
+                    continue
+                name = function.get("name")
+                if isinstance(name, str) and name:
+                    current = str(call["function"].get("name", ""))
+                    call["function"]["name"] = (
+                        name if not current or name.startswith(current) else current + name
+                    )
+                arguments = function.get("arguments")
+                if isinstance(arguments, str):
+                    call["function"]["arguments"] += arguments
+
+    if not saw_choice:
+        raise ProviderError(
+            provider.name,
+            ProviderOutcome.ERROR,
+            "malformed chat stream: no completion choices",
+        )
+    message: dict[str, Any] = {
+        "role": "assistant",
+        "content": "".join(content) if content else (None if tool_calls else ""),
+    }
+    if refusal:
+        message["refusal"] = refusal
+    if tool_calls:
+        message["tool_calls"] = [tool_calls[index] for index in sorted(tool_calls)]
+    payload: dict[str, Any] = {
+        "model": model or provider.model,
+        "choices": [
+            {
+                "index": 0,
+                "message": message,
+                "finish_reason": finish_reason or ("tool_calls" if tool_calls else "stop"),
+            }
+        ],
+    }
+    if usage is not None:
+        payload["usage"] = usage
+    return payload
+
+
 def _codex_config_400(message: str | Mapping[str, Any]) -> bool:
     """True when a codex error body names a model/parameter problem.
 
@@ -2054,6 +2257,7 @@ class _ProviderTransport(TypingProtocol):
         provider: ProviderConfig,
         prompt: dict[str, Any],
         timeout_s: float,
+        on_delta: Callable[[str, str], None] | None = None,
     ) -> _RawResponse: ...
 
     def classify_error(self, status: int, message: str) -> ProviderOutcome | None: ...
@@ -2076,6 +2280,7 @@ class _ChatCompletionsTransport:
         provider: ProviderConfig,
         prompt: dict[str, Any],
         timeout_s: float,
+        on_delta: Callable[[str, str], None] | None = None,
     ) -> _RawResponse:
         # Defensive transport guard: a ProviderConfig constructed without going
         # through the config loader must still never send the Authorization
@@ -2106,7 +2311,12 @@ class _ChatCompletionsTransport:
                 f"env var {provider.api_key_env!r} not set",
             )
         url = f"{provider.base_url.rstrip('/')}/chat/completions"
-        body = {**prompt, "model": provider.model}
+        body = {
+            **prompt,
+            "model": provider.model,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
         if isinstance(body.get("messages"), list):
             body["messages"] = [
                 {key: value for key, value in message.items() if key != "phase"}
@@ -2166,8 +2376,17 @@ class _ChatCompletionsTransport:
         payload: Any = None
         try:
             with opener.open(request, timeout=timeout_s) as response:
-                response_body = _read_provider_response(response, provider.name)
-                payload = json.loads(response_body.decode("utf-8"))
+                content_type = str(response.headers.get("Content-Type", "")).casefold()
+                if "text/event-stream" in content_type:
+                    _body, events = _read_provider_sse(
+                        response,
+                        provider.name,
+                        lambda event: _chat_stream_progress(event, on_delta),
+                    )
+                    payload = _chat_stream_payload(provider, events)
+                else:
+                    response_body = _read_provider_response(response, provider.name)
+                    payload = json.loads(response_body.decode("utf-8"))
         except urllib.error.HTTPError as exc:
             status = exc.code
             try:
@@ -2230,6 +2449,7 @@ class _CodexResponsesTransport:
         provider: ProviderConfig,
         prompt: dict[str, Any],
         timeout_s: float,
+        on_delta: Callable[[str, str], None] | None = None,
     ) -> _RawResponse:
         """Codex-ChatGPT ``/backend-api/codex/responses`` transport (SSE).
 
@@ -2296,7 +2516,12 @@ class _CodexResponsesTransport:
         stream = ""
         try:
             with opener.open(request, timeout=timeout_s) as response:
-                stream = _read_provider_response(response, provider.name).decode("utf-8")
+                body, _events = _read_provider_sse(
+                    response,
+                    provider.name,
+                    lambda event: _codex_stream_progress(event, on_delta),
+                )
+                stream = body.decode("utf-8")
         except urllib.error.HTTPError as exc:
             status = exc.code
             try:
@@ -2488,6 +2713,8 @@ class Diffundo:
         allow_model_substitution: bool = False,
         requirements: Mapping[str, Any] | None = None,
         call_budget_s: float | None = None,
+        on_delta: Callable[[str, str], None] | None = None,
+        on_status: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> CallResult:
         """Ordered cascade over tier-matching providers (arch §9.2).
 
@@ -2557,14 +2784,34 @@ class Diffundo:
             pending = list(candidates)
             while pending:
                 provider = pending.pop(0)
+                if on_status is not None:
+                    on_status(
+                        {
+                            "kind": "provider_attempt",
+                            "provider": provider.name,
+                            "model": provider.model,
+                        }
+                    )
                 try:
                     attempt_deadline = min(
                         deadline,
                         time.monotonic()
                         + _attempt_budget(float(effective_call_budget_s), provider),
                     )
-                    result = await self._attempt(provider, prompt, deadline=attempt_deadline)
+                    result = await self._attempt(
+                        provider, prompt, deadline=attempt_deadline, on_delta=on_delta
+                    )
                 except ProviderError as exc:
+                    if on_status is not None:
+                        on_status(
+                            {
+                                "kind": "provider_failed",
+                                "provider": provider.name,
+                                "model": provider.model,
+                                "outcome": exc.outcome.value,
+                                "retry_after_s": exc.retry_after_s,
+                            }
+                        )
                     if exc.probe_already_in_flight:
                         probe_rejected = True
                         continue
@@ -2615,6 +2862,15 @@ class Diffundo:
                         raise AllProvidersFailed(tried, last_error) from exc
                     continue
                 self._record_provider_success()
+                if on_status is not None:
+                    on_status(
+                        {
+                            "kind": "provider_succeeded",
+                            "provider": result.provider,
+                            "model": result.model,
+                            "provider_cache_hit": result.provider_cache_hit,
+                        }
+                    )
                 if budget_usd is not None and result.estimated_cost_usd > budget_usd:
                     raise CostBudgetExceeded(result.provider, result.estimated_cost_usd, budget_usd)
                 self._primary_provider = provider.name
@@ -2637,6 +2893,8 @@ class Diffundo:
         budget_usd: float | None = None,
         allow_model_substitution: bool = False,
         requirements: Mapping[str, Any] | None = None,
+        on_delta: Callable[[str, str], None] | None = None,
+        on_status: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> CallResult:
         """Run a semantic summary with extra provider response headroom.
 
@@ -2654,6 +2912,8 @@ class Diffundo:
             allow_model_substitution=allow_model_substitution,
             requirements=requirements,
             call_budget_s=self._summary_call_budget_s,
+            on_delta=on_delta,
+            on_status=on_status,
         )
 
     def _all_provider_failure_limit_reached(self) -> bool:
@@ -3163,6 +3423,7 @@ class Diffundo:
         prompt: dict[str, Any],
         *,
         deadline: float | None = None,
+        on_delta: Callable[[str, str], None] | None = None,
     ) -> CallResult:
         policy = provider
         ledger = self._quota_ledger
@@ -3201,7 +3462,9 @@ class Diffundo:
                     "configured subscription quota window is exhausted",
                 )
         try:
-            result = await self._quota_wrapped_attempt(provider, prompt, deadline=deadline)
+            result = await self._quota_wrapped_attempt(
+                provider, prompt, deadline=deadline, on_delta=on_delta
+            )
         except BaseException:
             if reservation is not None and ledger is not None:
                 await asyncio.to_thread(ledger.reconcile, reservation, policy.quota_windows, 0)
@@ -3225,6 +3488,7 @@ class Diffundo:
         prompt: dict[str, Any],
         *,
         deadline: float | None = None,
+        on_delta: Callable[[str, str], None] | None = None,
     ) -> CallResult:
         """One provider attempt: the full retry sequence, then health bookkeeping.
 
@@ -3289,6 +3553,7 @@ class Diffundo:
                             prompt,
                             timeout_s=timeout_s,
                             deadline=deadline,
+                            on_delta=on_delta,
                         )
                         result = raw.to_result(
                             provider,
@@ -3397,8 +3662,11 @@ class Diffundo:
         prompt: dict[str, Any],
         *,
         timeout_s: float,
+        on_delta: Callable[[str, str], None] | None = None,
     ) -> _RawResponse:
-        return await asyncio.to_thread(self._post_sync, provider, prompt, timeout_s)
+        if on_delta is None:
+            return await asyncio.to_thread(self._post_sync, provider, prompt, timeout_s)
+        return await asyncio.to_thread(self._post_sync, provider, prompt, timeout_s, on_delta)
 
     @staticmethod
     def _consume_post_task(task: asyncio.Task[Any]) -> None:
@@ -3423,10 +3691,11 @@ class Diffundo:
         *,
         timeout_s: float,
         deadline: float | None,
+        on_delta: Callable[[str, str], None] | None = None,
     ) -> _RawResponse:
         """Run one threaded HTTP operation under the call's wall deadline."""
         if deadline is None:
-            return await self._post(provider, prompt, timeout_s=timeout_s)
+            return await self._post(provider, prompt, timeout_s=timeout_s, on_delta=on_delta)
         remaining = self._remaining(deadline)
         if remaining is None or remaining <= 0:
             raise ProviderError(
@@ -3435,7 +3704,9 @@ class Diffundo:
                 "call budget exhausted",
                 budget_exhausted=True,
             )
-        post_task = asyncio.create_task(self._post(provider, prompt, timeout_s=timeout_s))
+        post_task = asyncio.create_task(
+            self._post(provider, prompt, timeout_s=timeout_s, on_delta=on_delta)
+        )
         try:
             # Shield the task so wait_for returns at the deadline even though
             # cancellation cannot stop the underlying executor thread.
@@ -3460,9 +3731,16 @@ class Diffundo:
         return result
 
     def _post_sync(
-        self, provider: ProviderConfig, prompt: dict[str, Any], timeout_s: float
+        self,
+        provider: ProviderConfig,
+        prompt: dict[str, Any],
+        timeout_s: float,
+        on_delta: Callable[[str, str], None] | None = None,
     ) -> _RawResponse:
-        return self._transports[provider.protocol].post_sync(self, provider, prompt, timeout_s)
+        transport = self._transports[provider.protocol]
+        if on_delta is None:
+            return transport.post_sync(self, provider, prompt, timeout_s)
+        return transport.post_sync(self, provider, prompt, timeout_s, on_delta)
 
     def _classify_http(
         self,

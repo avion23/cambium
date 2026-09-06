@@ -129,7 +129,6 @@ from enum import IntEnum, StrEnum
 from pathlib import Path
 from typing import Any, TypeGuard, cast
 
-from cambium import diffundo as _diffundo_module
 from cambium.auth import oauth_env_suffix, scrub_environment
 from cambium.branch_state import BranchState, inspect_state
 from cambium.context_policy import CastPolicy
@@ -178,7 +177,6 @@ from cambium.summary_trunk import (
     summary_entries,
     summary_trunk_tokens,
 )
-from cambium.terminal import sanitize_terminal_text
 from cambium.tools import ToolContext, ToolPermissionPolicy, ToolResult, run_tool
 
 SUMMARY_PROTOCOL_LINES = _SUMMARY_PROTOCOL_LINES
@@ -186,12 +184,11 @@ SUMMARY_PROTOCOL_LINES = _SUMMARY_PROTOCOL_LINES
 PROTO = 1
 HEARTBEAT_INTERVAL_S = 1.0
 PHASE_HEARTBEAT_INTERVAL_S = 1.0
-PHASE_TAIL_MAX_CHARS = 120
 TOOL_OUTPUT_DELTA_INTERVAL_S = 0.1
 _HEARTBEAT_DRAIN_TIMEOUT_S = 0.25
 INIT_TIMEOUT_S = 30.0
 IDLE_TIMEOUT_S = 300.0
-MAX_SUMMARY_CHARS = 2_000
+MAX_SUMMARY_CHARS = 420
 # Consecutive non-novel actions (valid plans, tool calls, and
 # invalid/unparseable actions) before the agent loop fails fast.
 MAX_NO_PROGRESS_ACTIONS = 2
@@ -270,8 +267,10 @@ FINAL_SYNTHESIS_HEADROOM_RATIO = 0.1
 FINAL_SYNTHESIS_MIN_HEADROOM_TOKENS = 4_000
 FINAL_SYNTHESIS_DIRECTIVE = (
     "Budget nearly exhausted. Complete the current step and its verification; "
-    "do not start new work or delegate. Then return finish with the result and "
-    "checks performed. Set objective_met=false when the task is incomplete."
+    "do not start new work or delegate. Then return finish. Default the user-facing summary to "
+    "one sentence: outcome plus only a material change, meaningful check, or blocker. Omit tool "
+    "names, commands, hashes, routine paths, lint chatter, and task restatement. Set "
+    "objective_met=false when the task is incomplete."
 )
 
 
@@ -1622,7 +1621,18 @@ def _config_from_run(run: dict[str, Any]) -> AgentConfig:
 class AgentProgress:
     """Current turn/tool/status shared with the heartbeat loop."""
 
-    __slots__ = ("turn", "tool", "status", "phase", "tail", "_phase_lock", "_phase_revision")
+    __slots__ = (
+        "turn",
+        "tool",
+        "status",
+        "phase",
+        "tail",
+        "provider",
+        "model",
+        "provider_cache_hit",
+        "_phase_lock",
+        "_phase_revision",
+    )
 
     def __init__(self) -> None:
         self.turn = 0
@@ -1630,38 +1640,71 @@ class AgentProgress:
         self.status = "working"
         self.phase: str | None = None
         self.tail: str | None = None
+        self.provider: str | None = None
+        self.model: str | None = None
+        self.provider_cache_hit: bool | None = None
         self._phase_lock = threading.Lock()
         self._phase_revision = 0
 
     def begin_provider_call(self) -> None:
-        """Publish the waiting state before a provider request starts."""
-        self._set_phase("waiting", None)
+        """Publish routing before the concrete provider attempt is known."""
+        with self._phase_lock:
+            self.provider = None
+            self.model = None
+            self.provider_cache_hit = None
+            self.phase = "waiting"
+            self.tail = "selecting provider"
+            self._phase_revision += 1
 
     def observe_delta(self, phase: str, fragment: str) -> None:
-        """Publish one sanitized provider reasoning or output-text delta."""
-        tail = _phase_tail(fragment)
-        if phase not in {"thinking", "streaming"} or not tail:
-            return
-        self._set_phase(phase, tail)
+        """Publish provider activity without exposing the internal JSON action stream."""
+        del fragment
+        if phase in {"thinking", "streaming"}:
+            self._set_phase(phase, None)
 
-    def phase_snapshot(self) -> tuple[str | None, str | None, int]:
-        """Return the phase state and revision for the heartbeat publisher."""
+    def observe_provider_status(self, event: Mapping[str, Any]) -> None:
+        """Track the concrete provider attempt without waiting for the final usage event."""
+        kind = event.get("kind")
+        provider = event.get("provider")
+        model = event.get("model")
+        if kind not in {"provider_attempt", "provider_failed", "provider_succeeded"}:
+            return
         with self._phase_lock:
-            return self.phase, self.tail, self._phase_revision
+            if isinstance(provider, str) and provider:
+                self.provider = provider
+            if isinstance(model, str) and model:
+                self.model = model
+            cache_hit = event.get("provider_cache_hit")
+            if type(cache_hit) is bool:
+                self.provider_cache_hit = cache_hit
+            identity = "/".join(part for part in (self.provider, self.model) if part)
+            outcome = event.get("outcome")
+            if kind == "provider_failed" and isinstance(outcome, str) and outcome:
+                self.tail = f"{identity} · {outcome}" if identity else outcome
+            elif identity:
+                self.tail = identity
+            self.phase = "waiting"
+            self._phase_revision += 1
+
+    def phase_snapshot(
+        self,
+    ) -> tuple[str | None, str | None, int, str | None, str | None, bool | None]:
+        """Return provider phase state for the heartbeat publisher."""
+        with self._phase_lock:
+            return (
+                self.phase,
+                self.tail,
+                self._phase_revision,
+                self.provider,
+                self.model,
+                self.provider_cache_hit,
+            )
 
     def _set_phase(self, phase: str, tail: str | None) -> None:
         with self._phase_lock:
             self.phase = phase
             self.tail = tail
             self._phase_revision += 1
-
-
-def _phase_tail(fragment: str) -> str:
-    """Return a safe, single-line, bounded provider delta tail."""
-    clean = sanitize_terminal_text(fragment, single_line=True).strip()
-    if len(clean) <= PHASE_TAIL_MAX_CHARS:
-        return clean
-    return clean[: PHASE_TAIL_MAX_CHARS - 1] + "…"
 
 
 def _delta_phase(value: Any) -> str | None:
@@ -1706,17 +1749,27 @@ def _progress_delta_callback(progress: AgentProgress) -> Callable[..., None]:
     return _on_delta
 
 
-def _delta_callback_keyword(caller: Callable[..., Any]) -> str | None:
+def _progress_status_callback(progress: AgentProgress) -> Callable[[Mapping[str, Any]], None]:
+    return progress.observe_provider_status
+
+
+def _callback_keyword(caller: Callable[..., Any], name: str) -> str | None:
     try:
         parameters = inspect.signature(caller).parameters.values()
     except (TypeError, ValueError):
         return None
     names = {parameter.name for parameter in parameters}
-    for name in ("on_delta", "on_stream_delta", "delta_callback"):
-        if name in names:
-            return name
+    if name in names:
+        return name
     if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters):
-        return "on_delta"
+        return name
+    return None
+
+
+def _delta_callback_keyword(caller: Callable[..., Any]) -> str | None:
+    for name in ("on_delta", "on_stream_delta", "delta_callback"):
+        if keyword := _callback_keyword(caller, name):
+            return keyword
     return None
 
 
@@ -1727,99 +1780,10 @@ async def _call_provider(
     callback_keyword = _delta_callback_keyword(caller)
     if callback_keyword is not None:
         kwargs[callback_keyword] = _progress_delta_callback(progress)
+    status_keyword = _callback_keyword(caller, "on_status")
+    if status_keyword is not None:
+        kwargs[status_keyword] = _progress_status_callback(progress)
     return await caller(*args, **kwargs)
-
-
-def _observe_sse_line(line: bytes, on_delta: Callable[[str, str], None]) -> None:
-    if not line.startswith(b"data:"):
-        return
-    data = line[len(b"data:") :].strip()
-    if not data or data == b"[DONE]":
-        return
-    try:
-        event = json.loads(data)
-    except json.JSONDecodeError:
-        return
-    if not isinstance(event, Mapping):
-        return
-    phase = _delta_phase(event.get("type"))
-    delta = event.get("delta")
-    if phase is not None and isinstance(delta, str):
-        on_delta(phase, delta)
-
-
-def _read_provider_response_with_progress(
-    response: Any, provider: str, on_delta: Callable[[str, str], None]
-) -> bytes:
-    """Read SSE in chunks so Codex deltas can update worker progress live."""
-    limit = _diffundo_module.MAX_PROVIDER_RESPONSE_BYTES
-    body = bytearray()
-    line = bytearray()
-    read_chunk = getattr(response, "read1", None)
-    if not callable(read_chunk):
-        read_chunk = response.read
-    while True:
-        chunk = cast(bytes, read_chunk(min(16 * 1024, limit + 1 - len(body))))
-        if not chunk:
-            break
-        body.extend(chunk)
-        if len(body) > limit:
-            raise _diffundo_module.ProviderError(
-                provider,
-                _diffundo_module.ProviderOutcome.ERROR,
-                f"response exceeds {limit} byte limit",
-            )
-        line.extend(chunk)
-        while b"\n" in line:
-            index = line.index(b"\n")
-            _observe_sse_line(bytes(line[:index]).rstrip(b"\r"), on_delta)
-            del line[: index + 1]
-    if line:
-        _observe_sse_line(bytes(line).rstrip(b"\r"), on_delta)
-    return bytes(body)
-
-
-def _install_codex_progress_observer(router: Any, progress: AgentProgress) -> None:
-    """Observe buffered Codex SSE reads without changing Diffundo's API."""
-    if not isinstance(router, Diffundo):
-        return
-    transports = getattr(router, "_transports", None)
-    if transports is None:
-        return
-    codex_protocol = _diffundo_module.Protocol.CODEX_RESPONSES
-    transport = transports.get(codex_protocol)
-    if transport is None:
-        return
-
-    def _observed_post_sync(
-        router_arg: Any, provider: Any, prompt: dict[str, Any], timeout_s: float
-    ) -> Any:
-        original_reader = _diffundo_module._read_provider_response
-
-        def _read(response: Any, provider_name: str) -> bytes:
-            return _read_provider_response_with_progress(
-                response, provider_name, progress.observe_delta
-            )
-
-        cast(Any, _diffundo_module)._read_provider_response = _read
-        try:
-            return transport.post_sync(router_arg, provider, prompt, timeout_s)
-        finally:
-            _diffundo_module._read_provider_response = original_reader
-
-    class _ObservedCodexTransport:
-        def post_sync(
-            self, router_arg: Any, provider: Any, prompt: dict[str, Any], timeout_s: float
-        ) -> Any:
-            return _observed_post_sync(router_arg, provider, prompt, timeout_s)
-
-        def classify_error(self, status: int, message: str) -> Any:
-            return transport.classify_error(status, message)
-
-    cast(Any, router)._transports = {
-        **transports,
-        codex_protocol: _ObservedCodexTransport(),
-    }
 
 
 def _cap_utf8(text: str, limit: int) -> str:
@@ -1834,6 +1798,19 @@ def _bounded_text(text: str, limit: int) -> str:
     if len(raw) <= limit:
         return text
     return raw[:limit].decode("utf-8", errors="ignore") + "\n... [truncated]"
+
+
+def _user_summary(text: str) -> str:
+    """Keep the operator-facing finish field concise; exact evidence stays in history."""
+    clean = text.strip()
+    raw = clean.encode("utf-8")
+    if len(raw) <= MAX_SUMMARY_CHARS:
+        return clean
+    clipped = raw[: MAX_SUMMARY_CHARS - 3].decode("utf-8", errors="ignore").rstrip()
+    boundary = max(clipped.rfind("\n"), clipped.rfind(". "))
+    if boundary >= max(80, len(clipped) // 2):
+        clipped = clipped[: boundary + 1].rstrip()
+    return clipped + "…"
 
 
 def _safe_task_id(task_id: str) -> str:
@@ -2016,15 +1993,38 @@ _STRICT_ACTION_DECODER = json.JSONDecoder()
 _LENIENT_ACTION_DECODER = json.JSONDecoder(strict=False)
 
 
+def _repair_tool_batch_closer(text: str) -> tuple[Any, int] | None:
+    """Normalize one observed provider typo without guessing action semantics."""
+    if not (
+        text.startswith('{"type":"tool_call","calls":[') or text.startswith('{"calls":[')
+    ) or not text.endswith("}]}]}"):
+        return None
+    repaired = text[:-5] + "}}]}"
+    try:
+        parsed, end = _STRICT_ACTION_DECODER.raw_decode(repaired)
+    except json.JSONDecodeError:
+        return None
+    if (
+        end != len(repaired)
+        or not isinstance(parsed, dict)
+        or not isinstance(parsed.get("calls"), list)
+    ):
+        return None
+    return parsed, len(text)
+
+
 def _decode_action_json(text: str) -> tuple[Any, int]:
-    """Decode one JSON value at the start of ``text``.  When the strict
-    decoder rejects the input only because a string value contains a raw
-    control character, retry with the lenient decoder; every other strictness
-    rule is unchanged."""
+    """Decode one action, tolerating raw controls and one observed batch-closer typo."""
     try:
         return _STRICT_ACTION_DECODER.raw_decode(text)
-    except json.JSONDecodeError:
-        return _LENIENT_ACTION_DECODER.raw_decode(text)
+    except json.JSONDecodeError as strict_error:
+        try:
+            return _LENIENT_ACTION_DECODER.raw_decode(text)
+        except json.JSONDecodeError:
+            repaired = _repair_tool_batch_closer(text)
+            if repaired is not None:
+                return repaired
+            raise strict_error from None
 
 
 def _complete_delegates(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2172,7 +2172,7 @@ def _parse_agent_action(content: str) -> dict[str, Any]:
             raise ValueError("finish summary must be a non-empty string")
         return {
             "type": "finish",
-            "summary": summary,
+            "summary": _user_summary(summary),
             "objective_met": parsed["objective_met"],
         }
     raise ValueError(f"unknown agent action type: {action_type!r}")
@@ -6002,7 +6002,6 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
     last_turn_checkpoint: int | None = None
     provider_compat = provider_compat or {}
     provider_boundaries = provider_boundaries or {}
-    _install_codex_progress_observer(router, progress)
 
     resume = config.resume
     try:
@@ -6992,6 +6991,11 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                             verified_after_change = False
                         batch_results.append((name, arguments, tool_result))
                 else:
+                    progress.tool = (
+                        tool_calls[0]["name"]
+                        if len(tool_calls) == 1
+                        else f"parallel×{len(tool_calls)}"
+                    )
                     with ToolContext(
                         worktree,
                         lint=lint_diag,
@@ -7727,8 +7731,10 @@ async def _heartbeat_loop(
         now = time.monotonic()
         heartbeat_due = now >= next_heartbeat
         phase_due = False
+        provider = model = None
+        cache_hit: bool | None = None
         if progress is not None:
-            phase, tail, revision = progress.phase_snapshot()
+            phase, tail, revision, provider, model, cache_hit = progress.phase_snapshot()
             phase_due = (
                 phase is not None
                 and revision > published_revision
@@ -7758,8 +7764,15 @@ async def _heartbeat_loop(
         }
         if published_phase is not None:
             heartbeat["phase"] = published_phase
+            heartbeat["phase_revision"] = published_revision
             if published_tail:
                 heartbeat["tail"] = published_tail
+        if provider:
+            heartbeat["provider"] = provider
+        if model:
+            heartbeat["model"] = model
+        if type(cache_hit) is bool:
+            heartbeat["provider_cache_hit"] = cache_hit
         write_message(writer, heartbeat)
         try:
             if drain_ok:

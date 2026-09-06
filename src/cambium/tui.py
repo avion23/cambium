@@ -975,7 +975,7 @@ async def _run_interactive(
     capabilities = terminal_capabilities(out)
     cockpit_stream = SynchronizedOutput(out, enabled=capabilities.synchronized_output)
     cockpit = Cockpit(cast(TextIO, cockpit_stream), enabled=not quiet)
-    cockpit.color = capabilities.color_depth > 0
+    cockpit.color = capabilities.color_depth
     live_render_enabled = True
 
     def disable_live_render() -> None:

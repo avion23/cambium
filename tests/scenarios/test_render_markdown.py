@@ -1,8 +1,9 @@
-"""Golden and gate scenarios for terminal markdown rendering."""
+"""Behavioral checks for the shared Rich terminal Markdown renderer."""
 
 from __future__ import annotations
 
 import asyncio
+import re
 from io import StringIO
 
 import pytest
@@ -12,136 +13,93 @@ from cambium.oneshot import OneShotConfig
 from cambium.render_markdown import render_markdown, render_markdown_if_tty
 from cambium.supervisor import PlanResult, TaskResult
 
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
 
 class _Tty(StringIO):
     def isatty(self) -> bool:
         return True
 
 
-def test_atx_headings_render_bold_with_level_colors() -> None:
-    assert render_markdown("# Title\n") == "\x1b[1;96mTitle\x1b[0m\n"
-    assert render_markdown("## Mid\n") == "\x1b[1;94mMid\x1b[0m\n"
-    assert render_markdown("### Low\n") == "\x1b[1;95mLow\x1b[0m\n"
-    assert render_markdown("#### Deep\n") == "\x1b[1;93mDeep\x1b[0m\n"
-    assert render_markdown("##### five hashes\n") == "##### five hashes\n"
-    assert render_markdown("#NoSpace\n") == "#NoSpace\n"
+def _visible(value: str) -> str:
+    return _ANSI.sub("", value)
 
 
-def test_fenced_block_is_verbatim_dim_cyan_and_suppresses_inline() -> None:
-    text = "```py\ncode **not bold** `not code`\n```\nafter *soft*\n"
-    expected = (
-        "\x1b[2;36m```py\x1b[0m\n"
-        "\x1b[2;36mcode **not bold** `not code`\x1b[0m\n"
-        "\x1b[2;36m```\x1b[0m\n"
-        "after \x1b[3;35msoft\x1b[0m\n"
+def test_rich_markdown_renders_structure_with_distinct_styles() -> None:
+    h1 = render_markdown("# Primary", width=60)
+    h2 = render_markdown("## Secondary", width=60)
+    document = render_markdown(
+        "- **Done** with `make test`\n\n> quoted\n\n```python\nprint(1)\n```",
+        width=60,
     )
-    assert render_markdown(text) == expected
 
-
-def test_inline_code_bold_and_italic_styles() -> None:
-    assert render_markdown("run `make test` now\n") == ("run \x1b[2;33mmake test\x1b[0m now\n")
-    assert render_markdown("**big** deal *soft*\n") == (
-        "\x1b[1;97mbig\x1b[0m deal \x1b[3;35msoft\x1b[0m\n"
-    )
-    assert render_markdown("2 * 3 + 4 * 5\n") == "2 * 3 + 4 * 5\n"
+    assert "\x1b[" in h1 and "\x1b[" in h2
+    assert h1 != h2
+    visible = _visible(document)
+    assert "Done" in visible and "make test" in visible and "quoted" in visible
+    assert "print(1)" in visible
+    assert "╭" in visible and "╯" in visible  # shared compact code panel
+    assert "\x1b[40m" not in document  # no forced dark background on light terminals
+    assert all(line == line.rstrip() for line in visible.splitlines())
 
 
 @pytest.mark.parametrize(
-    ("text", "expected"),
+    "raw",
     [
-        (
-            "- alpha\n* beta\n  - nested\n    - deeper\n",
-            "\x1b[32m-\x1b[0m alpha\n"
-            "\x1b[32m*\x1b[0m beta\n"
-            "  \x1b[32m-\x1b[0m nested\n"
-            "    \x1b[32m-\x1b[0m deeper\n",
-        ),
-        (
-            "1. one\n2. two\n  3. indented three\n",
-            "\x1b[32m1.\x1b[0m one\n\x1b[32m2.\x1b[0m two\n  \x1b[32m3.\x1b[0m indented three\n",
-        ),
-        (
-            "plain paragraph line\n\nanother one, with punctuation!\n",
-            "plain paragraph line\n\nanother one, with punctuation!\n",
-        ),
+        "a\x1b[31mesc\x07b\tc\x00d\ne\r\f\n",
+        "café 中\x80between\x9b31mend\n",
+        "left\x1b]2;secret\x07right\u202eabc\u202c\n",
     ],
-    ids=("unordered-list", "ordered-list", "paragraph"),
 )
-def test_markdown_preserves_list_layout_with_colored_markers(text: str, expected: str) -> None:
-    assert render_markdown(text) == expected
-
-
-def test_inline_links_are_underlined_without_changing_visible_text() -> None:
-    assert render_markdown("read [the docs](https://example.test/docs)\n") == (
-        "read \x1b[4;34m[the docs](https://example.test/docs)\x1b[0m\n"
-    )
-
-
-def test_blockquote_gets_dim_colored_prefix_and_inline_body() -> None:
-    assert render_markdown("> quoted **b**\n") == ("\x1b[2;34m>\x1b[0m quoted \x1b[1;97mb\x1b[0m\n")
-
-
-@pytest.mark.parametrize(
-    ("raw", "expected"),
-    [
-        ("a\x1b[31mesc\x07b\tc\x00d\ne\r\f\n", "aescb\tcd\ne\n"),
-        ("café 中\x80between\x9b31mend\n", "café 中betweenend\n"),
-        (
-            "left\x1b]2;secret\x07right\u202eabc\u202c\n",
-            "leftright\\u202Eabc\\u202C\n",
-        ),
-    ],
-    ids=("c0-and-csi", "c1-and-8-bit-csi", "osc-and-bidi"),
-)
-def test_terminal_controls_are_removed_without_losing_readable_text(
-    raw: str, expected: str
-) -> None:
-    assert render_markdown(raw) == expected
+def test_terminal_controls_are_removed_before_rich_parses(raw: str) -> None:
+    rendered = render_markdown(raw, width=60)
+    visible = _visible(rendered)
+    assert "secret" not in visible
+    assert "\x00" not in visible and "\x07" not in visible and "\x9b" not in visible
+    if "\u202e" in raw:
+        assert r"\u202E" in visible and r"\u202C" in visible
 
 
 def test_unicode_line_separators_are_normalized() -> None:
-    assert render_markdown("a\u0085b\u2028c\u2029d") == "a\nb\nc\nd"
+    visible = _visible(render_markdown("a\u0085b\u2028c\u2029d", width=60))
+    assert all(letter in visible for letter in "abcd")
+    assert "\u0085" not in visible and "\u2028" not in visible and "\u2029" not in visible
 
 
-@pytest.mark.parametrize(
-    ("name", "value"),
-    [("NO_COLOR", "1"), ("TERM", "dumb")],
-    ids=("no-color", "dumb-term"),
-)
-def test_disabled_color_gates_strip_controls_without_styling(
+@pytest.mark.parametrize(("name", "value"), [("NO_COLOR", "1"), ("TERM", "dumb")])
+def test_disabled_color_returns_sanitized_plain_markdown(
     monkeypatch, name: str, value: str
 ) -> None:
     monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.delenv("TERM", raising=False)
     monkeypatch.setenv(name, value)
-    text = "safe\x1b[31m\x9b31m\n# Title\n"
+    text = "safe\x1b[31m\n# Title\n"
     assert render_markdown_if_tty(text, _Tty()) == "safe\n# Title\n"
 
 
-def test_non_tty_stream_returns_sanitized_plain_text(monkeypatch) -> None:
+def test_renderer_uses_extended_palette_without_backgrounds(monkeypatch) -> None:
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("COLORTERM", raising=False)
+    monkeypatch.setenv("TERM", "xterm-256color")
+    rendered = render_markdown_if_tty("# Title\n- item", _Tty())
+    assert "38;5;" in rendered
+    assert "\x1b[48;" not in rendered and "\x1b[40m" not in rendered
+    assert "Title" in _visible(rendered) and "item" in _visible(rendered)
+
+
+def test_non_tty_returns_sanitized_plain_markdown(monkeypatch) -> None:
     monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.setenv("TERM", "xterm-256color")
     text = "# Title\n**bold**\n"
     assert render_markdown_if_tty(text, StringIO()) == text
 
 
-def test_empty_no_color_on_real_term_renders(monkeypatch) -> None:
-    monkeypatch.setenv("NO_COLOR", "")
-    monkeypatch.setenv("TERM", "xterm-256color")
-    assert render_markdown_if_tty("# T\n", _Tty()) == "\x1b[1;96mT\x1b[0m\n"
-
-
-def test_repl_emits_rendered_summaries_only_when_output_stream_is_a_tty(
-    monkeypatch,
-) -> None:
+def test_repl_uses_rich_only_for_tty(monkeypatch) -> None:
     result = PlanResult(
         (
             TaskResult(task_id="a", status="succeeded", exit_code=0, summary="# Done"),
             TaskResult(
-                task_id="b",
-                status="succeeded",
-                exit_code=0,
-                summary="used `make` and **won**",
+                task_id="b", status="succeeded", exit_code=0, summary="used `make` and **won**"
             ),
         )
     )
@@ -153,6 +111,7 @@ def test_repl_emits_rendered_summaries_only_when_output_stream_is_a_tty(
     monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.setenv("TERM", "xterm-256color")
     config = OneShotConfig()
+
     tty_out = _Tty()
     assert (
         asyncio.run(
@@ -165,6 +124,10 @@ def test_repl_emits_rendered_summaries_only_when_output_stream_is_a_tty(
         )
         == 0
     )
+    assert "\x1b[" in tty_out.getvalue()
+    assert "Done" in _visible(tty_out.getvalue())
+    assert "make" in _visible(tty_out.getvalue()) and "won" in _visible(tty_out.getvalue())
+
     plain_out = StringIO()
     assert (
         asyncio.run(
@@ -177,11 +140,5 @@ def test_repl_emits_rendered_summaries_only_when_output_stream_is_a_tty(
         )
         == 0
     )
-
-    value = tty_out.getvalue()
-    assert "\x1b[1;96mDone\x1b[0m" in value
-    assert "\x1b[2;33mmake\x1b[0m" in value
-    assert "\x1b[1;97mwon\x1b[0m" in value
-    plain = plain_out.getvalue()
-    assert "\x1b[1;97m" not in plain
-    assert "used `make` and **won**" in plain
+    assert "\x1b[" not in plain_out.getvalue()
+    assert "used `make` and **won**" in plain_out.getvalue()

@@ -23,8 +23,9 @@ uses a full 32-column operator rail. At 80–99 columns it uses a compact lineag
 rail; below that it omits the rail. Terminal height also limits visible rows.
 
 The full rail shows agent/context state and a compact **RESOURCES** block:
-output tokens and end-to-end output rate, input and cached tokens, calls, and
-estimated cost. Known provider windows appear under **QUOTA** when space allows.
+output tokens and end-to-end output rate, cached/input share, the latest
+provider-reported cache `HIT`/`MISS`, calls, and estimated cost. Known provider
+windows appear under **QUOTA** when space allows.
 Resource rows retain space in a short full-width terminal; omitted detail points
 to `/agents`, `/context`, or `/quota`.
 
@@ -35,14 +36,63 @@ explicit omitted count with `/agents`. The duplicate footer usage row is hidden
 by default; `/detail` reveals it without changing the agent state.
 A suspended parent says `waiting for children` and becomes active on resume.
 The rail does not repeat streamed response text or reserve empty phase/tail/tool/
-duration rows. CAST shows epoch, semantic-trunk estimate and raw-tail estimate;
-byte counts and checkpoint paths are available through `/context`. Conversation
-history and narrow layouts remain usable without color or the rail.
+duration rows. CAST includes a proportional block strip:
+
+```text
+H██ S▓▓▓▓▓ R░░
+```
+
+`H` is the stable head, `S` the semantic-only trunk, and `R` the raw tail. The
+bar is a size visualization, not a cache-hit claim. Exact byte counts,
+checkpoint paths, and segment details remain available through `/context`.
+Conversation history and narrow layouts remain usable without color or the rail.
 
 The output rate is generated output divided by call wall time, not total
-prompt-plus-output tokens. Missing output counts are unknown. Zero estimated
-cost is displayed numerically unless an explicit billing classification supports
-a free/subscription label. Neither label describes remaining token quota.
+prompt-plus-output tokens. Missing output counts are unknown. `cache HIT` and
+`cache MISS` come only from provider usage; the aggregate cache percentage is a
+separate token ratio. Zero estimated cost is displayed numerically unless an
+explicit billing classification supports a free/subscription label. Neither
+label describes remaining token quota.
+
+## Live-state vocabulary
+
+Cambium should not collapse all nonterminal time into a spinner. The status row
+names the resource currently producing or blocking progress:
+
+| State | Meaning |
+| --- | --- |
+| `ORCHESTRATING` | local controller work before a provider/tool boundary |
+| `ROUTING` | choosing the next hard-feasible provider lane |
+| `PROVIDER · P/M · waiting` | a concrete provider/model attempt is in flight; no model output yet |
+| `THINKING · P/M` | that provider reports reasoning-phase progress; reasoning text is not shown |
+| `STREAMING · P/M` | provider response tokens are arriving, with output tokens/s; internal action JSON is not shown |
+| `TOOL` | one tool or a parallel read batch is in flight; the row names it and elapsed time |
+| `CHILDREN · waiting` | parent is suspended on child results |
+| `COOLDOWN` | provider capacity/rate limit is delaying the next attempt |
+| `stalled` / `silent` / `no output` | the phase revision or output stopped changing for the stall threshold |
+
+Provider/model identity is published when an attempt starts rather than inferred
+from the eventual result. Fallback therefore changes the live owner row as it
+happens. Cache `HIT`/`MISS` appears only after provider usage establishes it; an
+unknown cache result stays unknown. The worker heartbeat carries a monotonic
+phase revision so active reasoning or response streaming does not look stalled.
+Private reasoning and the model's internal JSON action fragments are not copied
+into the cockpit. Tool output and stream-phase changes reset the progress clock.
+
+## Markdown and color
+
+Rich is a normal Cambium dependency and is the single Markdown parser/theme for
+one-shot/REPL output and the cockpit. The shared renderer uses a no-background
+extended palette when the terminal supports 256 colors and degrades to the
+standard palette or plain text. Headings, links, quotes, inline code, code blocks,
+tables, user/model/tool roles, routing, provider waits, reasoning, streaming,
+children, cache hits/misses, cooldowns and failures have distinct semantic
+styles. Code blocks use compact bordered panels and narrow tables retain the
+width-safe fallback so cells are not silently clipped.
+
+The renderer sanitizes model/provider text before Rich sees it. Cambium keeps
+Markdown in process rather than invoking a pager subprocess: the cockpit must
+retain its own width, scrollback, input draft, focus and live-event ownership.
 
 ## Input and controls
 

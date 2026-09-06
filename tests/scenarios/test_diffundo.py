@@ -20,6 +20,7 @@ and cascade-design contracts:
 from __future__ import annotations
 
 import asyncio
+import json
 import socket
 import threading
 import time
@@ -46,6 +47,13 @@ from cambium.diffundo import (
     prompt_prefix_estimate_tokens,
     validate_prompt_structure,
 )
+
+
+def _sse(*events: dict[str, Any]) -> bytes:
+    return (
+        b"".join(b"data: " + json.dumps(event).encode("utf-8") + b"\n\n" for event in events)
+        + b"data: [DONE]\n\n"
+    )
 
 
 def _tool_call_payload(tool_calls: list[dict[str, Any]]) -> dict[str, Any]:
@@ -144,6 +152,79 @@ def test_selected_provider_controls_native_wire_tools(
         server.close()
 
 
+def test_chat_completions_stream_reasoning_output_and_usage_live() -> None:
+    stream = _sse(
+        {
+            "model": "m-stream",
+            "choices": [{"index": 0, "delta": {"reasoning_content": "consider"}}],
+        },
+        {
+            "model": "m-stream",
+            "choices": [{"index": 0, "delta": {"content": '{"type":"finish",'}}],
+        },
+        {
+            "model": "m-stream",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"content": '"summary":"ok","objective_met":true}'},
+                    "finish_reason": "stop",
+                }
+            ],
+        },
+        {
+            "model": "m-stream",
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+                "prompt_tokens_details": {"cached_tokens": 4},
+            },
+        },
+    )
+    server = FakeServer([(200, stream, 0.0, {"Content-Type": "text/event-stream"})])
+    router = Diffundo((_config("p_stream", server, "K_STREAM", model="m-stream"),))
+    deltas: list[tuple[str, str]] = []
+    statuses: list[dict[str, Any]] = []
+    try:
+        result = asyncio.run(
+            router.call(
+                ProviderTier.FAST,
+                PROMPT,
+                on_delta=lambda phase, text: deltas.append((phase, text)),
+                on_status=lambda event: statuses.append(dict(event)),
+            )
+        )
+        assert result.content == '{"type":"finish","summary":"ok","objective_met":true}'
+        assert result.usage == {
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "total_tokens": 15,
+            "prompt_tokens_details": {"cached_tokens": 4},
+            "cached_tokens": 4,
+        }
+        assert result.provider_cache_hit is True
+        assert deltas == [
+            ("thinking", "consider"),
+            ("streaming", '{"type":"finish",'),
+            ("streaming", '"summary":"ok","objective_met":true}'),
+        ]
+        assert statuses == [
+            {"kind": "provider_attempt", "provider": "p_stream", "model": "m-stream"},
+            {
+                "kind": "provider_succeeded",
+                "provider": "p_stream",
+                "model": "m-stream",
+                "provider_cache_hit": True,
+            },
+        ]
+        assert server.calls[0]["stream"] is True
+        assert server.calls[0]["stream_options"] == {"include_usage": True}
+    finally:
+        server.close()
+
+
 # --------------------------------------------------------------------------- #
 # 1. cascade fallback
 # --------------------------------------------------------------------------- #
@@ -158,8 +239,15 @@ def test_cascade_falls_through_500_to_next_provider() -> None:
             _config("p_good", good, "K_GOOD"),
         )
     )
+    statuses: list[dict[str, Any]] = []
     try:
-        result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        result = asyncio.run(
+            router.call(
+                ProviderTier.FAST,
+                PROMPT,
+                on_status=lambda event: statuses.append(dict(event)),
+            )
+        )
         assert result.provider == "p_good"
         assert result.model == "m-good"
         assert result.content == "from good"
@@ -169,6 +257,12 @@ def test_cascade_falls_through_500_to_next_provider() -> None:
         assert result.request_rate_status == "available"
         assert result.retry_after_s is None
         assert result.account_quota_owner is None
+        assert [(event["kind"], event["provider"]) for event in statuses] == [
+            ("provider_attempt", "p_bad"),
+            ("provider_failed", "p_bad"),
+            ("provider_attempt", "p_good"),
+            ("provider_succeeded", "p_good"),
+        ]
     finally:
         bad.close()
         good.close()

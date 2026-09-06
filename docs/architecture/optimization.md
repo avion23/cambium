@@ -15,8 +15,9 @@ The checker runs against the accepted Git head, not an uncommitted worker tree
 or a model's claim of success. Reports retain changed paths, outcomes, elapsed
 time, calls, reported tokens, estimated cost, child policies and actual serving
 providers. They also distinguish summary requests, malformed actions, failed
-provider attempts, tool failures, output/cache tokens and accepted heads after
-each interactive turn. Execution artifacts remain in each rollout directory.
+provider attempts, tool failures, output/cache tokens, accepted heads after each
+interactive turn, and the character/line count of the final user-facing summary.
+Execution artifacts remain in each rollout directory.
 
 DSPy format is useful at this optimization boundary, not everywhere. Tools,
 Git effects, provider configuration and the normal action protocol stay ordinary
@@ -51,10 +52,24 @@ runtime artifact. These are experiment controls, not prerequisites for normal
 coding or delegation.
 
 GEPA uses `current_best` candidate selection, no candidate merging, and one
-rollout at a time. The experiment budget includes reflection requests and
-reported task usage. Concurrent in-flight requests can finish after a limit is
-observed; these limits are not a provider-enforced account quota. A zero cash
-estimate does not make subscription tokens unlimited.
+rollout at a time. Reflection feedback contains the fully rendered production
+prompt plus a bounded trajectory digest, so the optimizer sees the actual fixed
+protocol around the candidate instead of optimizing an isolated sentence. The
+digest flags malformed/tool failures, timeout-shaped runs, and overlong
+user-facing summaries. The current verbosity signal is per operator turn: more
+than roughly 320 aggregate characters or three lines per turn is called out to
+reflection. This is guidance, not a correctness gate; executable task checks
+still dominate the score.
+
+After the validation baseline, Cambium estimates one conservative case cost from
+the most expensive validation rollout and reserves enough calls/tokens/cash to
+rerun validation plus held-out cases. `effective_max_evals` may therefore be
+lower than the requested `--max-evals`. Search must not consume the experiment
+budget and then mislabel a budget-cancelled held-out task as a candidate
+regression. The experiment budget includes reflection requests and reported
+task usage. Concurrent in-flight requests can finish after a limit is observed;
+these limits are not a provider-enforced account quota. A zero cash estimate
+does not make subscription tokens unlimited.
 
 `--max-wall-s` covers one complete harness rollout across all of its operator
 turns, child joins and reconnects. It is not restarted for every follow-up.
@@ -119,8 +134,10 @@ runs are described in [the audit](../research/harness-audit-2026-09-04.md).
 ## Metrics and limitations
 
 Correct accepted output is primary. A passing case receives a small bounded
-efficiency contribution from elapsed time, token usage and calls; failed cases
-score zero. This is an explicit heuristic, not a calibrated economic model.
+efficiency contribution from elapsed time, token usage, calls, and user-summary
+length; failed cases score zero. Summary verbosity is only a tie-break cost—an
+incorrect terse answer never beats correct work. This is an explicit heuristic,
+not a calibrated economic model.
 
 Keep train, validation and test cases disjoint. Do not repeatedly revise prompts
 against the final test cases and still call them held out. Repeat close

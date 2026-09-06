@@ -10,20 +10,17 @@ from pathlib import Path
 
 from .summary_trunk import SUMMARY_FINDING_PRESERVATION_CONTRACT, SUMMARY_LIST_FIELDS
 
-PROMPTS_VERSION = 9
+PROMPTS_VERSION = 11
 
 CODING_POLICY = (
-    "Complete the task with small direct changes. Locate code with repo_query, read relevant "
-    "regions with read_batch, reuse existing code and the standard library. Verify edits with "
-    "relevant checks; diagnose failed calls instead of repeating them. "
-    "For a request with several independent workstreams, delegate them together in one calls "
-    "batch, with disjoint ownership and completion checks. Use semantic+spread when summaries "
-    "are useful, fresh+spread for self-contained work. A single blocking child that needs your "
-    "current context uses trunk+inherit. Keep tiny tasks local. Do not recursively subdivide "
-    "an already small delegated task. After children return, inspect the integrated files, "
-    "run combined checks, and finish; do not delegate the same work again. "
-    "Use branch_history to reopen specific evidence, not entire transcripts. "
-    "Plan only when useful. Report the result and checks in concise Markdown."
+    "Work directly and minimally. Locate with repo_query, read exact regions with read_batch, "
+    "reuse existing code and the standard library, and verify relevant behavior. Treat failures "
+    "as evidence instead of repeating calls. Delegate only separable work likely to save wall "
+    "time or context; batch independent siblings with disjoint ownership and checks, and keep "
+    "small or tightly coupled work local. After joins, inspect the accepted files and run the "
+    "combined check. Use branch_history for exact old evidence. Plan only when useful. Finish "
+    "for the operator, not for the transcript: state the result first, then only material "
+    "changes, meaningful checks, findings, or blockers the user needs next."
 )
 SUMMARY_POLICY = (
     SUMMARY_FINDING_PRESERVATION_CONTRACT + " Drop routine noise and duplicate reads. "
@@ -39,6 +36,12 @@ _ACTION_PROTOCOL = (
     '  {"name":"read_batch","arguments":{"paths":["file.py"]}}\n'
     '  {"calls":[{"name":"read_batch","arguments":{"paths":["a.py","b.py"]}}]}\n'
     '  {"type":"finish","summary":"...","objective_met":true}\n'
+    "The finish summary is user-facing. Default to one short sentence; use at most three "
+    "compact bullets only when the task genuinely has several findings. Do not restate the "
+    "task or narrate the process. Omit internal tool names, raw commands, hashes, checkpoint/"
+    "worktree details, routine file paths, lint chatter, dependency status, and 'no changes' "
+    "boilerplate unless the user explicitly asked for that evidence. Mention checks by outcome "
+    "('tests passed'), not by command. "
     "Independent reads may run concurrently; mutations run in listed order. "
     "Each delegate spec needs a task. One child defaults to trunk+inherit; several in a "
     "batch default to semantic+spread. Optional context_mode/placement override these defaults. "
