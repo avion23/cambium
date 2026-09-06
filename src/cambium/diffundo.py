@@ -1350,7 +1350,8 @@ class _CodexRawResponse(_RawResponse):
             messages = tuple(
                 {
                     "content": "".join(
-                        part.get("text", "") for part in item.get("content", [])
+                        part.get("text", "")
+                        for part in item.get("content", [])
                         if isinstance(part, dict) and part.get("type") == "output_text"
                     ),
                     **({"phase": item["phase"]} if "phase" in item else {}),
@@ -1359,9 +1360,14 @@ class _CodexRawResponse(_RawResponse):
                 if isinstance(item, dict) and item.get("type") == "message"
             )
             calls = tuple(
-                {"id": item.get("call_id", item.get("id")), "type": "function", "function": {
-                    "name": item.get("name"), "arguments": item.get("arguments"),
-                }}
+                {
+                    "id": item.get("call_id", item.get("id")),
+                    "type": "function",
+                    "function": {
+                        "name": item.get("name"),
+                        "arguments": item.get("arguments"),
+                    },
+                }
                 for item in (response.get("output", []) if isinstance(response, dict) else [])
                 if isinstance(item, dict) and item.get("type") == "function_call"
             )
@@ -1952,17 +1958,24 @@ def _parse_codex_sse(
     response = completed.get("response")
     if isinstance(response, dict) and not response.get("output") and output_items:
         response["output"] = [
-            item if item.get("content") or item.get("type") == "function_call" else {
-                **item, "content": [{
-                    "type": "output_text", "text": "".join(text_parts.get(key, [])),
-                }],
+            item
+            if item.get("content") or item.get("type") == "function_call"
+            else {
+                **item,
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "".join(text_parts.get(key, [])),
+                    }
+                ],
             }
             for key, item in output_items.items()
         ]
     answer = _codex_answer(completed)
     if answer is not None:
         text = "".join(
-            part.get("text", "") for part in answer.get("content", [])
+            part.get("text", "")
+            for part in answer.get("content", [])
             if isinstance(part, dict) and part.get("type") == "output_text"
         )
     return completed, text, None
@@ -2307,7 +2320,8 @@ class _ChatCompletionsTransport:
         if isinstance(body.get("messages"), list):
             body["messages"] = [
                 {key: value for key, value in message.items() if key != "phase"}
-                if isinstance(message, dict) else message
+                if isinstance(message, dict)
+                else message
                 for message in body["messages"]
             ]
         if provider.supports_native_tools and isinstance(body.get("tools"), list):

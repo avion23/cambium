@@ -267,9 +267,14 @@ def _child_row(child: Child) -> str:
 
 
 def _children_rows(state: BranchState) -> list[str]:
-    children = sorted(state.children, key=lambda child: (
-        child.lifecycle in _TERMINAL_LIFECYCLES, child.admission_index, child.branch_id,
-    ))
+    children = sorted(
+        state.children,
+        key=lambda child: (
+            child.lifecycle in _TERMINAL_LIFECYCLES,
+            child.admission_index,
+            child.branch_id,
+        ),
+    )
     return [_child_row(child) for child in children]
 
 
@@ -337,9 +342,7 @@ def _bounded_section(
     while selected and _line_bytes([section, *selected, marker]) > byte_cap:
         selected.pop()
     if _line_bytes([section, marker]) > byte_cap:
-        raise ValueError(
-            f"section byte cap for {section} is too small for its history anchor"
-        )
+        raise ValueError(f"section byte cap for {section} is too small for its history anchor")
     return [section, *selected, marker]
 
 

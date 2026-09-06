@@ -634,7 +634,10 @@ class LaneCapacityExhausted(ValueError):
 
 
 def quota_status(
-    provider: str, windows: Sequence[Any], *, now: float | None = None,
+    provider: str,
+    windows: Sequence[Any],
+    *,
+    now: float | None = None,
 ) -> tuple[float | None, float | None, float]:
     """Return observed utilization, blocked-until time and next reset.
 
@@ -699,21 +702,33 @@ def resolve_assignment(
     if not candidates:
         raise ValueError("model_candidates must be a non-empty list of model ids")
     timestamp = time.time()
-    pool = [p for p in pool if (
-        quota_status(p.name, quota_windows, now=timestamp)[1] is None
-        and not ((debt or {}).get(p.name, ProviderDebt()).retry_at or 0) > timestamp
-    )]
+    pool = [
+        p
+        for p in pool
+        if (
+            quota_status(p.name, quota_windows, now=timestamp)[1] is None
+            and not ((debt or {}).get(p.name, ProviderDebt()).retry_at or 0) > timestamp
+        )
+    ]
     if not pool:
         return None
     try:
         if requirements:
             provider_name, model, _score = score_providers(
-                pool, candidates, debt, lanes, requirements=requirements,
+                pool,
+                candidates,
+                debt,
+                lanes,
+                requirements=requirements,
                 quota_windows=quota_windows,
             )[0]
         else:
             provider_name, model = select_lane(
-                pool, candidates, debt, lanes or {}, quota_windows=quota_windows,
+                pool,
+                candidates,
+                debt,
+                lanes or {},
+                quota_windows=quota_windows,
             )
     except LaneCapacityExhausted:
         return None
@@ -1067,8 +1082,10 @@ def select_lane(
 
 
 def _resource_rank(
-    provider: Any, debt: Mapping[str, ProviderDebt] | None,
-    lanes: Mapping[str, LaneState], quota_windows: Sequence[Any],
+    provider: Any,
+    debt: Mapping[str, ProviderDebt] | None,
+    lanes: Mapping[str, LaneState],
+    quota_windows: Sequence[Any],
 ) -> tuple[float, int, float, int]:
     """Shared resource ordering after each caller's capability filtering."""
     lane = lanes.get(provider.name)

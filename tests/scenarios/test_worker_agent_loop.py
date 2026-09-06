@@ -428,14 +428,30 @@ async def _drive_loop_with_heartbeats(
 def test_semantic_child_summary_substitution_and_failure(tmp_path: Path, all_dead: bool) -> None:
     worktree = _make_worktree(tmp_path / "repo")
     config = _agent_config(
-        worktree, context_reuse=True, checkpoint_root=tmp_path / "checkpoints", max_turns=4,
+        worktree,
+        context_reuse=True,
+        checkpoint_root=tmp_path / "checkpoints",
+        max_turns=4,
     )
-    router = _SummaryFlushRouter(all_providers_dead=all_dead, responses=[json.dumps({
-        "name": "delegate", "arguments": {
-            "child_task_id": "review", "kind": "investigation",
-            "spec": {"task": "Review alpha.txt", "context_mode": "semantic", "placement": "spread"},
-        },
-    })])
+    router = _SummaryFlushRouter(
+        all_providers_dead=all_dead,
+        responses=[
+            json.dumps(
+                {
+                    "name": "delegate",
+                    "arguments": {
+                        "child_task_id": "review",
+                        "kind": "investigation",
+                        "spec": {
+                            "task": "Review alpha.txt",
+                            "context_mode": "semantic",
+                            "placement": "spread",
+                        },
+                    },
+                }
+            )
+        ],
+    )
     outcome = asyncio.run(_drive_loop(config, worktree, router))
     assert router.allow_model_substitution == [False, True]
     if all_dead:
@@ -449,12 +465,18 @@ def test_semantic_child_summary_substitution_and_failure(tmp_path: Path, all_dea
 def test_finish_keeps_raw_evidence_without_summary_call(tmp_path: Path) -> None:
     worktree = _make_worktree(tmp_path / "repo")
     config = _agent_config(
-        worktree, context_reuse=True, checkpoint_root=tmp_path / "checkpoints", max_turns=4,
+        worktree,
+        context_reuse=True,
+        checkpoint_root=tmp_path / "checkpoints",
+        max_turns=4,
     )
-    router = _SummaryFlushRouter(all_providers_dead=True, responses=[
-        '{"name":"read_batch","arguments":{"paths":["alpha.txt"]}}',
-        '{"type":"finish","summary":"read alpha","objective_met":true}',
-    ])
+    router = _SummaryFlushRouter(
+        all_providers_dead=True,
+        responses=[
+            '{"name":"read_batch","arguments":{"paths":["alpha.txt"]}}',
+            '{"type":"finish","summary":"read alpha","objective_met":true}',
+        ],
+    )
     writer = _FakeWriter()
     outcome = asyncio.run(_drive_loop(config, worktree, router, writer))
     assert outcome["status"] == "succeeded"
@@ -541,12 +563,15 @@ def test_two_malformed_summaries_fail_on_the_third_fold_attempt(tmp_path: Path) 
     assert len([message for message in messages if message["type"] == "compaction_deferred"]) == 2
     assert len([message for message in messages if message["type"] == "compaction_failed"]) == 1
     summary_prompts = [
-        p for p in router.prompts
+        p
+        for p in router.prompts
         if p["messages"][-1]["content"].startswith("<cambium-summary-control>\n")
     ]
     assert len(summary_prompts) == 6  # One ordinary repair per attempted fold.
-    assert all("Previous summary was invalid" in p["messages"][-1]["content"]
-               for p in summary_prompts[1::2])
+    assert all(
+        "Previous summary was invalid" in p["messages"][-1]["content"]
+        for p in summary_prompts[1::2]
+    )
 
 
 # ---------------------------------------------------------------------------

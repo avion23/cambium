@@ -5,10 +5,13 @@ from importlib import import_module
 import pytest
 
 
-@pytest.mark.parametrize(("package", "class_name"), [
-    ("example", "ShouldDecomposeModuleDSPy"),
-    ("should_review", "ShouldReviewModuleDSPy"),
-])
+@pytest.mark.parametrize(
+    ("package", "class_name"),
+    [
+        ("example", "ShouldDecomposeModuleDSPy"),
+        ("should_review", "ShouldReviewModuleDSPy"),
+    ],
+)
 def test_program_construction_does_not_mutate_its_class(package: str, class_name: str) -> None:
     dspy = pytest.importorskip("dspy")
     common = import_module("cambium.modules.dspy_module").DSPyModuleBase

@@ -1,4 +1,5 @@
 """Model and operator inspection share one turn-local, read-only projection."""
+
 from __future__ import annotations
 
 import asyncio
@@ -19,21 +20,48 @@ def test_inspection_does_not_interleave_turns_and_can_focus_a_child(tmp_path, mo
         path.parent.mkdir(parents=True)
         store = EventStore(path)
         try:
-            store.append({"kind": "task_assigned", "task_id": "root", "payload": {
-                "task": objective,
-            }})
-            store.append({"kind": "child_admitted", "task_id": "root", "payload": {
-                "parent_task_id": "root", "child_task_id": "review",
-            }})
-            store.append({"kind": "task_assigned", "task_id": "review", "payload": {
-                "parent_task_id": "root", "task": "review one commit",
-            }})
+            store.append(
+                {
+                    "kind": "task_assigned",
+                    "task_id": "root",
+                    "payload": {
+                        "task": objective,
+                    },
+                }
+            )
+            store.append(
+                {
+                    "kind": "child_admitted",
+                    "task_id": "root",
+                    "payload": {
+                        "parent_task_id": "root",
+                        "child_task_id": "review",
+                    },
+                }
+            )
+            store.append(
+                {
+                    "kind": "task_assigned",
+                    "task_id": "review",
+                    "payload": {
+                        "parent_task_id": "root",
+                        "task": "review one commit",
+                    },
+                }
+            )
             active = state_text(root, "review")
             assert "objective: review one commit" in active
             assert "result: unknown" in active
-            store.append({"kind": "result", "task_id": "review", "payload": {
-                "status": "succeeded", "summary": f"reviewed {objective}",
-            }})
+            store.append(
+                {
+                    "kind": "result",
+                    "task_id": "review",
+                    "payload": {
+                        "status": "succeeded",
+                        "summary": f"reviewed {objective}",
+                    },
+                }
+            )
         finally:
             store.close()
     state = load_state(root)
@@ -53,8 +81,11 @@ def test_inspection_does_not_interleave_turns_and_can_focus_a_child(tmp_path, mo
     tool = asyncio.run(inspect())
     assert tool.ok, tool.error
     operator = _command_output(
-        "/inspect review", session=SimpleNamespace(root=root), cumulative=None,
-        snapshot=None, cockpit=None,
+        "/inspect review",
+        session=SimpleNamespace(root=root),
+        cumulative=None,
+        snapshot=None,
+        cockpit=None,
     )
     assert tool.output == operator == render_situation_frame(child)
     assert "summary: reviewed current task" in operator
@@ -67,18 +98,38 @@ def test_inspection_remains_bounded_and_keeps_active_children_visible(tmp_path):
     path.parent.mkdir()
     store = EventStore(path)
     try:
-        store.append({"kind": "task_assigned", "task_id": "root", "payload": {
-            "task": "Review independent commits",
-        }})
+        store.append(
+            {
+                "kind": "task_assigned",
+                "task_id": "root",
+                "payload": {
+                    "task": "Review independent commits",
+                },
+            }
+        )
         for index in range(20):
             task = f"review-{index:02d}"
-            store.append({"kind": "child_admitted", "task_id": "root", "payload": {
-                "parent_task_id": "root", "child_task_id": task,
-            }})
+            store.append(
+                {
+                    "kind": "child_admitted",
+                    "task_id": "root",
+                    "payload": {
+                        "parent_task_id": "root",
+                        "child_task_id": task,
+                    },
+                }
+            )
             if index < 19:
-                store.append({"kind": "result", "task_id": task, "payload": {
-                    "status": "succeeded", "summary": "Reviewed without changes",
-                }})
+                store.append(
+                    {
+                        "kind": "result",
+                        "task_id": task,
+                        "payload": {
+                            "status": "succeeded",
+                            "summary": "Reviewed without changes",
+                        },
+                    }
+                )
         text = state_text(tmp_path)
         assert len(text.encode("utf-8")) <= DEFAULT_FRAME_BYTES
         assert "branch_id=review-19" in text

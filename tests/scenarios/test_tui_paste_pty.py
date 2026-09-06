@@ -20,6 +20,7 @@ from test_tui_live_pty import (
 
 pytestmark = pytest.mark.slow
 
+
 def _submitted_prompts(server: _CannedOpenAIServer) -> set[str]:
     """Distinct user prompts the TUI turned into provider requests."""
     prompts = set()
@@ -31,8 +32,9 @@ def _submitted_prompts(server: _CannedOpenAIServer) -> set[str]:
     return prompts
 
 
-@pytest.mark.parametrize("text", ['[tool]\nname = "界é"', 'line = "value"\n' * 2048],
-                         ids=["unicode", "large"])
+@pytest.mark.parametrize(
+    "text", ['[tool]\nname = "界é"', 'line = "value"\n' * 2048], ids=["unicode", "large"]
+)
 def test_bracketed_paste_submits_one_prompt_with_newlines(tmp_path: Path, text: str) -> None:
     server = _CannedOpenAIServer()
     process = None
@@ -45,7 +47,7 @@ def test_bracketed_paste_submits_one_prompt_with_newlines(tmp_path: Path, text: 
         process, master_fd = _spawn_tui(repo, providers)
         _read_until(master_fd, output, _PROMPT_REPAINT, 5.0)
 
-        wire = b'\x1b[200~' + text.replace('\n', '\r\n').encode() + b'\x1b[201~\r'
+        wire = b"\x1b[200~" + text.replace("\n", "\r\n").encode() + b"\x1b[201~\r"
         while wire:
             sent = os.write(master_fd, wire[:4096])
             wire = wire[sent:]
@@ -56,7 +58,7 @@ def test_bracketed_paste_submits_one_prompt_with_newlines(tmp_path: Path, text: 
         # give any queued turn time to reach the provider before asserting.
         _read_into(master_fd, output, 2.0)
 
-        assert _submitted_prompts(server) == {f'<cambium-task>\nTask: {text}\n</cambium-task>'}
+        assert _submitted_prompts(server) == {f"<cambium-task>\nTask: {text}\n</cambium-task>"}
 
         os.write(master_fd, b"/exit\n")
         assert _wait_exit(process, master_fd, output, 3.0) == 0

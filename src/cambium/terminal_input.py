@@ -3,6 +3,7 @@
 No native editor buffer or input thread is shared with the renderer. Pasted
 newlines remain one prompt; Enter submits, Alt-Enter inserts a newline.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -16,8 +17,12 @@ from typing import Any
 
 class TerminalInput:
     def __init__(
-        self, fd: int, cockpit: Any, history_path: Path,
-        interrupt: Callable[[], str | None], focus: Callable[[], None],
+        self,
+        fd: int,
+        cockpit: Any,
+        history_path: Path,
+        interrupt: Callable[[], str | None],
+        focus: Callable[[], None],
     ) -> None:
         self.fd, self.cockpit = fd, cockpit
         self.history_path, self.interrupt, self.focus = history_path, interrupt, focus
@@ -78,7 +83,7 @@ class TerminalInput:
         self.cockpit.set_input(self.text, self.cursor, paint=self.reading)
 
     def _insert(self, text: str) -> None:
-        self.text = self.text[:self.cursor] + text + self.text[self.cursor:]
+        self.text = self.text[: self.cursor] + text + self.text[self.cursor :]
         self.cursor += len(text)
 
     def _submit(self, value: str | None) -> None:
@@ -131,19 +136,19 @@ class TerminalInput:
             end = self.text.find("\n", self.cursor)
             self.cursor = len(self.text) if end < 0 else end
         elif key in {"\x7f", "\x08"} and self.cursor:
-            self.text = self.text[:self.cursor - 1] + self.text[self.cursor:]
+            self.text = self.text[: self.cursor - 1] + self.text[self.cursor :]
             self.cursor -= 1
         elif key == "\x1b[3~":
-            self.text = self.text[:self.cursor] + self.text[self.cursor + 1:]
+            self.text = self.text[: self.cursor] + self.text[self.cursor + 1 :]
         elif key == "\x15":
-            self.text, self.cursor = self.text[self.cursor:], 0
+            self.text, self.cursor = self.text[self.cursor :], 0
         elif key == "\x0b":
-            self.text = self.text[:self.cursor]
+            self.text = self.text[: self.cursor]
         elif key == "\x17":
-            end = len(self.text[:self.cursor].rstrip())
+            end = len(self.text[: self.cursor].rstrip())
             while end and not self.text[end - 1].isspace():
                 end -= 1
-            self.text = self.text[:end] + self.text[self.cursor:]
+            self.text = self.text[:end] + self.text[self.cursor :]
             self.cursor = end
         elif key in {"\x1b[A", "\x1b[B"} and "\n" in self.text:
             # Arrow keys edit a multiline draft instead of replacing it with history.
@@ -156,15 +161,19 @@ class TerminalInput:
                 end = self.text.find("\n", self.cursor)
                 if end >= 0:
                     following = self.text.find("\n", end + 1)
-                    self.cursor = min(end + 1 + column,
-                                      len(self.text) if following < 0 else following)
+                    self.cursor = min(
+                        end + 1 + column, len(self.text) if following < 0 else following
+                    )
         elif key in {"\x1b[A", "\x1b[B"}:
             if self.history_index == len(self.history):
                 self.draft = self.text
             change = -1 if key == "\x1b[A" else 1
             self.history_index = min(len(self.history), max(0, self.history_index + change))
-            self.text = (self.history[self.history_index]
-                         if self.history_index < len(self.history) else self.draft)
+            self.text = (
+                self.history[self.history_index]
+                if self.history_index < len(self.history)
+                else self.draft
+            )
             self.cursor = len(self.text)
         elif key == "\x03":
             self.block, self.continued = None, []
@@ -173,7 +182,7 @@ class TerminalInput:
             if not self.text:
                 self._submit(None)
             else:
-                self.text = self.text[:self.cursor] + self.text[self.cursor + 1:]
+                self.text = self.text[: self.cursor] + self.text[self.cursor + 1 :]
         elif key in {"\r", "\n"}:
             self._enter()
         elif key in {"\x1b\r", "\x1b\n"}:
@@ -200,9 +209,9 @@ class TerminalInput:
                         break
                     text, self.pending = self.pending[:end], self.pending[end:]
                     text = text.replace("\r\n", "\n").replace("\r", "\n")
-                    self._insert("".join(
-                        char for char in text if char.isprintable() or char in "\n\t"
-                    ))
+                    self._insert(
+                        "".join(char for char in text if char.isprintable() or char in "\n\t")
+                    )
                     continue
                 if self.pending.startswith("\x1b"):
                     # CSI sequences can arrive across reads; never execute a
@@ -210,11 +219,17 @@ class TerminalInput:
                     if len(self.pending) == 1:
                         break
                     if self.pending[1] in "[O":
-                        end = next((i for i in range(2, len(self.pending))
-                                    if "@" <= self.pending[i] <= "~"), None)
+                        end = next(
+                            (
+                                i
+                                for i in range(2, len(self.pending))
+                                if "@" <= self.pending[i] <= "~"
+                            ),
+                            None,
+                        )
                         if end is None:
                             break
-                        key, self.pending = self.pending[:end + 1], self.pending[end + 1:]
+                        key, self.pending = self.pending[: end + 1], self.pending[end + 1 :]
                     else:
                         key, self.pending = self.pending[:2], self.pending[2:]
                 else:

@@ -168,8 +168,14 @@ def test_full_operator_rail_rows_have_stable_golden_strings() -> None:
     rows = _rail_rows(snapshot, 32, 32)
 
     text = "\n".join(value for _, value in rows)
-    for expected in ("root E3", "child E3", "trunk ≈2k tok", "raw ≈1k tok",
-                     "context_epoch_advanced e4", "compaction_failed · provider"):
+    for expected in (
+        "root E3",
+        "child E3",
+        "trunk ≈2k tok",
+        "raw ≈1k tok",
+        "context_epoch_advanced e4",
+        "compaction_failed · provider",
+    ):
         assert expected in text
     assert all(marker in text for marker in ("H█", "S▓", "R░"))
     assert all(value.strip() and _display_width(value) <= 32 for _, value in rows)
