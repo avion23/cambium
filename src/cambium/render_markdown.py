@@ -96,9 +96,7 @@ def markdown_theme() -> Theme:
 
 def markdown_document(text: str) -> CambiumMarkdown:
     """Return a sanitized Rich document; model/provider escape codes never reach Rich."""
-    return CambiumMarkdown(
-        sanitize_terminal_text(text), hyperlinks=False, code_theme="ansi_dark"
-    )
+    return CambiumMarkdown(sanitize_terminal_text(text), hyperlinks=False, code_theme="ansi_dark")
 
 
 def _rich_color_system(depth: int) -> tuple[str | None, ColorSystem | None]:
@@ -146,9 +144,7 @@ def render_markdown_lines(text: str, *, width: int, color_depth: int = 16) -> li
     return lines
 
 
-def render_markdown(
-    text: str, *, width: int | None = None, color_depth: int = 256
-) -> str:
+def render_markdown(text: str, *, width: int | None = None, color_depth: int = 256) -> str:
     """Render Markdown to ANSI using Cambium's in-process Rich renderer."""
     lines = render_markdown_lines(
         text,

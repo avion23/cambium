@@ -1988,8 +1988,10 @@ class ActivityState:
 
         provider = "/".join(part for part in (self._provider, self._model) if part)
         cache = (
-            " · cache HIT" if self._cache_hit is True
-            else " · cache MISS" if self._cache_hit is False
+            " · cache HIT"
+            if self._cache_hit is True
+            else " · cache MISS"
+            if self._cache_hit is False
             else ""
         )
         owner = f" · {provider}" if provider else ""
@@ -2605,13 +2607,11 @@ def _live_window_lines(
         )
     elif phase == "thinking":
         row_one = (
-            f"{_ACTIVITY_PHASE_GLYPHS['thinking']} THINKING · "
-            f"{_fmt_secs(transcript._live_age_s)}"
+            f"{_ACTIVITY_PHASE_GLYPHS['thinking']} THINKING · {_fmt_secs(transcript._live_age_s)}"
         )
     elif phase == "streaming":
         row_one = (
-            f"{_ACTIVITY_PHASE_GLYPHS['streaming']} STREAMING · "
-            f"{_fmt_secs(transcript._live_age_s)}"
+            f"{_ACTIVITY_PHASE_GLYPHS['streaming']} STREAMING · {_fmt_secs(transcript._live_age_s)}"
         )
     else:
         row_one = "⠋ ORCHESTRATING"
@@ -2786,9 +2786,7 @@ def _usage_rows(
         _usage_float(getattr(snapshot, "estimated_cost_usd", 0.0)),
     )
     lane = _current_lane(snapshot)
-    last_cache_hit = (
-        getattr(lane, "last_provider_cache_hit", None) if lane is not None else None
-    )
+    last_cache_hit = getattr(lane, "last_provider_cache_hit", None) if lane is not None else None
     cache_rate = _cache_rate(cached_tokens, input_tokens)
     cache_share = f"{cache_rate:.0%}" if cache_rate is not None else "n/a"
     if last_cache_hit is True:
@@ -2863,9 +2861,7 @@ def _usage_rows(
         row("cost", _format_cost(cost)),
     ]
     if cache_rate is not None or last_cache_hit is not None:
-        rows.append(
-            _side_row(cache_kind, f" {'cache':<7}{cache_share} · last {cache_last}", width)
-        )
+        rows.append(_side_row(cache_kind, f" {'cache':<7}{cache_share} · last {cache_last}", width))
     return rows
 
 
@@ -3080,10 +3076,7 @@ def _context_bar(context: Any, width: int) -> str:
         counts[index] += 1
     head_label = "H" if head_known else "H?"
     semantic_label = "S" if head_known else "S?"
-    return (
-        f" {head_label}{'█' * counts[0]} "
-        f"{semantic_label}{'▓' * counts[1]} R{'░' * counts[2]}"
-    )
+    return f" {head_label}{'█' * counts[0]} {semantic_label}{'▓' * counts[1]} R{'░' * counts[2]}"
 
 
 def _context_rows(
@@ -3934,9 +3927,12 @@ def _detail_status_line(
         )
     )
     cache_style = (
-        "green" if last_cache_hit is True
-        else "yellow" if last_cache_hit is False
-        else "green" if cache_rate is not None and cache_rate >= 0.5
+        "green"
+        if last_cache_hit is True
+        else "yellow"
+        if last_cache_hit is False
+        else "green"
+        if cache_rate is not None and cache_rate >= 0.5
         else "yellow"
     )
     cache_text = _status_paint(cache, cache_style, color) if cache_rate is not None else cache

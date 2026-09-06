@@ -406,14 +406,7 @@ def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact che
         0.0
         if not passed
         else 0.9
-        + 0.1
-        / (
-            1
-            + elapsed / 60
-            + tokens / 10000
-            + calls / 10
-            + user_summary_chars / 1000
-        )
+        + 0.1 / (1 + elapsed / 60 + tokens / 10000 + calls / 10 + user_summary_chars / 1000)
     )
     usage = [e.get("payload", {}) for e in events if e.get("kind") == "usage_event"]
     failures = [

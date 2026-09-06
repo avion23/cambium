@@ -3695,9 +3695,7 @@ class Diffundo:
     ) -> _RawResponse:
         """Run one threaded HTTP operation under the call's wall deadline."""
         if deadline is None:
-            return await self._post(
-                provider, prompt, timeout_s=timeout_s, on_delta=on_delta
-            )
+            return await self._post(provider, prompt, timeout_s=timeout_s, on_delta=on_delta)
         remaining = self._remaining(deadline)
         if remaining is None or remaining <= 0:
             raise ProviderError(
