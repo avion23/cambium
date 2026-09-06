@@ -10,7 +10,14 @@ from pathlib import Path
 from statistics import mean
 from typing import Any
 
-from .benchmark import ExperimentBudget, ExperimentBudgetExceeded, load_cases, run_case
+from .benchmark import (
+    ExperimentBudget,
+    ExperimentBudgetExceeded,
+    json_finite,
+    load_cases,
+    run_case,
+    write_json_report,
+)
 from .prompts import coding_prompt, load_policy, prompt_path, save_policy
 
 _FEEDBACK_CHARS = 6000
@@ -71,7 +78,8 @@ def _render_component_prompt(component: str, selected: dict[str, str]) -> str:
         "type": "summarize_tail",
         "finding_preservation_contract": selected["summary"],
     }
-    return SUMMARY_CONTROL_OPEN + json.dumps(control, ensure_ascii=False) + SUMMARY_CONTROL_CLOSE
+    payload = json.dumps(json_finite(control), ensure_ascii=False, allow_nan=False)
+    return SUMMARY_CONTROL_OPEN + payload + SUMMARY_CONTROL_CLOSE
 
 
 def grounded_feedback(component: str, selected: dict[str, str], row: dict[str, Any]) -> str:
@@ -87,10 +95,15 @@ def grounded_feedback(component: str, selected: dict[str, str], row: dict[str, A
                 ),
                 "<trajectory-digest>\n"
                 + json.dumps(
-                    {key: row.get(key) for key in _DIGEST_KEYS} | {"derailment": _derailment(row)},
+                    json_finite(
+                        {key: row.get(key) for key in _DIGEST_KEYS}
+                        | {"derailment": _derailment(row)}
+                    ),
                     ensure_ascii=False,
+                    allow_nan=False,
                 ),
-                "<raw-row>\n" + json.dumps(row, ensure_ascii=False),
+                "<raw-row>\n"
+                + json.dumps(json_finite(row), ensure_ascii=False, allow_nan=False),
             )
         ),
         _FEEDBACK_CHARS,
@@ -142,7 +155,11 @@ def metric(
 ) -> Any:
     import dspy
 
-    return dspy.Prediction(score=float(pred.score), feedback=pred.report)
+    try:
+        score = float(pred.score)
+    except (AttributeError, TypeError, ValueError):
+        return dspy.Prediction(score=0.0, feedback=getattr(pred, "report", "") or "")
+    return dspy.Prediction(score=score, feedback=pred.report)
 
 
 def _reflection_lm(args: Any, budget: ExperimentBudget) -> Any:
@@ -347,15 +364,18 @@ def run(args: Any) -> int:
             cost_usd=budget.cost_usd,
             runs=budget.rows,
         )
-        (output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
+        write_json_report(output / "report.json", report)
     print(
         json.dumps(
-            {
-                key: value
-                for key, value in {**report, "report": str(output / "report.json")}.items()
-                if key not in {"runs", "baseline", "validation", "test"}
-            },
+            json_finite(
+                {
+                    key: value
+                    for key, value in {**report, "report": str(output / "report.json")}.items()
+                    if key not in {"runs", "baseline", "validation", "test"}
+                }
+            ),
             indent=2,
+            allow_nan=False,
         )
     )
     return code

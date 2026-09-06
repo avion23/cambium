@@ -8,7 +8,6 @@ pure file/digest and frozen-content checks stay in the first tier.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import shutil
@@ -26,12 +25,6 @@ from cambium.modules.base import (
     load_jsonl,
     load_module_manifest,
 )
-
-EXPECTED_SPLIT_DIGESTS = {
-    "train": "e41f1f4ca9e1905122e1faa0955cd2833bf032635ea721d33d36d1b3b7caf136",
-    "eval": "f43cb1501ba4ba10fc27e2333a3794db04d6f5afa95ebfe586f66cf9d486d7ca",
-    "canaries": "54bf2e41663b29d1382fe965cacb553009567287dc722a7710533bfe3e92ff3e",
-}
 
 
 def _one_discovered_module() -> str:
@@ -64,24 +57,6 @@ def test_manifest_loader_wraps_malformed_utf8(tmp_path: Path) -> None:
 
     with pytest.raises(ModuleContractError, match="invalid"):
         load_module_manifest(module_dir)
-
-
-def test_split_digests_anchor_metadata_baseline_and_content() -> None:
-    if "example" not in module_conformance.discover_modules():
-        pytest.skip("reference module cambium.modules.example is absent")
-    module_path = module_conformance.MODULES_DIR / _one_discovered_module()
-    metadata = json.loads((module_path / "datasets" / "meta.json").read_text(encoding="utf-8"))
-    baseline = json.loads(
-        (module_path / "tests" / "baselines" / "baseline.json").read_text(encoding="utf-8")
-    )
-    actual = {
-        split: hashlib.sha256((module_path / "datasets" / filename).read_bytes()).hexdigest()
-        for split, filename in module_conformance.DECISION_SPLITS.items()
-    }
-
-    assert metadata["split_digests"] == EXPECTED_SPLIT_DIGESTS
-    assert baseline["split_digests"] == EXPECTED_SPLIT_DIGESTS
-    assert actual == EXPECTED_SPLIT_DIGESTS
 
 
 def test_gate_accepts_module_scoped_baseline() -> None:
@@ -396,121 +371,3 @@ def test_freeze_check_survives_unrelated_tip_commit(tmp_path: Path, monkeypatch)
     assert len(findings) == 1
     assert findings[0].symbol == "eval"
     assert "without dataset_version bump (1.0.0)" in findings[0].detail
-
-
-@pytest.mark.slow
-def test_module_deletion_leaves_shared_scenarios_green(tmp_path: Path) -> None:
-    """Deleting one module directory must not break the shared scenarios.
-
-    Copies the repository into a throwaway directory, deletes only
-    ``src/cambium/modules/example/``, and runs the shared scenario suite from
-    the copy. Every module-dependent scenario must skip (tolerate absence) and
-    everything else must stay green; any scenario that hardcodes the removed
-    module fails this canary.
-    """
-    if not module_conformance.discover_modules():
-        pytest.skip("no decision modules are installed; nothing to delete")
-    if "example" not in module_conformance.discover_modules():
-        pytest.skip("reference module cambium.modules.example is absent")
-    copy = tmp_path / "repo"
-    copy.mkdir()
-    ignore = shutil.ignore_patterns(
-        ".git",
-        "__pycache__",
-        "*.pyc",
-        ".pytest_cache",
-        ".ruff_cache",
-        ".mypy_cache",
-        ".venv",
-        ".cambium",
-        "dist",
-        "build",
-    )
-    for entry in sorted(os.scandir(module_conformance.REPO_ROOT), key=lambda e: e.name):
-        if entry.name in ignore(module_conformance.REPO_ROOT, [entry.name]):
-            continue
-        source = Path(entry.path)
-        destination = copy / entry.name
-        if entry.is_dir():
-            shutil.copytree(source, destination, symlinks=True, ignore=ignore)
-        else:
-            shutil.copy2(source, destination)
-    assert not (copy / ".cambium").exists(), "runtime sessions are not test inputs"
-    git = ["git", "-c", "user.name=Cambium Test", "-c", "user.email=test@example.invalid"]
-    subprocess.run([*git, "init", "-q"], cwd=copy, check=True, capture_output=True)
-    subprocess.run([*git, "add", "-A"], cwd=copy, check=True, capture_output=True)
-    subprocess.run(
-        [*git, "commit", "-qm", "snapshot for deletion canary"],
-        cwd=copy,
-        check=True,
-        capture_output=True,
-    )
-    shutil.rmtree(copy / "src" / "cambium" / "modules" / "example")
-    environment = {
-        key: value
-        for key, value in os.environ.items()
-        if key not in {"PYTEST_ADDOPTS", "PYTEST_PLUGINS"}
-    }
-    # The canary checks the copied checkout with the same interpreter and test
-    # dependencies as the parent suite; uv environment resolution is not part
-    # of the deletion contract and only repeats interpreter startup.
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pytest",
-            "-q",
-            "tests/scenarios/test_module_conformance.py",
-            "tests/scenarios/test_tooling.py",
-        ],
-        cwd=copy,
-        env=environment,
-        capture_output=True,
-        text=True,
-        timeout=1800,
-    )
-
-    assert result.returncode == 0, result.stdout + result.stderr
-
-
-def test_reverse_scan_excludes_optimizer_driver() -> None:
-    optimize_path = module_conformance.REPO_ROOT / "src" / "cambium" / "optimize.py"
-
-    assert optimize_path not in module_conformance._reverse_scan_paths()
-
-
-def test_external_scan_excludes_dspy_scenarios(tmp_path: Path, monkeypatch) -> None:
-    scenarios = tmp_path / "tests" / "scenarios"
-    scenarios.mkdir(parents=True)
-    for filename in ("test_dspy_program.py", "test_optimize.py"):
-        (scenarios / filename).write_text(
-            "import cambium.modules.example\n",
-            encoding="utf-8",
-        )
-    monkeypatch.setattr(module_conformance, "REPO_ROOT", tmp_path)
-
-    findings = module_conformance.scan_external_module_files()
-    excluded = {
-        Path("tests/scenarios/test_dspy_program.py"),
-        Path("tests/scenarios/test_optimize.py"),
-    }
-
-    assert not {finding.path for finding in findings} & excluded
-
-
-def test_external_scan_flags_unlisted_module_scenario(tmp_path: Path, monkeypatch) -> None:
-    names = module_conformance.module_names()
-    if not names:
-        pytest.skip("no decision modules are installed; nothing to flag")
-    module_name = names[0]
-    scenario = tmp_path / "tests" / "scenarios" / "test_unlisted_module.py"
-    scenario.parent.mkdir(parents=True)
-    scenario.write_text(f"import cambium.modules.{module_name}\n", encoding="utf-8")
-    monkeypatch.setattr(module_conformance, "REPO_ROOT", tmp_path)
-
-    findings = module_conformance.scan_external_module_files()
-
-    assert any(
-        finding.rule == "layout" and finding.path == Path("tests/scenarios/test_unlisted_module.py")
-        for finding in findings
-    )

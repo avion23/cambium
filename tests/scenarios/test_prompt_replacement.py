@@ -107,6 +107,64 @@ def test_rollout_timeout_retains_report_and_checks_only_accepted_code(tmp_path, 
     assert json.loads((Path(row["directory"]) / "report.json").read_text()) == row
 
 
+def test_invalid_action_breaker_stops_a_decided_rollout(tmp_path, monkeypatch) -> None:
+    import asyncio
+
+    from cambium import benchmark, worker
+
+    async def broken_plan(*args, on_event=None, **kwargs):
+        on_event({"kind": "usage_event", "payload": {"usage": {"total_tokens": 10}}})
+        on_event(
+            {
+                "kind": "log",
+                "payload": {
+                    "message": (
+                        "invalid_action: bad JSON "
+                        f"(strike {worker.MAX_CONSECUTIVE_INVALID_ACTIONS})"
+                    )
+                },
+            }
+        )
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(benchmark, "run_plan", broken_plan)
+    monkeypatch.setattr(benchmark, "_resolve_provider", lambda config, repo: (config, {}))
+    row = benchmark.run_case(
+        {
+            "id": "breaker",
+            "split": "train",
+            "task": "Read without edits",
+            "files": {"note.txt": "unchanged"},
+            "read_only": True,
+            "check": [
+                "{python}",
+                "-c",
+                "from pathlib import Path; assert Path('note.txt').read_text() == 'unchanged'",
+            ],
+        },
+        {"coding": "Read only.", "summary": "Keep facts."},
+        output=tmp_path,
+        budget=ExperimentBudget(10, 1000, 1),
+        max_wall_s=60,
+    )
+    assert not row["passed"]
+    assert row["calls"] == 1
+    assert row["tokens"] == 10
+    assert "agent emitted 3 consecutive invalid actions" in row["feedback"]
+    assert "wall budget exhausted" not in row["feedback"]
+
+
+def test_gepa_metric_scores_malformed_prediction_zero() -> None:
+    from types import SimpleNamespace
+
+    pytest.importorskip("dspy")
+    from cambium import prompt_optimize
+
+    assert prompt_optimize.metric(None, SimpleNamespace(report="missing score")).score == 0.0
+    malformed = SimpleNamespace(score="bad", report="bad score")
+    assert prompt_optimize.metric(None, malformed).score == 0.0
+
+
 def test_gepa_reflection_feedback_is_grounded_in_rendered_prompt_and_trajectory() -> None:
     pytest.importorskip("dspy")
     from cambium import prompt_optimize

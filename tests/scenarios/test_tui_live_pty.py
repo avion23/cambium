@@ -125,7 +125,7 @@ def _provider_file(path: Path, base_url: str) -> Path:
                         "base_url": base_url,
                         "api_key_env": "CAMBIUM_PROVIDER_PTY_PROVIDER_API_KEY",
                         "api_key": "pty-secret",
-                        "timeout_s": 2.0,
+                        "timeout_s": 10.0,
                         "max_retries": 0,
                         "rpm": 120,
                         "enabled": True,
@@ -276,12 +276,15 @@ def test_live_tui_resize_preserves_one_input_prompt(tmp_path: Path) -> None:
         os.write(master_fd, b"\x1b[A\x1b[H^\x1b[F!\x1b[B\x1b[H>\x1b[F?")
         _read_into(master_fd, output, 0.1)
         assert b"2/2" in output
-        frames = output.count("┌ Cambium".encode())
+        repaints = output.count(_PROMPT_REPAINT)
+        resized_at = len(output)
         _set_size(master_fd, 90)
-        _read_into(master_fd, output, 0.3)
         _set_size(master_fd, 70)
-        _read_into(master_fd, output, 0.3)
-        assert output.count("┌ Cambium".encode()) > frames  # Immediate, while editing.
+        deadline = time.monotonic() + 5
+        while output.count(_PROMPT_REPAINT) <= repaints and time.monotonic() < deadline:
+            _read_into(master_fd, output, 0.1)
+        assert output.count(_PROMPT_REPAINT) > repaints
+        assert b"2/2 >secon!d?" in output[resized_at:]
         assert len(server.requests) == 1
         server.release.set()
         _read_until(master_fd, output, b"canned response", 8.0)

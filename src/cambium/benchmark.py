@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import subprocess
 import sys
@@ -19,6 +20,7 @@ from typing import Any
 from .oneshot import OneShotConfig, _resolve_provider, build_plan
 from .prompts import validate_policy
 from .supervisor import run_plan
+from .worker import MAX_CONSECUTIVE_INVALID_ACTIONS
 
 
 class ExperimentBudgetExceeded(RuntimeError):
@@ -53,6 +55,25 @@ class ExperimentBudget:
             + usage.get("completion_tokens", usage.get("output_tokens", 0))
         ))
         self.cost_usd += max(0.0, float(cost))
+
+
+def json_finite(value: Any) -> Any:
+    """Copy JSON report data with non-finite floats mapped to zero."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else 0.0
+    if isinstance(value, dict):
+        return {key: json_finite(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [json_finite(item) for item in value]
+    return value
+
+
+def write_json_report(path: Path, payload: Any) -> None:
+    """Write strict JSON so reports remain consumable after bad provider numbers."""
+    path.write_text(
+        json.dumps(json_finite(payload), indent=2, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
 
 
 def load_cases(path: Path) -> list[dict[str, Any]]:
@@ -136,6 +157,41 @@ def _peak_pending_children(events: list[dict]) -> int:
     return peak
 
 
+def _breaker_strike(event: dict) -> bool:
+    """Return whether the agent loop has already decided this rollout failed."""
+    if event.get("kind") != "log":
+        return False
+    message = event.get("payload", {}).get("message")
+    return (
+        isinstance(message, str)
+        and message.startswith("invalid_action:")
+        and message.endswith(f" (strike {MAX_CONSECUTIVE_INVALID_ACTIONS})")
+    )
+
+
+def _case_provider_pool(resolved: Any, case: dict) -> Any:
+    """Restrict one benchmark case to its declared credential-ready providers."""
+    if not case.get("providers"):
+        return resolved
+    from .provider_config import load_providers
+
+    names = set(case["providers"])
+    available = [
+        provider
+        for provider in load_providers(resolved.provider_config_path)
+        if provider.name in names and provider.name in resolved.authorized_providers
+    ]
+    if {provider.name for provider in available} != names:
+        raise ValueError("benchmark provider pool is not credential-ready")
+    if resolved.assigned_provider and resolved.assigned_provider not in names:
+        raise ValueError("benchmark primary provider is outside its provider pool")
+    return replace(
+        resolved,
+        authorized_providers=tuple(provider.name for provider in available),
+        model_candidates=tuple(sorted({provider.model for provider in available})),
+    )
+
+
 def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact checking
     case: dict, policy: dict[str, str], *, output: Path, budget: ExperimentBudget,
     provider: str | None = None, max_turns: int = 12, max_wall_s: float = 300,
@@ -163,7 +219,14 @@ def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact che
         owner = asyncio.current_task()
 
         def observe(event: dict) -> None:
+            nonlocal abort_reason
             events.append(event)
+            if abort_reason is None and _breaker_strike(event):
+                abort_reason = (
+                    f"agent emitted {MAX_CONSECUTIVE_INVALID_ACTIONS} consecutive invalid actions"
+                )
+                if owner is not None:
+                    owner.cancel()
             if event.get("kind") != "usage_event":
                 return
             data = event.get("payload", {})
@@ -175,22 +238,7 @@ def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact che
                     owner.cancel()
 
         resolved, environment = _resolve_provider(config, repo)
-        if case.get("providers"):
-            from .provider_config import load_providers
-
-            names = set(case["providers"])
-            available = [
-                p for p in load_providers(resolved.provider_config_path)
-                if p.name in names and p.name in resolved.authorized_providers
-            ]
-            if {p.name for p in available} != names:
-                raise ValueError("benchmark provider pool is not credential-ready")
-            if resolved.assigned_provider and resolved.assigned_provider not in names:
-                raise ValueError("benchmark primary provider is outside its provider pool")
-            resolved = replace(
-                resolved, authorized_providers=tuple(p.name for p in available),
-                model_candidates=tuple(sorted({p.model for p in available})),
-            )
+        resolved = _case_provider_pool(resolved, case)
         if case.get("followups"):
             from .interactive import InteractiveSession
 
@@ -243,12 +291,14 @@ def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact che
             return await execute()
 
     error = ""
+    abort_reason: str | None = None
     try:
         exit_code, error = asyncio.run(bounded_execute())
     except TimeoutError:
         exit_code, error = 1, f"rollout wall budget exhausted ({max_wall_s:g}s)"
     except asyncio.CancelledError:
-        exit_code, error = 1, "experiment budget exhausted; rollout cancelled"
+        exit_code = 1
+        error = abort_reason or "experiment budget exhausted; rollout cancelled"
     elapsed = time.monotonic() - started
     from .branch_history import _session_event_stores
     from .store import read_events_file
@@ -367,9 +417,9 @@ def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact che
             f"missing_tools={sorted(missing_tools)}; "
             f"parallel_children={peak_children}/{case.get('required_parallel_children', 0)}; "
             f"{error}\n"
-            f"{diagnostic}\n{json.dumps(failures)[-3000:]}"
+            f"{diagnostic}\n{json.dumps(json_finite(failures), allow_nan=False)[-3000:]}"
         ),
     }
     budget.rows.append(row)
-    (root / "report.json").write_text(json.dumps(row, indent=2) + "\n")
+    write_json_report(root / "report.json", row)
     return row
