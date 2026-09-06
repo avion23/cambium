@@ -165,30 +165,17 @@ published checkpoint remains immutable even after a rollover. These are the
 two meanings of append-only here, not a requirement to carry all old summaries
 in every future request.
 
-## Branches and provider placement
+## Branches
 
-Context representation and execution placement answer different questions:
+CAST defines what a child can inherit: exact trunk, semantic trunk, or fresh
+context. Delegation defaults and provider placement belong to
+[context branches](context-branches.md); child admission and artifact joins
+belong to [subagents](subagents.md). Exact values are in the
+[context-branch reference](../reference/context-branches.md).
 
-| Mode | Context at child start | Default placement |
-| --- | --- | --- |
-| `trunk` | Complete compatible parent checkpoint prefix and private continuation | Same provider/model (`inherit`) |
-| `semantic` | Published semantic entries under a fresh branch/provider head | Another usable lane (`spread`) |
-| `fresh` | Self-contained task, no parent checkpoint or semantic entries | `spread` |
-
-Exact reuse needs matching provider/model/protocol/reasoning, instructions,
-tools and checkpoint bytes. It is a correctness requirement for an exact fork,
-not proof of a cache hit. An explicit impossible exact fork does not silently
-become semantic. A semantic child on another provider transfers knowledge, not
-KV-cache state. A fresh child deliberately transfers neither.
-
-A child returns a bounded result. The supervisor separately integrates its code
-and resumes the parent at the accepted artifact head. The parent adds new
-observations and conclusions to its own continuation; it does not concatenate
-complete sibling transcripts into its trunk.
-
-[Context branches](context-branches.md) owns automatic delegation decisions and
-placement defaults. [Child lifecycle](subagents.md) owns suspension and joins.
-[The reference](../reference/context-branches.md) owns exact tool arguments.
+An exact fork requires compatible request identity; that proves only semantic
+compatibility, not a provider cache hit. Semantic/fresh forks do not transfer KV
+cache state.
 
 ## Resource economics
 
@@ -210,17 +197,10 @@ cannot repay itself through replay savings alone, which is why ordinary finish
 only checkpoints. The current threshold policy does not forecast `N`; further
 changes need task-level measurements, not a compulsory economic-model call.
 
-Cached input still consumes some provider resources and may consume account
-quota. A provider's cash tariff, request limit, weekly allowance and generation
-rate are separate quantities. Unknown quota is not unlimited quota; output
-rate must not count prompt tokens. Only provider-reported usage establishes
-cache hits. The TUI labels byte-derived context sizes as estimates.
-
-Small local work often costs less than spawn, fold, join and re-verification.
-Independent work can justify another provider when it shortens the critical
-path or uses otherwise idle capacity. Exact same-trunk blocking work keeps the
-parent provider. These are policies to evaluate, not a promise that every
-additional child makes a task faster.
+Provider quota, request capacity and placement are separate from CAST and are
+documented in [provider routing](provider-routing.md). For CAST decisions, use
+provider-reported cache/input/output evidence; a matching prefix alone is not a
+cache hit. The TUI labels byte-derived context sizes as estimates.
 
 ## Reading a trace
 
@@ -237,18 +217,11 @@ supply useful evidence references today; the string-based K0 compiler cannot
 infer which obligation a later check discharged. Inspect such losses before
 expanding the schema or adding more prompt instructions.
 
-## Prompts and experiments
+## Prompt experiments
 
-Coding and summary policies can be replaced by an offline GEPA run. A session
-pins its chosen text; replacement affects new sessions or `/new`, not a live
-prefix. Summary policy and its response schema are supplied only in the summary
-control message, not repeated in every coding request. Protocol/schema mechanics
-remain code-owned. See [optimization](optimization.md) for experiment commands.
-
-Compare prompt candidates on accepted artifacts and held-out tasks, including
-corrections, long sessions, history recall and joins. A shorter summary that
-loses an obligation is not a win. Neither one cache hit nor one passing task
-establishes a general resource improvement.
+Summary policy is supplied only when a fold is requested. Offline GEPA can
+replace coding or summary policy for new sessions; it does not change CAST
+semantics or add a runtime classifier. See [optimization](optimization.md).
 
 ## Implementation anchors
 

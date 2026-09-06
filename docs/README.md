@@ -1,60 +1,48 @@
 # Documentation map
 
-Start with [the current runtime map](architecture/architecture.md) and
-[providers as resources](architecture/provider-routing.md). Source and executable
-tests decide what is implemented. The [operating model](architecture/agent-operating-model.md)
-preserves the wider design; it is not a claim that every proposed layer ships.
+Start with the [runtime map](architecture/architecture.md). It states what is
+implemented and which module owns each effect. Source and executable checks are
+the final authority.
 
-## Current runtime contracts
+## Runtime contracts
 
-| Question | Owning document |
+| Topic | Owner |
 | --- | --- |
-| Which module owns which effect? | [Runtime map](architecture/architecture.md) |
-| What is a child/subagent, and why fork context? | [Context branches](architecture/context-branches.md) |
-| How are children admitted, suspended, and joined? | [Child lifecycle](architecture/subagents.md) |
-| How do summaries, checkpoints, and K0 rollover work? | [Context engine](architecture/context-engine.md) |
-| How are provider capacity, throughput, and quota accounted? | [Provider routing](architecture/provider-routing.md) |
-| What survives interactive turns and reconnect? | [Interactive lifecycle](architecture/interactive-tui.md) |
-| How does terminal input, layout, and inspection work? | [Terminal interface](architecture/terminal-interface.md) |
-| Which events are durable? | [Event glossary](architecture/events.md) |
-| How do operational plans, recovery, and publication work? | [Operations](architecture/operations.md) |
-| What does DSPy actually optimize and load? | [Offline optimization](architecture/optimization.md) |
+| Runtime flow and module ownership | [architecture](architecture/architecture.md) |
+| CAST working context and K0 | [context engine](architecture/context-engine.md) |
+| Delegation and context/placement defaults | [context branches](architecture/context-branches.md) |
+| Child admission, suspension, joins and failure | [subagents](architecture/subagents.md) |
+| Provider capacity, quota and routing | [provider routing](architecture/provider-routing.md) |
+| Persistent interactive sessions | [interactive TUI](architecture/interactive-tui.md) |
+| Terminal input, focus and cockpit layout | [terminal interface](architecture/terminal-interface.md) |
+| Durable events | [events](architecture/events.md) |
+| Recovery and publication | [operations](architecture/operations.md) |
+| DSPy/GEPA prompt experiments | [optimization](architecture/optimization.md) |
+| Design rationale | [agent operating model](architecture/agent-operating-model.md) |
 
-The active inspection/navigation tools are `inspect_state`, `repo_query`, and
-`branch_history`. Model `inspect_state`, TUI `/inspect`, and CLI `inspect-state`
-share the recorded `BranchState` reader and bounded SituationFrame renderer.
-Typed WorkLedger and richer ResultCapsule shapes remain proposals.
+## Exact interfaces
 
-## Reference and usage
+- [Agent state](reference/agent-state.md): `BranchState`, `SituationFrame`,
+  `inspect_state`, and state/reference semantics.
+- [Context branches](reference/context-branches.md): `delegate`, `repo_query`,
+  `branch_history`, context modes, placement values, and stable history refs.
+- CLI `--help` and `schemas.py` remain authoritative for command/tool arguments.
 
-[Context/navigation reference](reference/context-branches.md) owns exact public
-tool and policy values. [The driving loop](how-to/agent-driving-loop.md) and
-[delegate and inspect work](how-to/context-branches.md) show the current workflow.
-CLI `--help`, schemas, and source own exact command arguments and configuration
-defaults.
+## Workflows and evidence
 
-The contributor contract is [agents.md](../agents.md).
+- [Agent driving loop](how-to/agent-driving-loop.md)
+- [Delegation workflow](how-to/context-branches.md)
+- [System evaluation](research/agent-system-evaluation.md)
+- [Provider research](research/codex-activation.md)
+- [Harness audit and recorded failures](research/harness-audit-2026-09-04.md)
 
-## Design proposals and experiments
-
-[Agent operating model](architecture/agent-operating-model.md) explains the
-rationale. [Branch contracts](architecture/context-branch-requirements.md)
-collect cross-cutting runtime invariants; [agent-state reference](reference/agent-state.md)
-records the current inspection shapes. Future state ideas belong in research,
-not in the runtime reference. Planning is optional for a small task.
-
-[Agent-system evaluation](research/agent-system-evaluation.md) contains proposed
-experiments and metrics. [Codex activation research](research/codex-activation.md)
-is provider-specific research whose conclusions need checking against current
-configuration and transports. Neither research page proves runtime support or
-an optimization gain. The [2026-09-04 harness audit](research/harness-audit-2026-09-04.md)
-records concrete failures, repairs, test outcomes, and remaining limitations.
+`WorkLedger` and `ResultCapsule-v2` are proposals. Shared recorded inspection
+through `BranchState`/`SituationFrame` is implemented for the model, CLI and TUI.
+Do not infer runtime support from a proposed type name.
 
 ## Editing rule
 
-Give a contract one owner and link to it. Architecture explains rationale and
-ownership; reference gives exact shapes; how-to shows a sequence; research keeps
-hypotheses and results. Mark proposals explicitly, cite source symbols/files
-rather than rotating line numbers, and remove completed work from the plan.
-Do not repeat whole schemas, command tables, or mandatory gate lists across
-all four categories.
+One contract gets one owner. Architecture explains rationale and ownership;
+reference gives exact values; how-to gives sequences; research keeps hypotheses
+and measurements. Link instead of copying schemas, command tables, defaults or
+status prose into several documents.
