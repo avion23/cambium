@@ -2036,7 +2036,11 @@ def _complete_delegates(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         arguments = dict(call["arguments"])
         if isinstance(arguments.get("spec"), dict):
-            arguments["spec"] = complete_child_policy(arguments["spec"], siblings=siblings)
+            arguments["spec"] = complete_child_policy(
+                arguments["spec"],
+                siblings=siblings,
+                read_only=arguments.get("kind") == "investigation",
+            )
         arguments.setdefault("kind", "feature")
         call["arguments"] = arguments
     return calls
