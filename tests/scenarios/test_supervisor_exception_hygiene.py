@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import ast
 import asyncio
+import inspect
 from pathlib import Path
 from typing import Any, cast
 
@@ -97,6 +99,48 @@ def _set_sequencer(runtime: supervisor_module._Runtime, sequencer: Any) -> None:
         return sequencer
 
     cast(Any, runtime)._make_sequencer = make_sequencer
+
+
+def _target_handlers(function: ast.AST) -> list[ast.ExceptHandler]:
+    return [node for node in ast.walk(function) if isinstance(node, ast.ExceptHandler)]
+
+
+def _caught_names(handler: ast.ExceptHandler) -> set[str]:
+    if handler.type is None:
+        return set()
+    nodes = [handler.type]
+    if isinstance(handler.type, ast.Tuple):
+        nodes = list(handler.type.elts)
+    return {node.id for node in nodes if isinstance(node, ast.Name)}
+
+
+def test_target_handlers_are_explicit() -> None:
+    source = Path(inspect.getfile(supervisor_module)).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    runtime = next(
+        node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "_Runtime"
+    )
+    methods = {
+        node.name: node
+        for node in runtime.body
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+    }
+    emit_handlers = _target_handlers(methods["emit"])
+    drive = methods["_drive_generation"]
+    cancel_handlers = [
+        handler
+        for node in ast.walk(drive)
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+        and node.name == "_cancel_and_kill"
+        for handler in _target_handlers(node)
+    ]
+    merge_handlers = _target_handlers(methods["_merge_task"])
+
+    handlers = [*emit_handlers, *cancel_handlers, *merge_handlers]
+    assert handlers
+    assert all(handler.type is not None for handler in handlers)
+    assert all("Exception" not in _caught_names(handler) for handler in handlers)
+    assert all("BaseException" not in _caught_names(handler) for handler in handlers)
 
 
 def test_emit_propagates_cancellation_from_store(tmp_path: Path) -> None:

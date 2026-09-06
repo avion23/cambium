@@ -2154,9 +2154,7 @@ def _narrow_table_ranges(text: str, width: int) -> list[tuple[int, int]]:
     return ranges
 
 
-def _render_markdown_lines_rich_document(
-    text: str, width: int, color: bool | int
-) -> list[str]:
+def _render_markdown_lines_rich_document(text: str, width: int, color: bool | int) -> list[str]:
     """Use the shared Rich renderer at the caller's actual terminal color depth."""
     color_depth = color if type(color) is int else (16 if color else 0)
     return _shared_markdown_lines(text, width=width, color_depth=color_depth)
@@ -2186,9 +2184,7 @@ def _render_markdown_lines_rich(text: str, width: int, color: bool | int) -> lis
 
 
 @lru_cache(maxsize=512)
-def _render_markdown_lines_cached(
-    text: str, width: int, color: bool | int
-) -> tuple[str, ...]:
+def _render_markdown_lines_cached(text: str, width: int, color: bool | int) -> tuple[str, ...]:
     """Cache immutable per-entry Markdown rows by source, width, and color."""
     return tuple(_render_markdown_lines_rich(text, width, color))
 
