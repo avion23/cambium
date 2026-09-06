@@ -64,8 +64,9 @@ class ExperimentBudget:
 def json_finite(value: Any) -> Any:
     """Copy value with non-finite floats mapped to 0.0 so strict JSON cannot fail.
 
-    Provider-reported numbers can carry nan/inf (e.g. an ``estimated_cost_usd``
-    accumulating into ``budget.cost_usd``), which ``json.dumps(allow_nan=False)``
+    Provider-reported numbers can be non-finite (an ``inf`` ``estimated_cost_usd``
+    genuinely accumulates into ``budget.cost_usd``; nan/-inf are clamped to 0.0
+    by ``ExperimentBudget.record``), which ``json.dumps(allow_nan=False)``
     rejects and strict readers refuse.  Dicts and lists (nested) are rebuilt;
     ints, strings including numeric strings, bools, and None pass through.
     Report payloads are JSON-loaded or literal, so keys are always strings.
