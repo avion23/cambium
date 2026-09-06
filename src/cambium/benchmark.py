@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import subprocess
 import sys
@@ -53,6 +54,30 @@ class ExperimentBudget:
             + usage.get("completion_tokens", usage.get("output_tokens", 0))
         ))
         self.cost_usd += max(0.0, float(cost))
+
+
+def json_finite(value: Any) -> Any:
+    """Copy value with non-finite floats mapped to 0.0 so strict JSON cannot fail.
+
+    Provider-reported numbers can carry nan/inf (e.g. an ``estimated_cost_usd``
+    accumulating into ``budget.cost_usd``), which ``json.dumps(allow_nan=False)``
+    rejects and strict readers refuse.  Dicts and lists (nested) are rebuilt;
+    ints, strings including numeric strings, bools, and None pass through.
+    Report payloads are JSON-loaded or literal, so keys are always strings.
+    """
+    if isinstance(value, float):
+        return value if math.isfinite(value) else 0.0
+    if isinstance(value, dict):
+        return {key: json_finite(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [json_finite(item) for item in value]
+    return value
+
+
+def write_json_report(path: Path, payload: Any) -> None:
+    """Write an experiment report as strict JSON; non-finite floats become 0.0."""
+    text = json.dumps(json_finite(payload), indent=2, allow_nan=False) + "\n"
+    path.write_text(text, encoding="utf-8")
 
 
 def load_cases(path: Path) -> list[dict[str, Any]]:
@@ -337,9 +362,9 @@ def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact che
             f"missing_tools={sorted(missing_tools)}; "
             f"parallel_children={peak_children}/{case.get('required_parallel_children', 0)}; "
             f"{error}\n"
-            f"{diagnostic}\n{json.dumps(failures)[-3000:]}"
+            f"{diagnostic}\n{json.dumps(json_finite(failures), allow_nan=False)[-3000:]}"
         ),
     }
     budget.rows.append(row)
-    (root / "report.json").write_text(json.dumps(row, indent=2) + "\n")
+    write_json_report(root / "report.json", row)
     return row
