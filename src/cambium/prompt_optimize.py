@@ -130,7 +130,11 @@ def metric(
 ) -> Any:
     import dspy
 
-    return dspy.Prediction(score=float(pred.score), feedback=pred.report)
+    try:
+        score = float(pred.score)
+    except (AttributeError, TypeError, ValueError):
+        return dspy.Prediction(score=0.0, feedback=getattr(pred, "report", "") or "")
+    return dspy.Prediction(score=score, feedback=pred.report)
 
 
 def _reflection_lm(args: Any, budget: ExperimentBudget) -> Any:

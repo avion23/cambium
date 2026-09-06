@@ -133,6 +133,52 @@ def test_metric_handles_value_error_but_propagates_type_error() -> None:
         metric(_gold(), _prediction())
 
 
+def test_metric_accepts_boolean_scores_per_dspy_convention() -> None:
+    class TrueProgram:
+        def metric(self, _example):
+            return True
+
+    class FalseProgram:
+        def metric(self, _example):
+            return False
+
+    assert optimize.make_dspy_metric(TrueProgram())(_gold(), _prediction()) == 1.0
+    assert optimize.make_dspy_metric(FalseProgram())(_gold(), _prediction()) == 0.0
+
+
+def test_jlens_fusion_caches_identical_requests(monkeypatch) -> None:
+    from cambium.jlens import JlenClient
+
+    class CountingClient(JlenClient):
+        def __init__(self) -> None:
+            super().__init__("http://127.0.0.1:1")
+            self.score_calls = 0
+
+        def score(self, messages, expected, alt=None):
+            self.score_calls += 1
+            return {"rank": 1}
+
+        def signal(self, result, expected):
+            del result, expected
+            return 1.0
+
+    class HalfProgram:
+        def metric(self, _example):
+            return 0.5
+
+    monkeypatch.setenv("CAMBIUM_JLENS_WEIGHT", "0.5")
+    client = CountingClient()
+    metric = optimize.make_dspy_metric(HalfProgram(), client)
+    predictor = dspy.Predict("task -> decision")
+    trace = [(predictor, {"task": "Atomic task"}, None)]
+    assert metric(_gold(), _prediction(), trace) == 0.75
+    assert metric(_gold(), _prediction(), trace) == 0.75
+    assert client.score_calls == 1
+    other = [(predictor, {"task": "Different task"}, None)]
+    assert metric(_gold(), _prediction(), other) == 0.75
+    assert client.score_calls == 2
+
+
 def test_loader_import_and_data_failures_are_handled_but_type_errors_propagate(
     monkeypatch,
 ) -> None:

@@ -187,6 +187,19 @@ def test_gepa_reflection_feedback_renders_summary_control_for_summary_component(
     assert len(feedback) <= prompt_optimize._FEEDBACK_CHARS
 
 
+def test_prompt_metric_scores_malformed_predictions_zero() -> None:
+    from types import SimpleNamespace
+
+    from cambium import prompt_optimize
+
+    assert prompt_optimize.metric(None, SimpleNamespace(report="no score")).score == 0.0
+    assert prompt_optimize.metric(None, SimpleNamespace(score=None, report="r")).score == 0.0
+    assert prompt_optimize.metric(None, SimpleNamespace(score="bad", report="r")).score == 0.0
+    good = prompt_optimize.metric(None, SimpleNamespace(score=0.9, report="r"))
+    assert good.score == 0.9
+    assert good.feedback == "r"
+
+
 @pytest.mark.parametrize("no_deploy", [False, True])
 def test_gepa_winner_is_automatically_deployed_unless_disabled(
     tmp_path: Path,
