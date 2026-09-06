@@ -20,7 +20,7 @@ context forks, child joins, Git publication, cancellation, and recovery.
   leases, durable quota reservations, usage accounting, effort-aware deadlines,
   and bounded call-time failover (`routing.py`, `provider_scheduler.py`,
   `diffundo.py`).
-- **Recursive branches:** task trees bounded at width 8 and depth 3, isolated
+- **Recursive branches:** per-parent fan-out bounded at 8 and depth at 3, isolated
   child worktrees, per-child context/placement with deterministic defaults,
   serialized integration, and conflict-resolver support.
 - **Worker tools:** the active schema and dispatch expose `write_file`,
@@ -69,13 +69,17 @@ uv run cambium --help
 Run the persistent terminal cockpit against a repository:
 
 ```bash
-uv run cambium tui --repo . --auto
+uv run cambium tui --repo .
 ```
+
+With no `--provider` or `--model`, Cambium uses the credential-ready provider
+pool and its normal routing/resource state; no separate automatic-routing flag
+is needed.
 
 Continue the latest interactive branch:
 
 ```bash
-uv run cambium tui --repo . --continue --auto
+uv run cambium tui --repo . --continue
 ```
 
 Run a static plan:
@@ -132,8 +136,8 @@ Focused documents:
   — durable interactive turns, reconnect, and replay.
 - [`docs/architecture/events.md`](docs/architecture/events.md) — event-kind
   glossary for the durable event store.
-- [`docs/reference/agent-state.md`](docs/reference/agent-state.md) — branch
-  state inspection and proposed state shapes.
+- [`docs/reference/agent-state.md`](docs/reference/agent-state.md) — current
+  BranchState/SituationFrame inspection contracts.
 - [`docs/how-to/agent-driving-loop.md`](docs/how-to/agent-driving-loop.md) —
   driving sessions from another coding agent.
 - [`docs/research/agent-system-evaluation.md`](docs/research/agent-system-evaluation.md)

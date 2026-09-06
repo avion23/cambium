@@ -126,8 +126,8 @@ unambiguous because existing durable sessions use them.
 ## Tools, prompts, and future state
 
 The active schema exposes `write_file`, `edit_file`, `git_op`, `run_shell`,
-`read_batch`, `repo_query`, `branch_history`, and `delegate`. A tool's internal
-implementation filename is not another public tool name.
+`read_batch`, `repo_query`, `branch_history`, `inspect_state`, and `delegate`.
+A tool's internal implementation filename is not another public tool name.
 
 [prompts.py](../../src/cambium/prompts.py) combines code-owned action/summary
 protocols with replaceable coding and summary policies. The coding policy also
@@ -136,12 +136,9 @@ Sessions pin their policy text. New sessions and `/new` load the deployed
 artifact; see [prompt optimization](../architecture/optimization.md). A small
 task may start with a tool or a valid finish; a plan is optional.
 
-`branch_state.py` and CLI `inspect-state` provide current inspection. A
-model-facing `inspect_state` shares the operator's recorded-state reader;
-see [agent-state inspection](agent-state.md#9-inspect_state-tool--implemented).
-The worker's bounded local SituationFrame is also implemented. Typed WorkLedger
-and richer ResultCapsule remain proposals; do not infer wire support merely
-from their target names in [agent-state](agent-state.md).
+Model `inspect_state`, TUI `/inspect`, and CLI `inspect-state` share the
+recorded BranchState reader; see [agent-state inspection](agent-state.md#inspect_state-tool).
+Future state ideas are research topics, not additional wire contracts.
 
 ## Executable anchors
 

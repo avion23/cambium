@@ -20,11 +20,10 @@ preserves the wider design; it is not a claim that every proposed layer ships.
 | How do operational plans, recovery, and publication work? | [Operations](architecture/operations.md) |
 | What does DSPy actually optimize and load? | [Offline optimization](architecture/optimization.md) |
 
-The active navigation tools are `repo_query` and `branch_history`, backed by
-existing source/session artifacts. `branch_state.py` and CLI `inspect-state`
-also exist. A fully shared model/operator state projection, typed WorkLedger,
-and richer ResultCapsule remain separate integration work; do not infer them
-from target names or the existence of a library.
+The active inspection/navigation tools are `inspect_state`, `repo_query`, and
+`branch_history`. Model `inspect_state`, TUI `/inspect`, and CLI `inspect-state`
+share the recorded `BranchState` reader and bounded SituationFrame renderer.
+Typed WorkLedger and richer ResultCapsule shapes remain proposals.
 
 ## Reference and usage
 
@@ -40,10 +39,9 @@ The contributor contract is [agents.md](../agents.md).
 
 [Agent operating model](architecture/agent-operating-model.md) explains the
 rationale. [Branch contracts](architecture/context-branch-requirements.md)
-distinguish current invariants from gaps, while
-[agent-state reference](reference/agent-state.md) marks the remaining target
-shapes. Use proposals to guide a small implemented slice, not as a checklist
-requiring new per-turn control layers. Planning is optional for a small task.
+collect cross-cutting runtime invariants; [agent-state reference](reference/agent-state.md)
+records the current inspection shapes. Future state ideas belong in research,
+not in the runtime reference. Planning is optional for a small task.
 
 [Agent-system evaluation](research/agent-system-evaluation.md) contains proposed
 experiments and metrics. [Codex activation research](research/codex-activation.md)

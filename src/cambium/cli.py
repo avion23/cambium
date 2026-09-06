@@ -260,12 +260,6 @@ def _add_agent_arguments(parser: argparse.ArgumentParser) -> None:
 def _add_routing_budget_arguments(parser: argparse.ArgumentParser) -> None:
     _add_agent_arguments(parser)
     parser.add_argument(
-        "--auto",
-        action="store_true",
-        help="select from enabled providers with stored credentials using "
-        "recorded usage instead of pinning --provider/--model",
-    )
-    parser.add_argument(
         "--max-wall-s",
         type=_positive_float,
         metavar="SECONDS",
@@ -1097,7 +1091,6 @@ async def _run_oneshot(args: argparse.Namespace) -> int:
             session_root=args.session_dir,
             provider=provider,
             model=model,
-            auto=getattr(args, "auto", False),
             max_wall_s=_budget_or_default(
                 getattr(args, "max_wall_s", None), oneshot.DEFAULT_WALL_BUDGET_S
             ),
@@ -1157,7 +1150,6 @@ async def _run_repl(args: argparse.Namespace) -> int:
         session_root=args.session_dir,
         provider=provider,
         model=model,
-        auto=args.auto,
         # ``None`` lets the REPL resolve the interactive deadline from the
         # selected provider's hint and the branch's measured output rate.
         max_wall_s=args.max_wall_s,
@@ -1191,7 +1183,6 @@ async def _run_tui(args: argparse.Namespace) -> int:
         session_root=session_root,
         provider=provider,
         model=model,
-        auto=args.auto,
         # ``None`` lets InteractiveSession resolve the throughput-aware
         # interactive deadline; an explicit CLI value remains authoritative.
         max_wall_s=args.max_wall_s,
