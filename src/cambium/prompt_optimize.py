@@ -8,7 +8,7 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 from statistics import mean
-from typing import Any
+from typing import Any, cast
 
 from .benchmark import ExperimentBudget, ExperimentBudgetExceeded, load_cases, run_case
 from .prompts import coding_prompt, load_policy, prompt_path, save_policy
@@ -92,16 +92,18 @@ def make_program(component: str, policy: dict[str, str], runner: Any) -> Any:
 
     class Rollout(dspy.Predict):
         def __init__(self) -> None:
+            # dspy accepts a Signature instance and a positional string; its stubs reject both.
             super().__init__(
-                dspy.Signature(
-                    "case: dict -> report: str, score: float",
+                dspy.Signature(  # type: ignore[reportArgumentType]
+                    "case: dict -> report: str, score: float",  # type: ignore[reportCallIssue]
                     instructions=policy[component],
                 )
             )
 
         def forward(self, **kwargs: Any) -> Any:
             case = kwargs["case"]
-            selected = {**policy, component: self.signature.instructions}
+            # dspy binds .signature at runtime; the inferred stubs hide it from the checker.
+            selected = {**policy, component: cast(Any, self.signature).instructions}
             row = runner(case, selected)
             report = grounded_feedback(component, selected, row)
             return self._forward_postprocess(
@@ -269,7 +271,8 @@ def run(args: Any) -> int:
                 trainset=[dspy.Example(case=c).with_inputs("case") for c in splits["train"]],
                 valset=[dspy.Example(case=c).with_inputs("case") for c in splits["val"]],
             )
-            winner = {**policy, args.component: compiled.policy.signature.instructions}
+            # dspy exposes compiled.policy.signature only at runtime.
+            winner = {**policy, args.component: cast(Any, compiled.policy).signature.instructions}
             comparison = [rollout(c, winner) for c in splits["val"]]
             held_out = [rollout(c, winner) for c in splits["test"]]
             improved = (

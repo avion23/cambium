@@ -1210,7 +1210,9 @@ def run_stage_gepa(
         ledger=ledger,
     )
     try:
-        optimizer = gepa_class(
+        # dspy's inferred stubs lose the GEPA class through getattr, so the
+        # runtime optimizer (which exposes compile()) degrades to object.
+        optimizer: Any = gepa_class(
             metric=make_dspy_metric(program),
             max_metric_calls=max_metric_calls,
             reflection_lm=reflection_lm,
@@ -1309,6 +1311,7 @@ class _SingleFileDatasetLoader:
         load = getattr(loader, "load", None)
         if not callable(load):
             raise OptimizeError("explicit dataset loader does not provide load()")
+        load = cast(Callable[[], Iterable[Example]], load)
         examples = list(load())
         try:
             records = [
