@@ -140,8 +140,6 @@ Focused documents:
   `BranchState`/`SituationFrame` inspection and remaining state proposals.
 - [`docs/how-to/agent-driving-loop.md`](docs/how-to/agent-driving-loop.md) —
   driving sessions from another coding agent.
-- [`docs/research/agent-system-evaluation.md`](docs/research/agent-system-evaluation.md)
-  — evaluating the runtime end to end.
 
 ## License
 

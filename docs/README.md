@@ -28,13 +28,11 @@ the final authority.
   `branch_history`, context modes, placement values, and stable history refs.
 - CLI `--help` and `schemas.py` remain authoritative for command/tool arguments.
 
-## Workflows and evidence
+## Workflows and operations
 
 - [Agent driving loop](how-to/agent-driving-loop.md)
 - [Delegation workflow](how-to/context-branches.md)
-- [System evaluation](research/agent-system-evaluation.md)
-- [Provider research](research/codex-activation.md)
-- [Harness audit and recorded failures](research/harness-audit-2026-09-04.md)
+- [Codex OAuth activation](research/codex-activation.md)
 
 `WorkLedger` and `ResultCapsule-v2` are proposals. Shared recorded inspection
 through `BranchState`/`SituationFrame` is implemented for the model, CLI and TUI.
@@ -43,6 +41,7 @@ Do not infer runtime support from a proposed type name.
 ## Editing rule
 
 One contract gets one owner. Architecture explains rationale and ownership;
-reference gives exact values; how-to gives sequences; research keeps hypotheses
-and measurements. Link instead of copying schemas, command tables, defaults or
-status prose into several documents.
+reference gives exact values; how-to gives sequences. Keep dated run logs and
+completed implementation plans out of the active documentation tree. Link
+instead of copying schemas, command tables, defaults or status prose into
+several documents.

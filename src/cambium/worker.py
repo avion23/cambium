@@ -7726,33 +7726,35 @@ async def _heartbeat_loop(
     published_phase: str | None = None
     published_tail: str | None = None
     published_revision = 0
+    published_progress: tuple[Any, ...] | None = None
     last_phase_emit = float("-inf")
     drain_ok = True
     while not stop.is_set():
         now = time.monotonic()
         heartbeat_due = now >= next_heartbeat
-        phase_due = False
+        progress_due = False
         provider = model = None
         cache_hit: bool | None = None
+        tool = progress.tool if progress is not None else None
         if progress is not None:
             phase, tail, revision, provider, model, cache_hit = progress.phase_snapshot()
-            phase_due = (
+            visible_progress = (phase, tail, provider, model, cache_hit, tool)
+            changed = visible_progress != published_progress
+            repeated_phase_due = (
                 phase is not None
                 and revision > published_revision
-                and (
-                    (phase != published_phase and heartbeat_due)
-                    or now - last_phase_emit >= PHASE_HEARTBEAT_INTERVAL_S
-                )
+                and now - last_phase_emit >= PHASE_HEARTBEAT_INTERVAL_S
             )
-            if phase_due:
+            progress_due = changed or repeated_phase_due
+            if progress_due:
+                published_progress = visible_progress
                 published_phase, published_tail = phase, tail
                 published_revision = revision
                 last_phase_emit = now
-        if not heartbeat_due and not phase_due:
+        if not heartbeat_due and not progress_due:
             await asyncio.sleep(min(0.05, next_heartbeat - now))
             continue
         turn = progress.turn if progress is not None else 0
-        tool = progress.tool if progress is not None else None
         status = progress.status if progress is not None else "working"
         heartbeat: dict[str, Any] = {
             "type": "heartbeat",

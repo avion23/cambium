@@ -17,6 +17,8 @@ from cambium import optimize
 from cambium.modules.base import Example
 from cambium.modules.should_review.decide import should_review
 
+pytestmark = pytest.mark.xdist_group("dspy-runtime")
+
 if TYPE_CHECKING:
     from cambium.modules.example.dataset import Split as SplitType
     from cambium.modules.example.decide import DecomposeOutput as DecomposeOutputType

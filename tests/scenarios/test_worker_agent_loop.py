@@ -127,10 +127,10 @@ class _StreamingScriptedRouter(_ScriptedRouter):
                     "model": "loopback-model",
                 }
             )
-        if self.delta_delay_s:
-            await asyncio.sleep(self.delta_delay_s)
         if on_delta is not None:
             for kind, fragment in self.deltas:
+                if self.delta_delay_s:
+                    await asyncio.sleep(self.delta_delay_s)
                 on_delta(kind, fragment)
         await asyncio.sleep(self.hold_s)
         if on_status is not None:
@@ -1673,25 +1673,17 @@ def test_lint_feedback_visible_in_transcript(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("deltas", "expected_phases"),
-    (
-        ([("text", "answer fragment")], {"waiting", "streaming"}),
-        ([], {"waiting"}),
-    ),
-)
-def test_heartbeats_report_provider_and_phase(
+def test_heartbeats_publish_visible_provider_transitions_without_waiting_for_cadence(
     tmp_path: Path,
-    deltas: list[tuple[str, str]],
-    expected_phases: set[str],
 ) -> None:
     repo = tmp_path / "repo"
     worktree = _make_worktree(repo)
-    config = _agent_config(worktree)
+    config = _agent_config(worktree, heartbeat_interval_s=15.0)
     router = _StreamingScriptedRouter(
         ['{"type":"finish","summary":"done","objective_met":true}'],
-        deltas,
-        delta_delay_s=0.15 if deltas else 0.0,
+        [("thinking", "consider"), ("text", "answer fragment")],
+        delta_delay_s=0.08,
+        hold_s=0.05,
     )
 
     outcome, messages = asyncio.run(_drive_loop_with_heartbeats(config, worktree, router))
@@ -1699,15 +1691,12 @@ def test_heartbeats_report_provider_and_phase(
     assert outcome["status"] == "succeeded"
     heartbeats = [message for message in messages if message["type"] == "heartbeat"]
     phases = [heartbeat.get("phase") for heartbeat in heartbeats]
-    assert heartbeats
-    assert set(phases) == expected_phases
+    assert phases[:3] == ["waiting", "thinking", "streaming"]
     assert any(
         heartbeat.get("provider") == "loopback-provider"
         and heartbeat.get("model") == "loopback-model"
         for heartbeat in heartbeats
     )
-    if "streaming" in expected_phases:
-        assert phases.index("waiting") < phases.index("streaming")
     # Provider responses are internal JSON actions; the cockpit shows stream
     # state/rate, not protocol fragments.
     assert not any(

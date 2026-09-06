@@ -41,7 +41,6 @@ def _restart_worker(path: Path, *, mismatch: bool = False) -> None:
             import os
             import subprocess
             import sys
-            import time
             from pathlib import Path
 
             init = json.loads(sys.stdin.readline())
@@ -66,7 +65,7 @@ def _restart_worker(path: Path, *, mismatch: bool = False) -> None:
                     'workspace_hash': hashlib.sha256(diff).hexdigest(),
                 }}), encoding='utf-8')
                 {mutation}
-                time.sleep(1000)
+                raise SystemExit(7)
             if init.get('resume') is not None:
                 (worktree.parent / 'resume.json').write_text(
                     json.dumps(init['resume']), encoding='utf-8')

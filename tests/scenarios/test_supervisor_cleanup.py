@@ -180,7 +180,7 @@ def test_terminal_turn_prunes_worktree_and_reaps_worker(tmp_path: Path, mode: st
         base,
         task_id,
         worker,
-        max_wall_s=5.0 if mode == "wall" else 30.0,
+        max_wall_s=0.5 if mode == "wall" else 30.0,
     )
     worktree = Path(task_spec["worktree_path"])
     ready = asyncio.Event()
@@ -207,7 +207,7 @@ def test_terminal_turn_prunes_worktree_and_reaps_worker(tmp_path: Path, mode: st
             reason = result.results[0].reason or ""
             assert reason.startswith("max_restarts (0): wall (timeout: wall (elapsed=")
             assert re.search(r"elapsed=\d+(?:\.\d+)?s", reason)
-            assert "budget=5s, restarts=0))" in reason
+            assert "budget=0.5s, restarts=0))" in reason
 
     asyncio.run(run_and_cancel())
     assert worker_pid is not None

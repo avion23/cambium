@@ -5877,6 +5877,17 @@ class _Runtime:
         return False
 
     async def _handle_generation_eof(self, state: _GenerationState) -> None:
+        # Stream EOF can race the child watcher. Give an actually exited child
+        # one short scheduling window to publish its return code; reserve the
+        # expensive EOF grace/probe for the exceptional case where stdout
+        # closed but the process is still alive.
+        if state.proc.returncode is None:
+            try:
+                await asyncio.wait_for(state.proc.wait(), 0.05)
+            except TimeoutError:
+                pass
+        if state.proc.returncode is not None:
+            return
         await self.emit(
             "log",
             task_id=state.task_id,

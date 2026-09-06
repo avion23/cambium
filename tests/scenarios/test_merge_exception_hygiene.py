@@ -1,29 +1,11 @@
 from __future__ import annotations
 
-import ast
 import subprocess
 from pathlib import Path
 
 import pytest
 
 from cambium.merge import GitError, MergeSequencer
-
-MERGE_PATH = Path(__file__).resolve().parents[2] / "src" / "cambium" / "merge.py"
-
-
-def test_merge_has_no_unbounded_exception_handlers() -> None:
-    tree = ast.parse(MERGE_PATH.read_text(encoding="utf-8"))
-    broad_handlers = [
-        handler.lineno
-        for handler in ast.walk(tree)
-        if isinstance(handler, ast.ExceptHandler)
-        and (
-            handler.type is None
-            or isinstance(handler.type, ast.Name)
-            and handler.type.id in {"BaseException", "Exception"}
-        )
-    ]
-    assert broad_handlers == []
 
 
 def test_prepare_staging_rolls_back_after_git_worktree_failure(

@@ -17,6 +17,8 @@ from cambium.modules.should_review.decide import ReviewOutput
 from cambium.modules.should_review.decide import TaskInput as ReviewTaskInput
 from cambium.modules.should_review.dspy_program import ShouldReviewModuleDSPy
 
+pytestmark = pytest.mark.xdist_group("dspy-runtime")
+
 
 def _fake_lm(response: str):
     import dspy  # type: ignore[import-untyped]

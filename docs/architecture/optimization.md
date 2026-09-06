@@ -126,10 +126,9 @@ parallel work. `peak_pending_children` counts admitted, unfinished siblings,
 including queued work; it does not claim simultaneous provider calls or speedup.
 Provider lists report successful serving calls, not failed attempts alone.
 
-The raw source sessions are development artifacts under the earlier worktree's
-`.cambium` directories. The fixtures contain the minimum task/input/check,
-not credentials or entire private transcripts. Source provenance and negative
-runs are described in [the audit](../research/harness-audit-2026-09-04.md).
+The fixtures contain only the minimum task/input/check, not credentials or
+entire private transcripts. Optimization reports retain source provenance and
+negative outcomes; they are evidence for an experiment, not runtime contracts.
 
 ## Metrics and limitations
 
