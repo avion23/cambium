@@ -109,7 +109,7 @@ def test_resource_rail_keeps_throughput_and_quota_visible_in_a_short_terminal() 
         snapshot,
         32,
         18,
-        cumulative_line=("usage: calls=4 in=100 out=40 cached=70 out/s=10.0 cost=0"),
+        cumulative_line="usage: calls=4 in=100 out=40 cached=70 out/s=10.0 cost=0",
     )
     text = "\n".join(line for _, line in rows)
     assert "RESOURCES" in text
