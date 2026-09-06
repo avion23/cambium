@@ -25,6 +25,7 @@ def test_atomic_replacement_changes_new_prompts_not_existing_snapshot(
     assert second["coding"] in after["messages"][0]["content"]
     assert before == worker._build_agent_prompt("task", [], [], prompt_policy=pinned)
     assert '"type":"finish"' in after["messages"][0]["content"]
+    assert "under about 600 characters" in after["messages"][0]["content"]
     assert "summary_entry" not in second["coding"]
 
 
@@ -33,6 +34,17 @@ def test_experiment_budget_counts_tokens_when_cash_is_zero() -> None:
     budget.record({"prompt_tokens": 90, "completion_tokens": 10}, 0.0)
     with pytest.raises(ExperimentBudgetExceeded):
         budget.check()
+
+
+def test_gepa_search_reserves_measured_budget_for_final_evaluation() -> None:
+    from cambium.prompt_optimize import _effective_search_evals
+
+    budget = ExperimentBudget(600, 2_000_000, 50.0, calls=16, tokens=119_911)
+    baseline = [
+        {"calls": 10, "tokens": 97_740, "cost_usd": 0.0},
+        {"calls": 6, "tokens": 22_171, "cost_usd": 0.0},
+    ]
+    assert _effective_search_evals(24, budget, baseline, evaluation_cases=5) == 10
 
 
 def test_parallel_benchmark_distinguishes_overlapping_siblings_from_serial_work() -> None:
@@ -109,6 +121,8 @@ def test_gepa_reflection_feedback_is_grounded_in_rendered_prompt_and_trajectory(
         "tokens": 48000,
         "cost_usd": 0.5,
         "children": 2,
+        "user_summary_chars": 1200,
+        "user_summary_lines": 14,
         "malformed_actions": 7,
         "tool_failures": 3,
         "feedback": "exit=1; check=False; scope=True; rollout wall budget exhausted\n" + "x" * 9000,
@@ -139,12 +153,15 @@ def test_gepa_reflection_feedback_is_grounded_in_rendered_prompt_and_trajectory(
         "malformed_actions",
         "tool_failures",
         "children",
+        "user_summary_chars",
+        "user_summary_lines",
         "derailment",
     ):
         assert f'"{key}"' in feedback
     assert "malformed-heavy" in feedback
     assert "check-failed" in feedback
     assert "timeout-shaped" in feedback
+    assert "verbose-user-summary" in feedback
     # (iii) feedback stays bounded even for a large row; raw row JSON remains
     assert len(feedback) <= prompt_optimize._FEEDBACK_CHARS
     assert "[feedback truncated:" in feedback

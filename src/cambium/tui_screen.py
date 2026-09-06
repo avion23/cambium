@@ -30,6 +30,7 @@ from decimal import Decimal
 from functools import lru_cache
 from typing import Any, TextIO
 
+from .render_markdown import CambiumMarkdown, markdown_theme
 from .terminal import (
     clip_terminal_text,
     pad_terminal_text,
@@ -51,22 +52,43 @@ _BLUE = "\x1b[1;34m"
 _GREEN = "\x1b[1;32m"
 _YELLOW = "\x1b[1;33m"
 _RED = "\x1b[1;31m"
+_MAGENTA = "\x1b[1;35m"
 _WHITE = "\x1b[1;37m"
 
-# Markdown styles are deliberately a closed set.  Model text is sanitized
-# before one of these wrappers is added; the renderer below never forwards
-# provider-supplied escape sequences.
-_MD_HEADING = "\x1b[1;36m"
-_MD_CODE = "\x1b[33m"
+# Rich styles remain a closed set. Model text is sanitized before Rich adds
+# these sequences; provider-supplied escapes are never trusted as renderer output.
 _MD_BOLD = "\x1b[1m"
-_MD_ITALIC = "\x1b[3m"
-_MD_RULE = "\x1b[2;36m"
+_RICH_ANSI = frozenset(
+    {
+        "\x1b[34m",
+        "\x1b[36m",
+        "\x1b[90m",
+        "\x1b[92m",
+        "\x1b[94m",
+        "\x1b[95m",
+        "\x1b[96m",
+        "\x1b[1;33m",
+        "\x1b[1;37m",
+        "\x1b[1;92m",
+        "\x1b[1;93m",
+        "\x1b[1;94m",
+        "\x1b[1;95m",
+        "\x1b[1;96m",
+        "\x1b[1;97m",
+        "\x1b[2;36m",
+        "\x1b[3;95m",
+        "\x1b[4;94m",
+    }
+)
 _STATUS_PALETTE = {
     "cyan": _CYAN,
     "dim": _DIM,
+    "blue": _BLUE,
     "green": _GREEN,
     "yellow": _YELLOW,
     "red": _RED,
+    "magenta": _MAGENTA,
+    "white": _WHITE,
     "bold": _MD_BOLD,
 }
 _CONTROLLED_ANSI = frozenset(
@@ -79,12 +101,10 @@ _CONTROLLED_ANSI = frozenset(
         _GREEN,
         _YELLOW,
         _RED,
+        _MAGENTA,
         _WHITE,
-        _MD_HEADING,
-        _MD_CODE,
         _MD_BOLD,
-        _MD_ITALIC,
-        _MD_RULE,
+        *_RICH_ANSI,
     }
 )
 _ANSI_STYLE = re.compile(r"\x1b\[[0-9;]*m")
@@ -92,11 +112,11 @@ _ANSI_STYLE = re.compile(r"\x1b\[[0-9;]*m")
 _ROLE_COLORS = {
     "user": _BLUE,
     "assistant": _WHITE,
-    "tool": _YELLOW,
-    "system": _DIM,
+    "tool": _MAGENTA,
+    "system": _DIM_CYAN,
     "error": _RED,
     "dim": _DIM,
-    "live": _DIM_CYAN,
+    "live": _CYAN,
 }
 _ROLE_LABELS = {
     "user": "YOU",
@@ -189,7 +209,8 @@ _TOOL_ERROR_PREFIX = "tool errors:"
 _LIVE_DRAW_INTERVAL = 0.1
 
 _SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
-_ACTIVITY_PHASE_GLYPHS = {"thinking": "◌", "streaming": "▸", "waiting": "…"}
+_ACTIVITY_PHASE_GLYPHS = {"thinking": "◌", "streaming": "▸", "waiting": "◒"}
+_STALL_AFTER_S = 12.0
 _ACTIVITY_TAIL_MAX_CHARS = 120
 _ACTIVITY_PHASE_RE = re.compile(
     r"^[◌▸…]\s+(thinking|streaming|waiting)\s+(\d+(?:\.\d+)?)s(?:\s+·\s*(.*))?$",
@@ -198,15 +219,20 @@ _ACTIVITY_PHASE_RE = re.compile(
 _STATUS_PHASE_RE = re.compile(r"^(\S+)(\s+)([a-z][a-z-]*)(.*)$", re.IGNORECASE)
 _STATUS_PHASE_STYLES = {
     "idle": "dim",
-    "thinking": "green",
+    "thinking": "magenta",
     "streaming": "green",
     "responding": "green",
-    "running": "green",
+    "running": "cyan",
+    "tool": "cyan",
+    "provider": "blue",
+    "children": "blue",
+    "orchestrating": "cyan",
+    "stalled": "yellow",
     "done": "green",
     "failed": "red",
     "error": "red",
     "queued": "yellow",
-    "waiting": "yellow",
+    "waiting": "blue",
     "cooldown": "yellow",
     "suspended": "yellow",
 }
@@ -821,6 +847,7 @@ class Transcript:
         self._live_age_s = 0.0
         self._live_started_at: float | None = None
         self._live_provider_call_open = False
+        self._live_cache_hit: bool | None = None
         self._live_final = False
 
     @property
@@ -956,6 +983,7 @@ class Transcript:
         self._live_age_s = 0.0
         self._live_started_at = None
         self._live_provider_call_open = False
+        self._live_cache_hit = None
         self._live_final = False
 
     @staticmethod
@@ -1032,6 +1060,7 @@ class Transcript:
         self._live_age_s = 0.0
         self._live_started_at = event_clock
         self._live_provider_call_open = False
+        self._live_cache_hit = None
         self._live_final = False
 
     @staticmethod
@@ -1141,6 +1170,9 @@ class Transcript:
             if not self._live_provider_call_open:
                 self._live_calls += 1
             self._live_provider_call_open = False
+            cache_hit = data.get("provider_cache_hit")
+            if type(cache_hit) is bool:
+                self._live_cache_hit = cache_hit
 
         text = self._live_event_text(kind, data)
         if kind in _ASSISTANT_STREAM_KINDS or kind in _TOOL_STREAM_KINDS:
@@ -1546,6 +1578,8 @@ class ActivityState:
         self._heartbeat_tool: tuple[str, float] | None = None
         self._heartbeat_phase: str | None = None
         self._heartbeat_tail = ""
+        self._last_progress_at = 0.0
+        self._progress_signature: tuple[Any, ...] | None = None
 
     @property
     def active(self) -> bool:
@@ -1572,6 +1606,8 @@ class ActivityState:
         self._heartbeat_tool = None
         self._heartbeat_phase = None
         self._heartbeat_tail = ""
+        self._last_progress_at = self._turn_started_at
+        self._progress_signature = None
 
     def stop(self) -> None:
         """Stop the line without leaving stale tool state for a later turn."""
@@ -1658,6 +1694,11 @@ class ActivityState:
             return phase not in _TOOL_PHASE_STARTS
         return phase in _TOOL_PHASE_ENDS and kind.startswith("tool")
 
+    def _mark_progress(self, signature: tuple[Any, ...], now: float) -> None:
+        if signature != self._progress_signature:
+            self._progress_signature = signature
+            self._last_progress_at = now
+
     def _start_tool(self, data: Mapping[str, Any], now: float) -> None:
         tool_id = self._tool_id(data)
         if tool_id is None:
@@ -1665,10 +1706,12 @@ class ActivityState:
             key = f"anonymous:{self._next_tool_id}"
         else:
             key = f"id:{tool_id}"
-        self._tools[key] = (self._tool_name(data), now)
+        tool_name = self._tool_name(data)
+        self._tools[key] = (tool_name, now)
         self._responding = False
+        self._mark_progress(("tool", tool_name), now)
 
-    def _finish_tool(self, data: Mapping[str, Any]) -> None:
+    def _finish_tool(self, data: Mapping[str, Any], now: float) -> None:
         tool_id = self._tool_id(data)
         if tool_id is not None:
             key = f"id:{tool_id}"
@@ -1678,6 +1721,7 @@ class ActivityState:
                 self._responding = False
                 if not self._tools:
                     self._state = "WAITING"
+                self._mark_progress(("tool-finished", tool_id), now)
                 return
             return
 
@@ -1691,6 +1735,7 @@ class ActivityState:
                 self._responding = False
                 if not self._tools:
                     self._state = "WAITING"
+                self._mark_progress(("tool-finished", tool_name), now)
                 return
 
     @staticmethod
@@ -1766,6 +1811,7 @@ class ActivityState:
         if not isinstance(phase, str):
             self._heartbeat_phase = None
             self._heartbeat_tail = ""
+            self._mark_progress(("heartbeat", None, self._heartbeat_tool), event_now)
             self._state = "RUNNING" if self._heartbeat_tool is not None else "WAITING"
             self._responding = False
             return True
@@ -1773,11 +1819,17 @@ class ActivityState:
         if phase not in _ACTIVITY_PHASE_GLYPHS:
             self._heartbeat_phase = None
             self._heartbeat_tail = ""
+            self._mark_progress(("heartbeat", None, self._heartbeat_tool), event_now)
             self._state = "RUNNING" if self._heartbeat_tool is not None else "WAITING"
             self._responding = False
             return True
         self._heartbeat_phase = phase
-        self._heartbeat_tail = _activity_tail(data.get("tail")) if phase != "waiting" else ""
+        self._heartbeat_tail = _activity_tail(data.get("tail")) if phase == "streaming" else ""
+        revision = data.get("phase_revision")
+        revision = revision if type(revision) is int else None
+        self._mark_progress(
+            ("heartbeat", phase, revision, self._heartbeat_tool, self._heartbeat_tail), event_now
+        )
         self._state = "STREAMING" if phase == "streaming" else "WAITING"
         if self._heartbeat_tool is not None:
             self._state = "RUNNING"
@@ -1832,13 +1884,14 @@ class ActivityState:
             self._start_tool(data, event_now)
             return
         if self._is_tool_end(kind, data):
-            self._finish_tool(data)
+            self._finish_tool(data, event_now)
             return
 
         update = _stream_update(record)
         if update is not None and update[0] == "assistant" and update[1]:
             self._responding = True
             self._state = "STREAMING"
+            self._mark_progress(("assistant", update[1][-80:]), event_now)
             self._observe_stream_rate(data, update[1], event_now)
         elif update is not None and update[0] == "tool" and update[1]:
             tool_name = self._tool_name(data)
@@ -1846,119 +1899,75 @@ class ActivityState:
                 self._start_tool(data, event_now)
             self._state = "RUNNING"
             self._responding = False
+            self._mark_progress(("tool-output", tool_name, update[1][-80:]), event_now)
         elif kind in _FIRST_TOKEN_KINDS:
             self._state = "STREAMING"
 
     def render(self, *, now: float | None = None, advance: bool = False) -> str:
-        """Return one bounded status row, or an empty row when the turn is done."""
+        """Render the concrete resource currently blocking or producing progress."""
         if not self._active:
             return ""
         if advance:
             self._frame = (self._frame + 1) % len(_SPINNER_FRAMES)
         current = time.monotonic() if now is None else now
         turn_elapsed = max(0.0, current - self._turn_started_at)
-        if self._heartbeat_phase is not None and self._heartbeat_tool is None:
-            line = f"{_ACTIVITY_PHASE_GLYPHS[self._heartbeat_phase]} {self._heartbeat_phase} "
-            line += _fmt_secs(turn_elapsed)
-            if self._heartbeat_tail:
-                line += f" · {self._heartbeat_tail}"
-            return line
+        quiet_for = max(0.0, current - self._last_progress_at)
+        spinner = _SPINNER_FRAMES[self._frame]
+
         tool = self._heartbeat_tool or next(
             (self._tools[key] for key in reversed(self._tools)),
             None,
         )
         if tool is not None:
             tool_name, tool_started_at = tool
-            tool_name = _sanitize(tool_name)
-            tool_elapsed = max(0.0, current - tool_started_at)
-            # Fixed-width numerals keep the row byte-stable across magnitude
-            # changes (99.9->100.0) so no repaint ever leaves stale tails.
-            label = (
-                f"{self._state} · running {tool_name} {_fmt_secs(tool_elapsed)} "
-                f"· turn {_fmt_secs(turn_elapsed)} · out/s={self._stream_rate:5.1f}"
-            )
-        elif self._cooldown is not None:
+            tool_elapsed = _fmt_secs(max(0.0, current - tool_started_at))
+            label = f"TOOL · {_sanitize(tool_name)} {tool_elapsed}"
+            if quiet_for >= _STALL_AFTER_S:
+                label += f" · no output {_fmt_secs(quiet_for)}"
+            return f"{spinner} {label} · turn {_fmt_secs(turn_elapsed)}"
+
+        if self._cooldown is not None:
             provider, retry_after = self._cooldown
-            suffix = f" · {_fmt_secs(retry_after)}" if retry_after is not None else ""
             owner = f" · {provider}" if provider else ""
-            label = f"COOLDOWN{owner}{suffix} · turn {_fmt_secs(turn_elapsed)}"
-        elif self._state == "STREAMING" or self._responding:
-            elapsed = max(0.001, current - self._turn_started_at)
+            delay = f" · retry {_fmt_secs(retry_after)}" if retry_after is not None else ""
+            return f"{spinner} COOLDOWN{owner}{delay} · turn {_fmt_secs(turn_elapsed)}"
+
+        if self._heartbeat_phase == "waiting":
+            label = f"PROVIDER · waiting {_fmt_secs(turn_elapsed)}"
+            if quiet_for >= _STALL_AFTER_S:
+                label += f" · silent {_fmt_secs(quiet_for)}"
+            return f"{_ACTIVITY_PHASE_GLYPHS['waiting']} {label}"
+
+        if self._heartbeat_phase == "thinking":
+            label = f"THINKING · {_fmt_secs(turn_elapsed)}"
+            if quiet_for >= _STALL_AFTER_S:
+                label += f" · stalled {_fmt_secs(quiet_for)}"
+            return f"{_ACTIVITY_PHASE_GLYPHS['thinking']} {label}"
+
+        if self._heartbeat_phase == "streaming" or self._state == "STREAMING" or self._responding:
+            elapsed = max(0.001, turn_elapsed)
             rate = self._stream_rate or self._stream_tokens / elapsed
-            label = f"STREAMING · responding… {_fmt_secs(turn_elapsed)} · out/s={rate:5.1f}"
-        elif self._state == "DONE":
+            label = f"STREAMING · {_fmt_secs(turn_elapsed)} · {rate:5.1f} tok/s"
+            if quiet_for >= _STALL_AFTER_S:
+                label += f" · stalled {_fmt_secs(quiet_for)}"
+            if self._heartbeat_tail:
+                label += f" · {self._heartbeat_tail}"
+            return f"{_ACTIVITY_PHASE_GLYPHS['streaming']} {label}"
+
+        if self._state == "DONE":
             return "✓ DONE"
-        elif self._state == "ERROR":
+        if self._state == "ERROR":
             return "✗ ERROR"
-        elif self._state == "SUSPENDED":
-            label = f"SUSPENDED · waiting… {_fmt_secs(turn_elapsed)}"
-        else:
-            label = f"WAITING · thinking… {_fmt_secs(turn_elapsed)}"
-        return f"{_SPINNER_FRAMES[self._frame]} {label}"
+        if self._state == "SUSPENDED":
+            return f"{spinner} CHILDREN · waiting {_fmt_secs(turn_elapsed)}"
+        return f"{spinner} ORCHESTRATING · {_fmt_secs(turn_elapsed)}"
 
     def tick(self, *, now: float | None = None) -> str:
         """Advance the spinner once and return the resulting row."""
         return self.render(now=now, advance=True)
 
 
-_MD_HEADING_RE = re.compile(r"^(\s*)(#{1,6})[ \t]+(.+?)\s*#*\s*$")
-_MD_UL_RE = re.compile(r"^(\s*)([-+*])[ \t]+(.*)$")
-_MD_OL_RE = re.compile(r"^(\s*)(\d+[.)])[ \t]+(.*)$")
 _MD_FENCE_RE = re.compile(r"^\s*```([^`]*)\s*$")
-_MD_HRULE_RE = re.compile(r"^\s*(?:(?:\*\s*){3,}|(?:-\s*){3,}|(?:_\s*){3,})$")
-_MD_INLINE_RE = re.compile(
-    r"`([^`\n]+)`"
-    r"|\*\*(\S(?:[^*\n]*\S)?)\*\*"
-    r"|__(\S(?:[^_\n]*\S)?)__"
-    r"|(?<!\*)\*(\S(?:[^*\n]*\S)?)\*(?!\*)"
-    r"|(?<!\w)_(\S(?:[^_\n]*\S)?)_(?!\w)"
-)
-
-
-def _md_style(text: str, style: str, color: bool) -> str:
-    clean = _sanitize(text)
-    return f"{style}{clean}{_RESET}" if color and clean else clean
-
-
-def _render_inline_markdown(text: str, color: bool) -> str:
-    clean = _sanitize(text)
-
-    def replace(match: re.Match[str]) -> str:
-        code, bold, bold_alt, italic, italic_alt = match.groups()
-        if code is not None:
-            return _md_style(code, _MD_CODE, color)
-        if bold is not None or bold_alt is not None:
-            return _md_style(bold or bold_alt or "", _MD_BOLD, color)
-        return _md_style(italic or italic_alt or "", _MD_ITALIC, color)
-
-    return _MD_INLINE_RE.sub(replace, clean)
-
-
-def _wrap_plain_markdown(line: str, width: int) -> list[str]:
-    width = max(1, width)
-    clean = _sanitize(line).replace("\t", " ")
-    if not clean:
-        return [""]
-    if any(_char_width(char) != 1 for char in clean):
-        return _wrap_display_cells(clean, width)
-    chunks = textwrap.wrap(
-        clean,
-        width=width,
-        replace_whitespace=False,
-        drop_whitespace=True,
-        break_long_words=True,
-        break_on_hyphens=False,
-    ) or [""]
-    output: list[str] = []
-    for chunk in chunks:
-        while _display_width(chunk) > width:
-            head, tail = _take_display_width(chunk, width)
-            if not head:
-                head, tail = "?", chunk[1:]
-            output.append(head)
-            chunk = tail
-        output.append(chunk)
-    return output
 
 
 def _wrap_display_cells(line: str, width: int) -> list[str]:
@@ -2014,110 +2023,6 @@ def _wrap_display_cells(line: str, width: int) -> list[str]:
     return output
 
 
-def _md_rule(width: int, closing: bool, color: bool) -> str:
-    glyph = "└" if closing else "┌"
-    rule = "  " + glyph + "─" * max(0, width - 3)
-    return _md_style(_clip(rule, width), _MD_RULE, color)
-
-
-def _render_markdown_lines_fallback(
-    text: str,
-    width: int = 80,
-    *,
-    color: bool = True,
-) -> list[str]:
-    """Render a small, safe Markdown subset to width-bounded terminal lines."""
-    width = max(1, width)
-    clean = _sanitize(text)
-    if not clean:
-        return []
-    output: list[str] = []
-    in_fence = False
-    fence_width = max(1, width - 4)
-
-    def add_blank() -> None:
-        if output and output[-1] != "":
-            output.append("")
-
-    for raw_line in clean.splitlines():
-        fence = _MD_FENCE_RE.match(raw_line)
-        if in_fence:
-            if fence is not None:
-                output.append(_md_rule(width, True, color))
-                in_fence = False
-            else:
-                for part in _wrap_plain_markdown(raw_line, fence_width):
-                    output.append(_md_style("  │ " + part, _MD_RULE, color))
-            continue
-        if fence is not None:
-            language = fence.group(1).strip()
-            header = "  ┌─" + (f" {language}" if language else "")
-            output.append(_md_style(_clip(header, width), _MD_RULE, color))
-            in_fence = True
-            continue
-        if not raw_line.strip():
-            add_blank()
-            continue
-
-        heading = _MD_HEADING_RE.match(raw_line)
-        if heading is not None:
-            leading, marks, body = heading.groups()
-            indent = leading + "  " * (len(marks) - 1)
-            for index, part in enumerate(
-                _wrap_plain_markdown(body, width - _display_width(indent))
-            ):
-                prefix = indent if index == 0 else " " * _display_width(indent)
-                inline = _render_inline_markdown(part, color)
-                output.append(
-                    f"{_MD_HEADING}{_sanitize(prefix)}{inline}{_RESET}"
-                    if color
-                    else prefix + inline
-                )
-            continue
-
-        if _MD_HRULE_RE.match(raw_line):
-            output.append(_md_rule(width, False, color))
-            continue
-
-        list_match = _MD_UL_RE.match(raw_line) or _MD_OL_RE.match(raw_line)
-        if list_match is not None:
-            leading, marker, body = list_match.groups()
-            prefix = f"{leading}{marker} "
-            for index, part in enumerate(
-                _wrap_plain_markdown(body, width - _display_width(prefix))
-            ):
-                hanging = prefix if index == 0 else " " * _display_width(prefix)
-                output.append(hanging + _render_inline_markdown(part, color))
-            continue
-
-        stripped = raw_line.lstrip()
-        if stripped.startswith(">"):
-            body = stripped[1:].lstrip()
-            prefix = "│ "
-            for index, part in enumerate(
-                _wrap_plain_markdown(body, width - _display_width(prefix))
-            ):
-                hanging = prefix if index == 0 else " " * _display_width(prefix)
-                output.append(
-                    _md_style(hanging, _MD_RULE, color) + _render_inline_markdown(part, color)
-                )
-            continue
-
-        # Pipe-delimited tables remain deliberately preformatted; styling each
-        # cell is more code and less useful than preserving the source layout.
-        table = raw_line.strip().count("|") >= 2
-        for part in _wrap_plain_markdown(raw_line, width - 2 if table else width):
-            output.append(
-                ("  " if table else "") + _sanitize(part)
-                if table
-                else _render_inline_markdown(part, color)
-            )
-
-    while output and output[-1] == "":
-        output.pop()
-    return [_clip(line, width) for line in output]
-
-
 _MD_TABLE_DELIMITER_RE = re.compile(r"^:?-{3,}:?$")
 
 
@@ -2130,6 +2035,25 @@ def _markdown_table_cells(line: str) -> tuple[str, ...] | None:
     if stripped.endswith("|"):
         stripped = stripped[:-1]
     return tuple(cell.strip() for cell in stripped.split("|"))
+
+
+def _render_narrow_table_lines(text: str, width: int, color: bool) -> list[str]:
+    """Flatten only tables that Rich cannot fit; preserve every cell."""
+    output: list[str] = []
+    for row_index, line in enumerate(text.splitlines()):
+        cells = _markdown_table_cells(line)
+        if cells is None:
+            continue
+        if row_index == 1 and all(
+            _MD_TABLE_DELIMITER_RE.fullmatch(cell.replace(" ", "")) for cell in cells
+        ):
+            continue
+        prefix = "▸ " if row_index == 0 else "  "
+        for part in _wrap_display_cells(" · ".join(cells), max(1, width - 2)):
+            style = _CYAN if row_index == 0 else ""
+            output.append(_paint(_clip(prefix + part, width), style, color))
+            prefix = "  "
+    return output
 
 
 def _narrow_table_ranges(text: str, width: int) -> list[tuple[int, int]]:
@@ -2183,80 +2107,11 @@ def _narrow_table_ranges(text: str, width: int) -> list[tuple[int, int]]:
 
 @lru_cache(maxsize=1)
 def _rich_markdown_components() -> tuple[Any, Any, Any, Any]:
-    """Load Rich's custom Markdown element classes once, only when needed."""
-    from rich.box import ROUNDED
+    """Reuse the same Rich document class and theme as one-shot rendering."""
     from rich.color import ColorSystem
     from rich.console import Console
-    from rich.markdown import BlockQuote, CodeBlock, Heading, Markdown
-    from rich.padding import Padding
-    from rich.panel import Panel
-    from rich.segment import Segment
-    from rich.text import Text
-    from rich.theme import Theme
 
-    class PaneHeading(Heading):
-        LEVEL_ALIGN = {level: "left" for level in ("h1", "h2", "h3", "h4", "h5", "h6")}
-
-    class PaneBlockQuote(BlockQuote):
-        def __rich_console__(self, console, options):
-            render_options = options.update(width=max(1, options.max_width - 2))
-            lines = console.render_lines(
-                self.elements,
-                render_options,
-                style=self.style,
-                pad=False,
-            )
-            for line in lines:
-                yield Segment("│ ", self.style)
-                yield from line
-                yield Segment.line()
-
-    class PaneCodeBlock(CodeBlock):
-        def __rich_console__(self, console, options):
-            code = Text(
-                str(self.text).rstrip(),
-                style="markdown.code_block",
-                no_wrap=False,
-                overflow="fold",
-            )
-            panel = Panel(
-                code,
-                box=ROUNDED,
-                border_style="markdown.code_block",
-                expand=True,
-                padding=(0, 1),
-            )
-            yield Padding(panel, (0, 0, 0, 2))
-
-    class PaneMarkdown(Markdown):
-        elements = {
-            **Markdown.elements,
-            "heading_open": PaneHeading,
-            "blockquote_open": PaneBlockQuote,
-            "fence": PaneCodeBlock,
-            "code_block": PaneCodeBlock,
-        }
-
-    theme = Theme(
-        {
-            "markdown.h1": "bold cyan",
-            "markdown.h2": "bold cyan",
-            "markdown.h3": "bold cyan",
-            "markdown.h4": "bold cyan",
-            "markdown.h5": "bold cyan",
-            "markdown.h6": "bold cyan",
-            "markdown.code": "yellow",
-            "markdown.code_block": "dim cyan",
-            "markdown.item.bullet": "bold cyan",
-            "markdown.item.number": "bold cyan",
-            "markdown.block_quote": "dim cyan",
-            "markdown.table.border": "dim cyan",
-            "markdown.table.header": "bold",
-            "markdown.link": "bold cyan",
-            "markdown.link_url": "dim cyan",
-        }
-    )
-    return PaneMarkdown, Console, ColorSystem, theme
+    return CambiumMarkdown, Console, ColorSystem, markdown_theme()
 
 
 @lru_cache(maxsize=32)
@@ -2307,9 +2162,7 @@ def _render_markdown_lines_rich(text: str, width: int, color: bool) -> list[str]
         prefix = "\n".join(lines[cursor:start])
         if prefix.strip():
             rendered.extend(_render_markdown_lines_rich_document(prefix, width, color))
-        rendered.extend(
-            _render_markdown_lines_fallback("\n".join(lines[start:end]), width, color=color)
-        )
+        rendered.extend(_render_narrow_table_lines("\n".join(lines[start:end]), width, color))
         cursor = end
     suffix = "\n".join(lines[cursor:])
     if suffix.strip():
@@ -2322,11 +2175,7 @@ def _render_markdown_lines_rich(text: str, width: int, color: bool) -> list[str]
 @lru_cache(maxsize=512)
 def _render_markdown_lines_cached(text: str, width: int, color: bool) -> tuple[str, ...]:
     """Cache immutable per-entry Markdown rows by source, width, and color."""
-    try:
-        rendered = _render_markdown_lines_rich(text, width, color)
-    except ImportError:
-        rendered = _render_markdown_lines_fallback(text, width, color=color)
-    return tuple(rendered)
+    return tuple(_render_markdown_lines_rich(text, width, color))
 
 
 def render_markdown_lines(
@@ -2335,7 +2184,7 @@ def render_markdown_lines(
     *,
     color: bool = True,
 ) -> list[str]:
-    """Render sanitized Markdown through Rich, with the old renderer as fallback."""
+    """Render sanitized Markdown through the shared Rich theme and narrow-table adapter."""
     width = max(1, width)
     clean = _sanitize(text)
     if not clean:
@@ -2669,106 +2518,99 @@ def _live_window_lines(
     *,
     activity_line: str = "",
 ) -> list[str]:
-    """Render the two fixed live rows; event text never grows the layout."""
+    """Render a stable phase row plus the evidence currently backing that phase."""
     width = max(1, width)
-    if not transcript._live_kind and not activity_line:
+    activity = _single_line(activity_line)
+    if not transcript._live_kind and not activity:
         return [_status_row([], width), _status_row([], width)]
 
-    activity = _activity_parts(activity_line)
-    terminal_status = _terminal_activity_status(activity_line)
+    terminal_status = _terminal_activity_status(activity)
     if terminal_status is not None and (transcript._live_kind or transcript.live_final):
-        glyph = (
-            "✗" if terminal_status == "error" else "•" if terminal_status == "cancelled" else "✓"
-        )
-        elapsed = _fmt_secs(transcript._live_age_s)
-        if activity is not None:
-            elapsed = activity[2]
-        status = terminal_status
-        row_one = (
-            f"{glyph} result status={status} · age={elapsed} · "
-            f"turn={transcript._live_turn if transcript._live_turn is not None else '?'} · "
-            f"call={transcript._live_calls}"
-        )
+        glyph = {"error": "✗", "cancelled": "•"}.get(terminal_status, "✓")
+        row_one = activity or f"{glyph} {terminal_status}"
         label = _ROLE_LABELS.get(transcript._live_role, "RESULT")
         return [
             _status_row([row_one], width),
             _status_row([f"{label} ▸ {_latest_live_text(transcript)}"], width),
         ]
+
     if not transcript._live_kind:
-        if activity is None:
-            return [_status_row([], width), _status_row([], width)]
-        spinner, _phase, elapsed = activity
-        running = _running_tool(activity_line)
-        operation = f" · {running[0]}" if running is not None else ""
-        # No runtime event has arrived yet: claim only the local clock. The
-        # provider, turn, and call counts are unknown until a real event lands.
+        local = activity
+        if not local or "WAITING" in local.upper() or "PROVIDER" in local.upper():
+            parsed = _activity_parts(activity) if activity else None
+            local = "⠋ STARTING" + (f" · {parsed[2]}" if parsed is not None else "")
         return [
-            _status_row([f"{spinner} starting {elapsed}{operation}"], width),
-            _status_row(["no runtime events yet"], width),
+            _status_row([local], width),
+            _status_row(["runtime handshake pending"], width),
         ]
 
-    operation = transcript._live_tool or "provider call"
-    phase = transcript._live_phase.casefold().replace("_", "-")
-    if phase not in _ACTIVITY_PHASE_GLYPHS:
-        phase = (
-            "streaming"
-            if transcript._live_kind in _TOOL_STREAM_KINDS or transcript._live_text
-            else "thinking"
-        )
-    spinner = _ACTIVITY_PHASE_GLYPHS[phase]
-    elapsed = _fmt_secs(transcript._live_age_s)
-    if activity is not None:
-        spinner, phase, elapsed = activity
-    if phase not in _ACTIVITY_PHASE_GLYPHS:
-        phase = "thinking"
-    if phase == "waiting":
-        spinner, phase = _ACTIVITY_PHASE_GLYPHS["thinking"], "thinking"
+    meta: list[str] = []
+    if transcript._live_turn is not None:
+        meta.append(f"t{transcript._live_turn}")
+    if transcript._live_calls:
+        meta.append(f"call {transcript._live_calls}")
+    if transcript._live_cache_hit is not None:
+        meta.append("cache HIT" if transcript._live_cache_hit else "cache MISS")
+    if transcript._live_bytes:
+        meta.append(f"ctx {_human_bytes(transcript._live_bytes)}")
+
     if transcript.live_final:
-        glyph = (
-            "✗"
-            if transcript._live_status in {"failed", "error"}
-            else "•"
-            if transcript._live_status == "cancelled"
-            else "✓"
-        )
+        row_one = activity or f"✓ result {transcript._live_status or 'done'}"
+        row_two = f"{_ROLE_LABELS.get(transcript._live_role, 'RESULT')} ▸ "
+        row_two += transcript._live_text or "status recorded"
+        if meta:
+            row_two += " · " + " · ".join(meta)
+        return [_status_row([row_one], width), _status_row([row_two], width)]
+
+    phase = transcript._live_phase.casefold().replace("_", "-")
+    if activity:
+        row_one = activity
+    elif transcript._live_tool:
+        row_one = f"⠋ TOOL · {transcript._live_tool}"
+    elif phase == "waiting":
         row_one = (
-            f"{glyph} result status={transcript._live_status or 'done'} · "
-            f"age={elapsed} · "
-            f"turn={transcript._live_turn if transcript._live_turn is not None else '?'} · "
-            f"call={transcript._live_calls}"
+            f"{_ACTIVITY_PHASE_GLYPHS['waiting']} PROVIDER · waiting "
+            f"{_fmt_secs(transcript._live_age_s)}"
         )
-        result_text = transcript._live_text or "status recorded"
-        row_two = f"{_ROLE_LABELS.get(transcript._live_role, 'RESULT')} ▸ {result_text}"
+    elif phase == "thinking":
+        row_one = (
+            f"{_ACTIVITY_PHASE_GLYPHS['thinking']} THINKING · "
+            f"{_fmt_secs(transcript._live_age_s)}"
+        )
+    elif phase == "streaming":
+        row_one = (
+            f"{_ACTIVITY_PHASE_GLYPHS['streaming']} STREAMING · "
+            f"{_fmt_secs(transcript._live_age_s)}"
+        )
     else:
-        row_one = (
-            f"{spinner} {phase} {elapsed} · {operation} · "
-            f"turn={transcript._live_turn if transcript._live_turn is not None else '?'} · "
-            f"call={transcript._live_calls} · bytes={transcript._live_bytes}"
-        )
-        details: list[str] = []
-        if transcript._live_tool:
-            details.append(f"tool={transcript._live_tool}")
-        if transcript._live_status:
-            details.append(f"status={transcript._live_status}")
-        if transcript._live_tool and transcript._live_duration_ms is not None:
-            details.append(
-                f"{_format_duration(transcript._live_duration_ms)} ✓ {transcript._live_tool}"
-            )
-        elif transcript._live_kind == "tool_event" and transcript._live_status == "ok":
-            details.append(f"✓ {transcript._live_tool or 'tool'}")
-        if transcript._live_text and phase != "waiting":
-            details.append(
-                f"{_ROLE_LABELS.get(transcript._live_role, 'LIVE')} ▸ {transcript._live_text}"
-            )
-        else:
-            if transcript._live_command:
-                details.append(f"cmd={transcript._live_command}")
+        row_one = "⠋ ORCHESTRATING"
+
+    details: list[str] = []
+    if transcript._live_tool:
+        if transcript._live_kind == "tool_event":
+            glyph = {"ok": "✓", "failed": "✗"}.get(transcript._live_status, "•")
+            tool_result = f"{glyph} {transcript._live_tool}"
             if transcript._live_duration_ms is not None:
-                details.append(f"elapsed={_format_duration(transcript._live_duration_ms)}")
-            details.append("provider call in progress")
-        row_two = " · ".join(details) if details else "provider call in progress"
-        row_two += f" · bytes={transcript._live_bytes}"
-    return [_status_row([row_one], width), _status_row([row_two], width)]
+                tool_result += f" {_format_duration(transcript._live_duration_ms)}"
+            details.append(tool_result)
+        else:
+            details.append(f"tool {transcript._live_tool}")
+        if transcript._live_text:
+            label = _ROLE_LABELS.get(transcript._live_role, "TOOL")
+            details.append(f"{label} ▸ {transcript._live_text}")
+    elif transcript._live_text:
+        label = _ROLE_LABELS.get(transcript._live_role, "LIVE")
+        details.append(f"{label} ▸ {transcript._live_text}")
+    elif phase == "waiting" or "PROVIDER" in row_one.upper():
+        details.append("waiting for provider response")
+    elif "CHILDREN" in row_one.upper() or "SUSPENDED" in row_one.upper():
+        details.append("waiting for child results")
+    elif transcript._live_command:
+        details.append(transcript._live_command)
+    else:
+        details.append("processing runtime events")
+    details.extend(meta)
+    return [_status_row([row_one], width), _status_row([" · ".join(details)], width)]
 
 
 def _transcript_lines(
@@ -2912,13 +2754,27 @@ def _usage_rows(
         field("cost"),
         _usage_float(getattr(snapshot, "estimated_cost_usd", 0.0)),
     )
+    lane = _current_lane(snapshot)
+    last_cache_hit = (
+        getattr(lane, "last_provider_cache_hit", None) if lane is not None else None
+    )
+    cache_rate = _cache_rate(cached_tokens, input_tokens)
+    cache_share = f"{cache_rate:.0%}" if cache_rate is not None else "n/a"
+    if last_cache_hit is True:
+        cache_last, cache_kind = "HIT", "cache-hit"
+    elif last_cache_hit is False:
+        cache_last, cache_kind = "MISS", "cache-miss"
+    else:
+        cache_last, cache_kind = "?", "dim"
 
     if compact:
         return [
             _side_row("normal", f" out {_human_count(output_tokens)} · {rate:.1f} tok/s", width),
             _side_row(
-                "normal",
-                f" in {_human_count(input_tokens)} · cached {_human_count(cached_tokens)}",
+                cache_kind,
+                " cache "
+                f"{cache_share} · {_human_count(cached_tokens)}/{_human_count(input_tokens)} "
+                f"· {cache_last}",
                 width,
             ),
             _side_row("dim", f" {calls} calls · est {_format_cost(cost)}", width),
@@ -2968,8 +2824,6 @@ def _usage_rows(
                 ]
             )
 
-    cache_rate = _cache_rate(cached_tokens, input_tokens)
-
     rows = [
         row("calls", str(calls)),
         _side_row("normal", token_line, width),
@@ -2977,8 +2831,10 @@ def _usage_rows(
         row("out/s", f"{rate:.1f}"),
         row("cost", _format_cost(cost)),
     ]
-    if cache_rate is not None:
-        rows.append(row("cache-hit", f"{cache_rate:.0%}"))
+    if cache_rate is not None or last_cache_hit is not None:
+        rows.append(
+            _side_row(cache_kind, f" {'cache':<7}{cache_share} · last {cache_last}", width)
+        )
     return rows
 
 
@@ -3167,6 +3023,38 @@ def _rail_lane_rows(agents: tuple[Any, ...], width: int) -> list[tuple[str, str]
     return rows
 
 
+def _context_bar(context: Any, width: int) -> str:
+    """Render head / semantic trunk / raw tail as a compact CAST block strip."""
+    head = _usage_int(getattr(context, "stable_head_bytes", 0))
+    trunk = _usage_int(getattr(context, "summary_trunk_bytes", 0))
+    raw = _usage_int(getattr(context, "raw_tail_bytes", 0))
+    segments = _usage_int(getattr(context, "summary_segments", 0))
+    head_known = head > 0
+    if not head_known and trunk > 0 and segments == 0:
+        # With no semantic segments, the entire trunk is the stable head.
+        head = trunk
+        head_known = True
+    semantic = max(0, trunk - head) if head_known else trunk
+    values = [head, semantic, raw]
+    total = sum(values)
+    if total <= 0:
+        return " H· S· R·"
+    cells = max(3, min(14, max(3, width - 9)))
+    counts = [max(1, round(cells * value / total)) if value else 0 for value in values]
+    while sum(counts) > cells:
+        index = max((i for i, count in enumerate(counts) if count > 1), key=counts.__getitem__)
+        counts[index] -= 1
+    while sum(counts) < cells:
+        index = max(range(3), key=lambda i: values[i] / total - counts[i] / cells)
+        counts[index] += 1
+    head_label = "H" if head_known else "H?"
+    semantic_label = "S" if head_known else "S?"
+    return (
+        f" {head_label}{'█' * counts[0]} "
+        f"{semantic_label}{'▓' * counts[1]} R{'░' * counts[2]}"
+    )
+
+
 def _context_rows(
     snapshot: Any,
     width: int,
@@ -3183,9 +3071,10 @@ def _context_rows(
     return [
         _side_row(
             "normal",
-            f" epoch {epoch_text} · segments {getattr(context, 'summary_segments', 0)}",
+            f" CAST {epoch_text} · {getattr(context, 'summary_segments', 0)} seg",
             panel_width,
         ),
+        _side_row("cast", _context_bar(context, panel_width), panel_width),
         _side_row(
             "normal",
             f" trunk {approx}{_human_count(getattr(context, 'estimated_trunk_tokens', 0))} tok",
@@ -3308,20 +3197,50 @@ def _rail_detail_rows(
     state = _side_clean(getattr(agent, "state", "unknown"))
     rows: list[tuple[str, str]] = []
     if getattr(agent, "provider", None) or getattr(agent, "model", None):
-        rows.append(_side_row("dim", "   " + _agent_model(agent), width))
+        identity = "   " + _agent_model(agent)
+        cache_hit = getattr(agent, "last_provider_cache_hit", None)
+        if cache_hit is True:
+            identity += " · cache hit"
+            identity_kind = "cache-hit"
+        elif cache_hit is False:
+            identity += " · cache miss"
+            identity_kind = "cache-miss"
+        else:
+            identity_kind = "dim"
+        rows.append(_side_row(identity_kind, identity, width))
     if state == "suspended":
-        detail = "waiting for children"
+        detail, detail_kind = "waiting for children", "children"
     elif state in {"succeeded", "failed", "cancelled", "exited", "rejected"}:
-        detail = state
+        detail, detail_kind = state, state
+    elif activity_line:
+        detail = _side_clean(activity_line).strip()
+        if " " in detail:
+            detail = detail.split(" ", 1)[1]
+        upper = detail.upper()
+        if "STREAMING" in upper:
+            detail_kind = "streaming"
+        elif "THINKING" in upper:
+            detail_kind = "thinking"
+        elif "PROVIDER" in upper:
+            detail_kind = "provider"
+        elif "TOOL" in upper:
+            detail_kind = "tool"
+        elif "STALL" in upper or "SILENT" in upper or "NO OUTPUT" in upper:
+            detail_kind = "stalled"
+        else:
+            detail_kind = state
     else:
-        phase = _ACTIVITY_PHASE_RE.match(
-            sanitize_terminal_text(activity_line, single_line=True).strip()
-        )
         tool = getattr(agent, "tool", None)
-        detail = _side_clean(tool) if tool else (phase.group(1) if phase else state)
-        if phase is not None:
-            detail += " · " + _fmt_secs(_usage_float(phase.group(2)))
-    rows.append(_side_row(state, "   " + detail, width))
+        phase = _side_clean(getattr(agent, "phase", "")).strip().casefold()
+        if tool:
+            detail, detail_kind = f"tool {_side_clean(tool)}", "tool"
+        elif phase == "waiting":
+            detail, detail_kind = "provider wait", "provider"
+        elif phase in {"thinking", "streaming"}:
+            detail, detail_kind = phase, phase
+        else:
+            detail, detail_kind = state, state
+    rows.append(_side_row(detail_kind, "   " + detail, width))
     return rows
 
 
@@ -3342,7 +3261,7 @@ def _rail_rows(
     # Byte counts and checkpoint paths are available through /context.
     context.extend(
         row for index, row in enumerate(_context_rows(snapshot, panel_width, compact_epoch=True))
-        if index in {0, 1, 3}
+        if index in {0, 1, 2, 4}
     )
     context.extend(_rail_fold_rows(snapshot, panel_width))
     resources: list[tuple[str, str]] = []
@@ -3566,10 +3485,16 @@ def _style_kind(kind: Any) -> str:
         kind = _side_clean(kind)
     if kind in {"failed", "cancelled", "rejected", "error"}:
         return _RED
-    if kind in {"active", "starting", "merging", "running"}:
-        return _YELLOW
-    if kind in {"succeeded", "done"}:
+    if kind in {"streaming", "succeeded", "done", "cache-hit"}:
         return _GREEN
+    if kind in {"thinking", "cast"}:
+        return _MAGENTA
+    if kind in {"provider", "waiting", "children"}:
+        return _BLUE
+    if kind in {"stalled", "cooldown", "cache-miss"}:
+        return _YELLOW
+    if kind in {"active", "starting", "merging", "running", "tool"}:
+        return _CYAN
     if kind == "heading":
         return _CYAN
     if kind == "dim":
@@ -3659,24 +3584,24 @@ def _snapshot_is_active(snapshot: Any) -> bool:
 
 def _current_lane(snapshot: Any) -> Any | None:
     agents = tuple(getattr(snapshot, "agents", ()))
-    return next(
+    main = next((agent for agent in agents if getattr(agent, "role", "") == "main"), None)
+    active_main = (
+        main
+        if main is not None
+        and _side_clean(getattr(main, "state", "")).strip().casefold()
+        in {"starting", "active", "merging"}
+        else None
+    )
+    active = next(
         (
             agent
             for agent in agents
-            if getattr(agent, "role", "") == "main"
-            and _side_clean(getattr(agent, "state", "")).strip().casefold()
+            if _side_clean(getattr(agent, "state", "")).strip().casefold()
             in {"starting", "active", "merging"}
         ),
-        next(
-            (
-                agent
-                for agent in agents
-                if _side_clean(getattr(agent, "state", "")).strip().casefold()
-                in {"starting", "active", "merging"}
-            ),
-            None,
-        ),
+        None,
     )
+    return active_main or active or main or (agents[-1] if agents else None)
 
 
 def _status_fields(
@@ -3815,61 +3740,16 @@ def _primary_status_line(
 
 
 def _activity_status(snapshot: Any, activity_line: str) -> str:
-    """Reduce the verbose activity ticker to a single state-and-duration pair."""
+    """Keep the concrete ActivityState label; invent only an idle/terminal fallback."""
     clean = sanitize_terminal_text(activity_line, single_line=True).strip()
-    phase_match = _ACTIVITY_PHASE_RE.match(clean)
-    if phase_match is not None:
-        phase = phase_match.group(1).casefold()
-        if phase == "waiting" and _snapshot_is_active(snapshot):
-            phase = "thinking"
-        line = f"{_ACTIVITY_PHASE_GLYPHS[phase]} {phase} "
-        line += _fmt_secs(_usage_float(phase_match.group(2)))
-        tail = _activity_tail(phase_match.group(3)) if phase != "waiting" else ""
-        return f"{line} · {tail}" if tail else line.rstrip()
-    spinner = next((frame for frame in _SPINNER_FRAMES if clean.startswith(frame)), "⠋")
-    upper = clean.upper()
-    if "✗" in clean or "ERROR" in upper:
-        return "✗ error"
-    if "✓" in clean or "DONE" in upper or "SUCCEEDED" in upper:
+    if clean:
+        return clean
+    status = _side_clean(getattr(snapshot, "session_status", "idle")).casefold()
+    if status in {"done", "ended", "succeeded", "complete", "completed"}:
         return "✓ done"
-
-    if "SUSPENDED" in upper:
-        return f"{spinner} suspended"
-    if "COOLDOWN" in upper:
-        verb = "cooldown"
-    elif "QUEUED" in upper:
-        verb = "queued"
-    elif "STREAMING" in upper or "RESPONDING" in upper:
-        verb = "responding"
-    elif "IDLE" in upper:
-        return f"{spinner} idle"
-    elif "WAITING" in upper or "THINKING" in upper or "RUNNING" in upper:
-        verb = "thinking"
-    else:
-        status = _side_clean(getattr(snapshot, "session_status", "idle")).casefold()
-        if status in {"done", "ended", "succeeded", "complete", "completed"}:
-            return "✓ done"
-        if status in {"error", "failed", "failure"}:
-            return "✗ error"
-        verb = "thinking" if getattr(snapshot, "active_agents", 0) else "idle"
-
-    duration = None
-    if verb == "thinking" and "RUNNING" in upper:
-        match = re.search(r"\bturn\s+(\d+(?:\.\d+)?)s", clean, re.IGNORECASE)
-        if match is not None:
-            duration = match.group(1)
-    if duration is None:
-        match = re.search(
-            r"(?:thinking|responding|turn)\s*…?\s*(\d+(?:\.\d+)?)s",
-            clean,
-            re.IGNORECASE,
-        )
-        if match is not None:
-            duration = match.group(1)
-    duration_text = (
-        f" {_format_duration(_usage_float(duration) * 1000)}" if duration is not None else ""
-    )
-    return f"{spinner} {verb}{duration_text}"
+    if status in {"error", "failed", "failure"}:
+        return "✗ error"
+    return "⠋ orchestrating" if getattr(snapshot, "active_agents", 0) else "⠋ idle"
 
 
 def _status_activity(activity_line: str, color: bool) -> str:
@@ -3894,7 +3774,7 @@ def _short_model(value: Any) -> str:
 
 def _running_tool(activity_line: str) -> tuple[str, str] | None:
     match = re.search(
-        r"\brunning\s+(\S+)(?:\s+(\d+(?:\.\d+)?)s)?",
+        r"(?:\brunning\s+|\bTOOL\s+·\s+)(\S+)(?:\s+(\d+(?:\.\d+)?)s)?",
         _side_clean(activity_line),
         re.IGNORECASE,
     )
@@ -3974,7 +3854,12 @@ def _detail_status_line(
         )
     )
     cache_rate = _cache_rate(cached_tokens, input_tokens)
+    last_cache_hit = getattr(lane, "last_provider_cache_hit", None) if lane is not None else None
     cache = f"{cache_rate:.0%}" if cache_rate is not None else "n/a"
+    if last_cache_hit is True:
+        cache += "/HIT"
+    elif last_cache_hit is False:
+        cache += "/MISS"
 
     agents = " ".join(
         (
@@ -4001,7 +3886,12 @@ def _detail_status_line(
             ),
         )
     )
-    cache_style = "green" if cache_rate is not None and cache_rate >= 0.5 else "yellow"
+    cache_style = (
+        "green" if last_cache_hit is True
+        else "yellow" if last_cache_hit is False
+        else "green" if cache_rate is not None and cache_rate >= 0.5
+        else "yellow"
+    )
     cache_text = _status_paint(cache, cache_style, color) if cache_rate is not None else cache
     usage = (
         "usage "

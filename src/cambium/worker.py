@@ -129,7 +129,6 @@ from enum import IntEnum, StrEnum
 from pathlib import Path
 from typing import Any, TypeGuard, cast
 
-from cambium import diffundo as _diffundo_module
 from cambium.auth import oauth_env_suffix, scrub_environment
 from cambium.branch_state import BranchState, inspect_state
 from cambium.context_policy import CastPolicy
@@ -191,7 +190,7 @@ TOOL_OUTPUT_DELTA_INTERVAL_S = 0.1
 _HEARTBEAT_DRAIN_TIMEOUT_S = 0.25
 INIT_TIMEOUT_S = 30.0
 IDLE_TIMEOUT_S = 300.0
-MAX_SUMMARY_CHARS = 2_000
+MAX_SUMMARY_CHARS = 600
 # Consecutive non-novel actions (valid plans, tool calls, and
 # invalid/unparseable actions) before the agent loop fails fast.
 MAX_NO_PROGRESS_ACTIONS = 2
@@ -270,8 +269,9 @@ FINAL_SYNTHESIS_HEADROOM_RATIO = 0.1
 FINAL_SYNTHESIS_MIN_HEADROOM_TOKENS = 4_000
 FINAL_SYNTHESIS_DIRECTIVE = (
     "Budget nearly exhausted. Complete the current step and its verification; "
-    "do not start new work or delegate. Then return finish with the result and "
-    "checks performed. Set objective_met=false when the task is incomplete."
+    "do not start new work or delegate. Then return finish. Keep the user-facing summary "
+    "brief: outcome, material changes, checks, blocker if any; no task restatement or tool log. "
+    "Set objective_met=false when the task is incomplete."
 )
 
 
@@ -1638,11 +1638,15 @@ class AgentProgress:
         self._set_phase("waiting", None)
 
     def observe_delta(self, phase: str, fragment: str) -> None:
-        """Publish one sanitized provider reasoning or output-text delta."""
-        tail = _phase_tail(fragment)
-        if phase not in {"thinking", "streaming"} or not tail:
+        """Publish phase changes and only user-visible output text."""
+        if phase == "thinking":
+            self._set_phase("thinking", None)
             return
-        self._set_phase(phase, tail)
+        if phase != "streaming":
+            return
+        tail = _phase_tail(fragment)
+        if tail:
+            self._set_phase("streaming", tail)
 
     def phase_snapshot(self) -> tuple[str | None, str | None, int]:
         """Return the phase state and revision for the heartbeat publisher."""
@@ -1730,98 +1734,6 @@ async def _call_provider(
     return await caller(*args, **kwargs)
 
 
-def _observe_sse_line(line: bytes, on_delta: Callable[[str, str], None]) -> None:
-    if not line.startswith(b"data:"):
-        return
-    data = line[len(b"data:") :].strip()
-    if not data or data == b"[DONE]":
-        return
-    try:
-        event = json.loads(data)
-    except json.JSONDecodeError:
-        return
-    if not isinstance(event, Mapping):
-        return
-    phase = _delta_phase(event.get("type"))
-    delta = event.get("delta")
-    if phase is not None and isinstance(delta, str):
-        on_delta(phase, delta)
-
-
-def _read_provider_response_with_progress(
-    response: Any, provider: str, on_delta: Callable[[str, str], None]
-) -> bytes:
-    """Read SSE in chunks so Codex deltas can update worker progress live."""
-    limit = _diffundo_module.MAX_PROVIDER_RESPONSE_BYTES
-    body = bytearray()
-    line = bytearray()
-    read_chunk = getattr(response, "read1", None)
-    if not callable(read_chunk):
-        read_chunk = response.read
-    while True:
-        chunk = cast(bytes, read_chunk(min(16 * 1024, limit + 1 - len(body))))
-        if not chunk:
-            break
-        body.extend(chunk)
-        if len(body) > limit:
-            raise _diffundo_module.ProviderError(
-                provider,
-                _diffundo_module.ProviderOutcome.ERROR,
-                f"response exceeds {limit} byte limit",
-            )
-        line.extend(chunk)
-        while b"\n" in line:
-            index = line.index(b"\n")
-            _observe_sse_line(bytes(line[:index]).rstrip(b"\r"), on_delta)
-            del line[: index + 1]
-    if line:
-        _observe_sse_line(bytes(line).rstrip(b"\r"), on_delta)
-    return bytes(body)
-
-
-def _install_codex_progress_observer(router: Any, progress: AgentProgress) -> None:
-    """Observe buffered Codex SSE reads without changing Diffundo's API."""
-    if not isinstance(router, Diffundo):
-        return
-    transports = getattr(router, "_transports", None)
-    if transports is None:
-        return
-    codex_protocol = _diffundo_module.Protocol.CODEX_RESPONSES
-    transport = transports.get(codex_protocol)
-    if transport is None:
-        return
-
-    def _observed_post_sync(
-        router_arg: Any, provider: Any, prompt: dict[str, Any], timeout_s: float
-    ) -> Any:
-        original_reader = _diffundo_module._read_provider_response
-
-        def _read(response: Any, provider_name: str) -> bytes:
-            return _read_provider_response_with_progress(
-                response, provider_name, progress.observe_delta
-            )
-
-        cast(Any, _diffundo_module)._read_provider_response = _read
-        try:
-            return transport.post_sync(router_arg, provider, prompt, timeout_s)
-        finally:
-            _diffundo_module._read_provider_response = original_reader
-
-    class _ObservedCodexTransport:
-        def post_sync(
-            self, router_arg: Any, provider: Any, prompt: dict[str, Any], timeout_s: float
-        ) -> Any:
-            return _observed_post_sync(router_arg, provider, prompt, timeout_s)
-
-        def classify_error(self, status: int, message: str) -> Any:
-            return transport.classify_error(status, message)
-
-    cast(Any, router)._transports = {
-        **transports,
-        codex_protocol: _ObservedCodexTransport(),
-    }
-
-
 def _cap_utf8(text: str, limit: int) -> str:
     raw = text.encode("utf-8")
     if len(raw) <= limit:
@@ -1834,6 +1746,19 @@ def _bounded_text(text: str, limit: int) -> str:
     if len(raw) <= limit:
         return text
     return raw[:limit].decode("utf-8", errors="ignore") + "\n... [truncated]"
+
+
+def _user_summary(text: str) -> str:
+    """Keep the operator-facing finish field concise; exact evidence stays in history."""
+    clean = text.strip()
+    raw = clean.encode("utf-8")
+    if len(raw) <= MAX_SUMMARY_CHARS:
+        return clean
+    clipped = raw[: MAX_SUMMARY_CHARS - 3].decode("utf-8", errors="ignore").rstrip()
+    boundary = max(clipped.rfind("\n"), clipped.rfind(". "))
+    if boundary >= max(80, len(clipped) // 2):
+        clipped = clipped[: boundary + 1].rstrip()
+    return clipped + "…"
 
 
 def _safe_task_id(task_id: str) -> str:
@@ -2172,7 +2097,7 @@ def _parse_agent_action(content: str) -> dict[str, Any]:
             raise ValueError("finish summary must be a non-empty string")
         return {
             "type": "finish",
-            "summary": summary,
+            "summary": _user_summary(summary),
             "objective_met": parsed["objective_met"],
         }
     raise ValueError(f"unknown agent action type: {action_type!r}")
@@ -5996,7 +5921,6 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
     last_turn_checkpoint: int | None = None
     provider_compat = provider_compat or {}
     provider_boundaries = provider_boundaries or {}
-    _install_codex_progress_observer(router, progress)
 
     resume = config.resume
     try:
@@ -7737,6 +7661,7 @@ async def _heartbeat_loop(
         }
         if published_phase is not None:
             heartbeat["phase"] = published_phase
+            heartbeat["phase_revision"] = published_revision
             if published_tail:
                 heartbeat["tail"] = published_tail
         write_message(writer, heartbeat)

@@ -23,8 +23,14 @@ def test_lane_identity_waiting_and_context_fit_without_blank_rows(
                 lineage="semantic", epoch=3,
             ) for i in range(completed)),
             SimpleNamespace(
-                task_id="child", parent_task_id="root", role="sub", state="active",
+                task_id="child-tool", parent_task_id="root", role="sub", state="active",
                 lineage="semantic", epoch=3, provider="b", model="small", tool="read_batch",
+                phase="waiting", last_provider_cache_hit=True,
+            ),
+            SimpleNamespace(
+                task_id="child-provider", parent_task_id="root", role="sub", state="active",
+                lineage="semantic", epoch=3, provider="c", model="medium", tool=None,
+                phase="waiting", last_provider_cache_hit=False,
             ),
         ),
         context=SimpleNamespace(
@@ -37,10 +43,11 @@ def test_lane_identity_waiting_and_context_fit_without_blank_rows(
     text = "\n".join(value for _, value in rows)
     assert all(value.strip() and _display_width(value) <= width for _, value in rows)
     assert " CONTEXT" in text and "trunk" in text and "raw" in text
-    assert "root" in text and "child" in text and len(rows) <= 20
+    assert "root" in text and "child-tool" in text and len(rows) <= 20
     if completed:
         assert "more: /agents" in text
     elif width >= 24:
-        assert "a/large" in text and "b/small" in text
-        assert "waiting for children" in text and "read_batch" in text
+        assert "a/large" in text and "b/small" in text and "c/medium" in text
+        assert "waiting for children" in text and "tool read_batch" in text
+        assert "provider wait" in text and "cache hit" in text and "cache miss" in text
     assert "checkpoint" not in text

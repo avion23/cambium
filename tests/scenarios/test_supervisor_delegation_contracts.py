@@ -138,6 +138,7 @@ def test_heartbeat_phase_and_tail_are_forwarded_safely(tmp_path: Path) -> None:
                     "tool": "stream",
                     "status": "working",
                     "phase": "streaming",
+                    "phase_revision": 7,
                     "tail": "safe\\n\\x1b[31m" + "x" * 130,
                 },
                 {
@@ -195,6 +196,7 @@ def test_heartbeat_phase_and_tail_are_forwarded_safely(tmp_path: Path) -> None:
     assert result.results[0].status == "succeeded"
     assert len(heartbeats) == 3
     assert heartbeats[0]["phase"] == "streaming"
+    assert heartbeats[0]["phase_revision"] == 7
     assert heartbeats[0]["tail"] == "safe " + "x" * 115
     assert len(heartbeats[0]["tail"]) == 120
     assert "phase" not in heartbeats[1]

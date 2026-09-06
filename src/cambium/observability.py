@@ -70,6 +70,8 @@ class AgentSnapshot:
     last_seq: int
     last_kind: str | None
     lineage: str = ""
+    last_provider_cache_hit: bool | None = None
+    phase: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,6 +156,8 @@ class _Agent:
     summary_trunk_bytes: int = 0
     summary_segments: int = 0
     raw_tail_bytes: int = 0
+    last_provider_cache_hit: bool | None = None
+    phase: str | None = None
 
 
 def _payload(event: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -270,7 +274,9 @@ def _event_detail(kind: str, payload: Mapping[str, Any]) -> str:
             return value.replace("\n", " ")[:160]
     if kind == "usage_event":
         _, output_tokens, _, total_tokens = _usage_counts(payload)
-        return f"tokens={total_tokens} out={output_tokens}"
+        cache = payload.get("provider_cache_hit")
+        cache_text = "hit" if cache is True else "miss" if cache is False else "?"
+        return f"tokens={total_tokens} out={output_tokens} cache={cache_text}"
     return ""
 
 
@@ -572,6 +578,9 @@ class ObservabilityState:
                 agent.provider = provider
             if model is not None:
                 agent.model = model
+            if kind == "heartbeat":
+                phase = _string(payload.get("phase"))
+                agent.phase = phase.casefold().replace("_", "-") if phase is not None else None
             if "tool" in payload and payload.get("tool") is None:
                 # A heartbeat with tool=None is an explicit "no tool running"
                 # signal (the worker clears the field after each tool); keep
@@ -592,6 +601,9 @@ class ObservabilityState:
                 agent.calls += 1
                 if payload.get("call_kind") == "summary":
                     agent.summary_calls += 1
+                cache_hit = payload.get("provider_cache_hit")
+                if type(cache_hit) is bool:
+                    agent.last_provider_cache_hit = cache_hit
                 agent.input_tokens += input_tokens
                 agent.output_tokens += output_tokens
                 agent.cached_tokens += cached_tokens
@@ -714,6 +726,8 @@ class ObservabilityState:
                     estimated_cost_usd=round(agent.estimated_cost_usd, 6),
                     last_seq=agent.last_seq,
                     last_kind=agent.last_kind,
+                    last_provider_cache_hit=agent.last_provider_cache_hit,
+                    phase=agent.phase,
                 )
             )
 

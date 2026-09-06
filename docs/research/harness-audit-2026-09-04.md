@@ -422,3 +422,21 @@ its edit/history continuation used eight calls, 28,199 tokens and zero summaries
 Ruff and whitespace checks passed. GEPA dry-run resolved all eight historical or
 derived cases with automatic deployment enabled; no optimizer search ran and no
 candidate prompt was promoted.
+
+## Operator GEPA run — September 6
+
+The operator then ran `.cambium/gepa-coding-3` with 24 requested metric calls,
+a 600-call limit and a 2,000,000-token experiment limit. It completed 364 calls
+and recorded 2,004,810 provider-reported tokens. `improved=false` and
+`deployed=false`; the retained candidate's coding text was the prior built-in
+policy, so no prompt artifact was promoted.
+
+Both validation cases passed and two held-out cases passed. `corrected-history`
+was cancelled after the global experiment token budget was exhausted; its final
+artifact check still showed the obsolete behavior and its required
+`branch_history`/`inspect_state` trace was absent. This is a search-budget
+failure, not clean evidence that the candidate regressed. Prompt optimization
+now reserves measured call/token/cash capacity for validation plus held-out
+cases and reports a lower `effective_max_evals` when the requested search cannot
+fit. Rollout reports also include user-summary character/line counts so GEPA can
+penalize verbose operator output without rewarding terse incorrect answers.

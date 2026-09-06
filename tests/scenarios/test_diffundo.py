@@ -20,6 +20,7 @@ and cascade-design contracts:
 from __future__ import annotations
 
 import asyncio
+import json
 import socket
 import threading
 import time
@@ -46,6 +47,12 @@ from cambium.diffundo import (
     prompt_prefix_estimate_tokens,
     validate_prompt_structure,
 )
+
+
+def _sse(*events: dict[str, Any]) -> bytes:
+    return b"".join(
+        b"data: " + json.dumps(event).encode("utf-8") + b"\n\n" for event in events
+    ) + b"data: [DONE]\n\n"
 
 
 def _tool_call_payload(tool_calls: list[dict[str, Any]]) -> dict[str, Any]:
@@ -140,6 +147,68 @@ def test_selected_provider_controls_native_wire_tools(
         else:
             assert "tools" not in body
             assert "tool_choice" not in body
+    finally:
+        server.close()
+
+
+def test_chat_completions_stream_reasoning_output_and_usage_live() -> None:
+    stream = _sse(
+        {
+            "model": "m-stream",
+            "choices": [{"index": 0, "delta": {"reasoning_content": "consider"}}],
+        },
+        {
+            "model": "m-stream",
+            "choices": [{"index": 0, "delta": {"content": '{"type":"finish",'}}],
+        },
+        {
+            "model": "m-stream",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"content": '"summary":"ok","objective_met":true}'},
+                    "finish_reason": "stop",
+                }
+            ],
+        },
+        {
+            "model": "m-stream",
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+                "prompt_tokens_details": {"cached_tokens": 4},
+            },
+        },
+    )
+    server = FakeServer([(200, stream, 0.0, {"Content-Type": "text/event-stream"})])
+    router = Diffundo((_config("p_stream", server, "K_STREAM", model="m-stream"),))
+    deltas: list[tuple[str, str]] = []
+    try:
+        result = asyncio.run(
+            router.call(
+                ProviderTier.FAST,
+                PROMPT,
+                on_delta=lambda phase, text: deltas.append((phase, text)),
+            )
+        )
+        assert result.content == '{"type":"finish","summary":"ok","objective_met":true}'
+        assert result.usage == {
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "total_tokens": 15,
+            "prompt_tokens_details": {"cached_tokens": 4},
+            "cached_tokens": 4,
+        }
+        assert result.provider_cache_hit is True
+        assert deltas == [
+            ("thinking", "consider"),
+            ("streaming", '{"type":"finish",'),
+            ("streaming", '"summary":"ok","objective_met":true}'),
+        ]
+        assert server.calls[0]["stream"] is True
+        assert server.calls[0]["stream_options"] == {"include_usage": True}
     finally:
         server.close()
 
