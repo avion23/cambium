@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from . import oneshot, supervisor
-from .oneshot import OneShotConfig, RoutingMode, SessionMode
+from .oneshot import OneShotConfig, SessionMode
 from .store import EventStore, StoreError, read_events_file
 from .summary_trunk import (
     SummaryTrunkError,
@@ -1273,8 +1273,6 @@ class InteractiveSession:
             if self._seed.provider is not None:
                 changes["provider"] = self._seed.provider
                 changes["assigned_provider"] = self._seed.provider
-                changes["routing_mode"] = RoutingMode.CASCADE
-                changes["auto"] = False
             if self._seed.model is not None:
                 changes["model"] = self._seed.model
             if changes:
@@ -1285,8 +1283,6 @@ class InteractiveSession:
                 {
                     "provider": self._provider_preference,
                     "assigned_provider": self._provider_preference,
-                    "routing_mode": RoutingMode.CASCADE,
-                    "auto": False,
                 }
             )
         if self._model_preference is not None:

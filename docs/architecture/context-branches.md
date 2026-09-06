@@ -29,8 +29,8 @@ general request
 This is model-directed delegation with deterministic execution defaults. It is
 not a measured critical-path optimizer, and appropriateness is not guaranteed.
 The benchmark should measure whether delegation actually improves completion
-and resource use, not reward child count by itself. `--auto` concerns provider
-selection; it does not force decomposition.
+and resource use, not reward child count by itself. Provider selection does not
+force decomposition.
 
 ## Defaults without configuration rituals
 

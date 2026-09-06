@@ -17,7 +17,7 @@ import sys
 import tempfile
 from collections.abc import Mapping
 from contextlib import suppress
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from enum import Enum
 from hashlib import sha256
 from pathlib import Path
@@ -68,19 +68,6 @@ DEFAULT_INTERACTIVE_THROUGHPUT_SAFETY_FACTOR = 2.0
 DEFAULT_INTERACTIVE_WALL_BUDGET_S = 1_800.0
 
 
-class RoutingMode(Enum):
-    """How a one-shot run selects its provider.
-
-    CASCADE (the default) builds a credential-backed cascade over every
-    enabled provider with a usable credential and lets admission balancing
-    pick the (provider, model, tier). USAGE_BALANCED is the same candidate
-    set resolved against the usage-debt ledger explicitly.
-    """
-
-    CASCADE = "cascade"
-    USAGE_BALANCED = "usage_balanced"
-
-
 class SessionMode(Enum):
     """Admission policy for the session leaf a one-shot run targets.
 
@@ -96,7 +83,6 @@ class SessionMode(Enum):
 __all__ = [
     "EventSink",
     "OneShotConfig",
-    "RoutingMode",
     "SessionMode",
     "admit_session",
     "allocate_session_dir",
@@ -118,12 +104,9 @@ class OneShotConfig:
     when it is ``None``, :func:`run_oneshot` allocates a fresh leaf under the
     repository's default session root.
 
-    ``routing_mode`` selects the provider-routing policy: CASCADE builds a
-    credential-backed cascade over authorized providers; USAGE_BALANCED
-    resolves the (provider, model, tier) from ``model_candidates`` against the
-    usage-debt ledger. The deprecated ``auto`` boolean alias maps
-    ``True`` to USAGE_BALANCED and is retained until cli.py is rewired to pass
-    ``routing_mode`` directly.
+    With no explicit provider/model, Cambium uses every enabled provider with
+    a usable credential and lets admission choose from that pool. Callers pin a
+    provider or model only when they need to override that normal behavior.
 
     ``provider_env_keys``, ``authorized_providers``, ``assigned_provider``,
     and ``fanout_config`` are internal, non-secret plan fields.  Normal
@@ -140,7 +123,6 @@ class OneShotConfig:
     session_root: str | Path | None = None
     provider: str | None = None
     model: str | None = None
-    routing_mode: RoutingMode = RoutingMode.CASCADE
     model_candidates: tuple[str, ...] = ()
     authorized_providers: tuple[str, ...] = ()
     assigned_provider: str | None = None
@@ -165,16 +147,11 @@ class OneShotConfig:
     max_restarts: int | None = None
     target_file: str | None = None
     marker: str | None = None
-    # Deprecated boolean alias for ``routing_mode``; cli.py is migrated in a
-    # separate change. ``True`` selects USAGE_BALANCED.
-    auto: bool | None = field(default=None)
     # Cache-first context reuse is enabled for operator-facing one-shot runs.
     context_reuse: bool = True
     prompt_policy: Mapping[str, str] | None = None
 
     def __post_init__(self) -> None:
-        if self.auto:
-            object.__setattr__(self, "routing_mode", RoutingMode.USAGE_BALANCED)
         for name, value in (
             ("max_wall_s", self.max_wall_s),
             ("interactive_wall_budget_s", self.interactive_wall_budget_s),
@@ -558,8 +535,8 @@ def _interactive_wall_budget_s(
         if converted is not None and not isinstance(converted, bool) and converted > 0
     ]
     if configured_budgets:
-        # An auto/cascade turn may be assigned to any authorized candidate;
-        # choose the largest declared bound so the chosen provider is covered.
+        # An unpinned turn may be assigned to any authorized candidate; choose
+        # the largest declared bound so the eventual provider is covered.
         return max(configured_budgets)
 
     observed_rate, observed_output = _interactive_observed_metrics(
@@ -730,7 +707,7 @@ def _resolve_provider(
     repo: Path,
     auth_store: AuthStore | None = None,
 ) -> tuple[OneShotConfig, dict[str, str]]:
-    """Resolve one configured provider and prepare a non-global credential handoff.
+    """Resolve the provider pool or explicit pin and prepare credential handoff.
 
     ``auth_store`` is injected for callers that own their credential store
     (tests, sandboxes); the production default is the real ``AuthStore``.
@@ -745,7 +722,7 @@ def _resolve_provider(
     if marker_mode:
         return config, {}
 
-    cascade = config.routing_mode is RoutingMode.USAGE_BALANCED or (
+    use_pool = (
         config.provider is None
         and config.model is None
         and (
@@ -753,9 +730,7 @@ def _resolve_provider(
             or bool(config.model_candidates)
         )
     )
-    if cascade:
-        if config.provider is not None or config.model is not None:
-            raise ValueError("routing mode cannot be combined with --provider or --model")
+    if use_pool:
         config_path = _provider_config_path(config, repo)
         try:
             providers = load_providers(config_path)
@@ -1023,7 +998,6 @@ def build_plan(
         "max_tokens": _as_int(config.max_tokens, DEFAULT_MAX_TOKENS),
         "max_turns": _as_int(config.max_turns, DEFAULT_MAX_TURNS),
         "max_restarts": max_restarts,
-        "routing_mode": config.routing_mode.value,
         "session_mode": config.session_mode.value,
     }
     if config.prompt_policy is not None:

@@ -1,125 +1,116 @@
 # Operations
 
-## PLAN MODE
+**Status:** current plan/admission/recovery/publication behavior. Exact CLI
+arguments come from `cambium --help`; source owns current defaults.
 
-Plan file `P` is JSON; minimal plan. (src/cambium/supervisor.py:7920-7929,7971-8048)
+## Static plans
+
+A supervisor plan is JSON with one or more task specs. A minimal task names its
+identity, objective, repository, worktree, and branch:
 
 ```json
-{"tasks": [
-  {"task_id": "api", "task": "Implement the API change", "repo": "/work/repo",
-   "worktree_path": "/work/S/api", "branch": "cambium/api",
-   "requires_commit": true, "max_restarts": 1}
-]}
+{
+  "tasks": [
+    {
+      "task_id": "api",
+      "task": "Implement the API change",
+      "repo": "/work/repo",
+      "worktree_path": "/work/session/api",
+      "branch": "cambium/api"
+    }
+  ]
+}
 ```
 
-`task_id`, `task`, `repo`, `worktree_path`, and `branch` are checked at plan admission;
-`requires_commit` is sent to the worker and `max_restarts` is read by the supervisor.
-(src/cambium/supervisor.py:8010-8015,3300-3301,4730)
+Run it with:
 
 ```sh
-PYTHONPATH=src python -m cambium supervisor --session-dir S --plan P
+cambium supervisor --session-dir /work/session --plan plan.json
 ```
 
-The CLI requires `--session-dir` and one of `--plan`, `--task-spec`, or `--demo`, then delegates to
-`supervisor.main`, which loads and runs `P`.
-(src/cambium/cli.py:203-216,711-725; src/cambium/supervisor.py:9207-9270)
+Flat top-level plan entries are independent roots. Dynamic model delegation is a
+separate parent/child tree; do not describe many flat roots as children of one
+agent.
 
-`N` independent flat-plan entries create `N` concurrent trees in one `TaskGroup`. (src/cambium/supervisor.py:8785-8815,8941-8948)
+## Admission
 
-## ADMISSION
+Unpinned CLI/interactive runs use all enabled providers with usable stored
+credentials. Admission filters hard constraints first, then applies provider
+capacity/quota/debt preferences. Pin `--provider` or `--model` only when the
+operator wants to override the normal pool.
 
-For an unpinned `model_candidates` task, admission intersects authorized provider
-identities with enabled providers whose API-key or OAuth credential is locally ready.
-(src/cambium/supervisor.py:8140-8160)
+An explicit empty provider allowlist is deny-all. Missing credential-feasible
+providers fail before useful worker execution where possible. Provider
+assignment and actual serving provider can differ after call-time fallback; use
+usage events to establish where tokens were generated.
 
-Credential-infeasible providers are recorded and emitted as `provider_infeasible`;
-an empty feasible set raises `NoCredentialFeasibleProvidersError` and becomes a
-failed task, without starting its worker. (src/cambium/supervisor.py:8157-8184,4358-4375,4625-4632)
+## Recovery
 
-An explicit empty `authorized_providers` list is deny-all, not “use every
-configured provider”: the worker raises and returns
-`authorized_providers explicitly empty`. (src/cambium/supervisor.py:8010-8015;
-src/cambium/worker.py:1090-1093,7426-7430)
+Worker generations own immutable checkpoints and a fenced worktree generation.
+A restart resumes only from a compatible checkpoint/workspace identity. When
+that identity no longer matches, recovery preserves salvage evidence instead of
+pretending the old checkpoint still describes the tree.
 
-## STALL/RESTART LIFECYCLE
+Turn, wall, token, and restart budgets bound execution. Exhausting a budget
+without a terminal finish verdict is incomplete. Provider retry/fallback is
+owned by Diffundo and routing state, not by prompt prose.
 
-The worker calls repeated or empty action signatures stalled after the configured
-no-progress threshold and returns an `agent made no progress` failure.
-(src/cambium/worker.py:3191-3221,4894-4908,6229-6239)
+## Publication
 
-Each Diffundo provider attempt gets the smaller of the call deadline and its
-effort-aware deadline; `reasoning_effort: max` multiplies the base by `2.0`.
-(src/cambium/diffundo.py:167,784-786,2469-2474)
+The worker can create at most one fenced commit for its generation. The
+supervisor validates the worker result against the actual worktree/head before
+publication. A clean read-only success can keep `HEAD == base` with no empty
+commit.
 
-One-shot plans materialize `max_restarts: 1` when unset; explicit values, including zero,
-remain explicit. (src/cambium/oneshot.py:920-922)
+Child semantic results and child Git artifacts are accepted separately. A parent
+resumes from code-changing children only after its worktree matches the accepted
+integration head. Completion order does not choose join order.
 
-A restart-eligible failed generation consumes restart budget, emits `restart_scheduled`,
-sleeps with bounded jitter, starts a fresh process, and receives a fresh wall window.
-(src/cambium/supervisor.py:5265-5331)
+## Context and child suspension
 
-Every ordinary worker checkpoint records the tracked-workspace
-`workspace_hash`; the worker rejects resume if the current hash differs.
-(src/cambium/worker.py:3605-3617,5615-5619)
+One blocking exact child can suspend its parent while sharing the compatible
+trunk/provider. Independent children should be proposed together so they can be
+admitted concurrently; semantic children share the needed fold instead of
+forcing one summary per child.
 
-The supervisor resumes only when its newest valid checkpoint hash matches, then
-advances only the generation fence instead of resetting the worktree.
-(src/cambium/supervisor.py:2936-2969)
+The structural tree defaults are:
 
-On a mismatch, resume is abandoned: recovery captures
-`salvage/<task>/<gen>/workspace.diff` and `salvage.json`, emits
-`worktree_salvaged`, then resets to `base_commit` and cleans the tree.
-(src/cambium/supervisor.py:2834-2904,3021-3065)
+```text
+max child depth:        3
+max children per parent: 8
+```
 
-## SUCCESS INVARIANT
+These are `tasktree.MAX_DEPTH` and `tasktree.MAX_WIDTH`. Therefore a request such
+as “one child for each of 20 commits” cannot become 20 direct children of one
+parent. It must be chunked or expressed as several waves/roots. A flat static
+plan may contain more top-level roots because they do not share one tree parent.
 
-The worker finalizer stages non-`.cambium` changes, makes at most one fenced commit,
-and reports `requires_commit`; the envelope repeats that boolean.
-(src/cambium/worker.py:7544-7780)
+`--max-workers N` bounds simultaneous worker processes; zero/default means no
+additional CLI process cap beyond the runtime/provider limits. Provider request
+rate and provider in-flight capacity remain separate from worker-process count.
 
-The supervisor requires a boolean `requires_commit` and cross-checks commits,
-files, diff, base, and actual `HEAD` before entering merge.
-(src/cambium/supervisor.py:2037-2060,6645-6674)
+## Content/provider failures
 
-A reported success with a dirty worker tree fails integrity before merge, and
-normal cleanup retains it with `worktree_cleanup_deferred` rather than deleting
-it. (src/cambium/supervisor.py:5071-5108,3066-3235)
+Content flags, quota, timeout, transport failure, and refusal are distinct
+provider outcomes. They may fall through to another eligible provider according
+to Diffundo policy; they do not become successful task results merely because a
+fallback path exists.
 
-A verified clean no-op is accepted only with `requires_commit=false`: the
-worker reports no commit, and the supervisor accepts `HEAD == base_commit`.
-(src/cambium/worker.py:7667-7701;
-src/cambium/supervisor.py:2037-2060)
+Summary failures preserve the previously accepted CAST checkpoint/raw evidence.
+Do not invalidate valid code or replay completed work only to regenerate an
+administrative marker.
 
-## CONTENT-FLAG RECOVERY
+## Verification
 
-`CONTENT_FLAGGED` is request-level fall-through: Diffundo moves to the normal
-cascade without changing provider health or spending retry backoff.
-(src/cambium/diffundo.py:314-332,2400-2412,2475-2524,3137-3217)
+Use focused checks for the changed owner, then broader runtime tests when the
+change crosses process/context/publication boundaries:
 
-A moderation/content-flagged summary gets one retry with a transformed tail; the second flag fails summary compaction. (src/cambium/worker.py:2658-2682,5218-5227)
+```sh
+ruff check src tests
+python -m pytest -o addopts='' tests/scenarios/<focused>.py -q
+python -m pytest -o addopts='' -n 2 -m 'not acceptance' -q
+```
 
-Worker provider failure strings append the parseable `(content_flagged)`
-suffix when the outcome is content-flagged. (src/cambium/worker.py:3109-3132)
-
-## CAPACITIES
-
-The structural defaults are `MAX_WIDTH=8` and `MAX_DEPTH=3`; `build_tree`
-enforces per-parent fan-out `<=8` and depth `<=3`. Architectus also defaults
-its in-flight `max_width` to `8`; supervisor hierarchy waves resolve to the
-same default. (src/cambium/tasktree.py:44-50,245-269;
-src/cambium/architectus.py:288-311,544-648;
-src/cambium/supervisor.py:8717-8727)
-
-The admission semaphore bounds live worker processes; parallel dispatch is
-unlimited by default, while `--max-workers N` opts into an explicit cap.
-(`max_concurrent_tasks=0` disables the semaphore.) (src/cambium/supervisor.py:2342-2345,8949-8955;
-src/cambium/cli.py:229-234)
-
-Continuous integration is the enforced validation path for pushes to `main` and pull requests: after installing the `dev` extra with `python -m pip install -e ".[dev]"`, it runs `ruff check`, `python -m pytest -m "not slow" -q`, and then `python -m pytest -m slow -q` as a separate step; acceptance-marked checks are credential-gated but not hermetic because local provider configuration/auth can make them issue live calls, while CI supplies no credentials.
-
-**Can it start 50 subagents?** Yes: 50 flat top-level plan entries are
-configurable and all `N` entries are scheduled concurrently by default; no
-source-level count cap is present. Passing `--max-workers N` caps simultaneous
-processes, while hierarchical trees still obey fan-out `8`, depth `3`, and
-wave/core width `8`. (src/cambium/supervisor.py:8785-8815,8941-8951,8717-8727;
-src/cambium/tasktree.py:245-269; src/cambium/architectus.py:297-311)
+Real CLI/TUI provider exercises live in `tests/acceptance/test_live_frontends.py`.
+They consume configured provider quota and should be reported as observed runs,
+including failures.

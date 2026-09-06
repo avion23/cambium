@@ -284,8 +284,8 @@ def test_repository_without_main_is_rejected(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# --auto (routing mode, solution C): candidates from enabled providers with
-# stored credentials; supervisor resolves the (provider, model, tier).
+# Unpinned routing: candidates come from enabled providers with stored
+# credentials; supervisor resolves the (provider, model, tier).
 # --------------------------------------------------------------------------- #
 
 
@@ -326,74 +326,45 @@ def _write_providers(path: Path, *, pa_key: str = "secret-a", pb_key: str = "") 
     return path
 
 
-@pytest.mark.parametrize("auto", [False, True])
-def test_auto_mode_candidates_and_plan_shape(tmp_path: Path, auto: bool) -> None:
-    """--auto builds model_candidates from providers with file-backed credentials
-    and leaves the (provider, model, tier) to the supervisor resolution."""
+def test_unpinned_routing_candidates_and_plan_shape(tmp_path: Path) -> None:
+    """The normal unpinned path carries credential-ready candidates to admission."""
     from cambium.oneshot import _resolve_provider
 
     repo = _repo(tmp_path / "repo")
     config_path = _write_providers(tmp_path / "providers.json")
     config = oneshot.OneShotConfig(
-        prompt="run one auto task",
+        prompt="run one task",
         repo=repo,
-        auto=auto,
         provider_config_path=config_path,
     )
     resolved, environment = _resolve_provider(config, repo)
 
     assert resolved.model_candidates == ("model-a",)  # pb has no stored key
-    assert resolved.fanout_config == {}  # resolution fills model + tier
+    assert resolved.fanout_config == {}
     assert resolved.provider_env_keys == ("CAMBIUM_PROVIDER_PA_API_KEY",)
     assert environment == {"CAMBIUM_PROVIDER_PA_API_KEY": "secret-a"}
-    # Reconnecting re-resolves names, not environment keys, and keeps the pool.
+
+    # A reconnect keeps the admitted pool even if another credential appears.
     _write_providers(config_path, pb_key="now-ready")
     repeated, repeated_environment = _resolve_provider(resolved, repo)
     assert repeated == resolved
     assert repeated_environment == environment
-    # the plan the supervisor sees carries the candidates for resolution
-    plan = oneshot.build_plan(resolved, repo, tmp_path / "session")
-    spec = plan["tasks"][0]
+
+    spec = oneshot.build_plan(resolved, repo, tmp_path / "session")["tasks"][0]
     assert spec["model_candidates"] == ["model-a"]
     assert spec["fanout_config"] == {}
+    assert "routing_mode" not in spec
 
 
-def test_auto_mode_rejects_pinned_provider_or_model(tmp_path: Path) -> None:
-    from cambium.oneshot import _resolve_provider
-
-    repo = _repo(tmp_path / "repo")
-    config = oneshot.OneShotConfig(
-        prompt="p",
-        repo=repo,
-        auto=True,
-        provider="pa",
-        provider_config_path=_write_providers(tmp_path / "providers.json"),
-    )
-    try:
-        _resolve_provider(config, repo)
-    except ValueError as exc:
-        assert "cannot be combined" in str(exc)
-    else:
-        raise AssertionError("auto + provider must be rejected")
-
-
-def test_auto_mode_requires_file_credential(tmp_path: Path) -> None:
+def test_unpinned_routing_requires_a_stored_credential(tmp_path: Path) -> None:
     from cambium.oneshot import _resolve_provider
 
     repo = _repo(tmp_path / "repo")
     config_path = _write_providers(tmp_path / "providers.json", pa_key="", pb_key="")
-    config = oneshot.OneShotConfig(
-        prompt="p",
-        repo=repo,
-        auto=True,
-        provider_config_path=config_path,
-    )
-    try:
+    config = oneshot.OneShotConfig(prompt="p", repo=repo, provider_config_path=config_path)
+
+    with pytest.raises(ValueError, match="stored credentials"):
         _resolve_provider(config, repo)
-    except ValueError as exc:
-        assert "stored credentials" in str(exc)
-    else:
-        raise AssertionError("auto with no file-backed credentials must fail closed")
 
 
 def test_explicit_provider_requires_usable_credential_and_key_in_plan(
