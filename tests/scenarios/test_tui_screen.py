@@ -171,6 +171,55 @@ def test_usage_event_updates_live_cache_without_duplicate_transcript_text() -> N
     assert transcript._live_text == ""
 
 
+def test_child_rejected_lane_row_shows_reason_and_human_message() -> None:
+    transcript = Transcript()
+    transcript.observe_event(
+        {
+            "kind": "child_rejected",
+            "task_id": "parent",
+            "payload": {
+                "child_task_id": "child-7",
+                "reason": "ChildPolicyError",
+                "message": "spec.tool 'run_shell' is not allowed for children",
+            },
+        }
+    )
+    assert (
+        "child rejected: child-7 · ChildPolicyError"
+        " · spec.tool 'run_shell' is not allowed for children"
+    ) in [entry.text for entry in transcript.entries]
+
+
+def test_child_rejected_lane_row_truncates_message_and_falls_back_to_reason() -> None:
+    transcript = Transcript()
+    transcript.observe_event(
+        {
+            "kind": "child_rejected",
+            "task_id": "parent",
+            "payload": {
+                "child_task_id": "child-9",
+                "reason": "ValidationError",
+                "message": "x" * 300,
+            },
+        }
+    )
+    clipped = transcript.entries[-1].text
+    assert clipped.startswith("child rejected: child-9 · ValidationError · ")
+    assert clipped.endswith("…")
+    assert "x" * 121 not in clipped
+
+    transcript.observe_event(
+        {
+            "kind": "child_rejected",
+            "task_id": "parent",
+            "payload": {"child_task_id": "child-8", "reason": "BudgetExceeded"},
+        }
+    )
+    assert "child rejected: child-8 · BudgetExceeded" in [
+        entry.text for entry in transcript.entries
+    ]
+
+
 def test_activity_names_provider_and_cache_state_before_turn_finishes() -> None:
     activity = ActivityState()
     activity.start(now=10.0)
