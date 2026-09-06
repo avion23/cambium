@@ -55,11 +55,11 @@ half-open probe);
 the sliding-window failure-rate escalation is a secondary safety net that only
 fires once the window is full.
 
-Every ``call`` is bounded by a wall-clock deadline (``call_budget_s``): the
-per-attempt HTTP timeout is capped
-at the remaining budget, retries are skipped when the backoff no longer fits,
-and the cascade aborts (``AllProvidersFailed``) once the budget is spent — the
-deadline is not just a candidate-waiting bound.
+Every ``call`` is bounded by a wall-clock deadline (``call_budget_s``), and
+each provider wire request/stream is wall-bounded by its reasoning-adjusted
+``timeout_s``. Retry backoff still uses the whole call budget, and the cascade
+aborts only once that budget is spent — the deadline is not just a
+candidate-waiting bound.
 
 Stdlib only. HTTP calls use urllib against an OpenAI-compatible
 ``/chat/completions`` endpoint; the API key is read from the environment (name
@@ -2867,7 +2867,11 @@ class Diffundo:
                         if fallback_candidates:
                             pending.extend(fallback_candidates)
                             fallback_triggered = True
-                    if exc.budget_exhausted and not fallback_triggered:
+                    if (
+                        exc.budget_exhausted
+                        and self._remaining(deadline) <= 0
+                        and not fallback_triggered
+                    ):
                         raise AllProvidersFailed(tried, last_error) from exc
                     continue
                 self._record_provider_success()
@@ -3510,8 +3514,9 @@ class Diffundo:
 
         When ``deadline`` is given it bounds the whole attempt: the per-attempt
         HTTP timeout is capped at the remaining budget, retry backoff is skipped
-        when it no longer fits, and a spent budget raises a ``budget_exhausted``
-        ``ProviderError`` so the cascade aborts (cascade-design §2.2).
+        when it no longer fits, and a spent attempt raises a typed timeout. The
+        caller may continue to another provider while the overall call deadline
+        still has budget (cascade-design §2.2).
         """
         runtime = self._runtime(provider.name)
         async with runtime.lock.get():
@@ -3556,12 +3561,16 @@ class Diffundo:
                     timeout_s = provider.timeout_s
                     if remaining is not None:
                         timeout_s = min(timeout_s, remaining)
+                    request_deadline = min(
+                        deadline,
+                        time.monotonic() + _attempt_budget(provider.timeout_s, provider),
+                    )
                     try:
                         raw = await self._post_with_deadline(
                             provider,
                             prompt,
                             timeout_s=timeout_s,
-                            deadline=deadline,
+                            deadline=request_deadline,
                             on_delta=on_delta,
                         )
                         result = raw.to_result(

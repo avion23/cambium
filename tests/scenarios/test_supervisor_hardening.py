@@ -1149,3 +1149,30 @@ def test_status_line_is_fence_allows_cache_artifacts() -> None:
         " M .gitignore",
     ):
         assert fence(line) is False, line
+
+
+def test_discard_cache_artifacts_keeps_real_files(tmp_path: Path) -> None:
+    worktree = tmp_path / "worktree"
+    cache = worktree / "src" / "__pycache__"
+    cache.mkdir(parents=True)
+    pyc = cache / "x.cpython-312.pyc"
+    pyc.write_bytes(b"cache")
+    ruff = worktree / ".ruff_cache" / "0.14.14"
+    ruff.mkdir(parents=True)
+    ruff_marker = ruff / "state"
+    ruff_marker.write_text("cache", encoding="utf-8")
+    real = worktree / "src" / "calculator.py"
+    real.write_text("answer = 42\n", encoding="utf-8")
+
+    supervisor_module._discard_cache_artifacts(
+        worktree,
+        [
+            "?? src/__pycache__/x.cpython-312.pyc",
+            "!! .ruff_cache/0.14.14/state",
+            " M src/calculator.py",
+        ],
+    )
+
+    assert not pyc.exists()
+    assert not ruff_marker.exists()
+    assert real.read_text(encoding="utf-8") == "answer = 42\n"

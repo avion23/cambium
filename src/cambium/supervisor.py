@@ -914,6 +914,37 @@ def _status_line_is_fence(line: str) -> bool:
     return is_cache_artifact_path(path)
 
 
+def _discard_cache_artifacts(worktree: Path, status_lines: Sequence[str]) -> None:
+    """Delete only cache paths Git just reported inside ``worktree``.
+
+    Normal cleanup deliberately treats these paths as disposable. Remove them
+    before asking Git for a non-forced worktree removal so Git and Cambium use
+    the same definition of a clean terminal tree.
+    """
+    root = worktree.resolve()
+    for line in status_lines:
+        if len(line) < 4 or line[2] != " ":
+            continue
+        relative = line[3:].strip()
+        if not is_cache_artifact_path(relative):
+            continue
+        target = worktree / relative
+        try:
+            target.parent.resolve().relative_to(root)
+        except (OSError, ValueError):
+            continue
+        try:
+            if target.is_symlink() or target.is_file():
+                target.unlink(missing_ok=True)
+            elif target.is_dir():
+                shutil.rmtree(target)
+        except OSError:
+            # Keep the non-forced Git removal as the final safety check. A
+            # cache path that cannot be removed therefore leaves the worktree
+            # registered instead of escalating cleanup to a destructive force.
+            continue
+
+
 def _bounded_salvage_diff(diff: bytes) -> tuple[bytes, bool]:
     """Bound salvage bytes while retaining an explicit clipping marker."""
     if len(diff) <= MAX_SALVAGE_BYTES:
@@ -3202,9 +3233,10 @@ class _Runtime:
                         _deferred_observers=deferred,
                     )
                     return
+                status_lines = status.stdout.splitlines()
                 if not force and (
                     spec.get("_defer_cleanup") is True
-                    or any(not _status_line_is_fence(line) for line in status.stdout.splitlines())
+                    or any(not _status_line_is_fence(line) for line in status_lines)
                 ):
                     await self.emit(
                         "worktree_cleanup_deferred",
@@ -3233,6 +3265,8 @@ class _Runtime:
                 fence_dir = worktree / ".cambium"
                 if fence_dir.is_dir():
                     shutil.rmtree(fence_dir, ignore_errors=True)
+                if not force:
+                    await asyncio.to_thread(_discard_cache_artifacts, worktree, status_lines)
                 remove_args = (
                     ("worktree", "remove", "--force", str(worktree))
                     if force

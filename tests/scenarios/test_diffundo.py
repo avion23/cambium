@@ -1467,6 +1467,52 @@ def test_outage_pause_actually_blocks_not_busy_spins(monkeypatch) -> None:
 # --------------------------------------------------------------------------- #
 
 
+def test_provider_timeout_bounds_threaded_attempt_and_falls_back(monkeypatch) -> None:
+    """One tarpitted provider cannot consume the healthy sibling's call budget."""
+    slow = ProviderConfig(
+        name="p_attempt_slow",
+        tier=ProviderTier.FAST,
+        base_url="http://127.0.0.1:1",
+        api_key_env="K_ATTEMPT_SLOW",
+        api_key="sk-test-attempt-slow",
+        timeout_s=0.05,
+        max_retries=0,
+    )
+    fast = ProviderConfig(
+        name="p_attempt_fast",
+        tier=ProviderTier.FAST,
+        base_url="http://127.0.0.1:1",
+        api_key_env="K_ATTEMPT_FAST",
+        api_key="sk-test-attempt-fast",
+        timeout_s=0.3,
+        max_retries=0,
+    )
+    router = Diffundo((slow, fast), call_budget_s=0.4, pause_timeout_s=0.01)
+    release = threading.Event()
+    finished = threading.Event()
+
+    def post_sync(self, provider, prompt, timeout_s):
+        if provider.name == slow.name:
+            release.wait(timeout=1.0)
+            finished.set()
+            return _RawResponse(_ok_payload("late"), 0.3)
+        return _RawResponse(_ok_payload("healthy"), 0.01)
+
+    monkeypatch.setattr(Diffundo, "_post_sync", post_sync)
+
+    async def scenario() -> None:
+        start = time.monotonic()
+        result = await router.call(ProviderTier.FAST, PROMPT)
+        assert time.monotonic() - start < 0.25
+        assert result.provider == fast.name
+        assert result.content == "healthy"
+        assert router.health(slow.name) is HealthState.COOLDOWN
+        release.set()
+        assert await asyncio.to_thread(finished.wait, 1.0)
+
+    asyncio.run(scenario())
+
+
 def test_call_budget_outer_deadline_bounds_threaded_post(monkeypatch) -> None:
     """A blocking socket read cannot extend the async call past its budget."""
     provider = ProviderConfig(

@@ -6567,13 +6567,12 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                     {
                         "role": "user",
                         "content": _bounded_text(
-                            f"invalid action: {exc}. Each tool call needs name and arguments "
-                            "at the same level. Keep independent delegates in one calls array: "
-                            "the parent waits after each delegation batch. For ordinary tools, "
-                            "retry one call: "
-                            '{"name":"TOOL","arguments":{...}} using the actual tool name. '
-                            "JSON-escape string values. For completion, use the finish shape. "
-                            "No prose or markdown.",
+                            f"invalid action: {exc}. Return exactly one JSON object. Tool "
+                            "actions use "
+                            '{"calls":[{"name":"TOOL","arguments":{}}]}; put every tool '
+                            "field inside arguments. Batch only independent work. JSON-escape "
+                            "string values. For completion, use the finish shape. No prose or "
+                            "markdown.",
                             MAX_OBSERVATION_BYTES,
                         ),
                     },

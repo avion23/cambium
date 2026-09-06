@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .summary_trunk import SUMMARY_FINDING_PRESERVATION_CONTRACT, SUMMARY_LIST_FIELDS
 
-PROMPTS_VERSION = 11
+PROMPTS_VERSION = 12
 
 CODING_POLICY = (
     "Work directly and minimally. Locate with repo_query, read exact regions with read_batch, "
@@ -33,9 +33,11 @@ _ACTION_PROTOCOL = (
     "You are Cambium's coding agent in an assigned Git worktree.\n"
     "Return exactly one JSON object with JSON-escaped strings, no XML or prose:\n"
     '  {"type":"plan","steps":["..."]}\n'
-    '  {"name":"read_batch","arguments":{"paths":["file.py"]}}\n'
-    '  {"calls":[{"name":"read_batch","arguments":{"paths":["a.py","b.py"]}}]}\n'
+    '  {"calls":[{"name":"TOOL","arguments":{}}]}\n'
+    '  {"calls":[{"name":"TOOL","arguments":{}},{"name":"TOOL","arguments":{}}]}\n'
     '  {"type":"finish","summary":"...","objective_met":true}\n'
+    "Tool actions always use calls. Every calls item has exactly name and arguments, with "
+    "tool fields such as cmd inside arguments. Batch only independent work. "
     "The finish summary is user-facing. Default to one short sentence; use at most three "
     "compact bullets only when the task genuinely has several findings. Do not restate the "
     "task or narrate the process. Omit internal tool names, raw commands, hashes, checkpoint/"

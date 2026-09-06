@@ -1855,7 +1855,11 @@ def test_three_invalid_actions_fail_fast_with_no_progress(tmp_path: Path) -> Non
     assert [m["turn"] for m in checkpoints] == [1, 2, 3]
     recorded = json.loads(Path(checkpoints[-1]["state_ref"]).read_text())["transcript"]
     assert recorded[-2] == {"role": "assistant", "content": "not-json-three"}
-    assert "invalid action: action is not valid JSON" in recorded[-1]["content"]
+    correction = recorded[-1]["content"]
+    assert "invalid action: action is not valid JSON" in correction
+    assert '{"calls":[{"name":"TOOL","arguments":{}}]}' in correction
+    # exactly one occurrence: nested inside calls, never as a bare top-level shape
+    assert correction.count('{"name":"TOOL"') == 1
 
 
 def test_valid_action_resets_consecutive_invalid_action_bound(tmp_path: Path) -> None:
