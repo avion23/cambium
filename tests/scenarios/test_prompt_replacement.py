@@ -153,6 +153,40 @@ def test_gepa_reflection_feedback_is_grounded_in_rendered_prompt_and_trajectory(
     assert seen == {**policy, "coding": "baseline"}
 
 
+def test_gepa_reflection_feedback_renders_summary_control_for_summary_component() -> None:
+    pytest.importorskip("dspy")
+    from cambium import prompt_optimize
+
+    policy = {"coding": "baseline", "summary": "candidate findings contract"}
+    row = {
+        "id": "ground",
+        "split": "train",
+        "passed": True,
+        "score": 0.9,
+        "elapsed_s": 3.1,
+        "calls": 2,
+        "tokens": 900,
+        "cost_usd": 0.0,
+        "children": 0,
+        "malformed_actions": 0,
+        "tool_failures": 0,
+        "feedback": "exit=0; check=True; scope=True",
+    }
+
+    def runner(case, selected):
+        return row
+
+    prediction = prompt_optimize.make_program("summary", policy, runner)(case={"id": "ground"})
+    feedback = prompt_optimize.metric(None, prediction).feedback
+    # summary candidates render inside the production summary-control shape,
+    # not the coding prompt (which omits the summary text entirely)
+    assert "<cambium-summary-control>" in feedback
+    assert "candidate findings contract" in feedback
+    assert "finding_preservation_contract" in feedback
+    assert "You are Cambium's coding agent" not in feedback.split("<trajectory-digest>")[0]
+    assert len(feedback) <= prompt_optimize._FEEDBACK_CHARS
+
+
 @pytest.mark.parametrize("no_deploy", [False, True])
 def test_gepa_winner_is_automatically_deployed_unless_disabled(
     tmp_path: Path,

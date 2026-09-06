@@ -49,13 +49,30 @@ def _derailment(row: dict[str, Any]) -> list[str]:
     return flags or ["none observed"]
 
 
-def grounded_feedback(selected: dict[str, str], row: dict[str, Any]) -> str:
+def _render_component_prompt(component: str, selected: dict[str, str]) -> str:
+    """Render the production prompt shape the candidate text actually flows into."""
+    if component != "summary":
+        return coding_prompt(selected)
+    from .summary_trunk import SUMMARY_CONTROL_CLOSE, SUMMARY_CONTROL_OPEN
+
+    control = {
+        "type": "summarize_tail",
+        "finding_preservation_contract": selected["summary"],
+    }
+    return SUMMARY_CONTROL_OPEN + json.dumps(control, ensure_ascii=False) + SUMMARY_CONTROL_CLOSE
+
+
+def grounded_feedback(component: str, selected: dict[str, str], row: dict[str, Any]) -> str:
     """Ground reflection in what the model saw: rendered prompt, digest, raw row."""
     return _bounded(
         "\n\n".join(
             (
                 "<rendered-production-prompt>\n"
-                + _bounded(coding_prompt(selected), _PROMPT_CHARS, "rendered prompt"),
+                + _bounded(
+                    _render_component_prompt(component, selected),
+                    _PROMPT_CHARS,
+                    "rendered prompt",
+                ),
                 "<trajectory-digest>\n"
                 + json.dumps(
                     {key: row.get(key) for key in _DIGEST_KEYS} | {"derailment": _derailment(row)},
@@ -86,7 +103,7 @@ def make_program(component: str, policy: dict[str, str], runner: Any) -> Any:
             case = kwargs["case"]
             selected = {**policy, component: self.signature.instructions}
             row = runner(case, selected)
-            report = grounded_feedback(selected, row)
+            report = grounded_feedback(component, selected, row)
             return self._forward_postprocess(
                 [{"report": report, "score": row["score"]}],
                 self.signature,
