@@ -204,6 +204,7 @@ def test_resume_at_turn_two_restores_no_progress_history(tmp_path: Path) -> None
             "epoch": checkpoint.epoch,
             "child_results": [],
             "child_results_truncated": False,
+            "rejection_feedback": None,
             "workspace_changed": False,
         },
     )

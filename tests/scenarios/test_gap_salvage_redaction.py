@@ -187,6 +187,7 @@ def test_normal_checkpoint_resumes_by_workspace_hash_without_salvage(
         "epoch": 1,
         "child_results": [],
         "child_results_truncated": False,
+        "rejection_feedback": None,
         "workspace_changed": False,
     }
     events = read_events(session)

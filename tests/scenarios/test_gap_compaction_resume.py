@@ -226,6 +226,7 @@ def test_compaction_deferral_count_survives_generation_boundary(tmp_path: Path) 
             "epoch": 1,
             "child_results": [],
             "child_results_truncated": False,
+            "rejection_feedback": None,
             "workspace_changed": False,
         },
     )
