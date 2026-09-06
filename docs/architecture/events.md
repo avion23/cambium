@@ -24,7 +24,7 @@ vocabulary.
 | `protocol` | `supervisor.py` | Records a supervisor-to-worker wire write failure and the worker kill that follows. |
 | `parse_error` | `supervisor.py` | Records an undecodable worker stdout line with a truncated message. |
 | `log` | `supervisor.py` | Records a bounded worker log/diagnostic line (stderr tail, worker log/error messages, EOF lifecycle notes). |
-| `heartbeat` | `worker.py`; forwarded by `supervisor.py` | Periodic worker liveness/progress; current fields are `turn`, `tool`, `status`. |
+| `heartbeat` | `worker.py`; forwarded by `supervisor.py` | Worker liveness/progress: `turn`, current `tool`, status, provider phase (`waiting`, `thinking`, `streaming`) and a monotonic `phase_revision`. Only visible streaming may carry a bounded tail; private reasoning text is not emitted. |
 | `tool_event` | `worker.py`; forwarded by `supervisor.py` | Redacted bounded tool invocation/result with turn, outcome, command, and duration. |
 | `tool_output_delta` | `worker.py`; forwarded by `supervisor.py` | Records a redacted streamed chunk of tool output with tool, turn, and stream name. |
 | `usage_event` | `worker.py`; forwarded by `supervisor.py` | Redacted provider call usage, cost, latency, rate, quota, and context accounting. |

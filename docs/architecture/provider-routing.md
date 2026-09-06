@@ -67,6 +67,15 @@ provider that actually served it; repeated calls do not reserve it again. A
 failed attempt does not move that reservation. Persisted Retry-After timestamps
 expire naturally; a past 429 is not a permanent ban.
 
+OpenAI-compatible Chat Completions use SSE streaming when the endpoint returns
+`text/event-stream`; Codex Responses uses the same bounded SSE reader. Reasoning
+and visible text deltas update worker progress without changing the final
+provider result or accounting. Private reasoning text is not forwarded to the
+operator. A provider that ignores streaming and returns ordinary JSON still
+uses the same completed-response path. Observability callbacks are read-only:
+a broken renderer/progress callback cannot turn a valid provider response into
+a failed attempt.
+
 Child placement is described once in [context branches](context-branches.md).
 `spread` prefers another feasible provider; it is not permission to ignore
 quota or to migrate an exact same-provider prefix to an incompatible backend.

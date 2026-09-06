@@ -84,6 +84,15 @@ def load_cases(path: Path) -> list[dict[str, Any]]:
     return cases
 
 
+def _root_summaries(result: Any, task_id: str) -> list[str]:
+    """Return the one user-facing root summary, if the plan produced one."""
+    selected = next(
+        (item for item in result.results if item.task_id == task_id),
+        result.results[0] if result.results else None,
+    )
+    return [selected.summary] if selected is not None and selected.summary else []
+
+
 def _git(repo: Path, *args: str) -> str:
     return subprocess.check_output(
         ["git", "-C", str(repo), *args], text=True, stderr=subprocess.PIPE,
@@ -141,6 +150,7 @@ def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact che
     base = _git(repo, "rev-parse", "HEAD")
     events: list[dict] = []
     turn_heads: list[str] = []
+    user_summaries: list[str] = []
     started = time.monotonic()
     before = (budget.calls, budget.tokens, budget.cost_usd)
     config = OneShotConfig(
@@ -200,6 +210,7 @@ def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact che
                     result = await session.run_turn(
                         turn, on_event=live, max_concurrent_tasks=max_workers,
                     )
+                    user_summaries.extend(_root_summaries(result, turn.config.task_id))
                     session.complete_turn(turn, succeeded=result.exit_code == 0)
                     turn_heads.append(_git(repo, "rev-parse", "main"))
                     if result.exit_code:
@@ -221,6 +232,7 @@ def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact che
                 routing_state_path=root / "routing.json", on_event=observe,
                 max_concurrent_tasks=max_workers, context_reuse=True,
             )
+            user_summaries.extend(_root_summaries(result, plan["tasks"][0]["task_id"]))
             turn_heads.append(_git(repo, "rev-parse", "main"))
         return result.exit_code, "; ".join(r.reason for r in result.results if r.reason)
 
@@ -281,8 +293,24 @@ def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact che
     trace_ok = trace_ok and rollovers >= case.get("required_rollovers", 0)
     passed = exit_code == 0 and checked and scope_ok and trace_ok
     calls, tokens = budget.calls - before[0], budget.tokens - before[1]
-    # Correctness dominates. Small bounded efficiency reward breaks ties.
-    score = 0.0 if not passed else 0.9 + 0.1 / (1 + elapsed / 60 + tokens / 10000 + calls / 10)
+    user_summary_chars = sum(len(text.strip()) for text in user_summaries)
+    user_summary_lines = sum(
+        len(text.strip().splitlines()) for text in user_summaries if text.strip()
+    )
+    # Correctness dominates. Resource use and operator-visible verbosity only break ties.
+    score = (
+        0.0
+        if not passed
+        else 0.9
+        + 0.1
+        / (
+            1
+            + elapsed / 60
+            + tokens / 10000
+            + calls / 10
+            + user_summary_chars / 1000
+        )
+    )
     usage = [e.get("payload", {}) for e in events if e.get("kind") == "usage_event"]
     failures = [
         e.get("payload", {}) for e in events
@@ -313,6 +341,8 @@ def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact che
         "directory": str(root), "turn_heads": turn_heads,
         "source": case.get("source"), "family": case.get("family"), "rollovers": rollovers,
         "summary_calls": sum(e.get("call_kind") == "summary" for e in usage),
+        "user_summary_chars": user_summary_chars,
+        "user_summary_lines": user_summary_lines,
         "failed_provider_calls": sum(bool(e.get("failure_reason")) for e in usage),
         "malformed_actions": sum(
             e.get("kind") == "log"
