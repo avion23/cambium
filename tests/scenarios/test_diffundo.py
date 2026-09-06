@@ -185,12 +185,14 @@ def test_chat_completions_stream_reasoning_output_and_usage_live() -> None:
     server = FakeServer([(200, stream, 0.0, {"Content-Type": "text/event-stream"})])
     router = Diffundo((_config("p_stream", server, "K_STREAM", model="m-stream"),))
     deltas: list[tuple[str, str]] = []
+    statuses: list[dict[str, Any]] = []
     try:
         result = asyncio.run(
             router.call(
                 ProviderTier.FAST,
                 PROMPT,
                 on_delta=lambda phase, text: deltas.append((phase, text)),
+                on_status=lambda event: statuses.append(dict(event)),
             )
         )
         assert result.content == '{"type":"finish","summary":"ok","objective_met":true}'
@@ -206,6 +208,15 @@ def test_chat_completions_stream_reasoning_output_and_usage_live() -> None:
             ("thinking", "consider"),
             ("streaming", '{"type":"finish",'),
             ("streaming", '"summary":"ok","objective_met":true}'),
+        ]
+        assert statuses == [
+            {"kind": "provider_attempt", "provider": "p_stream", "model": "m-stream"},
+            {
+                "kind": "provider_succeeded",
+                "provider": "p_stream",
+                "model": "m-stream",
+                "provider_cache_hit": True,
+            },
         ]
         assert server.calls[0]["stream"] is True
         assert server.calls[0]["stream_options"] == {"include_usage": True}
@@ -227,8 +238,15 @@ def test_cascade_falls_through_500_to_next_provider() -> None:
             _config("p_good", good, "K_GOOD"),
         )
     )
+    statuses: list[dict[str, Any]] = []
     try:
-        result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        result = asyncio.run(
+            router.call(
+                ProviderTier.FAST,
+                PROMPT,
+                on_status=lambda event: statuses.append(dict(event)),
+            )
+        )
         assert result.provider == "p_good"
         assert result.model == "m-good"
         assert result.content == "from good"
@@ -238,6 +256,12 @@ def test_cascade_falls_through_500_to_next_provider() -> None:
         assert result.request_rate_status == "available"
         assert result.retry_after_s is None
         assert result.account_quota_owner is None
+        assert [(event["kind"], event["provider"]) for event in statuses] == [
+            ("provider_attempt", "p_bad"),
+            ("provider_failed", "p_bad"),
+            ("provider_attempt", "p_good"),
+            ("provider_succeeded", "p_good"),
+        ]
     finally:
         bad.close()
         good.close()

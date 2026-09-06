@@ -30,11 +30,12 @@ from decimal import Decimal
 from functools import lru_cache
 from typing import Any, TextIO
 
-from .render_markdown import CambiumMarkdown, markdown_theme
+from .render_markdown import render_markdown_lines as _shared_markdown_lines
 from .terminal import (
     clip_terminal_text,
     pad_terminal_text,
     sanitize_terminal_text,
+    terminal_color_depth,
     terminal_display_width,
 )
 
@@ -54,6 +55,15 @@ _YELLOW = "\x1b[1;33m"
 _RED = "\x1b[1;31m"
 _MAGENTA = "\x1b[1;35m"
 _WHITE = "\x1b[1;37m"
+_SKY = "\x1b[38;5;81m"
+_TEAL = "\x1b[38;5;44m"
+_VIOLET = "\x1b[38;5;141m"
+_AMBER = "\x1b[38;5;179m"
+_CORAL = "\x1b[38;5;203m"
+_PINK = "\x1b[38;5;213m"
+_MINT = "\x1b[38;5;84m"
+_STEEL = "\x1b[38;5;110m"
+_BRIGHT = "\x1b[38;5;255m"
 
 # Rich styles remain a closed set. Model text is sanitized before Rich adds
 # these sequences; provider-supplied escapes are never trusted as renderer output.
@@ -81,15 +91,16 @@ _RICH_ANSI = frozenset(
     }
 )
 _STATUS_PALETTE = {
-    "cyan": _CYAN,
-    "dim": _DIM,
-    "blue": _BLUE,
-    "green": _GREEN,
-    "yellow": _YELLOW,
-    "red": _RED,
-    "magenta": _MAGENTA,
-    "white": _WHITE,
-    "bold": _MD_BOLD,
+    "cyan": (_CYAN, _TEAL),
+    "dim": (_DIM, _DIM),
+    "blue": (_BLUE, _SKY),
+    "green": (_GREEN, _MINT),
+    "yellow": (_YELLOW, _AMBER),
+    "red": (_RED, _CORAL),
+    "magenta": (_MAGENTA, _VIOLET),
+    "white": (_WHITE, _BRIGHT),
+    "pink": (_MAGENTA, _PINK),
+    "bold": (_MD_BOLD, _MD_BOLD),
 }
 _CONTROLLED_ANSI = frozenset(
     {
@@ -103,6 +114,15 @@ _CONTROLLED_ANSI = frozenset(
         _RED,
         _MAGENTA,
         _WHITE,
+        _SKY,
+        _TEAL,
+        _VIOLET,
+        _AMBER,
+        _CORAL,
+        _PINK,
+        _MINT,
+        _STEEL,
+        _BRIGHT,
         _MD_BOLD,
         *_RICH_ANSI,
     }
@@ -112,11 +132,20 @@ _ANSI_STYLE = re.compile(r"\x1b\[[0-9;]*m")
 _ROLE_COLORS = {
     "user": _BLUE,
     "assistant": _WHITE,
-    "tool": _MAGENTA,
+    "tool": _YELLOW,
     "system": _DIM_CYAN,
     "error": _RED,
     "dim": _DIM,
     "live": _CYAN,
+}
+_ROLE_VIVID = {
+    "user": _SKY,
+    "assistant": _TEAL,
+    "tool": _AMBER,
+    "system": _STEEL,
+    "error": _CORAL,
+    "dim": _DIM,
+    "live": _MINT,
 }
 _ROLE_LABELS = {
     "user": "YOU",
@@ -225,7 +254,8 @@ _STATUS_PHASE_STYLES = {
     "running": "cyan",
     "tool": "cyan",
     "provider": "blue",
-    "children": "blue",
+    "routing": "cyan",
+    "children": "pink",
     "orchestrating": "cyan",
     "stalled": "yellow",
     "done": "green",
@@ -461,20 +491,28 @@ def _human_bytes(value: int) -> str:
     return f"{value / (1_024 * 1_024):.1f}".rstrip("0").rstrip(".") + "MiB"
 
 
-def _color_enabled(stream: Any) -> bool:
-    return (
-        _is_tty(stream) and not os.environ.get("NO_COLOR") and os.environ.get("TERM", "") != "dumb"
-    )
-
-
-def _paint(text: str, color: str, enabled: bool) -> str:
+def _paint(text: str, color: str, enabled: bool | int) -> str:
     clean = _safe_rendered(text)
     return f"{color}{clean}{_RESET}" if enabled else clean
 
 
-def _status_paint(text: str, style: str, enabled: bool) -> str:
-    """Apply one status palette entry, gated by the caller's color capability."""
-    return _paint(text, _STATUS_PALETTE[style], enabled)
+def _vivid_color(enabled: bool | int) -> bool:
+    return type(enabled) is int and (enabled == 24 or enabled >= 256)
+
+
+def _status_color(style: str, enabled: bool | int) -> str:
+    standard, vivid = _STATUS_PALETTE[style]
+    return vivid if _vivid_color(enabled) else standard
+
+
+def _status_paint(text: str, style: str, enabled: bool | int) -> str:
+    """Apply one semantic palette entry at the terminal's available color depth."""
+    return _paint(text, _status_color(style, enabled), enabled)
+
+
+def _role_color(role: str, enabled: bool | int) -> str:
+    palette = _ROLE_VIVID if _vivid_color(enabled) else _ROLE_COLORS
+    return palette.get(role, "")
 
 
 def _event_data(record: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -1007,16 +1045,9 @@ class Transcript:
                     return value
             return ""
         if kind == "usage_event":
-            usage = data.get("usage")
-            if isinstance(usage, Mapping):
-                total = usage.get("total_tokens")
-                output = usage.get("output_tokens", usage.get("completion_tokens"))
-                if type(total) is int or type(output) is int:
-                    total_text = total if type(total) is int else "?"
-                    output_text = output if type(output) is int else "?"
-                    return f"tokens={total_text} out={output_text}"
-            provider = data.get("provider") or data.get("assigned_provider")
-            return f"provider={provider}" if isinstance(provider, str) else ""
+            # Usage/cache values already have dedicated status and rail rows.
+            # Repeating them as LIVE transcript text adds noise without state.
+            return ""
         if kind == "result":
             return _result_text(data) or _single_line(data.get("status"))
         for key in (
@@ -1573,6 +1604,9 @@ class ActivityState:
         self._stream_tokens = 0
         self._stream_rate = 0.0
         self._cooldown: tuple[str | None, float | None] | None = None
+        self._provider: str | None = None
+        self._model: str | None = None
+        self._cache_hit: bool | None = None
         self._next_tool_id = 0
         self._tools: dict[str, tuple[str, float]] = {}
         self._heartbeat_tool: tuple[str, float] | None = None
@@ -1601,6 +1635,9 @@ class ActivityState:
         self._stream_tokens = 0
         self._stream_rate = 0.0
         self._cooldown = None
+        self._provider = None
+        self._model = None
+        self._cache_hit = None
         self._next_tool_id = 0
         self._tools.clear()
         self._heartbeat_tool = None
@@ -1764,6 +1801,17 @@ class ActivityState:
                     return number
         return None
 
+    def _observe_provider(self, data: Mapping[str, Any]) -> None:
+        provider = data.get("provider")
+        model = data.get("model")
+        if isinstance(provider, str) and provider:
+            self._provider = provider
+        if isinstance(model, str) and model:
+            self._model = model
+        cache_hit = data.get("provider_cache_hit")
+        if type(cache_hit) is bool:
+            self._cache_hit = cache_hit
+
     def _observe_cooldown(self, data: Mapping[str, Any]) -> None:
         status = data.get("request_rate_status")
         if not isinstance(status, str):
@@ -1802,6 +1850,11 @@ class ActivityState:
     def _observe_heartbeat(self, data: Mapping[str, Any], event_now: float) -> bool:
         phase = data.get("phase")
         tool = data.get("tool")
+        self._observe_provider(data)
+        if phase == "waiting" and type(data.get("provider_cache_hit")) is not bool:
+            # A new provider attempt has no cache result yet. Do not carry the
+            # previous request's HIT/MISS into this one.
+            self._cache_hit = None
         if isinstance(tool, str) and tool.strip():
             tool_name = _sanitize(tool).strip() or "tool"
             if self._heartbeat_tool is None or self._heartbeat_tool[0] != tool_name:
@@ -1824,7 +1877,7 @@ class ActivityState:
             self._responding = False
             return True
         self._heartbeat_phase = phase
-        self._heartbeat_tail = _activity_tail(data.get("tail")) if phase == "streaming" else ""
+        self._heartbeat_tail = _activity_tail(data.get("tail"))
         revision = data.get("phase_revision")
         revision = revision if type(revision) is int else None
         self._mark_progress(
@@ -1847,6 +1900,7 @@ class ActivityState:
             return
         data = _event_data(record)
         event_now = time.monotonic() if now is None else now
+        self._observe_provider(data)
         self._observe_cooldown(data)
 
         if (
@@ -1932,27 +1986,43 @@ class ActivityState:
             delay = f" · retry {_fmt_secs(retry_after)}" if retry_after is not None else ""
             return f"{spinner} COOLDOWN{owner}{delay} · turn {_fmt_secs(turn_elapsed)}"
 
+        provider = "/".join(part for part in (self._provider, self._model) if part)
+        cache = (
+            " · cache HIT" if self._cache_hit is True
+            else " · cache MISS" if self._cache_hit is False
+            else ""
+        )
+        owner = f" · {provider}" if provider else ""
+
         if self._heartbeat_phase == "waiting":
-            label = f"PROVIDER · waiting {_fmt_secs(turn_elapsed)}"
+            detail = self._heartbeat_tail
+            if detail == "selecting provider":
+                label = f"ROUTING · {_fmt_secs(turn_elapsed)}"
+            else:
+                label = f"PROVIDER{owner} · waiting {_fmt_secs(turn_elapsed)}"
+                if detail and provider and detail.startswith(provider + " · "):
+                    label += " · " + detail[len(provider) + 3 :]
             if quiet_for >= _STALL_AFTER_S:
                 label += f" · silent {_fmt_secs(quiet_for)}"
-            return f"{_ACTIVITY_PHASE_GLYPHS['waiting']} {label}"
+            return f"{_ACTIVITY_PHASE_GLYPHS['waiting']} {label}{cache}"
 
         if self._heartbeat_phase == "thinking":
-            label = f"THINKING · {_fmt_secs(turn_elapsed)}"
+            label = f"THINKING{owner} · {_fmt_secs(turn_elapsed)}"
             if quiet_for >= _STALL_AFTER_S:
                 label += f" · stalled {_fmt_secs(quiet_for)}"
-            return f"{_ACTIVITY_PHASE_GLYPHS['thinking']} {label}"
+            return f"{_ACTIVITY_PHASE_GLYPHS['thinking']} {label}{cache}"
 
         if self._heartbeat_phase == "streaming" or self._state == "STREAMING" or self._responding:
             elapsed = max(0.001, turn_elapsed)
             rate = self._stream_rate or self._stream_tokens / elapsed
-            label = f"STREAMING · {_fmt_secs(turn_elapsed)} · {rate:5.1f} tok/s"
+            label = f"STREAMING{owner} · {_fmt_secs(turn_elapsed)}"
+            if rate >= 0.1:
+                label += f" · {rate:5.1f} tok/s"
             if quiet_for >= _STALL_AFTER_S:
                 label += f" · stalled {_fmt_secs(quiet_for)}"
             if self._heartbeat_tail:
                 label += f" · {self._heartbeat_tail}"
-            return f"{_ACTIVITY_PHASE_GLYPHS['streaming']} {label}"
+            return f"{_ACTIVITY_PHASE_GLYPHS['streaming']} {label}{cache}"
 
         if self._state == "DONE":
             return "✓ DONE"
@@ -2105,48 +2175,9 @@ def _narrow_table_ranges(text: str, width: int) -> list[tuple[int, int]]:
     return ranges
 
 
-@lru_cache(maxsize=1)
-def _rich_markdown_components() -> tuple[Any, Any, Any, Any]:
-    """Reuse the same Rich document class and theme as one-shot rendering."""
-    from rich.color import ColorSystem
-    from rich.console import Console
-
-    return CambiumMarkdown, Console, ColorSystem, markdown_theme()
-
-
-@lru_cache(maxsize=32)
-def _rich_console(width: int, color: bool) -> tuple[Any, Any]:
-    _, Console, ColorSystem, theme = _rich_markdown_components()
-    console = Console(
-        color_system="standard" if color else None,
-        force_terminal=color,
-        height=None,
-        highlight=False,
-        markup=False,
-        no_color=not color,
-        theme=theme,
-        width=width,
-    )
-    return console, ColorSystem.STANDARD if color else None
-
-
 def _render_markdown_lines_rich_document(text: str, width: int, color: bool) -> list[str]:
-    PaneMarkdown, _, _, _ = _rich_markdown_components()
-    console, ansi_color_system = _rich_console(width, color)
-    rendered: list[str] = []
-    for line in console.render_lines(PaneMarkdown(text, hyperlinks=False), pad=False):
-        parts: list[str] = []
-        for segment in line:
-            if segment.control:
-                continue
-            if color and segment.style:
-                parts.append(segment.style.render(segment.text, color_system=ansi_color_system))
-            else:
-                parts.append(segment.text)
-        rendered.append("".join(parts))
-    while rendered and not _visible(rendered[-1]).strip():
-        rendered.pop()
-    return rendered
+    """Use the same in-process Rich renderer as one-shot/REPL output."""
+    return _shared_markdown_lines(text, width=width, color_depth=16 if color else 0)
 
 
 def _render_markdown_lines_rich(text: str, width: int, color: bool) -> list[str]:
@@ -3221,8 +3252,12 @@ def _rail_detail_rows(
             detail_kind = "streaming"
         elif "THINKING" in upper:
             detail_kind = "thinking"
+        elif "ROUTING" in upper:
+            detail_kind = "routing"
         elif "PROVIDER" in upper:
             detail_kind = "provider"
+        elif "CHILDREN" in upper:
+            detail_kind = "children"
         elif "TOOL" in upper:
             detail_kind = "tool"
         elif "STALL" in upper or "SILENT" in upper or "NO OUTPUT" in upper:
@@ -3480,26 +3515,28 @@ def _side_sections(
     return [_side_row(kind, text, panel_width) for kind, text in lines[:capacity]]
 
 
-def _style_kind(kind: Any) -> str:
+def _style_kind(kind: Any, enabled: bool | int = True) -> str:
     if not isinstance(kind, str):
         kind = _side_clean(kind)
     if kind in {"failed", "cancelled", "rejected", "error"}:
-        return _RED
-    if kind in {"streaming", "succeeded", "done", "cache-hit"}:
-        return _GREEN
-    if kind in {"thinking", "cast"}:
-        return _MAGENTA
-    if kind in {"provider", "waiting", "children"}:
-        return _BLUE
-    if kind in {"stalled", "cooldown", "cache-miss"}:
-        return _YELLOW
-    if kind in {"active", "starting", "merging", "running", "tool"}:
-        return _CYAN
-    if kind == "heading":
-        return _CYAN
-    if kind == "dim":
-        return _DIM
-    return ""
+        style = "red"
+    elif kind in {"streaming", "succeeded", "done", "cache-hit"}:
+        style = "green"
+    elif kind in {"thinking", "cast"}:
+        style = "magenta"
+    elif kind in {"children"}:
+        style = "pink"
+    elif kind in {"provider", "waiting"}:
+        style = "blue"
+    elif kind in {"stalled", "cooldown", "cache-miss"}:
+        style = "yellow"
+    elif kind in {"active", "starting", "merging", "running", "tool", "heading"}:
+        style = "cyan"
+    elif kind == "dim":
+        style = "dim"
+    else:
+        return ""
+    return _status_color(style, enabled)
 
 
 def _primary_rows(
@@ -3996,7 +4033,7 @@ def _split_frame_row(
     left = _paint(_frame_inside(text, left_width + 2), left_color, color)
     if not rail_width:
         return left
-    right = _pad(_paint(rail_text, _style_kind(rail_kind), color), rail_width)
+    right = _pad(_paint(rail_text, _style_kind(rail_kind, color), color), rail_width)
     return left + right + _paint("│", _DIM_CYAN, color)
 
 
@@ -4053,7 +4090,7 @@ def _cockpit_frame_lines(
             lines.append(
                 _paint(
                     _frame_inside(text, width),
-                    _ROLE_COLORS.get(role, ""),
+                    _role_color(role, color),
                     color,
                 )
             )
@@ -4095,7 +4132,7 @@ def _cockpit_frame_lines(
                 width,
                 rail_width,
                 rail_text=rail_text,
-                left_color=_ROLE_COLORS.get(role, ""),
+                left_color=_role_color(role, color),
                 rail_kind=rail_kind,
                 color=color,
             )
@@ -4152,7 +4189,7 @@ def render_primary(
     """Render conversation rows followed by the rolling tool/status rows."""
     width = max(8, width)
     lines = [
-        _paint(text, _ROLE_COLORS.get(role, ""), color)
+        _paint(text, _role_color(role, color), color)
         for role, text in _primary_rows(
             transcript,
             width,
@@ -4241,7 +4278,7 @@ class Cockpit:
     def __init__(self, stream: TextIO, *, enabled: bool = True) -> None:
         self.stream = stream
         self.enabled = enabled and _is_tty(stream)
-        self.color = self.enabled and _color_enabled(stream)
+        self.color = terminal_color_depth(stream) if self.enabled else 0
         self._entered = False
         self._previous_sigterm_handler: Any = None
         self._last_size = os.terminal_size((120, 40))
@@ -4563,7 +4600,7 @@ class Cockpit:
         live_rows = self._small_live_rows(transcript, width, activity_line)
         lines_list = [
             *(
-                _paint(text, _ROLE_COLORS.get(role, ""), self.color)
+                _paint(text, _role_color(role, self.color), self.color)
                 for role, text in conversation_rows
             ),
             *(_paint(text, _DIM_CYAN, self.color) for text in live_rows),
@@ -4967,7 +5004,7 @@ class Cockpit:
                 # The fixed frame keeps only the tail; flush newly hidden rows
                 # so restored history and large live entries reach scrollback.
                 for role, text in hidden_rows:
-                    self.stream.write(_paint(text, _ROLE_COLORS.get(role, ""), self.color))
+                    self.stream.write(_paint(text, _role_color(role, self.color), self.color))
                     self.stream.write("\n")
             lines = _cockpit_frame_lines(
                 snapshot,
@@ -5094,7 +5131,7 @@ class Cockpit:
             if preserve_input:
                 self.stream.write("\r\n")
             for role, text in new_rows:
-                self.stream.write(_paint(text, _ROLE_COLORS.get(role, ""), self.color))
+                self.stream.write(_paint(text, _role_color(role, self.color), self.color))
                 self.stream.write("\n")
             for status_row in status_rows:
                 self.stream.write(_paint(status_row, _DIM_CYAN, self.color))
@@ -5139,7 +5176,7 @@ class Cockpit:
                 self._last_size.columns,
                 rail_width,
                 rail_text=rail_text,
-                left_color=_ROLE_COLORS.get(role, ""),
+                left_color=_role_color(role, self.color),
                 rail_kind=kind,
                 color=self.color,
             )

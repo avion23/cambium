@@ -25,7 +25,8 @@ def test_atomic_replacement_changes_new_prompts_not_existing_snapshot(
     assert second["coding"] in after["messages"][0]["content"]
     assert before == worker._build_agent_prompt("task", [], [], prompt_policy=pinned)
     assert '"type":"finish"' in after["messages"][0]["content"]
-    assert "under about 600 characters" in after["messages"][0]["content"]
+    assert "Default to one short sentence" in after["messages"][0]["content"]
+    assert "Mention checks by outcome" in after["messages"][0]["content"]
     assert "summary_entry" not in second["coding"]
 
 
