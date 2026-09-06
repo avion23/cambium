@@ -21,6 +21,7 @@ from typing import Any
 from .oneshot import OneShotConfig, _resolve_provider, build_plan
 from .prompts import validate_policy
 from .supervisor import run_plan
+from .worker import MAX_CONSECUTIVE_INVALID_ACTIONS
 
 
 class ExperimentBudgetExceeded(RuntimeError):
@@ -160,6 +161,41 @@ def _peak_pending_children(events: list[dict]) -> int:
     return peak
 
 
+def _breaker_strike(event: dict) -> bool:
+    """True when the supervisor logged the agent loop's final invalid-action strike."""
+    if event.get("kind") != "log":
+        return False
+    message = event.get("payload", {}).get("message")
+    return (
+        isinstance(message, str)
+        and message.startswith("invalid_action:")
+        and message.endswith(f" (strike {MAX_CONSECUTIVE_INVALID_ACTIONS})")
+    )
+
+
+def _case_provider_pool(resolved: Any, case: dict) -> Any:
+    """Restrict one case's resolved provider to its declared credential-ready pool."""
+    if not case.get("providers"):
+        return resolved
+    from .provider_config import load_providers
+
+    names = set(case["providers"])
+    available = [
+        p
+        for p in load_providers(resolved.provider_config_path)
+        if p.name in names and p.name in resolved.authorized_providers
+    ]
+    if {p.name for p in available} != names:
+        raise ValueError("benchmark provider pool is not credential-ready")
+    if resolved.assigned_provider and resolved.assigned_provider not in names:
+        raise ValueError("benchmark primary provider is outside its provider pool")
+    return replace(
+        resolved,
+        authorized_providers=tuple(p.name for p in available),
+        model_candidates=tuple(sorted({p.model for p in available})),
+    )
+
+
 def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact checking
     case: dict,
     policy: dict[str, str],
@@ -198,7 +234,20 @@ def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact che
         owner = asyncio.current_task()
 
         def observe(event: dict) -> None:
+            nonlocal abort_reason
             events.append(event)
+            if abort_reason is None and _breaker_strike(event):
+                # The agent-loop breaker has decided this rollout FAILED: the
+                # worker returns failed immediately and no later result can
+                # un-fail the plan (any non-succeeded task forces exit 1).
+                # Cancel like the budget path below instead of burning provider
+                # calls to the wall; the verdict fields, including the breaker
+                # reason, are unchanged.
+                abort_reason = (
+                    f"agent emitted {MAX_CONSECUTIVE_INVALID_ACTIONS} consecutive invalid actions"
+                )
+                if owner is not None:
+                    owner.cancel()
             if event.get("kind") != "usage_event":
                 return
             data = event.get("payload", {})
@@ -210,24 +259,7 @@ def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact che
                     owner.cancel()
 
         resolved, environment = _resolve_provider(config, repo)
-        if case.get("providers"):
-            from .provider_config import load_providers
-
-            names = set(case["providers"])
-            available = [
-                p
-                for p in load_providers(resolved.provider_config_path)
-                if p.name in names and p.name in resolved.authorized_providers
-            ]
-            if {p.name for p in available} != names:
-                raise ValueError("benchmark provider pool is not credential-ready")
-            if resolved.assigned_provider and resolved.assigned_provider not in names:
-                raise ValueError("benchmark primary provider is outside its provider pool")
-            resolved = replace(
-                resolved,
-                authorized_providers=tuple(p.name for p in available),
-                model_candidates=tuple(sorted({p.model for p in available})),
-            )
+        resolved = _case_provider_pool(resolved, case)
         if case.get("followups"):
             from .interactive import InteractiveSession
 
@@ -290,12 +322,14 @@ def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact che
             return await execute()
 
     error = ""
+    abort_reason: str | None = None
     try:
         exit_code, error = asyncio.run(bounded_execute())
     except TimeoutError:
         exit_code, error = 1, f"rollout wall budget exhausted ({max_wall_s:g}s)"
     except asyncio.CancelledError:
-        exit_code, error = 1, "experiment budget exhausted; rollout cancelled"
+        exit_code = 1
+        error = abort_reason or "experiment budget exhausted; rollout cancelled"
     elapsed = time.monotonic() - started
     from .branch_history import _session_event_stores
     from .store import read_events_file
