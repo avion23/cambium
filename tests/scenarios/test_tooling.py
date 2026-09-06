@@ -7,6 +7,7 @@ run ruff over ``src`` with the project's rules.
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -209,3 +210,22 @@ def test_doctor_exits_zero_on_healthy_session_artifacts(tmp_path, monkeypatch) -
     assert result.returncode == 0, result.stdout + result.stderr
     assert "conversations.db: integrity ok" in result.stdout
     assert "0 fail" in result.stdout
+
+
+def test_python_sources_parse() -> None:
+    """Every tracked Python source parses; a syntax error anywhere fails here.
+
+    Adapted from the former test_syntax_hygiene.py; the unparenthesized
+    ``except A, b`` regex was dropped because that form is a Python 3
+    ``SyntaxError`` that ``ast.parse`` already rejects.
+    """
+    offenders: list[str] = []
+    for source_root in (REPO_ROOT / "src", REPO_ROOT / "tests"):
+        for path in sorted(source_root.rglob("*.py")):
+            try:
+                ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            except SyntaxError as error:
+                relative = path.relative_to(REPO_ROOT)
+                offenders.append(f"{relative}:{error.lineno or '?'}: {error.msg}")
+
+    assert not offenders, "Python syntax errors found:\n" + "\n".join(offenders)
