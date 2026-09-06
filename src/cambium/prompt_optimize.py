@@ -56,10 +56,9 @@ def _derailment(row: dict[str, Any]) -> list[str]:
     if row.get("tool_failures"):
         flags.append(f"tool-failures: {row['tool_failures']} failed tool events")
     turns = max(1, len(row.get("turn_heads") or ()))
-    if (
-        (row.get("user_summary_chars") or 0) > 320 * turns
-        or (row.get("user_summary_lines") or 0) > 3 * turns
-    ):
+    if (row.get("user_summary_chars") or 0) > 320 * turns or (
+        row.get("user_summary_lines") or 0
+    ) > 3 * turns:
         flags.append(
             "verbose-user-summary: "
             f"{row.get('user_summary_chars', 0)} chars / {row.get('user_summary_lines', 0)} lines "
@@ -102,8 +101,7 @@ def grounded_feedback(component: str, selected: dict[str, str], row: dict[str, A
                     ensure_ascii=False,
                     allow_nan=False,
                 ),
-                "<raw-row>\n"
-                + json.dumps(json_finite(row), ensure_ascii=False, allow_nan=False),
+                "<raw-row>\n" + json.dumps(json_finite(row), ensure_ascii=False, allow_nan=False),
             )
         ),
         _FEEDBACK_CHARS,

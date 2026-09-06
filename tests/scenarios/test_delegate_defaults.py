@@ -50,6 +50,69 @@ def test_minimal_delegate_inherits_execution_without_pinning_spread(tmp_path: Pa
     assert exact["assigned_provider"] == "a"
 
 
+def test_delegate_schema_rejects_missing_task() -> None:
+    schema = next(s for s in TOOL_SCHEMAS if s["name"] == "delegate")
+    errors = validate_tool_call(
+        schema,
+        {"child_task_id": "child-review", "kind": "investigation", "spec": {}},
+    )
+
+    assert errors == ["validation failed: missing 'spec.task' (string)"]
+
+
+def test_delegate_schema_accepts_explicit_provider_constraints() -> None:
+    schema = next(s for s in TOOL_SCHEMAS if s["name"] == "delegate")
+    errors = validate_tool_call(
+        schema,
+        {
+            "child_task_id": "child-review",
+            "kind": "investigation",
+            "spec": {
+                "task": (
+                    "Inspect provider routing only; own no files; report concrete "
+                    "violations and the tests that reproduce them."
+                ),
+                "context_mode": "fresh",
+                "placement": "spread",
+                "requirements": {"quality": "strong", "needs_native_tools": True},
+                "model_candidates": ["gpt-5.6", "claude-opus"],
+                "authorized_providers": ["openai", "anthropic"],
+                "authorized_providers_explicit": True,
+                "child_only": True,
+            },
+        },
+    )
+
+    assert errors == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    [
+        ("max_turns", 0, ">= 1"),
+        ("max_turns", -1, ">= 1"),
+        ("max_turns", "two", "integer"),
+        ("max_wall_s", 0, ">= 30"),
+        ("max_wall_s", -1, ">= 30"),
+        ("max_wall_s", "slow", "integer"),
+    ],
+)
+def test_delegate_schema_rejects_invalid_budget_values(
+    field: str, value: object, expected: str
+) -> None:
+    schema = next(s for s in TOOL_SCHEMAS if s["name"] == "delegate")
+    errors = validate_tool_call(
+        schema,
+        {
+            "child_task_id": "child-review",
+            "kind": "investigation",
+            "spec": {"task": "inspect the routing", field: value},
+        },
+    )
+
+    assert errors == [f"validation failed: 'spec.{field}' must be {expected}"]
+
+
 def test_child_path_cannot_escape_session(tmp_path: Path) -> None:
     parent = {
         "task_id": "root",

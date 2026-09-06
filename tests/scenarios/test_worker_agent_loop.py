@@ -1711,8 +1711,7 @@ def test_heartbeats_report_provider_and_phase(
     # Provider responses are internal JSON actions; the cockpit shows stream
     # state/rate, not protocol fragments.
     assert not any(
-        heartbeat.get("phase") == "streaming" and heartbeat.get("tail")
-        for heartbeat in heartbeats
+        heartbeat.get("phase") == "streaming" and heartbeat.get("tail") for heartbeat in heartbeats
     )
 
 
