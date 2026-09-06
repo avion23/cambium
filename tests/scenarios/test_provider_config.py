@@ -145,22 +145,16 @@ def test_enabled_defaults_to_true_when_omitted(tmp_path: Path) -> None:
     assert providers[0].enabled is True
 
 
-@pytest.mark.parametrize(
-    ("declared", "expected"),
-    [(None, False), (False, False), (True, True)],
-)
-def test_native_tool_capability_is_opt_in(
-    tmp_path: Path, declared: bool | None, expected: bool
-) -> None:
-    entry = _provider()
-    if declared is None:
-        entry.pop("supports_native_tools", None)
-    else:
-        entry["supports_native_tools"] = declared
+def test_native_tool_capability_is_opt_in(tmp_path: Path) -> None:
+    for index, (declared, expected) in enumerate(((None, False), (False, False), (True, True))):
+        entry = _provider()
+        if declared is None:
+            entry.pop("supports_native_tools", None)
+        else:
+            entry["supports_native_tools"] = declared
 
-    providers = load_providers(_write(tmp_path / "providers.json", [entry]))
-
-    assert providers[0].supports_native_tools is expected
+        providers = load_providers(_write(tmp_path / f"providers-{index}.json", [entry]))
+        assert providers[0].supports_native_tools is expected
 
 
 def test_explicit_source_overrides_environment_path(
@@ -440,36 +434,26 @@ def test_provider_without_api_key_env_loads_with_empty_env(
     assert providers[0].api_key_env == ""
 
 
-@pytest.mark.parametrize("model", ["", "   ", "\t\n"])
-def test_blank_model_is_quarantined(
-    tmp_path: Path, model: str, caplog: pytest.LogCaptureFixture
+def test_blank_model_is_quarantined(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    for index, model in enumerate(("", "   ", "\t\n")):
+        path = _write(tmp_path / f"providers-{index}.json", [_provider(model=model)])
+        _assert_quarantined(path, r"providers\[0\]\.model: must not be blank", caplog)
+
+
+def test_malformed_auth_protocol_values_are_quarantined(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    path = _write(tmp_path / "providers.json", [_provider(model=model)])
-
-    _assert_quarantined(path, r"providers\[0\]\.model: must not be blank", caplog)
-
-
-@pytest.mark.parametrize(
-    ("overrides", "match"),
-    [
+    cases = (
         ({"auth": "bearer"}, "invalid auth mode"),
         ({"auth": 1}, "must be an auth mode name"),
         ({"auth": None}, "must be an auth mode name"),
         ({"protocol": "responses"}, "invalid protocol"),
         ({"protocol": 2}, "must be a protocol name"),
         ({"protocol": None}, "must be a protocol name"),
-    ],
-)
-def test_malformed_auth_protocol_values_are_quarantined(
-    tmp_path: Path,
-    overrides: dict[str, object],
-    match: str,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    # An explicit malformed tag is an error, never a silent default.
-    path = _write(tmp_path / "providers.json", [_provider(**overrides)])
-
-    _assert_quarantined(path, match, caplog)
+    )
+    for index, (overrides, match) in enumerate(cases):
+        path = _write(tmp_path / f"providers-{index}.json", [_provider(**overrides)])
+        _assert_quarantined(path, match, caplog)
 
 
 def test_mixed_api_key_and_codex_providers_load_and_select(tmp_path: Path) -> None:
@@ -489,19 +473,15 @@ def test_mixed_api_key_and_codex_providers_load_and_select(tmp_path: Path) -> No
     assert select_provider(providers, name="codex").protocol is Protocol.CODEX_RESPONSES
 
 
-@pytest.mark.parametrize(
-    "value",
-    [5, "", "   ", True],
-)
 def test_malformed_reasoning_effort_is_quarantined(
-    tmp_path: Path, value: object, caplog: pytest.LogCaptureFixture
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    path = _write(
-        tmp_path / "providers.json",
-        [_codex_provider(reasoning_effort=value)],
-    )
-
-    _assert_quarantined(path, "reasoning_effort", caplog)
+    for index, value in enumerate((5, "", "   ", True)):
+        path = _write(
+            tmp_path / f"providers-{index}.json",
+            [_codex_provider(reasoning_effort=value)],
+        )
+        _assert_quarantined(path, "reasoning_effort", caplog)
 
 
 def test_reasoning_effort_requires_codex_responses_protocol_is_quarantined(

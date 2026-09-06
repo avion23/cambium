@@ -20,6 +20,8 @@ from cambium.lm import CambiumLM
 if TYPE_CHECKING:
     dspy: Any
 
+pytestmark = pytest.mark.slow
+
 
 def _require_dspy() -> None:
     """Import dspy lazily: every dspy-consuming scenario is slow-tier, so the
@@ -313,9 +315,9 @@ def test_free_threaded_build_is_rejected_at_lm_import() -> None:
     assert "free-threaded CPython" in completed.stderr
 
 
-@pytest.mark.parametrize(
-    "key",
-    [
+def test_credential_marker_variants_cannot_reach_dump_state() -> None:
+    _require_dspy()
+    keys = (
         "auth",
         "AUTH",
         "bearer",
@@ -345,27 +347,25 @@ def test_free_threaded_build_is_rejected_at_lm_import() -> None:
         "SESSION-KEY",
         "auth_token",
         "AUTH-TOKEN",
-    ],
-)
-def test_credential_marker_variants_cannot_reach_dump_state(key: str) -> None:
-    _require_dspy()
-    with pytest.raises(ValueError, match="provider credentials"):
-        CambiumLM(
-            FakeDiffundo(),
-            ProviderTier.FAST,
-            **{key: "SENSITIVE_CANARY"},
-        )  # type: ignore[arg-type]
+    )
+    for key in keys:
+        with pytest.raises(ValueError, match="provider credentials"):
+            CambiumLM(
+                FakeDiffundo(),
+                ProviderTier.FAST,
+                **{key: "SENSITIVE_CANARY"},
+            )  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize("key", ["apiKey", "API-Key", "api_key", "api.key"])
-def test_nested_extension_credential_keys_cannot_reach_dump_state(key: str) -> None:
+def test_nested_extension_credential_keys_cannot_reach_dump_state() -> None:
     _require_dspy()
-    with pytest.raises(ValueError, match="provider credentials"):
-        CambiumLM(
-            FakeDiffundo(),
-            ProviderTier.FAST,
-            extensions={"nested": [({key: "SENSITIVE_CANARY"},)]},
-        )  # type: ignore[arg-type]
+    for key in ("apiKey", "API-Key", "api_key", "api.key"):
+        with pytest.raises(ValueError, match="provider credentials"):
+            CambiumLM(
+                FakeDiffundo(),
+                ProviderTier.FAST,
+                extensions={"nested": [({key: "SENSITIVE_CANARY"},)]},
+            )  # type: ignore[arg-type]
 
 
 def test_post_construction_nested_mutation_cannot_reach_dump_state() -> None:
@@ -497,9 +497,54 @@ def test_copy_rejects_hostile_private_keys_without_tier_or_provider_corruption()
     assert provider_b.calls == []
 
 
-@pytest.mark.parametrize(
-    ("entry_point", "key"),
-    [
+def test_hostile_former_parameter_keys_cannot_change_provider() -> None:
+    _require_dspy()
+    import dspy
+
+    def exercise(entry_point: str, key: str) -> None:
+        provider_a = FakeDiffundo("https://provider-a.invalid")
+        provider_b = FakeDiffundo("https://provider-b.invalid")
+        lm = CambiumLM(provider_a, ProviderTier.FAST)  # type: ignore[arg-type]
+        other = CambiumLM(provider_b, ProviderTier.FAST)  # type: ignore[arg-type]
+        provider_a_reference = lm._diffundo_reference
+
+        class HostileKey(str):
+            def __hash__(self) -> int:
+                return hash(key)
+
+            def __eq__(self, other_key: object) -> bool:
+                if type(other_key) is str and other_key == key:
+                    lm._diffundo = provider_b
+                    lm._diffundo_reference = other._diffundo_reference
+                return str.__eq__(self, other_key)
+
+        hostile_kwargs = {HostileKey(key): object()}
+        with pytest.raises(TypeError, match="exact builtin string"):
+            if entry_point == "constructor":
+                CambiumLM(  # type: ignore[arg-type]
+                    provider_a, ProviderTier.FAST, **hostile_kwargs
+                )
+            elif entry_point == "call":
+                lm(**hostile_kwargs)
+            else:
+
+                async def invoke() -> None:
+                    await lm.acall(**hostile_kwargs)
+
+                asyncio.run(invoke())
+
+        assert lm._diffundo_reference == provider_a_reference
+        state = lm.dump_state()
+        assert _call(lm, "live prompt") == ["completion text"]
+        loaded = dspy.BaseLM.load_state(state, allow_custom_lm_class=True)
+        assert _call(loaded, "loaded prompt") == ["completion text"]
+        assert [call["endpoint"] for call in provider_a.calls] == [
+            "https://provider-a.invalid",
+            "https://provider-a.invalid",
+        ]
+        assert provider_b.calls == []
+
+    cases = (
         ("constructor", "diffundo"),
         ("constructor", "tier"),
         ("constructor", "model"),
@@ -512,51 +557,9 @@ def test_copy_rejects_hostile_private_keys_without_tier_or_provider_corruption()
         ("acall", "prompt"),
         ("acall", "messages"),
         ("acall", "request"),
-    ],
-)
-def test_hostile_former_parameter_key_cannot_change_provider(entry_point: str, key: str) -> None:
-    _require_dspy()
-    import dspy
-
-    provider_a = FakeDiffundo("https://provider-a.invalid")
-    provider_b = FakeDiffundo("https://provider-b.invalid")
-    lm = CambiumLM(provider_a, ProviderTier.FAST)  # type: ignore[arg-type]
-    other = CambiumLM(provider_b, ProviderTier.FAST)  # type: ignore[arg-type]
-    provider_a_reference = lm._diffundo_reference
-
-    class HostileKey(str):
-        def __hash__(self) -> int:
-            return hash(key)
-
-        def __eq__(self, other_key: object) -> bool:
-            if type(other_key) is str and other_key == key:
-                lm._diffundo = provider_b
-                lm._diffundo_reference = other._diffundo_reference
-            return str.__eq__(self, other_key)
-
-    hostile_kwargs = {HostileKey(key): object()}
-    with pytest.raises(TypeError, match="exact builtin string"):
-        if entry_point == "constructor":
-            CambiumLM(provider_a, ProviderTier.FAST, **hostile_kwargs)  # type: ignore[arg-type]
-        elif entry_point == "call":
-            lm(**hostile_kwargs)
-        else:
-
-            async def invoke() -> None:
-                await lm.acall(**hostile_kwargs)
-
-            asyncio.run(invoke())
-
-    assert lm._diffundo_reference == provider_a_reference
-    state = lm.dump_state()
-    assert _call(lm, "live prompt") == ["completion text"]
-    loaded = dspy.BaseLM.load_state(state, allow_custom_lm_class=True)
-    assert _call(loaded, "loaded prompt") == ["completion text"]
-    assert [call["endpoint"] for call in provider_a.calls] == [
-        "https://provider-a.invalid",
-        "https://provider-a.invalid",
-    ]
-    assert provider_b.calls == []
+    )
+    for entry_point, key in cases:
+        exercise(entry_point, key)
 
 
 def test_post_construction_callback_does_not_observe_prompt() -> None:

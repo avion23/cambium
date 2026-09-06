@@ -52,16 +52,16 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests", "src"]
 pythonpath = ["src"]
-# Default run is the fast tier: subprocess/process-boundary integration
-# scenarios opt out via the `slow` marker and run with `pytest -m slow`.
+# Default run is the fast offline tier: subprocess/process-boundary integration
+# and live-provider acceptance scenarios are explicit opt-ins.
 # The suite uses tmp_path for filesystem state and ephemeral loopback ports.
 # The two provider timing modules are kept together by the root conftest hook:
 # their sub-second deadline assertions can be starved by load scheduling even
 # though their state is otherwise hermetic.  loadgroup preserves that boundary
 # while keeping the remaining tests distributed across workers.
-addopts = "-m 'not slow' -n auto --dist=loadgroup"
+addopts = "-m 'not slow and not acceptance' -n auto --dist=loadgroup"
 markers = [
-    "slow: subprocess/process-boundary integration scenario; run with -m slow",
+    "slow: subprocess/process-boundary or optional-framework integration; run with -m slow",
     "acceptance: opt-in live-provider acceptance; requires explicit credentials and config",
     "xdist_group(name): keep timing-sensitive provider scenarios on one worker",
 ]

@@ -4,6 +4,8 @@ from importlib import import_module
 
 import pytest
 
+pytestmark = pytest.mark.slow
+
 
 @pytest.mark.parametrize(
     ("package", "class_name"),

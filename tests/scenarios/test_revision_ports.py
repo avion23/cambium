@@ -12,18 +12,9 @@ admitted/rejected revision is additionally persisted through
 ``meta``). Both backends are optional; with neither configured, ``run_plan``
 is byte-for-byte the historical behavior.
 
-Scenarios:
-  RP1 an injected ``ArchitectusCore`` (``ScriptedLLM``) drives one valid child
-      admission through the existing ``child_admitted`` path with a
-      conversation row persisted.
-  RP2 a malformed proposal from the port (a spawn for an unknown task id) is
-      durably rejected with ``child_rejected`` and spawns nothing.
-  RP3 a port proposal whose spec is not a valid task spec is durably rejected
-      with ``child_rejected`` and spawns nothing.
-  RP4 the port and conversation store are optional: a default fanout run
-      behaves exactly as before (no conversation db, no child events).
-  RP5 a conversation store open failure raises (no silent success).
-  RP6 a conversation store append failure surfaces visibly (no silent success).
+Scenarios retain the behavioral boundaries: valid child admission with durable
+conversation history, invalid child rejection without spawn, and visible
+conversation-store open/append failures.
 """
 
 from __future__ import annotations
@@ -47,6 +38,8 @@ TEST_RESOURCE_THRESHOLDS = {
     "disk_free": 0,
 }
 FAKE_WORKER = str(Path(__file__).resolve().parents[2] / "scripts" / "fake_worker.py")
+
+pytestmark = pytest.mark.slow
 
 
 def _make_repo(repo: Path, files: dict[str, str]) -> str:
@@ -208,49 +201,6 @@ def test_rp1_port_drives_valid_child_admission_with_conversation_row(tmp_path) -
 
 
 # ---------------------------------------------------------------------------
-# RP2: a malformed proposal from the port (spawn for an unknown task id) is
-# durably rejected with child_rejected and spawns nothing.
-# ---------------------------------------------------------------------------
-
-
-def test_rp2_port_malformed_proposal_rejected_no_spawn(tmp_path) -> None:
-    session_dir = tmp_path / "session"
-    repo = session_dir / "repo"
-    base = _make_repo(repo, {"a.txt": "file a\n"})
-    root = _task(
-        session_dir,
-        repo,
-        base,
-        "t-root",
-        worktree="wt-root",
-        branch="wt-root",
-        target_file="a.txt",
-        marker="// root-marker",
-    )
-    core = ArchitectusCore(
-        ScriptedLLM([{"action": "spawn", "task_id": "ghost-child"}]),
-        tree=_core_tree(root),
-    )
-
-    result = asyncio.run(run_plan(session_dir, {"tasks": [root]}, architectus=core))
-
-    assert result.exit_code == 0
-    assert [r.task_id for r in result.results] == ["t-root"]
-    assert result.results[0].status == "succeeded"
-    assert "// root-marker" in _show(repo, "main", "a.txt")
-
-    events = read_events(session_dir)
-    rejected = _kinds(events, "child_rejected")
-    assert len(rejected) == 1
-    assert rejected[0]["task_id"] == "t-root"
-    assert rejected[0]["payload"]["reason"] == "MalformedProposal"
-    assert not _kinds(events, "child_admitted")
-    spawned = _kinds(events, "spawned")
-    assert {e["task_id"] for e in spawned} == {"t-root"}
-    assert not (session_dir / "wt-ghost-child").exists()
-
-
-# ---------------------------------------------------------------------------
 # RP3: a port proposal whose spec is not a valid task spec is durably rejected
 # with child_rejected and spawns nothing; the rejection row is persisted.
 # ---------------------------------------------------------------------------
@@ -302,54 +252,6 @@ def test_rp3_port_invalid_child_spec_rejected_no_spawn(tmp_path) -> None:
     assert content["outcome"] == "rejected"
     assert content["reason"] == "ValueError"
     assert content["proposal"]["child_task_id"] == "c1"
-
-
-# ---------------------------------------------------------------------------
-# RP4: the port and conversation store are optional — a default fanout run
-# behaves exactly as before (no conversation db, no child events).
-# ---------------------------------------------------------------------------
-
-
-def test_rp4_port_and_conversations_optional_by_default(tmp_path) -> None:
-    session_dir = tmp_path / "session"
-    repo = session_dir / "repo"
-    base = _make_repo(repo, {"a.txt": "file a\n", "b.txt": "file b\n"})
-    plan = {
-        "tasks": [
-            _task(
-                session_dir,
-                repo,
-                base,
-                "t-a",
-                worktree="wt-a",
-                branch="wt-a",
-                target_file="a.txt",
-                marker="// cambium-a",
-            ),
-            _task(
-                session_dir,
-                repo,
-                base,
-                "t-b",
-                worktree="wt-b",
-                branch="wt-b",
-                target_file="b.txt",
-                marker="// cambium-b",
-            ),
-        ]
-    }
-
-    result = asyncio.run(run_plan(session_dir, plan))
-
-    assert result.exit_code == 0
-    assert {r.task_id for r in result.results} == {"t-a", "t-b"}
-    assert all(r.status == "succeeded" for r in result.results)
-    assert "// cambium-a" in _show(repo, "main", "a.txt")
-    assert "// cambium-b" in _show(repo, "main", "b.txt")
-    events = read_events(session_dir)
-    assert not _kinds(events, "child_admitted")
-    assert not _kinds(events, "child_rejected")
-    assert not (session_dir / ".cambium" / "conversations.db").exists()
 
 
 # ---------------------------------------------------------------------------

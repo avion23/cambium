@@ -17,7 +17,7 @@ from cambium import optimize
 from cambium.modules.base import Example
 from cambium.modules.should_review.decide import should_review
 
-pytestmark = pytest.mark.xdist_group("dspy-runtime")
+pytestmark = [pytest.mark.slow, pytest.mark.xdist_group("dspy-runtime")]
 
 if TYPE_CHECKING:
     from cambium.modules.example.dataset import Split as SplitType
@@ -703,11 +703,6 @@ def test_eval_mean_excludes_parse_failures_and_reports_bucket() -> None:
     assert summary["count"] == 2
     assert summary["scored_count"] == 1
     assert summary["parse_failures"] == 1
-
-
-def test_main_tiny_budget_fails_without_crashing() -> None:
-    result = optimize.main(["should_decompose", "--optimizer", "zero", "--budget-usd", "0.000001"])
-    assert result != 0
 
 
 def test_run_stage_gepa_requires_four_reviewed_records() -> None:

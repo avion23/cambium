@@ -20,7 +20,7 @@ def _decision(
     available_frac: float | None = 0.5,
     load1: float | None = 0.0,
     cpu_count: int | None = 4,
-    disk_free: int | None = 100,
+    disk_free: int | float | None = 100,
     thresholds: dict | None = None,
 ) -> tuple[bool, list[str]]:
     return decide_heavy_work(
@@ -32,37 +32,22 @@ def _decision(
     )
 
 
-@pytest.mark.parametrize(
-    ("load1", "allowed"),
-    [(7.999, True), (8.0, True), (8.001, False)],
-)
-def test_load_cutoff_is_inclusive(load1: float, allowed: bool) -> None:
-    result, reasons = _decision(load1=load1)
-
-    assert result is allowed, reasons
-    assert (reasons == []) is allowed
-
-
-@pytest.mark.parametrize(
-    ("available_frac", "allowed"),
-    [(0.499, False), (0.5, True), (0.501, True)],
-)
-def test_memory_cutoff_is_inclusive(available_frac: float, allowed: bool) -> None:
-    result, reasons = _decision(available_frac=available_frac)
-
-    assert result is allowed, reasons
-    assert (reasons == []) is allowed
-
-
-@pytest.mark.parametrize(
-    ("disk_free", "allowed"),
-    [(99, False), (100, True), (101, True)],
-)
-def test_disk_cutoff_is_inclusive(disk_free: int, allowed: bool) -> None:
-    result, reasons = _decision(disk_free=disk_free)
-
-    assert result is allowed, reasons
-    assert (reasons == []) is allowed
+def test_resource_cutoffs_are_inclusive() -> None:
+    cases = (
+        ({"load1": 7.999}, True),
+        ({"load1": 8.0}, True),
+        ({"load1": 8.001}, False),
+        ({"available_frac": 0.499}, False),
+        ({"available_frac": 0.5}, True),
+        ({"available_frac": 0.501}, True),
+        ({"disk_free": 99}, False),
+        ({"disk_free": 100}, True),
+        ({"disk_free": 101}, True),
+    )
+    for kwargs, allowed in cases:
+        result, reasons = _decision(**kwargs)
+        assert result is allowed, (kwargs, reasons)
+        assert (reasons == []) is allowed, (kwargs, reasons)
 
 
 def test_zero_readings_are_valid_at_zero_thresholds() -> None:
@@ -81,47 +66,27 @@ def test_zero_readings_are_valid_at_zero_thresholds() -> None:
     assert reasons == []
 
 
-@pytest.mark.parametrize(
-    ("kwargs", "reason"),
-    [
+def test_unavailable_load_or_cpu_fails_closed() -> None:
+    for kwargs, reason in (
         ({"load1": None}, "load1 unavailable"),
         ({"cpu_count": None}, "cpu_count unavailable"),
         ({"cpu_count": 0}, "cpu_count unavailable"),
-    ],
-)
-def test_unavailable_or_zero_cpu_readings_fail_closed(kwargs: dict[str, Any], reason: str) -> None:
-    result, reasons = _decision(**kwargs)
-
-    assert result is False
-    assert reason in reasons
+    ):
+        result, reasons = _decision(**kwargs)
+        assert result is False, kwargs
+        assert reason in reasons, kwargs
 
 
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        {"available_frac": None},
-        {"disk_free": None},
-    ],
-)
-def test_unreadable_readings_are_skipped(kwargs: dict[str, Any]) -> None:
-    """Readings a host cannot provide are skipped, not failed closed.
-
-    macOS exposes no memory reading; blocking all heavy work there makes
-    the product unusable. A present-but-invalid reading still fails
-    closed (covered by the invalid-value tests).
-    """
-    result, reasons = _decision(**kwargs)
-
-    assert result is True, reasons
-    assert reasons == []
+def test_unreadable_optional_readings_are_skipped() -> None:
+    for kwargs in ({"available_frac": None}, {"disk_free": None}):
+        result, reasons = _decision(**kwargs)
+        assert result is True, (kwargs, reasons)
+        assert reasons == []
 
 
-@pytest.mark.parametrize(
-    "contents",
-    ["", "MemAvailable: 0 kB\nMemTotal: 0 kB\n", "MemAvailable: 1 kB\n"],
-)
-def test_empty_or_zero_proc_memory_is_unavailable(contents: str) -> None:
-    assert system_health._parse_meminfo(contents) is None
+def test_empty_or_zero_proc_memory_is_unavailable() -> None:
+    for contents in ("", "MemAvailable: 0 kB\nMemTotal: 0 kB\n", "MemAvailable: 1 kB\n"):
+        assert system_health._parse_meminfo(contents) is None
 
 
 def test_missing_memory_sources_are_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -130,14 +95,12 @@ def test_missing_memory_sources_are_skipped(monkeypatch: pytest.MonkeyPatch) -> 
 
     assert system_health._memory_metrics() == (None, None, None)
     result, reasons = _decision(available_frac=None)
-
     assert result is True, reasons
     assert reasons == []
 
 
-@pytest.mark.parametrize(
-    ("kwargs", "reason"),
-    [
+def test_invalid_readings_fail_closed() -> None:
+    cases: tuple[tuple[dict[str, Any], str], ...] = (
         ({"available_frac": -0.01}, "mem_available_frac invalid"),
         ({"available_frac": 1.01}, "mem_available_frac invalid"),
         ({"available_frac": math.nan}, "mem_available_frac invalid"),
@@ -146,31 +109,26 @@ def test_missing_memory_sources_are_skipped(monkeypatch: pytest.MonkeyPatch) -> 
         ({"load1": math.nan}, "load1 invalid"),
         ({"disk_free": -1}, "disk_free invalid"),
         ({"disk_free": math.inf}, "disk_free invalid"),
-    ],
-)
-def test_negative_or_absurd_readings_fail_closed(kwargs: dict[str, Any], reason: str) -> None:
-    result, reasons = _decision(**kwargs)
-
-    assert result is False
-    assert reason in reasons
+    )
+    for kwargs, reason in cases:
+        result, reasons = _decision(**kwargs)
+        assert result is False, kwargs
+        assert reason in reasons, kwargs
 
 
-@pytest.mark.parametrize(
-    ("thresholds", "reason"),
-    [
+def test_invalid_thresholds_fail_closed() -> None:
+    cases = (
         ({"mem_available_frac": -0.1}, "mem_available_frac threshold invalid"),
         ({"mem_available_frac": 1.1}, "mem_available_frac threshold invalid"),
         ({"load1_per_cpu": -0.1}, "load1_per_cpu threshold invalid"),
         ({"load1_per_cpu": math.inf}, "load1_per_cpu threshold invalid"),
         ({"disk_free": -1}, "disk_free threshold invalid"),
         ({"disk_free": 1.5}, "disk_free threshold invalid"),
-    ],
-)
-def test_invalid_thresholds_fail_closed(thresholds: dict, reason: str) -> None:
-    result, reasons = _decision(thresholds=thresholds)
-
-    assert result is False
-    assert reason in reasons
+    )
+    for thresholds, reason in cases:
+        result, reasons = _decision(thresholds=thresholds)
+        assert result is False, thresholds
+        assert reason in reasons, thresholds
 
 
 def test_can_run_heavy_keeps_io_at_the_edge(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -186,6 +144,5 @@ def test_can_run_heavy_keeps_io_at_the_edge(monkeypatch: pytest.MonkeyPatch) -> 
     )
 
     result, reasons = can_run_heavy(BOUNDARY_THRESHOLDS)
-
     assert result is True, reasons
     assert reasons == []
