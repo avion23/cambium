@@ -2714,6 +2714,7 @@ class Diffundo:
         requirements: Mapping[str, Any] | None = None,
         call_budget_s: float | None = None,
         on_delta: Callable[[str, str], None] | None = None,
+        on_status: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> CallResult:
         """Ordered cascade over tier-matching providers (arch §9.2).
 
@@ -2783,6 +2784,14 @@ class Diffundo:
             pending = list(candidates)
             while pending:
                 provider = pending.pop(0)
+                if on_status is not None:
+                    on_status(
+                        {
+                            "kind": "provider_attempt",
+                            "provider": provider.name,
+                            "model": provider.model,
+                        }
+                    )
                 try:
                     attempt_deadline = min(
                         deadline,
@@ -2793,6 +2802,16 @@ class Diffundo:
                         provider, prompt, deadline=attempt_deadline, on_delta=on_delta
                     )
                 except ProviderError as exc:
+                    if on_status is not None:
+                        on_status(
+                            {
+                                "kind": "provider_failed",
+                                "provider": provider.name,
+                                "model": provider.model,
+                                "outcome": exc.outcome.value,
+                                "retry_after_s": exc.retry_after_s,
+                            }
+                        )
                     if exc.probe_already_in_flight:
                         probe_rejected = True
                         continue
@@ -2843,6 +2862,15 @@ class Diffundo:
                         raise AllProvidersFailed(tried, last_error) from exc
                     continue
                 self._record_provider_success()
+                if on_status is not None:
+                    on_status(
+                        {
+                            "kind": "provider_succeeded",
+                            "provider": result.provider,
+                            "model": result.model,
+                            "provider_cache_hit": result.provider_cache_hit,
+                        }
+                    )
                 if budget_usd is not None and result.estimated_cost_usd > budget_usd:
                     raise CostBudgetExceeded(result.provider, result.estimated_cost_usd, budget_usd)
                 self._primary_provider = provider.name
@@ -2865,6 +2893,8 @@ class Diffundo:
         budget_usd: float | None = None,
         allow_model_substitution: bool = False,
         requirements: Mapping[str, Any] | None = None,
+        on_delta: Callable[[str, str], None] | None = None,
+        on_status: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> CallResult:
         """Run a semantic summary with extra provider response headroom.
 
@@ -2882,6 +2912,8 @@ class Diffundo:
             allow_model_substitution=allow_model_substitution,
             requirements=requirements,
             call_budget_s=self._summary_call_budget_s,
+            on_delta=on_delta,
+            on_status=on_status,
         )
 
     def _all_provider_failure_limit_reached(self) -> bool:

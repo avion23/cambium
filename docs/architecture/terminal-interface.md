@@ -62,30 +62,37 @@ names the resource currently producing or blocking progress:
 | State | Meaning |
 | --- | --- |
 | `ORCHESTRATING` | local controller work before a provider/tool boundary |
-| `PROVIDER · waiting` | request sent; no model output yet |
-| `THINKING` | provider is reporting reasoning-phase progress; reasoning text is not shown |
-| `STREAMING` | user-visible model output is arriving, with output tokens/s |
-| `TOOL` | a tool is in flight; the row names it and its elapsed time |
+| `ROUTING` | choosing the next hard-feasible provider lane |
+| `PROVIDER · P/M · waiting` | a concrete provider/model attempt is in flight; no model output yet |
+| `THINKING · P/M` | that provider reports reasoning-phase progress; reasoning text is not shown |
+| `STREAMING · P/M` | provider response tokens are arriving, with output tokens/s; internal action JSON is not shown |
+| `TOOL` | one tool or a parallel read batch is in flight; the row names it and elapsed time |
 | `CHILDREN · waiting` | parent is suspended on child results |
 | `COOLDOWN` | provider capacity/rate limit is delaying the next attempt |
 | `stalled` / `silent` / `no output` | the phase revision or output stopped changing for the stall threshold |
 
-The worker heartbeat carries a monotonic phase revision so active reasoning does
-not look stalled even though private reasoning text is intentionally absent.
-Tool output and visible streaming text also reset the progress clock.
+Provider/model identity is published when an attempt starts rather than inferred
+from the eventual result. Fallback therefore changes the live owner row as it
+happens. Cache `HIT`/`MISS` appears only after provider usage establishes it; an
+unknown cache result stays unknown. The worker heartbeat carries a monotonic
+phase revision so active reasoning or response streaming does not look stalled.
+Private reasoning and the model's internal JSON action fragments are not copied
+into the cockpit. Tool output and stream-phase changes reset the progress clock.
 
 ## Markdown and color
 
 Rich is a normal Cambium dependency and is the single Markdown parser/theme for
-one-shot/REPL output and the cockpit. Headings use distinct cyan/blue/magenta/
-green/yellow levels; code is yellow/cyan, tool output magenta, provider waits
-blue, reasoning magenta, streaming/success green, and failures red. Code blocks
-use compact bordered panels and block quotes use a colored rule. Narrow tables
-retain the existing width-safe fallback so cells are not silently clipped.
+one-shot/REPL output and the cockpit. The shared renderer uses a no-background
+extended palette when the terminal supports 256 colors and degrades to the
+standard palette or plain text. Headings, links, quotes, inline code, code blocks,
+tables, user/model/tool roles, routing, provider waits, reasoning, streaming,
+children, cache hits/misses, cooldowns and failures have distinct semantic
+styles. Code blocks use compact bordered panels and narrow tables retain the
+width-safe fallback so cells are not silently clipped.
 
-The renderer sanitizes model/provider text before Rich sees it. Cambium does not
-shell out to a second Markdown TUI; the live cockpit needs in-process width,
-scrollback, input, and event ownership.
+The renderer sanitizes model/provider text before Rich sees it. Cambium keeps
+Markdown in process rather than invoking a pager subprocess: the cockpit must
+retain its own width, scrollback, input draft, focus and live-event ownership.
 
 ## Input and controls
 

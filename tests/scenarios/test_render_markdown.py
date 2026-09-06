@@ -77,6 +77,16 @@ def test_disabled_color_returns_sanitized_plain_markdown(
     assert render_markdown_if_tty(text, _Tty()) == "safe\n# Title\n"
 
 
+def test_renderer_uses_extended_palette_without_backgrounds(monkeypatch) -> None:
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("COLORTERM", raising=False)
+    monkeypatch.setenv("TERM", "xterm-256color")
+    rendered = render_markdown_if_tty("# Title\n- item", _Tty())
+    assert "38;5;" in rendered
+    assert "\x1b[48;" not in rendered and "\x1b[40m" not in rendered
+    assert "Title" in _visible(rendered) and "item" in _visible(rendered)
+
+
 def test_non_tty_returns_sanitized_plain_markdown(monkeypatch) -> None:
     monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.setenv("TERM", "xterm-256color")

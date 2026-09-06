@@ -56,7 +56,10 @@ rollout at a time. Reflection feedback contains the fully rendered production
 prompt plus a bounded trajectory digest, so the optimizer sees the actual fixed
 protocol around the candidate instead of optimizing an isolated sentence. The
 digest flags malformed/tool failures, timeout-shaped runs, and overlong
-user-facing summaries.
+user-facing summaries. The current verbosity signal is per operator turn: more
+than roughly 320 aggregate characters or three lines per turn is called out to
+reflection. This is guidance, not a correctness gate; executable task checks
+still dominate the score.
 
 After the validation baseline, Cambium estimates one conservative case cost from
 the most expensive validation rollout and reserves enough calls/tokens/cash to

@@ -113,17 +113,35 @@ class _StreamingScriptedRouter(_ScriptedRouter):
         budget_usd: float | None = None,
         allow_model_substitution: bool = False,
         on_delta: Any = None,
+        on_status: Any = None,
     ) -> _FakeCallResult:
         del tier, model, budget_usd, allow_model_substitution
         self.prompts.append(prompt)
         if not self.responses:
             raise AssertionError("router call with no scripted response")
+        if on_status is not None:
+            on_status(
+                {
+                    "kind": "provider_attempt",
+                    "provider": "loopback-provider",
+                    "model": "loopback-model",
+                }
+            )
         if self.delta_delay_s:
             await asyncio.sleep(self.delta_delay_s)
         if on_delta is not None:
             for kind, fragment in self.deltas:
                 on_delta(kind, fragment)
         await asyncio.sleep(self.hold_s)
+        if on_status is not None:
+            on_status(
+                {
+                    "kind": "provider_succeeded",
+                    "provider": "loopback-provider",
+                    "model": "loopback-model",
+                    "provider_cache_hit": False,
+                }
+            )
         return _FakeCallResult(self.responses.pop(0))
 
 
@@ -1271,6 +1289,21 @@ def test_plan_and_thought_round_trip_through_parser() -> None:
     assert worker._action_trailing('{"type":"plan","steps":["a"]}') == ""
     assert worker._action_trailing('{"type":"plan"') == ""
 
+    # ZAI has repeatedly emitted this exact closer typo after otherwise valid
+    # single-call batches. Normalize only that unambiguous structural defect.
+    assert worker._parse_agent_action(
+        '{"type":"tool_call","calls":[{"name":"run_shell","arguments":'
+        '{"cmd":["python","-c","assert 2 + 3 == 5"],"timeout_s":30}]}]}'
+    ) == {
+        "type": "tool_call",
+        "calls": [
+            {
+                "name": "run_shell",
+                "arguments": {"cmd": ["python", "-c", "assert 2 + 3 == 5"], "timeout_s": 30},
+            }
+        ],
+    }
+
     for bad in (
         '{"type":"plan"}',
         '{"type":"plan","steps":[]}',
@@ -1641,17 +1674,16 @@ def test_lint_feedback_visible_in_transcript(
 
 
 @pytest.mark.parametrize(
-    ("deltas", "expected_phases", "expected_tail"),
+    ("deltas", "expected_phases"),
     (
-        ([("text", "answer fragment")], {"waiting", "streaming"}, "answer fragment"),
-        ([], {"waiting"}, None),
+        ([("text", "answer fragment")], {"waiting", "streaming"}),
+        ([], {"waiting"}),
     ),
 )
-def test_heartbeats_report_provider_phase_and_tail(
+def test_heartbeats_report_provider_and_phase(
     tmp_path: Path,
     deltas: list[tuple[str, str]],
     expected_phases: set[str],
-    expected_tail: str | None,
 ) -> None:
     repo = tmp_path / "repo"
     worktree = _make_worktree(repo)
@@ -1669,35 +1701,19 @@ def test_heartbeats_report_provider_phase_and_tail(
     phases = [heartbeat.get("phase") for heartbeat in heartbeats]
     assert heartbeats
     assert set(phases) == expected_phases
-    if expected_tail is None:
-        assert all("tail" not in heartbeat for heartbeat in heartbeats)
-    else:
-        assert phases.index("waiting") < phases.index("streaming")
-        assert any(heartbeat.get("tail") == expected_tail for heartbeat in heartbeats)
-
-
-def test_heartbeat_tail_is_bounded_and_terminally_safe(tmp_path: Path) -> None:
-    repo = tmp_path / "repo"
-    worktree = _make_worktree(repo)
-    config = _agent_config(worktree)
-    fragment = "\x1b[31m" + ("x" * 200) + "\x1b[0m\nnext"
-    router = _StreamingScriptedRouter(
-        ['{"type":"finish","summary":"done","objective_met":true}'],
-        [("output_text", fragment)],
-        delta_delay_s=0.15,
+    assert any(
+        heartbeat.get("provider") == "loopback-provider"
+        and heartbeat.get("model") == "loopback-model"
+        for heartbeat in heartbeats
     )
-
-    outcome, messages = asyncio.run(_drive_loop_with_heartbeats(config, worktree, router))
-
-    assert outcome["status"] == "succeeded"
-    tails = [
-        heartbeat["tail"]
-        for heartbeat in messages
-        if heartbeat["type"] == "heartbeat" and "tail" in heartbeat
-    ]
-    assert tails
-    assert all(len(tail) <= 120 for tail in tails)
-    assert all("\x1b" not in tail and "\n" not in tail for tail in tails)
+    if "streaming" in expected_phases:
+        assert phases.index("waiting") < phases.index("streaming")
+    # Provider responses are internal JSON actions; the cockpit shows stream
+    # state/rate, not protocol fragments.
+    assert not any(
+        heartbeat.get("phase") == "streaming" and heartbeat.get("tail")
+        for heartbeat in heartbeats
+    )
 
 
 def test_run_task_drain_uses_config_heartbeat_interval(tmp_path: Path) -> None:

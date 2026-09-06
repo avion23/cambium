@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .summary_trunk import SUMMARY_FINDING_PRESERVATION_CONTRACT, SUMMARY_LIST_FIELDS
 
-PROMPTS_VERSION = 10
+PROMPTS_VERSION = 11
 
 CODING_POLICY = (
     "Work directly and minimally. Locate with repo_query, read exact regions with read_batch, "
@@ -19,7 +19,8 @@ CODING_POLICY = (
     "time or context; batch independent siblings with disjoint ownership and checks, and keep "
     "small or tightly coupled work local. After joins, inspect the accepted files and run the "
     "combined check. Use branch_history for exact old evidence. Plan only when useful. Finish "
-    "with only the operator-relevant outcome, material changes, checks, and blockers."
+    "for the operator, not for the transcript: state the result first, then only material "
+    "changes, meaningful checks, findings, or blockers the user needs next."
 )
 SUMMARY_POLICY = (
     SUMMARY_FINDING_PRESERVATION_CONTRACT + " Drop routine noise and duplicate reads. "
@@ -35,9 +36,12 @@ _ACTION_PROTOCOL = (
     '  {"name":"read_batch","arguments":{"paths":["file.py"]}}\n'
     '  {"calls":[{"name":"read_batch","arguments":{"paths":["a.py","b.py"]}}]}\n'
     '  {"type":"finish","summary":"...","objective_met":true}\n'
-    "The finish summary is user-facing: keep it under about 600 characters and at most four "
-    "compact bullets. Do not restate the task, narrate internal steps, paste commands, or list "
-    "routine tool calls. "
+    "The finish summary is user-facing. Default to one short sentence; use at most three "
+    "compact bullets only when the task genuinely has several findings. Do not restate the "
+    "task or narrate the process. Omit internal tool names, raw commands, hashes, checkpoint/"
+    "worktree details, routine file paths, lint chatter, dependency status, and 'no changes' "
+    "boilerplate unless the user explicitly asked for that evidence. Mention checks by outcome "
+    "('tests passed'), not by command. "
     "Independent reads may run concurrently; mutations run in listed order. "
     "Each delegate spec needs a task. One child defaults to trunk+inherit; several in a "
     "batch default to semantic+spread. Optional context_mode/placement override these defaults. "
