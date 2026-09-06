@@ -18,7 +18,7 @@ from rich.segment import Segment
 from rich.syntax import Syntax
 from rich.theme import Theme
 
-from .terminal import sanitize_terminal_text
+from .terminal import sanitize_terminal_text, terminal_color_depth
 
 
 class _CambiumHeading(Heading):
@@ -70,26 +70,26 @@ class CambiumMarkdown(Markdown):
 
 @lru_cache(maxsize=1)
 def markdown_theme() -> Theme:
-    """High-contrast palette shared by one-shot output and the live cockpit."""
+    """Readable no-background palette; Rich degrades it to the terminal's color depth."""
     return Theme(
         {
-            "markdown.h1": "bold bright_cyan",
-            "markdown.h2": "bold bright_blue",
-            "markdown.h3": "bold bright_magenta",
-            "markdown.h4": "bold bright_green",
-            "markdown.h5": "bold bright_yellow",
-            "markdown.h6": "bold white",
-            "markdown.code": "bold yellow",
-            "markdown.code_block": "cyan",
-            "markdown.item.bullet": "bright_magenta",
-            "markdown.item.number": "bright_magenta",
-            "markdown.block_quote": "blue",
-            "markdown.table.border": "cyan",
-            "markdown.table.header": "bold bright_cyan",
-            "markdown.link": "underline bright_blue",
-            "markdown.link_url": "dim cyan",
-            "markdown.strong": "bold bright_white",
-            "markdown.em": "italic bright_magenta",
+            "markdown.h1": "bold #5fd7ff",
+            "markdown.h2": "bold #87afff",
+            "markdown.h3": "bold #af87ff",
+            "markdown.h4": "bold #5fd7af",
+            "markdown.h5": "bold #d7af5f",
+            "markdown.h6": "bold #d0d0d0",
+            "markdown.code": "bold #ffd75f",
+            "markdown.code_block": "#5f87af",
+            "markdown.item.bullet": "#d787ff",
+            "markdown.item.number": "#d787ff",
+            "markdown.block_quote": "italic #87afd7",
+            "markdown.table.border": "#5f87af",
+            "markdown.table.header": "bold #5fd7ff",
+            "markdown.link": "underline #5fafff",
+            "markdown.link_url": "dim #00d7d7",
+            "markdown.strong": "bold #eeeeee",
+            "markdown.em": "italic #d787ff",
         }
     )
 
@@ -101,17 +101,29 @@ def markdown_document(text: str) -> CambiumMarkdown:
     )
 
 
-def render_markdown(text: str, *, width: int | None = None) -> str:
-    """Render Markdown to ANSI using the same parser and palette as the cockpit."""
+def _rich_color_system(depth: int) -> tuple[str | None, ColorSystem | None]:
+    if depth == 24:
+        return "truecolor", ColorSystem.TRUECOLOR
+    if depth >= 256:
+        return "256", ColorSystem.EIGHT_BIT
+    if depth >= 16:
+        return "standard", ColorSystem.STANDARD
+    return None, None
+
+
+def render_markdown_lines(text: str, *, width: int, color_depth: int = 16) -> list[str]:
+    """Render sanitized Markdown to terminal lines without a pager or subprocess."""
+    color_name, color_system = _rich_color_system(color_depth)
     console = Console(
-        color_system="standard",
+        color_system=color_name,
         file=StringIO(),
-        force_terminal=True,
+        force_terminal=color_system is not None,
         height=None,
         highlight=False,
         markup=False,
+        no_color=color_system is None,
         theme=markdown_theme(),
-        width=max(20, width or shutil.get_terminal_size((100, 40)).columns),
+        width=max(20, width),
     )
     lines: list[str] = []
     for line in console.render_lines(markdown_document(text), pad=False):
@@ -124,13 +136,25 @@ def render_markdown(text: str, *, width: int | None = None) -> str:
             segments.pop()
         parts: list[str] = []
         for segment in segments:
-            if segment.style:
-                parts.append(segment.style.render(segment.text, color_system=ColorSystem.STANDARD))
+            if color_system is not None and segment.style:
+                parts.append(segment.style.render(segment.text, color_system=color_system))
             else:
                 parts.append(segment.text)
         lines.append("".join(parts))
     while lines and not lines[-1].strip():
         lines.pop()
+    return lines
+
+
+def render_markdown(
+    text: str, *, width: int | None = None, color_depth: int = 256
+) -> str:
+    """Render Markdown to ANSI using Cambium's in-process Rich renderer."""
+    lines = render_markdown_lines(
+        text,
+        width=max(20, width or shutil.get_terminal_size((100, 40)).columns),
+        color_depth=color_depth,
+    )
     return "\n".join(lines) + ("\n" if lines else "")
 
 
@@ -143,7 +167,11 @@ def render_markdown_if_tty(text: str, stream: TextIO) -> str:
         return clean
     if not is_tty or os.environ.get("NO_COLOR") or os.environ.get("TERM", "") == "dumb":
         return clean
-    return render_markdown(clean, width=shutil.get_terminal_size((100, 40)).columns)
+    return render_markdown(
+        clean,
+        width=shutil.get_terminal_size((100, 40)).columns,
+        color_depth=terminal_color_depth(stream),
+    )
 
 
 __all__ = [
@@ -152,4 +180,5 @@ __all__ = [
     "markdown_theme",
     "render_markdown",
     "render_markdown_if_tty",
+    "render_markdown_lines",
 ]

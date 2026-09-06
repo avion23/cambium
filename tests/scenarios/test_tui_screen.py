@@ -657,6 +657,15 @@ def test_status_phase_palette_follows_activity_state(
     assert f"{getattr(tui_screen, style)}{label}{tui_screen._RESET}" in rendered
 
 
+def test_256_color_palette_keeps_semantic_states_distinct() -> None:
+    assert tui_screen._status_paint("THINKING", "magenta", 256) == (
+        f"{tui_screen._VIOLET}THINKING{tui_screen._RESET}"
+    )
+    assert tui_screen._role_color("assistant", 256) == tui_screen._TEAL
+    assert tui_screen._style_kind("cache-miss", 256) == tui_screen._AMBER
+    assert tui_screen._style_kind("children", 256) == tui_screen._PINK
+
+
 def test_detail_command_shows_optional_row_on_next_frame(monkeypatch) -> None:
     monkeypatch.setattr(
         tui_screen.shutil,
@@ -823,6 +832,82 @@ def test_activity_heartbeat_phase_tail_is_latest_sanitized_and_not_transcript() 
         {"kind": "heartbeat", "payload": {"phase": "thinking", "tail": "private tail"}}
     )
     assert transcript.entries == ()
+
+
+def test_usage_event_updates_live_cache_without_duplicate_transcript_text() -> None:
+    transcript = Transcript()
+    transcript.observe_event(
+        {
+            "kind": "usage_event",
+            "task_id": "root",
+            "payload": {
+                "provider": "zai",
+                "model": "glm-5.3",
+                "provider_cache_hit": False,
+                "usage": {"total_tokens": 123, "completion_tokens": 7},
+            },
+        }
+    )
+    assert transcript._live_cache_hit is False
+    assert transcript._live_text == ""
+
+
+def test_activity_names_provider_and_cache_state_before_turn_finishes() -> None:
+    activity = ActivityState()
+    activity.start(now=10.0)
+    activity.observe_event(
+        {
+            "kind": "heartbeat",
+            "payload": {
+                "phase": "waiting",
+                "phase_revision": 1,
+                "provider": "zai",
+                "model": "glm-5.3",
+                "tail": "zai/glm-5.3",
+            },
+        },
+        now=11.0,
+    )
+    assert "PROVIDER · zai/glm-5.3 · waiting" in activity.render(now=12.0)
+
+    activity.observe_event(
+        {
+            "kind": "usage_event",
+            "payload": {
+                "provider": "zai",
+                "model": "glm-5.3",
+                "provider_cache_hit": False,
+            },
+        },
+        now=12.0,
+    )
+    activity.observe_event(
+        {
+            "kind": "heartbeat",
+            "payload": {
+                "phase": "thinking",
+                "phase_revision": 2,
+                "provider": "zai",
+                "model": "glm-5.3",
+            },
+        },
+        now=13.0,
+    )
+    assert activity.render(now=14.0) == "◌ THINKING · zai/glm-5.3 · 4s · cache MISS"
+
+    activity.observe_event(
+        {
+            "kind": "heartbeat",
+            "payload": {
+                "phase": "waiting",
+                "phase_revision": 3,
+                "provider": "zai",
+                "model": "glm-5.3",
+            },
+        },
+        now=15.0,
+    )
+    assert "cache MISS" not in activity.render(now=16.0)
 
 
 def test_activity_distinguishes_active_thinking_from_stalled_provider_or_tool() -> None:

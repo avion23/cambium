@@ -177,7 +177,6 @@ from cambium.summary_trunk import (
     summary_entries,
     summary_trunk_tokens,
 )
-from cambium.terminal import sanitize_terminal_text
 from cambium.tools import ToolContext, ToolPermissionPolicy, ToolResult, run_tool
 
 SUMMARY_PROTOCOL_LINES = _SUMMARY_PROTOCOL_LINES
@@ -185,12 +184,11 @@ SUMMARY_PROTOCOL_LINES = _SUMMARY_PROTOCOL_LINES
 PROTO = 1
 HEARTBEAT_INTERVAL_S = 1.0
 PHASE_HEARTBEAT_INTERVAL_S = 1.0
-PHASE_TAIL_MAX_CHARS = 120
 TOOL_OUTPUT_DELTA_INTERVAL_S = 0.1
 _HEARTBEAT_DRAIN_TIMEOUT_S = 0.25
 INIT_TIMEOUT_S = 30.0
 IDLE_TIMEOUT_S = 300.0
-MAX_SUMMARY_CHARS = 600
+MAX_SUMMARY_CHARS = 420
 # Consecutive non-novel actions (valid plans, tool calls, and
 # invalid/unparseable actions) before the agent loop fails fast.
 MAX_NO_PROGRESS_ACTIONS = 2
@@ -269,9 +267,10 @@ FINAL_SYNTHESIS_HEADROOM_RATIO = 0.1
 FINAL_SYNTHESIS_MIN_HEADROOM_TOKENS = 4_000
 FINAL_SYNTHESIS_DIRECTIVE = (
     "Budget nearly exhausted. Complete the current step and its verification; "
-    "do not start new work or delegate. Then return finish. Keep the user-facing summary "
-    "brief: outcome, material changes, checks, blocker if any; no task restatement or tool log. "
-    "Set objective_met=false when the task is incomplete."
+    "do not start new work or delegate. Then return finish. Default the user-facing summary to "
+    "one sentence: outcome plus only a material change, meaningful check, or blocker. Omit tool "
+    "names, commands, hashes, routine paths, lint chatter, and task restatement. Set "
+    "objective_met=false when the task is incomplete."
 )
 
 
@@ -1622,7 +1621,18 @@ def _config_from_run(run: dict[str, Any]) -> AgentConfig:
 class AgentProgress:
     """Current turn/tool/status shared with the heartbeat loop."""
 
-    __slots__ = ("turn", "tool", "status", "phase", "tail", "_phase_lock", "_phase_revision")
+    __slots__ = (
+        "turn",
+        "tool",
+        "status",
+        "phase",
+        "tail",
+        "provider",
+        "model",
+        "provider_cache_hit",
+        "_phase_lock",
+        "_phase_revision",
+    )
 
     def __init__(self) -> None:
         self.turn = 0
@@ -1630,42 +1640,71 @@ class AgentProgress:
         self.status = "working"
         self.phase: str | None = None
         self.tail: str | None = None
+        self.provider: str | None = None
+        self.model: str | None = None
+        self.provider_cache_hit: bool | None = None
         self._phase_lock = threading.Lock()
         self._phase_revision = 0
 
     def begin_provider_call(self) -> None:
-        """Publish the waiting state before a provider request starts."""
-        self._set_phase("waiting", None)
+        """Publish routing before the concrete provider attempt is known."""
+        with self._phase_lock:
+            self.provider = None
+            self.model = None
+            self.provider_cache_hit = None
+            self.phase = "waiting"
+            self.tail = "selecting provider"
+            self._phase_revision += 1
 
     def observe_delta(self, phase: str, fragment: str) -> None:
-        """Publish phase changes and only user-visible output text."""
-        if phase == "thinking":
-            self._set_phase("thinking", None)
-            return
-        if phase != "streaming":
-            return
-        tail = _phase_tail(fragment)
-        if tail:
-            self._set_phase("streaming", tail)
+        """Publish provider activity without exposing the internal JSON action stream."""
+        del fragment
+        if phase in {"thinking", "streaming"}:
+            self._set_phase(phase, None)
 
-    def phase_snapshot(self) -> tuple[str | None, str | None, int]:
-        """Return the phase state and revision for the heartbeat publisher."""
+    def observe_provider_status(self, event: Mapping[str, Any]) -> None:
+        """Track the concrete provider attempt without waiting for the final usage event."""
+        kind = event.get("kind")
+        provider = event.get("provider")
+        model = event.get("model")
+        if kind not in {"provider_attempt", "provider_failed", "provider_succeeded"}:
+            return
         with self._phase_lock:
-            return self.phase, self.tail, self._phase_revision
+            if isinstance(provider, str) and provider:
+                self.provider = provider
+            if isinstance(model, str) and model:
+                self.model = model
+            cache_hit = event.get("provider_cache_hit")
+            if type(cache_hit) is bool:
+                self.provider_cache_hit = cache_hit
+            identity = "/".join(part for part in (self.provider, self.model) if part)
+            outcome = event.get("outcome")
+            if kind == "provider_failed" and isinstance(outcome, str) and outcome:
+                self.tail = f"{identity} · {outcome}" if identity else outcome
+            elif identity:
+                self.tail = identity
+            self.phase = "waiting"
+            self._phase_revision += 1
+
+    def phase_snapshot(
+        self,
+    ) -> tuple[str | None, str | None, int, str | None, str | None, bool | None]:
+        """Return provider phase state for the heartbeat publisher."""
+        with self._phase_lock:
+            return (
+                self.phase,
+                self.tail,
+                self._phase_revision,
+                self.provider,
+                self.model,
+                self.provider_cache_hit,
+            )
 
     def _set_phase(self, phase: str, tail: str | None) -> None:
         with self._phase_lock:
             self.phase = phase
             self.tail = tail
             self._phase_revision += 1
-
-
-def _phase_tail(fragment: str) -> str:
-    """Return a safe, single-line, bounded provider delta tail."""
-    clean = sanitize_terminal_text(fragment, single_line=True).strip()
-    if len(clean) <= PHASE_TAIL_MAX_CHARS:
-        return clean
-    return clean[: PHASE_TAIL_MAX_CHARS - 1] + "…"
 
 
 def _delta_phase(value: Any) -> str | None:
@@ -1710,17 +1749,27 @@ def _progress_delta_callback(progress: AgentProgress) -> Callable[..., None]:
     return _on_delta
 
 
-def _delta_callback_keyword(caller: Callable[..., Any]) -> str | None:
+def _progress_status_callback(progress: AgentProgress) -> Callable[[Mapping[str, Any]], None]:
+    return progress.observe_provider_status
+
+
+def _callback_keyword(caller: Callable[..., Any], name: str) -> str | None:
     try:
         parameters = inspect.signature(caller).parameters.values()
     except (TypeError, ValueError):
         return None
     names = {parameter.name for parameter in parameters}
-    for name in ("on_delta", "on_stream_delta", "delta_callback"):
-        if name in names:
-            return name
+    if name in names:
+        return name
     if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters):
-        return "on_delta"
+        return name
+    return None
+
+
+def _delta_callback_keyword(caller: Callable[..., Any]) -> str | None:
+    for name in ("on_delta", "on_stream_delta", "delta_callback"):
+        if keyword := _callback_keyword(caller, name):
+            return keyword
     return None
 
 
@@ -1731,6 +1780,9 @@ async def _call_provider(
     callback_keyword = _delta_callback_keyword(caller)
     if callback_keyword is not None:
         kwargs[callback_keyword] = _progress_delta_callback(progress)
+    status_keyword = _callback_keyword(caller, "on_status")
+    if status_keyword is not None:
+        kwargs[status_keyword] = _progress_status_callback(progress)
     return await caller(*args, **kwargs)
 
 
@@ -1941,15 +1993,39 @@ _STRICT_ACTION_DECODER = json.JSONDecoder()
 _LENIENT_ACTION_DECODER = json.JSONDecoder(strict=False)
 
 
+def _repair_tool_batch_closer(text: str) -> tuple[Any, int] | None:
+    """Normalize one observed provider typo without guessing action semantics."""
+    if not (
+        text.startswith('{"type":"tool_call","calls":[')
+        or text.startswith('{"calls":[')
+    ) or not text.endswith("}]}]}"):
+        return None
+    repaired = text[:-5] + "}}]}"
+    try:
+        parsed, end = _STRICT_ACTION_DECODER.raw_decode(repaired)
+    except json.JSONDecodeError:
+        return None
+    if (
+        end != len(repaired)
+        or not isinstance(parsed, dict)
+        or not isinstance(parsed.get("calls"), list)
+    ):
+        return None
+    return parsed, len(text)
+
+
 def _decode_action_json(text: str) -> tuple[Any, int]:
-    """Decode one JSON value at the start of ``text``.  When the strict
-    decoder rejects the input only because a string value contains a raw
-    control character, retry with the lenient decoder; every other strictness
-    rule is unchanged."""
+    """Decode one action, tolerating raw controls and one observed batch-closer typo."""
     try:
         return _STRICT_ACTION_DECODER.raw_decode(text)
-    except json.JSONDecodeError:
-        return _LENIENT_ACTION_DECODER.raw_decode(text)
+    except json.JSONDecodeError as strict_error:
+        try:
+            return _LENIENT_ACTION_DECODER.raw_decode(text)
+        except json.JSONDecodeError:
+            repaired = _repair_tool_batch_closer(text)
+            if repaired is not None:
+                return repaired
+            raise strict_error from None
 
 
 def _complete_delegates(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -6899,6 +6975,11 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                             verified_after_change = False
                         batch_results.append((name, arguments, tool_result))
                 else:
+                    progress.tool = (
+                        tool_calls[0]["name"]
+                        if len(tool_calls) == 1
+                        else f"parallel×{len(tool_calls)}"
+                    )
                     with ToolContext(
                         worktree,
                         lint=lint_diag,
@@ -7630,8 +7711,10 @@ async def _heartbeat_loop(
         now = time.monotonic()
         heartbeat_due = now >= next_heartbeat
         phase_due = False
+        provider = model = None
+        cache_hit: bool | None = None
         if progress is not None:
-            phase, tail, revision = progress.phase_snapshot()
+            phase, tail, revision, provider, model, cache_hit = progress.phase_snapshot()
             phase_due = (
                 phase is not None
                 and revision > published_revision
@@ -7664,6 +7747,12 @@ async def _heartbeat_loop(
             heartbeat["phase_revision"] = published_revision
             if published_tail:
                 heartbeat["tail"] = published_tail
+        if provider:
+            heartbeat["provider"] = provider
+        if model:
+            heartbeat["model"] = model
+        if type(cache_hit) is bool:
+            heartbeat["provider_cache_hit"] = cache_hit
         write_message(writer, heartbeat)
         try:
             if drain_ok:

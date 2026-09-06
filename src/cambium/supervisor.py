@@ -6309,6 +6309,12 @@ class _Runtime:
         tail = msg.get("tail")
         if isinstance(tail, str):
             forwarded["tail"] = sanitize_terminal_text(tail, single_line=True)[:120]
+        for key in ("provider", "model"):
+            value = msg.get(key)
+            if isinstance(value, str) and value:
+                forwarded[key] = sanitize_terminal_text(value, single_line=True)[:160]
+        if type(msg.get("provider_cache_hit")) is bool:
+            forwarded["provider_cache_hit"] = msg["provider_cache_hit"]
         await self.emit(
             "heartbeat",
             task_id=state.task_id,

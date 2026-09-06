@@ -48,10 +48,15 @@ def _derailment(row: dict[str, Any]) -> list[str]:
         flags.append(f"timeout-shaped: elapsed_s={row.get('elapsed_s')}")
     if row.get("tool_failures"):
         flags.append(f"tool-failures: {row['tool_failures']} failed tool events")
-    if (row.get("user_summary_chars") or 0) > 800 or (row.get("user_summary_lines") or 0) > 6:
+    turns = max(1, len(row.get("turn_heads") or ()))
+    if (
+        (row.get("user_summary_chars") or 0) > 320 * turns
+        or (row.get("user_summary_lines") or 0) > 3 * turns
+    ):
         flags.append(
             "verbose-user-summary: "
-            f"{row.get('user_summary_chars', 0)} chars / {row.get('user_summary_lines', 0)} lines"
+            f"{row.get('user_summary_chars', 0)} chars / {row.get('user_summary_lines', 0)} lines "
+            f"across {turns} operator turn(s)"
         )
     return flags or ["none observed"]
 
