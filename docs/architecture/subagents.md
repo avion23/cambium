@@ -50,9 +50,8 @@ These are related but not interchangeable.
 The current worker result reports its terminal status and objective verdict,
 commit requirement, commit/file evidence, and bounded provider/result metadata.
 The supervisor checks the reported artifact against the actual worktree and
-base. The richer evidence-linked **ResultCapsule** described in
-[agent-state reference](../reference/agent-state.md) remains a design target;
-it must not be documented as the current result wire schema.
+base. A richer evidence-linked ResultCapsule remains a research idea, not the
+current result wire schema.
 
 For mutating work the accepted child commit is integrated through the existing
 serialized merge path. Before the parent resumes, its worktree must match the
