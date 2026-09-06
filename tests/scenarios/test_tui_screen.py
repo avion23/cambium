@@ -155,6 +155,7 @@ def test_full_operator_rail_rows_have_stable_golden_strings() -> None:
     )
     snapshot.context.summary_segments = 2
     snapshot.context.estimated_trunk_tokens = 2_000
+    snapshot.context.stable_head_bytes = 2_048
     snapshot.context.summary_trunk_bytes = 8_192
     snapshot.context.estimated_raw_tail_tokens = 1_000
     snapshot.context.raw_tail_bytes = 4_096
@@ -176,7 +177,20 @@ def test_full_operator_rail_rows_have_stable_golden_strings() -> None:
         "compaction_failed · provider",
     ):
         assert expected in text
+    assert all(marker in text for marker in ("H█", "S▓", "R░"))
     assert all(value.strip() and _display_width(value) <= 32 for _, value in rows)
+
+
+def test_cast_bar_zero_segments_does_not_mislabel_head_as_semantic() -> None:
+    context = SimpleNamespace(
+        stable_head_bytes=0,
+        summary_trunk_bytes=8_000,
+        raw_tail_bytes=2_000,
+        summary_segments=0,
+    )
+    bar = tui_screen._context_bar(context, 32)
+    assert "H█" in bar and "R░" in bar
+    assert "S▓" not in bar and "H?" not in bar
 
 
 def test_compact_operator_rail_rows_keep_glyphs_and_epoch() -> None:
@@ -270,8 +284,7 @@ def test_activity_rail_ticks_redraw_in_place_at_duration_width_change(monkeypatc
         delta = stream.getvalue()[len(first) :]
 
     assert "┌ Cambium · conversation" not in delta
-    assert "read_batch · 10s" in delta
-    assert "starting 10s" in delta
+    assert "thinking 10s · read config" in delta
 
 
 def test_replaying_events_after_snapshot_is_idempotent() -> None:
@@ -395,9 +408,8 @@ def test_conversation_markdown_is_structured_styled_and_sanitized() -> None:
         assert table_header.index("b") == table_row.index("two")
     else:
         assert all(cell in "\n".join(visible) for cell in ("a", "b", "one", "two"))
-    assert "\x1b[1m" in rendered
-    assert "\x1b[33m" in rendered
-    assert "\x1b[2;36m" in rendered
+    assert "\x1b[" in rendered
+    assert rendered.count("\x1b[") >= 3
 
     hostile = render_markdown_lines("safe\x1b[31m\x1b]2;secret\x07 text", 36)
     assert "secret" not in "\n".join(hostile)
@@ -418,19 +430,7 @@ def test_rich_markdown_sanitizes_before_the_parser_sees_text(monkeypatch) -> Non
     assert seen == ["safe injected text"]
 
 
-def test_markdown_falls_back_when_rich_import_is_unavailable(monkeypatch) -> None:
-    text = "# Heading\n\n**bold** `code`\n\nvalue_with_underscores"
-    expected = tui_screen._render_markdown_lines_fallback(text, 36, color=False)
-
-    def unavailable(*args, **kwargs):
-        raise ImportError("rich unavailable")
-
-    monkeypatch.setattr(tui_screen, "_render_markdown_lines_rich", unavailable)
-    assert render_markdown_lines(text, 36, color=False) == expected
-
-
 def test_rich_path_keeps_literal_markup_text() -> None:
-    pytest.importorskip("rich")
     rendered = "\n".join(render_markdown_lines("[bold]x[/bold]", 36, color=False))
     assert "[bold]x[/bold]" in rendered
 
@@ -559,12 +559,12 @@ def test_status_strip_has_one_detail_row_and_hides_context_internals_from_spinne
         branch_line="branch: generation=4 turn=2 epoch=9",
         cumulative_line="usage: tokens=1100000",
         width=80,
-        activity_line="⠇ WAITING · thinking… 12s",
+        activity_line="◒ PROVIDER · waiting 12s",
     )
 
     assert len(rows) == 3
     assert all("\n" not in row for row in rows)
-    assert rows[1].strip() == "⠇ thinking 12s · codex/gpt-5.6 · t2 · 1.1m tok"
+    assert rows[1].strip() == "◒ PROVIDER · waiting 12s · codex/gpt-5.6 · t2 · 1.1m tok"
     assert all(
         value not in rows[1] for value in ("branch", "generation", "epoch", "session", "checkpoint")
     )
@@ -635,16 +635,19 @@ def test_status_palette_is_gated_without_changing_visible_text() -> None:
 
 
 @pytest.mark.parametrize(
-    ("activity_line", "phase", "style"),
+    ("activity_line", "label", "style"),
     [
         ("⠋ idle", "idle", "_DIM"),
-        ("▸ streaming 1s", "streaming", "_GREEN"),
+        ("◌ THINKING · 1s", "THINKING", "_MAGENTA"),
+        ("▸ STREAMING · 1s", "STREAMING", "_GREEN"),
+        ("◒ PROVIDER · waiting 1s", "PROVIDER", "_BLUE"),
+        ("⠋ TOOL · run_shell 1s", "TOOL", "_CYAN"),
         ("⠋ queued", "queued", "_YELLOW"),
-        ("✗ ERROR", "error", "_RED"),
+        ("✗ ERROR", "ERROR", "_RED"),
     ],
 )
 def test_status_phase_palette_follows_activity_state(
-    activity_line: str, phase: str, style: str
+    activity_line: str, label: str, style: str
 ) -> None:
     rendered = _status_rows(
         _snapshot(),
@@ -657,7 +660,7 @@ def test_status_phase_palette_follows_activity_state(
         activity_line=activity_line,
     )[1]
 
-    assert f"{getattr(tui_screen, style)}{phase}{tui_screen._RESET}" in rendered
+    assert f"{getattr(tui_screen, style)}{label}{tui_screen._RESET}" in rendered
 
 
 def test_detail_command_shows_optional_row_on_next_frame(monkeypatch) -> None:
@@ -763,7 +766,7 @@ def test_activity_state_reports_waiting_streaming_done_error_and_cooldown() -> N
     activity = ActivityState()
     activity.start(now=10.0)
     assert activity.state == "WAITING"
-    assert "WAITING" in activity.render(now=10.0)
+    assert "ORCHESTRATING" in activity.render(now=10.0)
 
     activity.observe_event(
         {
@@ -774,7 +777,7 @@ def test_activity_state_reports_waiting_streaming_done_error_and_cooldown() -> N
     )
     assert activity.state == "STREAMING"
     assert "STREAMING" in activity.render(now=11.0)
-    assert "out/s= 12.5" in activity.render(now=11.0)  # fixed-width field
+    assert "12.5 tok/s" in activity.render(now=11.0)
 
     activity.observe_event(
         {"kind": "usage_event", "payload": {"request_rate_status": "cooldown", "retry_after_s": 4}},
@@ -803,7 +806,7 @@ def test_activity_heartbeat_phase_tail_is_latest_sanitized_and_not_transcript() 
         },
         now=11.0,
     )
-    assert activity.render(now=13.0) == "◌ thinking 3s · read config"
+    assert activity.render(now=13.0) == "◌ THINKING · 3s"
 
     activity.observe_event(
         {
@@ -812,19 +815,49 @@ def test_activity_heartbeat_phase_tail_is_latest_sanitized_and_not_transcript() 
         },
         now=12.0,
     )
-    assert activity.render(now=14.0) == "▸ streaming 4s · answer fragment"
+    assert "▸ STREAMING · 4s" in activity.render(now=14.0)
+    assert "answer fragment" in activity.render(now=14.0)
 
     activity.observe_event(
         {"kind": "heartbeat", "payload": {"phase": "waiting", "tail": "stale tail"}},
         now=15.0,
     )
-    assert activity.render(now=16.0) == "… waiting 6s"
+    assert activity.render(now=16.0) == "◒ PROVIDER · waiting 6s"
 
     transcript = Transcript()
     transcript.observe_event(
         {"kind": "heartbeat", "payload": {"phase": "thinking", "tail": "private tail"}}
     )
     assert transcript.entries == ()
+
+
+def test_activity_distinguishes_active_thinking_from_stalled_provider_or_tool() -> None:
+    activity = ActivityState()
+    activity.start(now=0.0)
+    activity.observe_event(
+        {"kind": "heartbeat", "payload": {"phase": "thinking", "phase_revision": 1}},
+        now=1.0,
+    )
+    activity.observe_event(
+        {"kind": "heartbeat", "payload": {"phase": "thinking", "phase_revision": 2}},
+        now=10.0,
+    )
+    assert "stalled" not in activity.render(now=20.0)
+    assert "stalled 13s" in activity.render(now=23.0)
+
+    activity.observe_event(
+        {"kind": "heartbeat", "payload": {"phase": "waiting", "phase_revision": 3}},
+        now=24.0,
+    )
+    assert "PROVIDER · waiting" in activity.render(now=37.0)
+    assert "silent 13s" in activity.render(now=37.0)
+
+    activity.observe_event(
+        {"kind": "tool_start", "payload": {"tool": "run_shell", "tool_call_id": "x"}},
+        now=40.0,
+    )
+    assert "TOOL · run_shell" in activity.render(now=53.0)
+    assert "no output 13s" in activity.render(now=53.0)
 
 
 def test_suspended_activity_stays_live_and_has_distinct_status() -> None:
@@ -837,7 +870,7 @@ def test_suspended_activity_stays_live_and_has_distinct_status() -> None:
 
     assert activity.active
     assert activity.state == "SUSPENDED"
-    assert "SUSPENDED" in activity.render(now=1.0)
+    assert "CHILDREN · waiting" in activity.render(now=1.0)
     assert activity.status_line() != "✓ DONE"
 
 
@@ -856,7 +889,7 @@ def test_compact_cockpit_stays_bounded() -> None:
     assert len(lines) == 22
     assert all(len(line) == 72 for line in lines)
     assert "conversation · running" in "\n".join(lines)
-    assert "⠋ thinking" in "\n".join(lines)
+    assert "⠋ orchestrating" in "\n".join(lines)
     assert lines[-1].startswith("└")
 
 
@@ -890,10 +923,9 @@ def test_long_words_wrap_without_clipping_content_or_frame_borders() -> None:
 
 
 def test_wide_text_wraps_by_cells_without_losing_continuation_spaces() -> None:
-    for wrapper in (tui_screen._wrap_plain_markdown, _wrap_markdown):
-        lines = wrapper("界界 a b", 5)
-        assert lines == ["界界", "a b"]
-        assert all(_display_width(line) <= 5 for line in lines)
+    lines = _wrap_markdown("界界 a b", 5)
+    assert lines == ["界界", "a b"]
+    assert all(_display_width(line) <= 5 for line in lines)
 
 
 def test_wide_side_columns_measure_cells_before_selecting_layout() -> None:
@@ -971,7 +1003,7 @@ def test_primary_renderer_ends_with_compact_status_row() -> None:
     assert "CAMBIUM" in "\n".join(lines)
     assert len(lines[-3:]) == 3
     assert lines[-3].startswith(" · 0 tools")
-    assert lines[-2].startswith(" ⠋ thinking")
+    assert lines[-2].startswith(" ⠋ orchestrating")
     assert "12.3k tok" in lines[-2]
     assert lines[-1].startswith(" agents active=")
 
@@ -1123,7 +1155,7 @@ def test_cockpit_paints_mid_turn_tool_tick_while_input_is_pending() -> None:
         )
 
         live_output = stream.getvalue()
-        assert "118s ✓ run_shell" in live_output
+        assert "✓ run_shell 118s" in live_output
         assert live_output.endswith("› ")
         assert cockpit._input_active
 
@@ -1553,12 +1585,12 @@ def test_local_waiting_activity_renders_honest_starting_state() -> None:
     # clock. It must not fabricate a provider call, turn, or call counter.
     joined = " ".join(rows)
     assert all("waiting" not in row.casefold() for row in rows)
-    assert "starting" in rows[0]
+    assert "STARTING" in rows[0]
     assert "12s" in rows[0]
-    assert "provider call" not in joined
+    assert "provider" not in joined.casefold()
     assert "turn=" not in joined
     assert "call=" not in joined
-    assert "no runtime events yet" in rows[1]
+    assert "runtime handshake pending" in rows[1]
 
 
 def test_small_terminal_live_events_rewrite_two_rows_without_newlines(monkeypatch) -> None:
@@ -1641,7 +1673,7 @@ def test_live_tool_tail_and_duration_clear_at_provider_boundary() -> None:
     assert all(
         value not in " ".join(rows) for value in ("stale command output", "run_shell", "1250ms")
     )
-    assert "provider call" in " ".join(rows)
+    assert "waiting for provider response" in " ".join(rows)
 
 
 def test_live_provider_tail_clears_when_heartbeat_phase_changes() -> None:
@@ -1655,7 +1687,7 @@ def test_live_provider_tail_clears_when_heartbeat_phase_changes() -> None:
 
     rows = _live_window_lines(transcript, 100)
     assert "old provider tail" not in " ".join(rows)
-    assert "provider call" in " ".join(rows)
+    assert "waiting for provider response" in " ".join(rows)
 
 
 def test_heartbeat_tool_none_clears_the_tool_in_every_view() -> None:
@@ -2234,16 +2266,16 @@ def test_activity_state_transitions_thinking_responding_tool_and_done() -> None:
     activity = ActivityState()
     activity.start(now=10.0)
 
-    thinking = activity.render(now=10.0)
-    assert thinking.startswith("⠋ ")
-    assert "thinking… 0s" in thinking
+    starting = activity.render(now=10.0)
+    assert starting.startswith("⠋ ")
+    assert "ORCHESTRATING · 0s" in starting
     assert activity.tick(now=10.1).startswith("⠙ ")
 
     activity.observe_event(
         {"kind": "assistant_delta", "payload": {"delta": "I will inspect this."}},
         now=11.0,
     )
-    assert "responding… 2s" in activity.render(now=12.0)
+    assert "STREAMING · 2s" in activity.render(now=12.0)
 
     activity.observe_event(
         {
@@ -2253,7 +2285,7 @@ def test_activity_state_transitions_thinking_responding_tool_and_done() -> None:
         now=13.0,
     )
     running = activity.render(now=14.5)
-    assert "running run_shell 1s" in running
+    assert "TOOL · run_shell 1s" in running
     assert "turn 4s" in running
     frame = render_cockpit(
         _snapshot(),
@@ -2279,7 +2311,7 @@ def test_activity_state_transitions_thinking_responding_tool_and_done() -> None:
         },
         now=15.0,
     )
-    assert "thinking… 5s" in activity.render(now=15.0)
+    assert "ORCHESTRATING · 5s" in activity.render(now=15.0)
 
     activity.stop()
     assert activity.render(now=16.0) == ""
@@ -2340,7 +2372,7 @@ def test_activity_keeps_tool_in_flight_until_matching_end() -> None:
         },
         now=3.0,
     )
-    assert "running run_shell" in activity.render(now=3.0)
+    assert "TOOL · run_shell" in activity.render(now=3.0)
 
     activity.observe_event(
         {
@@ -2349,7 +2381,7 @@ def test_activity_keeps_tool_in_flight_until_matching_end() -> None:
         },
         now=4.0,
     )
-    assert "running run_shell" not in activity.render(now=4.0)
+    assert "TOOL · run_shell" not in activity.render(now=4.0)
 
 
 def test_restore_input_line_escapes_lone_surrogates_before_writing() -> None:

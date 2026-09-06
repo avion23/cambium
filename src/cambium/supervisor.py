@@ -6303,6 +6303,9 @@ class _Runtime:
         state.heartbeat_phase = phase
         if type(phase) is str and phase in _HEARTBEAT_PHASES:
             forwarded["phase"] = phase
+            revision = msg.get("phase_revision")
+            if type(revision) is int and revision >= 0:
+                forwarded["phase_revision"] = revision
         tail = msg.get("tail")
         if isinstance(tail, str):
             forwarded["tail"] = sanitize_terminal_text(tail, single_line=True)[:120]

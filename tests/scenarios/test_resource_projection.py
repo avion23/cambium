@@ -99,20 +99,27 @@ def test_resource_rail_keeps_throughput_and_quota_visible_in_a_short_terminal() 
                 1,
                 "one",
                 usage={"input_tokens": 100, "output_tokens": 20},
+                provider_cache_hit=False,
                 quota_windows=[_window("one", 300)],
             ),
+            {
+                "seq": 2,
+                "kind": "result",
+                "task_id": "one",
+                "payload": {"status": "succeeded"},
+            },
         ]
     )
     rows = _rail_rows(
         snapshot,
         32,
         18,
-        cumulative_line=("usage: calls=4 in=100 out=40 cached=70 out/s=10.0 cost=0"),
+        cumulative_line="usage: calls=4 in=100 out=40 cached=70 out/s=10.0 cost=0",
     )
     text = "\n".join(line for _, line in rows)
     assert "RESOURCES" in text
     assert "out 40 · 10.0 tok/s" in text
-    assert "in 100 · cached 70" in text
+    assert "cache 70% · 70/100 · MISS" in text
     assert "4 calls · est $0" in text
     assert "QUOTA" in text and "700/1000 tokens" in text
     assert len(rows) <= 18

@@ -17,7 +17,8 @@ class FakeServer:
     def __init__(
         self,
         behaviors: list[
-            tuple[int, dict[str, Any], float] | tuple[int, dict[str, Any], float, dict[str, str]]
+            tuple[int, dict[str, Any] | bytes, float]
+            | tuple[int, dict[str, Any] | bytes, float, dict[str, str]]
         ],
         *,
         echo_authorization_in_body: bool = False,
@@ -44,7 +45,9 @@ class FakeServer:
             self.request_headers.append(headers)
             return len(self.calls) - 1
 
-    def behavior_at(self, index: int) -> tuple[int, dict[str, Any], float, dict[str, str]]:
+    def behavior_at(
+        self, index: int
+    ) -> tuple[int, dict[str, Any] | bytes, float, dict[str, str]]:
         behavior = self.behaviors[index] if index < len(self.behaviors) else self.behaviors[-1]
         if len(behavior) == 3:
             status, payload, delay = behavior
@@ -83,7 +86,7 @@ class _Handler(BaseHTTPRequestHandler):
         status, payload, delay, extra_headers = server.behavior_at(index)
         if delay:
             time.sleep(delay)
-        if server.echo_authorization_in_body:
+        if server.echo_authorization_in_body and isinstance(payload, dict):
             error = payload.get("error")
             if isinstance(error, dict):
                 payload = {
@@ -95,12 +98,15 @@ class _Handler(BaseHTTPRequestHandler):
                         ),
                     },
                 }
-        encoded = json.dumps(payload).encode("utf-8")
+        encoded = payload if isinstance(payload, bytes) else json.dumps(payload).encode("utf-8")
+        content_type = extra_headers.get("Content-Type", "application/json")
         try:
             self.send_response(status)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(encoded)))
             for name, value in extra_headers.items():
+                if name.casefold() == "content-type":
+                    continue
                 self.send_header(name, value)
             self.end_headers()
             self.wfile.write(encoded)

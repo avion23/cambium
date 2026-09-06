@@ -1234,6 +1234,17 @@ def test_plan_and_thought_round_trip_through_parser() -> None:
     assert worker._parse_agent_action(
         '{"type":"finish","summary":"done","objective_met":true,"thought":"verified"}'
     ) == {"type": "finish", "summary": "done", "objective_met": True}
+    verbose = worker._parse_agent_action(
+        json.dumps(
+            {
+                "type": "finish",
+                "summary": "Useful result. " + "routine tool narration " * 80,
+                "objective_met": True,
+            }
+        )
+    )["summary"]
+    assert len(verbose.encode("utf-8")) <= worker.MAX_SUMMARY_CHARS
+    assert verbose.endswith("…")
     for bad, match in (
         ('{"type":"tool_call","calls":[]}', "non-empty array"),
         ('{"type":"tool_call","calls":[null]}', "calls\\[0\\] must be an object"),

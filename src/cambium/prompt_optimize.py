@@ -31,6 +31,8 @@ _DIGEST_KEYS = (
     "malformed_actions",
     "tool_failures",
     "children",
+    "user_summary_chars",
+    "user_summary_lines",
 )
 
 
@@ -53,6 +55,11 @@ def _derailment(row: dict[str, Any]) -> list[str]:
         flags.append(f"timeout-shaped: elapsed_s={row.get('elapsed_s')}")
     if row.get("tool_failures"):
         flags.append(f"tool-failures: {row['tool_failures']} failed tool events")
+    if (row.get("user_summary_chars") or 0) > 800 or (row.get("user_summary_lines") or 0) > 6:
+        flags.append(
+            "verbose-user-summary: "
+            f"{row.get('user_summary_chars', 0)} chars / {row.get('user_summary_lines', 0)} lines"
+        )
     return flags or ["none observed"]
 
 
@@ -192,6 +199,40 @@ def _reflection_lm(args: Any, budget: ExperimentBudget) -> Any:
     return CambiumLM(router, selected.tier, budget_usd=args.budget_usd, max_tokens=2048)
 
 
+def _effective_search_evals(
+    requested: int,
+    budget: ExperimentBudget,
+    baseline: list[dict[str, Any]],
+    evaluation_cases: int,
+) -> int:
+    """Reserve measured capacity for validation and held-out evaluation."""
+    if not baseline or evaluation_cases < 1:
+        return requested
+    max_tokens = max(1, max(int(row.get("tokens", 0) or 0) for row in baseline))
+    max_calls = max(1, max(int(row.get("calls", 0) or 0) for row in baseline))
+    cushion = 1.25
+    reserve_tokens = math.ceil(max_tokens * evaluation_cases * cushion)
+    reserve_calls = math.ceil(max_calls * evaluation_cases * cushion)
+    token_headroom = budget.max_tokens - budget.tokens - reserve_tokens
+    call_headroom = budget.max_calls - budget.calls - reserve_calls
+    if token_headroom <= 0 or call_headroom <= 0:
+        raise ExperimentBudgetExceeded("budget cannot cover GEPA search plus final evaluation")
+    token_evals = token_headroom // math.ceil(max_tokens * cushion)
+    call_evals = call_headroom // math.ceil(max_calls * cushion)
+    limits = [requested, token_evals, call_evals]
+    max_cost = max(float(row.get("cost_usd", 0.0) or 0.0) for row in baseline)
+    if max_cost > 0:
+        reserve_cost = max_cost * evaluation_cases * cushion
+        cost_headroom = budget.max_usd - budget.cost_usd - reserve_cost
+        if cost_headroom <= 0:
+            raise ExperimentBudgetExceeded("cash budget cannot cover final GEPA evaluation")
+        limits.append(int(cost_headroom // (max_cost * cushion)))
+    effective = min(limits)
+    if effective < 1:
+        raise ExperimentBudgetExceeded("budget leaves no GEPA search call after evaluation reserve")
+    return int(effective)
+
+
 def run(args: Any) -> int:
     """Run a benchmark or hill climb; publish winners for new sessions by default."""
     dataset = args.dataset or Path(__file__).with_name("benchmarks") / "prompts.jsonl"
@@ -268,11 +309,18 @@ def run(args: Any) -> int:
             if not all(splits.values()):
                 raise ValueError("GEPA needs disjoint train, val and test cases")
             baseline = [rollout(c, policy) for c in splits["val"]]
+            effective_max_evals = _effective_search_evals(
+                args.max_evals,
+                budget,
+                baseline,
+                len(splits["val"]) + len(splits["test"]),
+            )
+            report["effective_max_evals"] = effective_max_evals
             student = make_program(args.component, policy, rollout)
             optimizer = dspy.GEPA(
                 metric=metric,
                 reflection_lm=_reflection_lm(args, budget),
-                max_metric_calls=args.max_evals,
+                max_metric_calls=effective_max_evals,
                 reflection_minibatch_size=1,
                 candidate_selection_strategy="current_best",
                 use_merge=False,
