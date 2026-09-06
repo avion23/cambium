@@ -132,8 +132,8 @@ Focused documents:
   — durable interactive turns, reconnect, and replay.
 - [`docs/architecture/events.md`](docs/architecture/events.md) — event-kind
   glossary for the durable event store.
-- [`docs/reference/agent-state.md`](docs/reference/agent-state.md) — branch
-  state inspection and proposed state shapes.
+- [`docs/reference/agent-state.md`](docs/reference/agent-state.md) — shared
+  `BranchState`/`SituationFrame` inspection and remaining state proposals.
 - [`docs/how-to/agent-driving-loop.md`](docs/how-to/agent-driving-loop.md) —
   driving sessions from another coding agent.
 - [`docs/research/agent-system-evaluation.md`](docs/research/agent-system-evaluation.md)
