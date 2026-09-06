@@ -1,4 +1,5 @@
 """GEPA over real Cambium rollouts, with automatic plain-text deployment."""
+
 from __future__ import annotations
 
 import json
@@ -10,7 +11,62 @@ from statistics import mean
 from typing import Any
 
 from .benchmark import ExperimentBudget, ExperimentBudgetExceeded, load_cases, run_case
-from .prompts import load_policy, prompt_path, save_policy
+from .prompts import coding_prompt, load_policy, prompt_path, save_policy
+
+_FEEDBACK_CHARS = 6000
+_PROMPT_CHARS = 3500
+_DIGEST_KEYS = (
+    "passed",
+    "score",
+    "elapsed_s",
+    "calls",
+    "tokens",
+    "malformed_actions",
+    "tool_failures",
+    "children",
+)
+
+
+def _bounded(text: str, cap: int, label: str) -> str:
+    if len(text) <= cap:
+        return text
+    suffix = f"\n[{label} truncated: +~{len(text) - cap} chars]"
+    return text[: cap - len(suffix)] + suffix
+
+
+def _derailment(row: dict[str, Any]) -> list[str]:
+    """Name where the rollout derailed so reflection proposals are not blind."""
+    feedback = str(row.get("feedback", ""))
+    flags = []
+    if row.get("malformed_actions"):
+        flags.append(f"malformed-heavy: {row['malformed_actions']} invalid_action logs")
+    if not row.get("passed") and "check=False" in feedback:
+        flags.append("check-failed: acceptance command failed")
+    if "wall budget exhausted" in feedback:
+        flags.append(f"timeout-shaped: elapsed_s={row.get('elapsed_s')}")
+    if row.get("tool_failures"):
+        flags.append(f"tool-failures: {row['tool_failures']} failed tool events")
+    return flags or ["none observed"]
+
+
+def grounded_feedback(selected: dict[str, str], row: dict[str, Any]) -> str:
+    """Ground reflection in what the model saw: rendered prompt, digest, raw row."""
+    return _bounded(
+        "\n\n".join(
+            (
+                "<rendered-production-prompt>\n"
+                + _bounded(coding_prompt(selected), _PROMPT_CHARS, "rendered prompt"),
+                "<trajectory-digest>\n"
+                + json.dumps(
+                    {key: row.get(key) for key in _DIGEST_KEYS} | {"derailment": _derailment(row)},
+                    ensure_ascii=False,
+                ),
+                "<raw-row>\n" + json.dumps(row, ensure_ascii=False),
+            )
+        ),
+        _FEEDBACK_CHARS,
+        "feedback",
+    )
 
 
 def make_program(component: str, policy: dict[str, str], runner: Any) -> Any:
@@ -19,17 +75,22 @@ def make_program(component: str, policy: dict[str, str], runner: Any) -> Any:
 
     class Rollout(dspy.Predict):
         def __init__(self) -> None:
-            super().__init__(dspy.Signature(
-                "case: dict -> report: str, score: float", instructions=policy[component],
-            ))
+            super().__init__(
+                dspy.Signature(
+                    "case: dict -> report: str, score: float",
+                    instructions=policy[component],
+                )
+            )
 
         def forward(self, **kwargs: Any) -> Any:
             case = kwargs["case"]
             selected = {**policy, component: self.signature.instructions}
             row = runner(case, selected)
-            report = json.dumps(row, ensure_ascii=False)
+            report = grounded_feedback(selected, row)
             return self._forward_postprocess(
-                [{"report": report, "score": row["score"]}], self.signature, case=case,
+                [{"report": report, "score": row["score"]}],
+                self.signature,
+                case=case,
             )
 
     class Program(dspy.Module):
@@ -44,7 +105,11 @@ def make_program(component: str, policy: dict[str, str], runner: Any) -> Any:
 
 
 def metric(
-    gold: Any, pred: Any, trace: Any = None, pred_name: Any = None, pred_trace: Any = None,
+    gold: Any,
+    pred: Any,
+    trace: Any = None,
+    pred_name: Any = None,
+    pred_trace: Any = None,
 ) -> Any:
     import dspy
 
@@ -59,7 +124,8 @@ def _reflection_lm(args: Any, budget: ExperimentBudget) -> Any:
     from .provider_config import AuthMode, load_providers, select_provider
 
     resolved, environment = _resolve_provider(
-        OneShotConfig(provider=args.reflection_provider or args.provider), Path.cwd(),
+        OneShotConfig(provider=args.reflection_provider or args.provider),
+        Path.cwd(),
     )
     providers = [
         replace(p, api_key=environment.get(p.api_key_env, p.api_key))
@@ -67,7 +133,8 @@ def _reflection_lm(args: Any, budget: ExperimentBudget) -> Any:
         if p.name in resolved.authorized_providers
     ]
     selected = select_provider(
-        providers, name=resolved.assigned_provider,
+        providers,
+        name=resolved.assigned_provider,
         tier=ProviderTier(args.tier) if resolved.assigned_provider is None else None,
     )
     options: dict[str, Any] = {"primary_provider": selected.name}
@@ -107,28 +174,47 @@ def run(args: Any) -> int:
     if not selected_cases:
         raise ValueError("no benchmark cases selected")
     if args.dry_run:
-        print(json.dumps({
-            "optimizer": args.optimizer, "component": args.component,
-            "cases": [{"id": c["id"], "split": c["split"]} for c in selected_cases],
-            "deploy": not args.no_deploy and args.optimizer == "gepa",
-            "prompt_file": str(prompt_path()), "output": str(output),
-            "max_evals": args.max_evals, "max_calls": args.max_calls,
-            "max_tokens": args.max_tokens,
-        }, indent=2))
+        print(
+            json.dumps(
+                {
+                    "optimizer": args.optimizer,
+                    "component": args.component,
+                    "cases": [{"id": c["id"], "split": c["split"]} for c in selected_cases],
+                    "deploy": not args.no_deploy and args.optimizer == "gepa",
+                    "prompt_file": str(prompt_path()),
+                    "output": str(output),
+                    "max_evals": args.max_evals,
+                    "max_calls": args.max_calls,
+                    "max_tokens": args.max_tokens,
+                },
+                indent=2,
+            )
+        )
         return 0
     budget = ExperimentBudget(args.max_calls, args.max_tokens, args.budget_usd)
 
     def rollout(case: dict, candidate: dict) -> dict:
         row = run_case(
-            case, candidate, output=output, budget=budget, provider=args.provider,
-            max_turns=args.max_turns, max_wall_s=args.max_wall_s, max_workers=args.max_workers,
+            case,
+            candidate,
+            output=output,
+            budget=budget,
+            provider=args.provider,
+            max_turns=args.max_turns,
+            max_wall_s=args.max_wall_s,
+            max_workers=args.max_workers,
         )
-        print(f"{case['id']}: {'pass' if row['passed'] else 'FAIL'} "
-              f"{row['elapsed_s']}s {row['calls']} calls {row['tokens']} tokens", file=sys.stderr)
+        print(
+            f"{case['id']}: {'pass' if row['passed'] else 'FAIL'} "
+            f"{row['elapsed_s']}s {row['calls']} calls {row['tokens']} tokens",
+            file=sys.stderr,
+        )
         return row
 
     report: dict[str, Any] = {
-        "optimizer": args.optimizer, "component": args.component, "deployed": False,
+        "optimizer": args.optimizer,
+        "component": args.component,
+        "deployed": False,
     }
     code = 0
     try:
@@ -146,10 +232,16 @@ def run(args: Any) -> int:
             baseline = [rollout(c, policy) for c in splits["val"]]
             student = make_program(args.component, policy, rollout)
             optimizer = dspy.GEPA(
-                metric=metric, reflection_lm=_reflection_lm(args, budget),
-                max_metric_calls=args.max_evals, reflection_minibatch_size=1,
-                candidate_selection_strategy="current_best", use_merge=False,
-                num_threads=1, seed=args.seed, track_stats=True, skip_perfect_score=False,
+                metric=metric,
+                reflection_lm=_reflection_lm(args, budget),
+                max_metric_calls=args.max_evals,
+                reflection_minibatch_size=1,
+                candidate_selection_strategy="current_best",
+                use_merge=False,
+                num_threads=1,
+                seed=args.seed,
+                track_stats=True,
+                skip_perfect_score=False,
             )
             compiled = optimizer.compile(
                 student,
@@ -167,7 +259,10 @@ def run(args: Any) -> int:
             )
             save_policy(winner, output / "candidate.json")
             report.update(
-                baseline=baseline, validation=comparison, test=held_out, improved=improved,
+                baseline=baseline,
+                validation=comparison,
+                test=held_out,
+                improved=improved,
             )
             if improved and not args.no_deploy:
                 report.update(deployed=True, prompt_file=str(save_policy(winner)))
@@ -177,11 +272,20 @@ def run(args: Any) -> int:
     finally:
         output.mkdir(parents=True, exist_ok=True)
         report.update(
-            calls=budget.calls, tokens=budget.tokens, cost_usd=budget.cost_usd, runs=budget.rows,
+            calls=budget.calls,
+            tokens=budget.tokens,
+            cost_usd=budget.cost_usd,
+            runs=budget.rows,
         )
         (output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
-    print(json.dumps({
-        key: value for key, value in {**report, "report": str(output / "report.json")}.items()
-        if key not in {"runs", "baseline", "validation", "test"}
-    }, indent=2))
+    print(
+        json.dumps(
+            {
+                key: value
+                for key, value in {**report, "report": str(output / "report.json")}.items()
+                if key not in {"runs", "baseline", "validation", "test"}
+            },
+            indent=2,
+        )
+    )
     return code
