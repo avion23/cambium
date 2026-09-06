@@ -1056,6 +1056,19 @@ def _read_provider_response(response: Any, provider: str) -> bytes:
     return body
 
 
+def _notify_observer(
+    callback: Callable[[Mapping[str, Any]], None] | None,
+    event: Mapping[str, Any],
+) -> None:
+    """Keep read-only progress observers outside provider call correctness."""
+    if callback is None:
+        return
+    try:
+        callback(event)
+    except Exception:
+        pass
+
+
 def _read_provider_sse(
     response: Any,
     provider: str,
@@ -1082,11 +1095,7 @@ def _read_provider_sse(
         if not isinstance(value, dict):
             return
         events.append(value)
-        if on_event is not None:
-            try:
-                on_event(value)
-            except Exception:
-                pass  # Observability must not turn a valid provider response into failure.
+        _notify_observer(on_event, value)
 
     while True:
         chunk = cast(bytes, reader(min(16 * 1024, MAX_PROVIDER_RESPONSE_BYTES + 1 - len(body))))
@@ -2784,14 +2793,14 @@ class Diffundo:
             pending = list(candidates)
             while pending:
                 provider = pending.pop(0)
-                if on_status is not None:
-                    on_status(
-                        {
-                            "kind": "provider_attempt",
-                            "provider": provider.name,
-                            "model": provider.model,
-                        }
-                    )
+                _notify_observer(
+                    on_status,
+                    {
+                        "kind": "provider_attempt",
+                        "provider": provider.name,
+                        "model": provider.model,
+                    },
+                )
                 try:
                     attempt_deadline = min(
                         deadline,
@@ -2802,16 +2811,16 @@ class Diffundo:
                         provider, prompt, deadline=attempt_deadline, on_delta=on_delta
                     )
                 except ProviderError as exc:
-                    if on_status is not None:
-                        on_status(
-                            {
-                                "kind": "provider_failed",
-                                "provider": provider.name,
-                                "model": provider.model,
-                                "outcome": exc.outcome.value,
-                                "retry_after_s": exc.retry_after_s,
-                            }
-                        )
+                    _notify_observer(
+                        on_status,
+                        {
+                            "kind": "provider_failed",
+                            "provider": provider.name,
+                            "model": provider.model,
+                            "outcome": exc.outcome.value,
+                            "retry_after_s": exc.retry_after_s,
+                        },
+                    )
                     if exc.probe_already_in_flight:
                         probe_rejected = True
                         continue
@@ -2862,15 +2871,15 @@ class Diffundo:
                         raise AllProvidersFailed(tried, last_error) from exc
                     continue
                 self._record_provider_success()
-                if on_status is not None:
-                    on_status(
-                        {
-                            "kind": "provider_succeeded",
-                            "provider": result.provider,
-                            "model": result.model,
-                            "provider_cache_hit": result.provider_cache_hit,
-                        }
-                    )
+                _notify_observer(
+                    on_status,
+                    {
+                        "kind": "provider_succeeded",
+                        "provider": result.provider,
+                        "model": result.model,
+                        "provider_cache_hit": result.provider_cache_hit,
+                    },
+                )
                 if budget_usd is not None and result.estimated_cost_usd > budget_usd:
                     raise CostBudgetExceeded(result.provider, result.estimated_cost_usd, budget_usd)
                 self._primary_provider = provider.name

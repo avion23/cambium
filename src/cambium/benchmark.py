@@ -68,9 +68,8 @@ def json_finite(value: Any) -> Any:
     Provider-reported numbers can be non-finite (an ``inf`` ``estimated_cost_usd``
     genuinely accumulates into ``budget.cost_usd``; nan/-inf are clamped to 0.0
     by ``ExperimentBudget.record``), which ``json.dumps(allow_nan=False)``
-    rejects and strict readers refuse.  Dicts and lists (nested) are rebuilt;
-    ints, strings including numeric strings, bools, and None pass through.
-    Report payloads are JSON-loaded or literal, so keys are always strings.
+    rejects and strict readers refuse. Dicts and lists are rebuilt; ordinary
+    JSON scalars pass through unchanged.
     """
     if isinstance(value, float):
         return value if math.isfinite(value) else 0.0
@@ -83,8 +82,10 @@ def json_finite(value: Any) -> Any:
 
 def write_json_report(path: Path, payload: Any) -> None:
     """Write an experiment report as strict JSON; non-finite floats become 0.0."""
-    text = json.dumps(json_finite(payload), indent=2, allow_nan=False) + "\n"
-    path.write_text(text, encoding="utf-8")
+    path.write_text(
+        json.dumps(json_finite(payload), indent=2, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
 
 
 def load_cases(path: Path) -> list[dict[str, Any]]:
@@ -172,7 +173,7 @@ def _peak_pending_children(events: list[dict]) -> int:
 
 
 def _breaker_strike(event: dict) -> bool:
-    """True when the supervisor logged the agent loop's final invalid-action strike."""
+    """Return whether the agent loop has already decided this rollout failed."""
     if event.get("kind") != "log":
         return False
     message = event.get("payload", {}).get("message")
@@ -184,25 +185,25 @@ def _breaker_strike(event: dict) -> bool:
 
 
 def _case_provider_pool(resolved: Any, case: dict) -> Any:
-    """Restrict one case's resolved provider to its declared credential-ready pool."""
+    """Restrict one benchmark case to its declared credential-ready providers."""
     if not case.get("providers"):
         return resolved
     from .provider_config import load_providers
 
     names = set(case["providers"])
     available = [
-        p
-        for p in load_providers(resolved.provider_config_path)
-        if p.name in names and p.name in resolved.authorized_providers
+        provider
+        for provider in load_providers(resolved.provider_config_path)
+        if provider.name in names and provider.name in resolved.authorized_providers
     ]
-    if {p.name for p in available} != names:
+    if {provider.name for provider in available} != names:
         raise ValueError("benchmark provider pool is not credential-ready")
     if resolved.assigned_provider and resolved.assigned_provider not in names:
         raise ValueError("benchmark primary provider is outside its provider pool")
     return replace(
         resolved,
-        authorized_providers=tuple(p.name for p in available),
-        model_candidates=tuple(sorted({p.model for p in available})),
+        authorized_providers=tuple(provider.name for provider in available),
+        model_candidates=tuple(sorted({provider.model for provider in available})),
     )
 
 
@@ -248,12 +249,8 @@ def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact che
             nonlocal abort_reason
             events.append(event)
             if abort_reason is None and _breaker_strike(event):
-                # The agent-loop breaker has decided this rollout FAILED: the
-                # worker returns failed immediately and no later result can
-                # un-fail the plan (any non-succeeded task forces exit 1).
-                # Cancel like the budget path below instead of burning provider
-                # calls to the wall; the verdict fields, including the breaker
-                # reason, are unchanged.
+                # The worker has already decided the rollout failed. Cancel the
+                # remaining harness work instead of burning provider quota.
                 abort_reason = (
                     f"agent emitted {MAX_CONSECUTIVE_INVALID_ACTIONS} consecutive invalid actions"
                 )

@@ -1996,7 +1996,8 @@ _LENIENT_ACTION_DECODER = json.JSONDecoder(strict=False)
 def _repair_tool_batch_closer(text: str) -> tuple[Any, int] | None:
     """Normalize one observed provider typo without guessing action semantics."""
     if not (
-        text.startswith('{"type":"tool_call","calls":[') or text.startswith('{"calls":[')
+        text.startswith('{"type":"tool_call","calls":[')
+        or text.startswith('{"calls":[')
     ) or not text.endswith("}]}]}"):
         return None
     repaired = text[:-5] + "}}]}"

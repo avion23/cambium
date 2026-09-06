@@ -664,6 +664,7 @@ def test_status_phase_palette_follows_activity_state(
 
 
 def test_256_color_palette_keeps_semantic_states_distinct() -> None:
+    assert "38;5;" in "\n".join(render_markdown_lines("# heading", 36, color=256))
     assert tui_screen._status_paint("THINKING", "magenta", 256) == (
         f"{tui_screen._VIOLET}THINKING{tui_screen._RESET}"
     )

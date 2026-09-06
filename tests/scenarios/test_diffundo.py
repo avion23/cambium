@@ -187,13 +187,19 @@ def test_chat_completions_stream_reasoning_output_and_usage_live() -> None:
     router = Diffundo((_config("p_stream", server, "K_STREAM", model="m-stream"),))
     deltas: list[tuple[str, str]] = []
     statuses: list[dict[str, Any]] = []
+
+    def status_callback(event: dict[str, Any]) -> None:
+        statuses.append(dict(event))
+        if event.get("kind") == "provider_succeeded":
+            raise RuntimeError("display failure must not fail a provider call")
+
     try:
         result = asyncio.run(
             router.call(
                 ProviderTier.FAST,
                 PROMPT,
                 on_delta=lambda phase, text: deltas.append((phase, text)),
-                on_status=lambda event: statuses.append(dict(event)),
+                on_status=status_callback,
             )
         )
         assert result.content == '{"type":"finish","summary":"ok","objective_met":true}'

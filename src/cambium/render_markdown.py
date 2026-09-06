@@ -15,6 +15,7 @@ from rich.markdown import BlockQuote, CodeBlock, Heading, Markdown
 from rich.padding import Padding
 from rich.panel import Panel
 from rich.segment import Segment
+from rich.style import Style
 from rich.syntax import Syntax
 from rich.theme import Theme
 
@@ -109,6 +110,35 @@ def _rich_color_system(depth: int) -> tuple[str | None, ColorSystem | None]:
     return None, None
 
 
+_STYLE_ATTRIBUTES = (
+    "bold",
+    "dim",
+    "italic",
+    "underline",
+    "blink",
+    "blink2",
+    "reverse",
+    "conceal",
+    "strike",
+    "underline2",
+    "frame",
+    "encircle",
+    "overline",
+)
+
+
+def _render_style(style: Style, text: str, color_system: ColorSystem) -> str:
+    """Encode a semantic Rich style without reusing its process-global ANSI cache."""
+    fresh = Style(
+        color=style.color,
+        bgcolor=style.bgcolor,
+        link=style.link,
+        meta=style.meta,
+        **{name: getattr(style, name) for name in _STYLE_ATTRIBUTES},
+    )
+    return fresh.render(text, color_system=color_system)
+
+
 def render_markdown_lines(text: str, *, width: int, color_depth: int = 16) -> list[str]:
     """Render sanitized Markdown to terminal lines without a pager or subprocess."""
     color_name, color_system = _rich_color_system(color_depth)
@@ -135,7 +165,7 @@ def render_markdown_lines(text: str, *, width: int, color_depth: int = 16) -> li
         parts: list[str] = []
         for segment in segments:
             if color_system is not None and segment.style:
-                parts.append(segment.style.render(segment.text, color_system=color_system))
+                parts.append(_render_style(segment.style, segment.text, color_system))
             else:
                 parts.append(segment.text)
         lines.append("".join(parts))

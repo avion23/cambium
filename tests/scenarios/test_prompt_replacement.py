@@ -125,8 +125,6 @@ def test_tripped_breaker_aborts_dead_rollout_promptly_with_identical_verdict(tmp
                     "payload": {"message": f"invalid_action: bad JSON (strike {strike})"},
                 }
             )
-        # The abort must land here. The usage event after this await models the
-        # waste a dead rollout used to burn until the wall budget.
         await asyncio.sleep(0.05)
         if on_event is not None:
             on_event(usage)
@@ -152,21 +150,29 @@ def test_tripped_breaker_aborts_dead_rollout_promptly_with_identical_verdict(tmp
         budget=ExperimentBudget(10, 1000, 1),
         max_wall_s=60,
     )
-    # Verdict fields identical to the would-be-timeout FAIL.
     assert not row["passed"]
     assert row["score"] == 0.0
     assert row["feedback"].startswith("exit=1; ")
     assert "check=True" in row["feedback"]
     assert row["head"] == row["base"]
-    # The breaker reason is preserved, not replaced by a wall or budget message.
     assert "agent emitted 3 consecutive invalid actions" in row["feedback"]
     assert "rollout wall budget exhausted" not in row["feedback"]
     assert "experiment budget exhausted" not in row["feedback"]
-    # Prompt abort: bounded elapsed/calls/tokens instead of burning to the wall.
     assert row["elapsed_s"] < 30
     assert row["calls"] == 1
     assert row["tokens"] == 10
     assert json.loads((Path(row["directory"]) / "report.json").read_text()) == row
+
+
+def test_gepa_metric_scores_malformed_prediction_zero() -> None:
+    from types import SimpleNamespace
+
+    pytest.importorskip("dspy")
+    from cambium import prompt_optimize
+
+    assert prompt_optimize.metric(None, SimpleNamespace(report="missing score")).score == 0.0
+    malformed = SimpleNamespace(score="bad", report="bad score")
+    assert prompt_optimize.metric(None, malformed).score == 0.0
 
 
 def test_gepa_reflection_feedback_is_grounded_in_rendered_prompt_and_trajectory() -> None:

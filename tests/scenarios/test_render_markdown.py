@@ -78,6 +78,7 @@ def test_disabled_color_returns_sanitized_plain_markdown(
 
 
 def test_renderer_uses_extended_palette_without_backgrounds(monkeypatch) -> None:
+    render_markdown("# standard first", width=60, color_depth=16)
     monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.delenv("COLORTERM", raising=False)
     monkeypatch.setenv("TERM", "xterm-256color")
