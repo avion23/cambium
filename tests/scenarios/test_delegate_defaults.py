@@ -50,6 +50,23 @@ def test_minimal_delegate_inherits_execution_without_pinning_spread(tmp_path: Pa
     assert exact["assigned_provider"] == "a"
 
 
+@pytest.mark.parametrize(
+    ("spec", "message"),
+    [
+        ({"context_mode": "fresh", "placement": "spread"}, "missing 'spec.task'"),
+        ({"task": "inspect", "max_turns": 0}, "spec.max_turns"),
+        ({"task": "inspect", "max_wall_s": 0}, "spec.max_wall_s"),
+    ],
+)
+def test_delegate_rejects_missing_workload_and_invalid_budgets(spec: dict, message: str) -> None:
+    schema = next(item for item in TOOL_SCHEMAS if item["name"] == "delegate")
+    errors = validate_tool_call(
+        schema,
+        {"child_task_id": "child", "kind": "investigation", "spec": spec},
+    )
+    assert len(errors) == 1 and message in errors[0]
+
+
 def test_child_path_cannot_escape_session(tmp_path: Path) -> None:
     parent = {
         "task_id": "root",

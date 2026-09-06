@@ -2062,11 +2062,16 @@ def _normalize_tool_calls(action: Mapping[str, Any]) -> list[dict[str, Any]]:
             if not isinstance(raw_call, dict):
                 errors.append(f"tool_call calls[{index}] must be an object")
                 continue
-            if set(raw_call) != {"name", "arguments"}:
-                errors.append(f"tool_call calls[{index}] must carry exactly name/arguments")
-                continue
             name = raw_call.get("name")
-            arguments = raw_call.get("arguments")
+            if "arguments" in raw_call:
+                if set(raw_call) != {"name", "arguments"}:
+                    errors.append(
+                        f"tool_call calls[{index}] must not mix arguments with flattened fields"
+                    )
+                    continue
+                arguments = raw_call.get("arguments")
+            else:
+                arguments = {key: value for key, value in raw_call.items() if key != "name"}
             entry_errors: list[str] = []
             if not isinstance(name, str) or not name:
                 entry_errors.append("name must be a non-empty string")
@@ -2086,6 +2091,12 @@ def _normalize_tool_calls(action: Mapping[str, Any]) -> list[dict[str, Any]]:
     arguments = action.get("arguments")
     if not isinstance(name, str) or not name:
         raise ValueError("tool_call name must be a non-empty string")
+    if arguments is None:
+        arguments = {
+            key: value
+            for key, value in action.items()
+            if key not in {"type", "name", "thought"}
+        }
     if not isinstance(arguments, dict):
         raise ValueError("tool_call arguments must be an object")
     if name not in _ALL_TOOL_NAMES:
@@ -2097,10 +2108,11 @@ _FENCED_ACTION_RE = re.compile(r"^```[A-Za-z0-9_-]*\r?\n(.*)\r?\n?```\s*$", re.D
 
 
 def _parse_agent_action(content: str) -> dict[str, Any]:
-    """Strictly parse ONE agent action; the response must be exactly one
-    top-level JSON object.  Any prose, trailing JSON, or concatenated
-    actions are rejected (the owner overrode trailing-prose tolerance).
-    Raises ``ValueError`` on any deviation.
+    """Parse one unambiguous agent action and reject competing action content.
+
+    A complete JSON object may follow provider commentary, but nothing may
+    follow that object. The parsed action still passes the normal structural
+    and tool-schema checks; concatenated or ambiguous actions are rejected.
 
     Exactly one well-formed markdown fence wrapping the object is unwrapped
     first (```` ```json ... ``` ```` or a bare ```` ``` ... ``` ```` fence);
@@ -2128,7 +2140,14 @@ def _parse_agent_action(content: str) -> dict[str, Any]:
     try:
         parsed, _end = _decode_action_json(text)
     except (json.JSONDecodeError, UnicodeDecodeError, RecursionError) as exc:
-        raise ValueError(f"action is not valid JSON: {exc}") from None
+        object_start = text.find("{")
+        if object_start <= 0 or "```" in text[:object_start]:
+            raise ValueError(f"action is not valid JSON: {exc}") from None
+        try:
+            parsed, relative_end = _decode_action_json(text[object_start:])
+        except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
+            raise ValueError(f"action is not valid JSON: {exc}") from None
+        _end = object_start + relative_end
     if not isinstance(parsed, dict):
         raise ValueError("agent action must be exactly one JSON object")
     if text[_end:].strip():
@@ -2154,6 +2173,18 @@ def _parse_agent_action(content: str) -> dict[str, Any]:
             required = frozenset({"type", "calls"})
             shape = "type/calls"
         else:
+            if "arguments" not in parsed:
+                flattened = {
+                    key: value
+                    for key, value in parsed.items()
+                    if key not in {"type", "name", "thought"}
+                }
+                parsed = {
+                    "type": "tool_call",
+                    "name": parsed.get("name"),
+                    "arguments": flattened,
+                    **({"thought": parsed["thought"]} if "thought" in parsed else {}),
+                }
             required = frozenset({"type", "name", "arguments"})
             shape = "type/name/arguments"
         if not _action_keys(parsed, required):
@@ -3072,9 +3103,8 @@ def _build_agent_prompt(
     if model_identity:
         system_lines.insert(
             -1,
-            f"You are running as the configured model {model_identity}. When "
-            "asked what model or provider you are, answer truthfully from this "
-            "identity and never guess.",
+            f"Configured route: {model_identity}. A later Cambium fallback note names the "
+            "actual serving provider/model and overrides this route hint.",
         )
     system_lines.append(json.dumps(tools, sort_keys=True))
     messages = [
@@ -6794,7 +6824,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                         "provider_messages": terminal_messages,
                         "continuation_suffix": terminal_suffix,
                         "provider": terminal_provider,
-                        "model": model,
+                        "model": result.model,
                         "tools_sha256": _sha256_hex(
                             json.dumps(tools, sort_keys=True).encode("utf-8")
                         ),

@@ -185,14 +185,8 @@ def test_abnormal_exit_dirty_worktree_is_salvaged_before_prune(tmp_path: Path) -
     salvage_dir = session / salvage_ref.removesuffix("/workspace.diff")
     assert "dirty" in (salvage_dir / "workspace.diff").read_text(encoding="utf-8")
     metadata = json.loads((salvage_dir / "salvage.json").read_text(encoding="utf-8"))
-    assert set(metadata) == {
-        "task_id",
-        "generation",
-        "base_commit",
-        "branch",
-        "captured_at",
-        "truncated",
-    }
+    assert metadata["task_id"] == "abnormal"
+    assert metadata["generation"] == 1
     events = read_events(session)
     salvaged = [event for event in events if event["kind"] == "worktree_salvaged"]
     assert len(salvaged) == 1

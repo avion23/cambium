@@ -473,3 +473,78 @@ narrow parser rule; arbitrary malformed JSON remains rejected. The focused live
 CLI rerun passed with zero invalid-action logs. The final TUI acceptance also
 passed and its capture showed Codex-to-ZAI fallback, provider-owned thinking and
 streaming phases, cache state, tool activity, and the CAST H/S/R block strip.
+
+## Latest GEPA and test-harness audit — September 6
+
+The later `.cambium/gepa-summary-1` experiment spent **318 calls and 1,686,885
+reported tokens** but its baseline and validation cases made **zero semantic
+summary calls**. The selected component therefore had no causal path to those
+validation outcomes. GEPA proposed the unrelated summary policy `Given the
+fields case, produce the fields report, score`; `improved=false` and
+`deployed=false` prevented promotion. Prompt optimization now records
+`summary_calls` in reflection feedback and refuses summary search after the
+validation baseline when no validation rollout exercised that component.
+
+`.cambium/gepa-coding-2` contains 17 task reports but no top-level report. It is
+an interrupted experiment, not a completed comparison. The retained rows show
+mixed parallel-task outcomes. `.cambium/gepa-coding-3` completed but failed its
+held-out condition and likewise did not deploy. The current benchmark corpus has
+11 cases; three newer validation cases cover strict finish output, compacted fact
+retention, and parallel derivations.
+
+A test audit removed interface/presence checks that merely pinned exact dict key
+sets, helper exception plumbing, help text, source syntax already enforced by
+Python/Ruff, or duplicated config/cache normalization. Security, redaction,
+process-hang, malformed-input, publication, history, quota, child isolation and
+real effect checks remain. Optimizer scenarios retain actual DSPy execution,
+boolean score semantics, jlens request caching, budget behavior and deployment.
+
+The newer coding GEPA run exposed an exact-continuation defect in
+`calibration-memory`. A turn served by ZAI/GLM-5.3 wrote its terminal epoch with
+the originally requested `gpt-5.6-luna` model. The next turn therefore rejected
+the exact checkpoint as a model mismatch and started without the first-turn
+calibration values. Terminal epochs now use the serving result model. The same
+trace also showed that the stable prompt called the configured route the running
+model even after fallback; operator/provider events remain the authority for the
+actual serving lane.
+
+Malformed-action replay over the coding-GEPA checkpoints found 17 unique failed
+assistant responses available in completed checkpoints. With the current parser,
+13/17 (76.5%) are accepted without another provider call: five had harmless
+leading commentary before one complete JSON action, four flattened tool
+arguments beside `name`, and four matched the already-observed batch closer
+repair. Competing/trailing actions and ambiguous malformed JSON remain rejected.
+
+A parallel strict-JSON change correctly identified that experiment reports must
+not contain `NaN`/`Infinity`, but mapped non-finite numbers to `0.0`. That would
+turn invalid evidence into a plausible zero-cost/zero-value observation. The
+integrated path instead rejects non-finite token/cost accounting and writes
+reports with `allow_nan=False`.
+
+The operator's `.cambium/gepa-coding-4` run ended at the experiment token limit:
+**421 calls / 2,003,121 reported tokens**, `deployed=false`, with no completed
+candidate comparison. Its retained 35 rollout rows were 27 pass / 8 fail and
+contained 100 malformed actions plus 19 failed tool events. In particular,
+`calibration-memory` passed only 2/5 and `parallel-derive` 2/5. Those outcomes
+cannot be treated as clean prompt evidence because the run used the pre-fix
+exact-continuation path described above. A fresh `calibration-memory` baseline
+after the cache-model fix passed in 14.153 seconds, five calls and 17,504 tokens.
+
+A second semantic-boundary bug appeared while constructing a summary-specific
+benchmark. A new interactive turn copied epoch 1 into its checkpoint directory,
+but the new supervisor runtime started `_task_epochs` empty. The worker emitted
+epoch 2 after a successful semantic fold; the supervisor rejected it as a stale
+transition, then rejected the semantic child because it had no current parent
+epoch. The supervisor now validates and seeds its current epoch from the imported
+`context_fork` before the worker runs. A dedicated `summary-transfer-val` run
+then passed with one semantic+spread child, exactly one summary call, zero
+malformed actions and zero tool failures in 105.507 seconds / 13 calls / 53,613
+tokens. Coding and summary GEPA now use separate corpora so validation exercises
+the policy component being optimized.
+
+The systematic test pass deleted seven redundant scenario files and collapsed
+large port/optimizer/conformance suites into effect-oriented coverage. Against
+the rebased `main` baseline, tests are 1,337 net lines smaller. The complete
+non-acceptance suite passes 1,869 tests, and the real CLI/TUI frontend pair passes
+2/2. Exact dict layouts, help text, source-syntax self-tests and tests of tests
+were removed where an effect or trust-boundary check already owns the behavior.

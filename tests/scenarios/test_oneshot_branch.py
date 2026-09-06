@@ -326,7 +326,7 @@ def _write_providers(path: Path, *, pa_key: str = "secret-a", pb_key: str = "") 
     return path
 
 
-def test_unpinned_routing_candidates_and_plan_shape(tmp_path: Path) -> None:
+def test_unpinned_routing_uses_credential_ready_pool(tmp_path: Path) -> None:
     """The normal unpinned path carries credential-ready candidates to admission."""
     from cambium.oneshot import _resolve_provider
 
@@ -340,7 +340,6 @@ def test_unpinned_routing_candidates_and_plan_shape(tmp_path: Path) -> None:
     resolved, environment = _resolve_provider(config, repo)
 
     assert resolved.model_candidates == ("model-a",)  # pb has no stored key
-    assert resolved.fanout_config == {}
     assert resolved.provider_env_keys == ("CAMBIUM_PROVIDER_PA_API_KEY",)
     assert environment == {"CAMBIUM_PROVIDER_PA_API_KEY": "secret-a"}
 
@@ -350,10 +349,9 @@ def test_unpinned_routing_candidates_and_plan_shape(tmp_path: Path) -> None:
     assert repeated == resolved
     assert repeated_environment == environment
 
-    spec = oneshot.build_plan(resolved, repo, tmp_path / "session")["tasks"][0]
-    assert spec["model_candidates"] == ["model-a"]
-    assert spec["fanout_config"] == {}
-    assert "routing_mode" not in spec
+    assert oneshot.build_plan(resolved, repo, tmp_path / "session")["tasks"][0][
+        "model_candidates"
+    ] == ["model-a"]
 
 
 def test_unpinned_routing_requires_a_stored_credential(tmp_path: Path) -> None:

@@ -146,6 +146,21 @@ def test_usage_stats_from_events_prompt_and_completion_aliases() -> None:
     assert stats.total_tokens == 30
 
 
+@pytest.mark.parametrize(
+    ("usage", "expected"),
+    [
+        ({"cached_tokens": 11}, 11),
+        ({"cache_read_input_tokens": 12}, 12),
+        ({"prompt_tokens_details": {"cached_tokens": 13}}, 13),
+        ({"input_tokens_details": {"cached_tokens": 14}}, 14),
+        ({"cached_tokens": 20, "prompt_tokens_details": {"cached_tokens": 20}}, 20),
+    ],
+)
+def test_usage_stats_normalizes_provider_cache_shapes_once(usage, expected) -> None:
+    stats = usage_stats_from_events([_event("usage_event", {"turn": 1, "usage": usage})])
+    assert stats is not None and stats.cached_tokens == expected
+
+
 def test_usage_stats_from_events_total_falls_back_to_input_plus_output() -> None:
     events = [
         _event(

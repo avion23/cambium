@@ -615,6 +615,41 @@ def _load_epoch_checkpoint_data(
     return data
 
 
+def _imported_context_epoch(
+    session_dir: Path, descriptor: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    """Recover the immutable epoch already imported for a new worker turn."""
+    checkpoint_ref = descriptor.get("checkpoint_ref")
+    if not isinstance(checkpoint_ref, str) or not checkpoint_ref:
+        return None
+    try:
+        source_task, _epoch, _pre, _persisted = _validate_checkpoint_ref_shape(checkpoint_ref)
+        data = _load_epoch_checkpoint_data(session_dir, source_task, checkpoint_ref)
+        checkpoint = _validate_epoch_checkpoint_data(data, checkpoint_ref)
+    except (OSError, TypeError, ValueError):
+        return None
+    cache_key = asdict(checkpoint.cache_key)
+    for field in (
+        "provider",
+        "model",
+        "system_sha256",
+        "tools_sha256",
+        "prefix_sha256",
+        "suffix_sha256",
+        "full_sha256",
+        "prefix_bytes",
+        "provider_boundary",
+    ):
+        if descriptor.get(field) != cache_key.get(field):
+            return None
+    return {
+        "epoch": checkpoint.epoch,
+        "turn": checkpoint.turn,
+        "checkpoint_ref": checkpoint_ref,
+        "cache_key": cache_key,
+    }
+
+
 def _validate_advanced_epoch_checkpoint(
     session_dir: Path,
     task_id: str,
@@ -5643,6 +5678,12 @@ class _Runtime:
             return _GenOutcome(clean=False, fatal=True, reason=f"spawn failed: {exc}")
         handle.proc = proc
         handle.state = "SPAWNING"
+        if self._context_reuse and task_id not in self._task_epochs:
+            descriptor = spec.get("context_fork")
+            if isinstance(descriptor, Mapping):
+                imported_epoch = _imported_context_epoch(self._session_dir, descriptor)
+                if imported_epoch is not None:
+                    self._task_epochs[task_id] = imported_epoch
         return _GenerationState(
             task_id=task_id,
             spec=spec,

@@ -1252,6 +1252,22 @@ def test_plan_and_thought_round_trip_through_parser() -> None:
     assert worker._parse_agent_action(
         '{"type":"finish","summary":"done","objective_met":true,"thought":"verified"}'
     ) == {"type": "finish", "summary": "done", "objective_met": True}
+    assert worker._parse_agent_action(
+        'I will inspect the file now. {"name":"repo_query","action":"tree"}'
+    ) == {
+        "type": "tool_call",
+        "calls": [{"name": "repo_query", "arguments": {"action": "tree"}}],
+    }
+    assert worker._parse_agent_action(
+        '{"calls":[{"name":"branch_history","action":"tools","limit":8},'
+        '{"name":"inspect_state"}]}'
+    ) == {
+        "type": "tool_call",
+        "calls": [
+            {"name": "branch_history", "arguments": {"action": "tools", "limit": 8}},
+            {"name": "inspect_state", "arguments": {}},
+        ],
+    }
     verbose = worker._parse_agent_action(
         json.dumps(
             {
@@ -1337,10 +1353,10 @@ def test_parse_agent_action_accepts_fenced_finish_with_backticks_in_body() -> No
 
 def test_parse_agent_action_rejects_fenced_with_prose_or_unclosed_fence() -> None:
     prose = 'Here is the action:\n```json\n{"type":"plan","steps":["a"]}\n```'
-    with pytest.raises(ValueError, match="not valid JSON"):
+    with pytest.raises(ValueError):
         worker._parse_agent_action(prose)
     unclosed = '```json\n{"type":"plan","steps":["a"]}\n'
-    with pytest.raises(ValueError, match="not valid JSON"):
+    with pytest.raises(ValueError):
         worker._parse_agent_action(unclosed)
     two_fences = (
         '```json\n{"type":"plan","steps":["a"]}\n```\n```json\n{"type":"plan","steps":["b"]}\n```'

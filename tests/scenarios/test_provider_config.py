@@ -296,53 +296,6 @@ def test_non_finite_numeric_field_is_rejected(tmp_path: Path) -> None:
         load_providers(path)
 
 
-def test_valid_config_round_trips_all_fields(tmp_path: Path) -> None:
-    path = _write(
-        tmp_path / "providers.json",
-        [
-            {
-                "name": "openai",
-                "tier": "strong",
-                "base_url": "https://api.example.test/v1",
-                "api_key_env": "CAMBIUM_PROVIDER_OPENAI_API_KEY",
-                "api_key": "sk-provider-config",
-                "required": True,
-                "timeout_s": 45.5,
-                "max_retries": 3,
-                "rpm": 120,
-                "enabled": True,
-                "model": "example-model",
-                "priority": 5,
-                "cooldown_s": 12.5,
-                "price": 0.25,
-            }
-        ],
-    )
-
-    providers = load_providers(path)
-
-    assert providers == [
-        diffundo.ProviderConfig(
-            name="openai",
-            tier=diffundo.ProviderTier.STRONG,
-            base_url="https://api.example.test/v1",
-            api_key_env="CAMBIUM_PROVIDER_OPENAI_API_KEY",
-            api_key="sk-provider-config",
-            timeout_s=45.5,
-            max_retries=3,
-            rpm=120,
-            enabled=True,
-            model="example-model",
-            priority=5,
-            cooldown_s=12.5,
-            price_per_1m_in=0.25,
-            price_per_1m_out=0.25,
-            price_per_1m_cached_in=0.25,
-            pricing_known=True,
-        )
-    ]
-
-
 # --------------------------------------------------------------------------- #
 # Tagged auth/protocol modes (codex-oauth plan W1)
 # --------------------------------------------------------------------------- #

@@ -10,14 +10,7 @@ from pathlib import Path
 from statistics import mean
 from typing import Any, cast
 
-from .benchmark import (
-    ExperimentBudget,
-    ExperimentBudgetExceeded,
-    json_finite,
-    load_cases,
-    run_case,
-    write_json_report,
-)
+from .benchmark import ExperimentBudget, ExperimentBudgetExceeded, load_cases, run_case
 from .prompts import coding_prompt, load_policy, prompt_path, save_policy
 
 _FEEDBACK_CHARS = 6000
@@ -28,6 +21,7 @@ _DIGEST_KEYS = (
     "elapsed_s",
     "calls",
     "tokens",
+    "summary_calls",
     "malformed_actions",
     "tool_failures",
     "children",
@@ -78,7 +72,7 @@ def _render_component_prompt(component: str, selected: dict[str, str]) -> str:
         "type": "summarize_tail",
         "finding_preservation_contract": selected["summary"],
     }
-    payload = json.dumps(json_finite(control), ensure_ascii=False, allow_nan=False)
+    payload = json.dumps(control, ensure_ascii=False, allow_nan=False)
     return SUMMARY_CONTROL_OPEN + payload + SUMMARY_CONTROL_CLOSE
 
 
@@ -95,14 +89,12 @@ def grounded_feedback(component: str, selected: dict[str, str], row: dict[str, A
                 ),
                 "<trajectory-digest>\n"
                 + json.dumps(
-                    json_finite(
-                        {key: row.get(key) for key in _DIGEST_KEYS}
-                        | {"derailment": _derailment(row)}
-                    ),
+                    {key: row.get(key) for key in _DIGEST_KEYS}
+                    | {"derailment": _derailment(row)},
                     ensure_ascii=False,
                     allow_nan=False,
                 ),
-                "<raw-row>\n" + json.dumps(json_finite(row), ensure_ascii=False, allow_nan=False),
+                "<raw-row>\n" + json.dumps(row, ensure_ascii=False, allow_nan=False),
             )
         ),
         _FEEDBACK_CHARS,
@@ -156,11 +148,17 @@ def metric(
 ) -> Any:
     import dspy
 
-    try:
-        score = float(pred.score)
-    except (AttributeError, TypeError, ValueError):
-        return dspy.Prediction(score=0.0, feedback=getattr(pred, "report", "") or "")
-    return dspy.Prediction(score=score, feedback=pred.report)
+    raw_score = getattr(pred, "score", None)
+    if isinstance(raw_score, bool):
+        score = float(raw_score)
+    else:
+        try:
+            score = float(raw_score)
+        except (TypeError, ValueError):
+            score = 0.0
+    if not math.isfinite(score):
+        score = 0.0
+    return dspy.Prediction(score=score, feedback=getattr(pred, "report", "") or "")
 
 
 def _reflection_lm(args: Any, budget: ExperimentBudget) -> Any:
@@ -240,7 +238,9 @@ def _effective_search_evals(
 
 def run(args: Any) -> int:
     """Run a benchmark or hill climb; publish winners for new sessions by default."""
-    dataset = args.dataset or Path(__file__).with_name("benchmarks") / "prompts.jsonl"
+    dataset = args.dataset or Path(__file__).with_name("benchmarks") / (
+        "summary_prompts.jsonl" if args.component == "summary" else "prompts.jsonl"
+    )
     cases = load_cases(dataset)
     for name in ("max_evals", "max_calls", "max_tokens", "max_turns", "max_workers"):
         if getattr(args, name) < 1:
@@ -257,19 +257,17 @@ def run(args: Any) -> int:
     if args.dry_run:
         print(
             json.dumps(
-                json_finite(
-                    {
-                        "optimizer": args.optimizer,
-                        "component": args.component,
-                        "cases": [{"id": c["id"], "split": c["split"]} for c in selected_cases],
-                        "deploy": not args.no_deploy and args.optimizer == "gepa",
-                        "prompt_file": str(prompt_path()),
-                        "output": str(output),
-                        "max_evals": args.max_evals,
-                        "max_calls": args.max_calls,
-                        "max_tokens": args.max_tokens,
-                    }
-                ),
+                {
+                    "optimizer": args.optimizer,
+                    "component": args.component,
+                    "cases": [{"id": c["id"], "split": c["split"]} for c in selected_cases],
+                    "deploy": not args.no_deploy and args.optimizer == "gepa",
+                    "prompt_file": str(prompt_path()),
+                    "output": str(output),
+                    "max_evals": args.max_evals,
+                    "max_calls": args.max_calls,
+                    "max_tokens": args.max_tokens,
+                },
                 indent=2,
                 allow_nan=False,
             )
@@ -314,6 +312,12 @@ def run(args: Any) -> int:
             if not all(splits.values()):
                 raise ValueError("GEPA needs disjoint train, val and test cases")
             baseline = [rollout(c, policy) for c in splits["val"]]
+            if args.component == "summary" and not any(
+                row.get("summary_calls", 0) for row in baseline
+            ):
+                raise ValueError(
+                    "summary GEPA needs a validation rollout that actually performs a summary call"
+                )
             effective_max_evals = _effective_search_evals(
                 args.max_evals,
                 budget,
@@ -369,16 +373,16 @@ def run(args: Any) -> int:
             cost_usd=budget.cost_usd,
             runs=budget.rows,
         )
-        write_json_report(output / "report.json", report)
+        (output / "report.json").write_text(
+            json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8"
+        )
     print(
         json.dumps(
-            json_finite(
-                {
-                    key: value
-                    for key, value in {**report, "report": str(output / "report.json")}.items()
-                    if key not in {"runs", "baseline", "validation", "test"}
-                }
-            ),
+            {
+                key: value
+                for key, value in {**report, "report": str(output / "report.json")}.items()
+                if key not in {"runs", "baseline", "validation", "test"}
+            },
             indent=2,
             allow_nan=False,
         )

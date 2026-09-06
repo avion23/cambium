@@ -345,10 +345,47 @@ def test_run_payload_has_no_publication_gate_field(tmp_path: Path, monkeypatch) 
 
 
 def test_compaction_events_are_strictly_validated_and_durable(tmp_path: Path) -> None:
+    from dataclasses import asdict, replace
+
     repo, worktree, base = _make_repo(tmp_path)
-    checkpoint = _context_checkpoint_message()
-    checkpoint["cache_key"]["tools_sha256"] = _provider_task_tools_hash()
     session_dir = tmp_path / "session"
+    config = replace(
+        worker._PROVIDER_TOOLS_CONFIG,
+        task_id="task",
+        checkpoint_root=session_dir / ".cambium" / "checkpoints",
+    )
+    imported = worker._write_epoch_checkpoint(
+        config,
+        turn=1,
+        epoch=1,
+        provider_messages=[
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "question"},
+        ],
+        continuation_suffix=[],
+        provider="fake-provider",
+        model="fake-model",
+        tools_sha256=_provider_task_tools_hash(),
+        provider_compat={"fake-provider": ("loopback", None)},
+        provider_boundary=_provider_boundary(),
+        created_at=1.0,
+        wall_deadline=10.0,
+    )
+    assert imported is not None
+    cache_key = asdict(imported.cache_key)
+    fork_fields = (
+        "provider",
+        "model",
+        "system_sha256",
+        "tools_sha256",
+        "prefix_sha256",
+        "suffix_sha256",
+        "full_sha256",
+        "prefix_bytes",
+        "provider_boundary",
+    )
+    context_fork = {"checkpoint_ref": imported.checkpoint_ref}
+    context_fork.update({field: cache_key[field] for field in fork_fields})
     valid_advanced = _write_advanced_checkpoint(session_dir)
     advanced_cache_key = valid_advanced["cache_key"]
     valid_failed = {
@@ -369,11 +406,10 @@ def test_compaction_events_are_strictly_validated_and_durable(tmp_path: Path) ->
         "folded_from_epoch": 2,
     }
     malformed_failed = {**valid_failed, "reason": ""}
-    worker = tmp_path / "events_worker.py"
+    worker_path = tmp_path / "events_worker.py"
     _write_worker(
-        worker,
+        worker_path,
         [
-            checkpoint,
             valid_advanced,
             valid_failed,
             invalid_checkpoint,
@@ -383,10 +419,12 @@ def test_compaction_events_are_strictly_validated_and_durable(tmp_path: Path) ->
     )
     event_store = _MemoryStore()
     runtime = _Runtime(session_dir, event_store)
+    spec = _spec(repo, worktree, base, worker_path)
+    spec["context_fork"] = context_fork
 
     outcome = asyncio.run(
         runtime._drive_generation(
-            _spec(repo, worktree, base, worker),
+            spec,
             WorkerHandle(task_id="task", generation=1),
             ready_timeout=2.0,
             heartbeat_interval=0.1,
