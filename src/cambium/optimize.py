@@ -543,12 +543,37 @@ def _decision_strings(expected: Mapping[str, object]) -> tuple[list[str], list[s
     return expected_strings, alt_strings
 
 
+_JLENS_CACHE_MAX = 1024
+
+
+def _jlens_cache_key(
+    messages: list[dict[str, Any]],
+    expected_strings: list[str],
+    alt_strings: list[str],
+    weight: float,
+) -> str:
+    """Hash the judge request so identical messages reuse one score call."""
+    payload = json.dumps(
+        {
+            "messages": messages,
+            "expected": expected_strings,
+            "alt": alt_strings,
+            "weight": weight,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _fuse_jlens(
     jlens_client: JlenClient,
     expected: Mapping[str, object],
     trace: object,
     score: float,
     weight: float,
+    cache: dict[str, float] | None = None,
 ) -> float:
     """Blend the exact-match score with the jlens readout signal.
 
@@ -569,13 +594,25 @@ def _fuse_jlens(
             continue
         try:
             messages = render_messages(predictor, inputs)
+            if cache is not None:
+                key = _jlens_cache_key(messages, expected_strings, alt_strings, weight)
+                if key in cache:
+                    return cache[key]
             result = jlens_client.score(messages, expected_strings, alt_strings)
             jlens_score = jlens_client.signal(result, expected_strings)
         except (JlenError, TypeError, ValueError, OSError):
             return score
         if not isinstance(jlens_score, int | float) or not math.isfinite(jlens_score):
             return score
-        return weight * max(0.0, min(1.0, jlens_score)) + (1.0 - weight) * score
+        fused = weight * max(0.0, min(1.0, jlens_score)) + (1.0 - weight) * score
+        if cache is not None:
+            # Judge readout is a forward-pass function of the messages, so an
+            # identical request reuses the stored fusion; failures stay uncached
+            # because a downed service may recover on the next example.
+            if len(cache) >= _JLENS_CACHE_MAX:
+                cache.pop(next(iter(cache)))
+            cache[_jlens_cache_key(messages, expected_strings, alt_strings, weight)] = fused
+        return fused
     return score
 
 
@@ -603,6 +640,7 @@ def make_dspy_metric(program, jlens_client: JlenClient | None = None) -> Callabl
             jlens_weight = 0.5
     if not math.isfinite(jlens_weight) or not 0.0 <= jlens_weight <= 1.0:
         jlens_weight = 0.5
+    jlens_cache: dict[str, float] = {}
 
     def metric(
         gold: object,
@@ -627,13 +665,15 @@ def make_dspy_metric(program, jlens_client: JlenClient | None = None) -> Callabl
                 prediction=prediction,
             )
             score = scorer(example)
-            if isinstance(score, bool) or not isinstance(score, int | float):
+            if isinstance(score, bool):
+                score = 1.0 if score else 0.0
+            elif not isinstance(score, int | float):
                 return 0.0
             if not math.isfinite(score) or not 0.0 <= score <= 1.0:
                 return 0.0
             score = float(score)
             if jlens_client is not None:
-                score = _fuse_jlens(jlens_client, expected, trace, score, jlens_weight)
+                score = _fuse_jlens(jlens_client, expected, trace, score, jlens_weight, jlens_cache)
             return score
         except (ImportError, KeyError, ValueError):
             return 0.0
@@ -1170,7 +1210,9 @@ def run_stage_gepa(
         ledger=ledger,
     )
     try:
-        optimizer = gepa_class(
+        # dspy's inferred stubs lose the GEPA class through getattr, so the
+        # runtime optimizer (which exposes compile()) degrades to object.
+        optimizer: Any = gepa_class(
             metric=make_dspy_metric(program),
             max_metric_calls=max_metric_calls,
             reflection_lm=reflection_lm,
@@ -1269,6 +1311,7 @@ class _SingleFileDatasetLoader:
         load = getattr(loader, "load", None)
         if not callable(load):
             raise OptimizeError("explicit dataset loader does not provide load()")
+        load = cast(Callable[[], Iterable[Example]], load)
         examples = list(load())
         try:
             records = [

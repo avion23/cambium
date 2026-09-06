@@ -96,9 +96,7 @@ def markdown_theme() -> Theme:
 
 def markdown_document(text: str) -> CambiumMarkdown:
     """Return a sanitized Rich document; model/provider escape codes never reach Rich."""
-    return CambiumMarkdown(
-        sanitize_terminal_text(text), hyperlinks=False, code_theme="ansi_dark"
-    )
+    return CambiumMarkdown(sanitize_terminal_text(text), hyperlinks=False, code_theme="ansi_dark")
 
 
 def render_markdown(text: str, *, width: int | None = None) -> str:

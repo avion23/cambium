@@ -1327,9 +1327,7 @@ class TokenManager:
                 except OSError as exc:
                     last_exc = exc
                     if exc.errno == errno.ELOOP:
-                        raise OAuthStoreError(
-                            "oauth lock file must not be a symlink"
-                        ) from exc
+                        raise OAuthStoreError("oauth lock file must not be a symlink") from exc
                     if exc.errno == errno.ENOENT:
                         time.sleep(0.001 * (attempt + 1))
                         continue

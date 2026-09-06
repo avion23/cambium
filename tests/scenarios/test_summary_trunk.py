@@ -102,21 +102,36 @@ def test_consecutive_entries_never_resummarize_prior_entries() -> None:
 def test_corrections_and_closed_work_survive_folds_and_k0() -> None:
     trunk = list(HEAD)
     deltas = [
-        {"facts_added": ["F1: old conclusion"], "decisions_added": ["D1: old design"],
-         "open_items": ["O1: recheck joined code", "O2: inspect quota reset"],
-         "verification_results": ["V1: check passed at head abc"]},
-        {"facts_invalidated": ["F1"], "facts_added": ["F1: corrected conclusion"],
-         "decisions_superseded": ["D1"], "decisions_added": ["D1: direct implementation"],
-         "open_items_resolved": ["O1"], "verification_invalidated": ["V1"]},
+        {
+            "facts_added": ["F1: old conclusion"],
+            "decisions_added": ["D1: old design"],
+            "open_items": ["O1: recheck joined code", "O2: inspect quota reset"],
+            "verification_results": ["V1: check passed at head abc"],
+        },
+        {
+            "facts_invalidated": ["F1"],
+            "facts_added": ["F1: corrected conclusion"],
+            "decisions_superseded": ["D1"],
+            "decisions_added": ["D1: direct implementation"],
+            "open_items_resolved": ["O1"],
+            "verification_invalidated": ["V1"],
+        },
         {"open_items_resolved": ["O1"], "verification_results": ["V2: joined check at head def"]},
     ]
     history = []
     for turn, delta in enumerate(deltas, 1):
         raw = [{"role": "user", "content": f"observed transition {turn}"}]
         _, expected = build_summary_request(trunk, raw, through_turn=turn)
-        entry = parse_summary_response(json.dumps({
-            "objective": "complete review", "outcome": "recorded", **delta,
-        }), expected)
+        entry = parse_summary_response(
+            json.dumps(
+                {
+                    "objective": "complete review",
+                    "outcome": "recorded",
+                    **delta,
+                }
+            ),
+            expected,
+        )
         trunk = append_summary_entry(trunk, entry)
         history.append(trunk[-1]["content"])
     rolled, state, sources = summary_trunk.rollover_summary_trunk(trunk)

@@ -45,9 +45,7 @@ class FakeServer:
             self.request_headers.append(headers)
             return len(self.calls) - 1
 
-    def behavior_at(
-        self, index: int
-    ) -> tuple[int, dict[str, Any] | bytes, float, dict[str, str]]:
+    def behavior_at(self, index: int) -> tuple[int, dict[str, Any] | bytes, float, dict[str, str]]:
         behavior = self.behaviors[index] if index < len(self.behaviors) else self.behaviors[-1]
         if len(behavior) == 3:
             status, payload, delay = behavior

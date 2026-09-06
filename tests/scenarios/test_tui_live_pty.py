@@ -139,9 +139,7 @@ def _provider_file(path: Path, base_url: str) -> Path:
     return path
 
 
-def _spawn_tui(
-    repo: Path, provider_file: Path, *args: str
-) -> tuple[subprocess.Popen[bytes], int]:
+def _spawn_tui(repo: Path, provider_file: Path, *args: str) -> tuple[subprocess.Popen[bytes], int]:
     env = os.environ.copy()
     env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(SRC_DIR), env.get("PYTHONPATH")]))
     env.update(
@@ -291,8 +289,10 @@ def test_live_tui_resize_preserves_one_input_prompt(tmp_path: Path) -> None:
         while len(server.requests) < 2 and time.monotonic() < deadline:
             _read_into(master_fd, output, 0.1)
         assert len(server.requests) == 2
-        assert any("^first!\n>secon!d?" in str(m.get("content", ""))
-                   for m in server.requests[-1]["messages"])
+        assert any(
+            "^first!\n>secon!d?" in str(m.get("content", ""))
+            for m in server.requests[-1]["messages"]
+        )
         os.write(master_fd, b"/exit\n")
         assert _wait_exit(process, master_fd, output, 5) == 0
     finally:

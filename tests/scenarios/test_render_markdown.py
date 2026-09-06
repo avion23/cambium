@@ -103,22 +103,32 @@ def test_repl_uses_rich_only_for_tty(monkeypatch) -> None:
     config = OneShotConfig()
 
     tty_out = _Tty()
-    assert asyncio.run(repl.run_repl(
-        config,
-        input_stream=StringIO("go\n/exit\n"),
-        output_stream=tty_out,
-        error_stream=StringIO(),
-    )) == 0
+    assert (
+        asyncio.run(
+            repl.run_repl(
+                config,
+                input_stream=StringIO("go\n/exit\n"),
+                output_stream=tty_out,
+                error_stream=StringIO(),
+            )
+        )
+        == 0
+    )
     assert "\x1b[" in tty_out.getvalue()
     assert "Done" in _visible(tty_out.getvalue())
     assert "make" in _visible(tty_out.getvalue()) and "won" in _visible(tty_out.getvalue())
 
     plain_out = StringIO()
-    assert asyncio.run(repl.run_repl(
-        config,
-        input_stream=StringIO("go\n/exit\n"),
-        output_stream=plain_out,
-        error_stream=StringIO(),
-    )) == 0
+    assert (
+        asyncio.run(
+            repl.run_repl(
+                config,
+                input_stream=StringIO("go\n/exit\n"),
+                output_stream=plain_out,
+                error_stream=StringIO(),
+            )
+        )
+        == 0
+    )
     assert "\x1b[" not in plain_out.getvalue()
     assert "used `make` and **won**" in plain_out.getvalue()

@@ -50,9 +50,10 @@ from cambium.diffundo import (
 
 
 def _sse(*events: dict[str, Any]) -> bytes:
-    return b"".join(
-        b"data: " + json.dumps(event).encode("utf-8") + b"\n\n" for event in events
-    ) + b"data: [DONE]\n\n"
+    return (
+        b"".join(b"data: " + json.dumps(event).encode("utf-8") + b"\n\n" for event in events)
+        + b"data: [DONE]\n\n"
+    )
 
 
 def _tool_call_payload(tool_calls: list[dict[str, Any]]) -> dict[str, Any]:

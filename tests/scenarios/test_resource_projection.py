@@ -93,14 +93,24 @@ def test_quota_inspection_does_not_create_or_reconfigure_storage(tmp_path: Path)
 
 
 def test_resource_rail_keeps_throughput_and_quota_visible_in_a_short_terminal() -> None:
-    snapshot = snapshot_from_events([
-        _event(1, "one", usage={"input_tokens": 100, "output_tokens": 20},
-               provider_cache_hit=False, quota_windows=[_window("one", 300)]),
-        {"seq": 2, "kind": "result", "task_id": "one", "payload": {"status": "succeeded"}},
-    ])
-    rows = _rail_rows(snapshot, 32, 18, cumulative_line=(
-        "usage: calls=4 in=100 out=40 cached=70 out/s=10.0 cost=0"
-    ))
+    snapshot = snapshot_from_events(
+        [
+            _event(
+                1,
+                "one",
+                usage={"input_tokens": 100, "output_tokens": 20},
+                provider_cache_hit=False,
+                quota_windows=[_window("one", 300)],
+            ),
+            {"seq": 2, "kind": "result", "task_id": "one", "payload": {"status": "succeeded"}},
+        ]
+    )
+    rows = _rail_rows(
+        snapshot,
+        32,
+        18,
+        cumulative_line="usage: calls=4 in=100 out=40 cached=70 out/s=10.0 cost=0",
+    )
     text = "\n".join(line for _, line in rows)
     assert "RESOURCES" in text
     assert "out 40 · 10.0 tok/s" in text
@@ -112,10 +122,12 @@ def test_resource_rail_keeps_throughput_and_quota_visible_in_a_short_terminal() 
 
 
 def test_completed_rail_does_not_reserve_empty_live_detail_rows() -> None:
-    snapshot = snapshot_from_events([
-        _event(1, "one", usage={"output_tokens": 20}),
-        {"seq": 2, "kind": "result", "task_id": "one", "payload": {"status": "succeeded"}},
-    ])
+    snapshot = snapshot_from_events(
+        [
+            _event(1, "one", usage={"output_tokens": 20}),
+            {"seq": 2, "kind": "result", "task_id": "one", "payload": {"status": "succeeded"}},
+        ]
+    )
     rows = _rail_rows(snapshot, 32, 24)
     assert all(line.strip() for _, line in rows)
     assert any(line.strip() == "succeeded" for _, line in rows)

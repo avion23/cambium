@@ -189,9 +189,21 @@ def test_content_flagged_summary_retries_once_with_redacted_tail(
             ),
             (400, _FLAGGED, 0.0),
             (200, _ok_payload(_SUMMARY, model="loopback-model", usage=_USAGE), 0.0),
-            (200, _ok_payload(json.dumps({
-                "type": "finish", "summary": _SECRET, "objective_met": True,
-            }), model="loopback-model", usage=_USAGE), 0.0),
+            (
+                200,
+                _ok_payload(
+                    json.dumps(
+                        {
+                            "type": "finish",
+                            "summary": _SECRET,
+                            "objective_met": True,
+                        }
+                    ),
+                    model="loopback-model",
+                    usage=_USAGE,
+                ),
+                0.0,
+            ),
         ],
     )
     router = _router(server)

@@ -797,15 +797,20 @@ def _resolve_provider(
         environment = {}
         env_store = auth_store if auth_store is not None else AuthStore()
         candidates = [
-            p for p in load_providers(config.provider_config_path)
+            p
+            for p in load_providers(config.provider_config_path)
             if p.api_key_env in config.provider_env_keys
         ]
         if set(config.provider_env_keys) - {p.api_key_env for p in candidates}:
             raise ValueError("provider credential is not configured")
         for candidate in candidates:
-            environment.update(_stored_provider_environment(
-                candidate.name, env_store, provider_config_path=config.provider_config_path,
-            ))
+            environment.update(
+                _stored_provider_environment(
+                    candidate.name,
+                    env_store,
+                    provider_config_path=config.provider_config_path,
+                )
+            )
         return _apply_interactive_wall_budget(config, ()), environment
 
     config_path = _provider_config_path(config, repo)

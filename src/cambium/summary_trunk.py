@@ -167,7 +167,8 @@ def _canonical_json_bytes(value: Any) -> bytes:
 
 def _copy_message(value: Any, location: str) -> dict[str, str]:
     if not isinstance(value, Mapping) or set(value) not in (
-        {"role", "content"}, {"role", "content", "phase"},
+        {"role", "content"},
+        {"role", "content", "phase"},
     ):
         raise SummaryTrunkError(f"{location} must have role/content and optional phase")
     role = value.get("role")
@@ -697,7 +698,9 @@ def compile_k0_projection(entries: Sequence[SummaryEntry]) -> K0Projection:
         ),
         constraints=_unique_semantic_items(normalized, "relevant_failed_approaches"),
         verification_state=_active_semantic_items(
-            normalized, ("verification_results",), ("verification_invalidated",),
+            normalized,
+            ("verification_results",),
+            ("verification_invalidated",),
         ),
         open_work=_active_semantic_items(normalized, ("open_items",), ("open_items_resolved",)),
     )

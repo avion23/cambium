@@ -1,4 +1,5 @@
 """One read-only current-state view for the model, CLI and terminal."""
+
 from __future__ import annotations
 
 from dataclasses import replace
@@ -36,9 +37,13 @@ def load_state(session_dir: str | Path, task_id: str | None = None) -> BranchSta
                     payload.pop("parent_task_id", None)
                     event = {**event, "parent_task_id": None, "payload": payload}
                 state = reduce(state, event)
-        return replace(state, identity=replace(
-            state.identity, session_id=str(store.parent.parent),
-        ))
+        return replace(
+            state,
+            identity=replace(
+                state.identity,
+                session_id=str(store.parent.parent),
+            ),
+        )
     raise ValueError(f"no recorded state for {task_id or 'session'} under {session_dir}")
 
 

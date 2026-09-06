@@ -106,6 +106,68 @@ def test_rollout_timeout_retains_report_and_checks_only_accepted_code(tmp_path, 
     assert json.loads((Path(row["directory"]) / "report.json").read_text()) == row
 
 
+def test_tripped_breaker_aborts_dead_rollout_promptly_with_identical_verdict(tmp_path, monkeypatch):
+    import asyncio
+    import json
+
+    from cambium import benchmark, worker
+
+    strike = worker.MAX_CONSECUTIVE_INVALID_ACTIONS
+    usage = {"kind": "usage_event", "payload": {"usage": {"total_tokens": 10}}}
+
+    async def tripped_breaker(session_dir, plan, on_event=None, **kwargs):
+        if on_event is not None:
+            on_event(usage)
+            on_event(
+                {
+                    "kind": "log",
+                    "payload": {"message": f"invalid_action: bad JSON (strike {strike})"},
+                }
+            )
+        # The abort must land here. The usage event after this await models the
+        # waste a dead rollout used to burn until the wall budget.
+        await asyncio.sleep(0.05)
+        if on_event is not None:
+            on_event(usage)
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(benchmark, "run_plan", tripped_breaker)
+    monkeypatch.setattr(benchmark, "_resolve_provider", lambda config, repo: (config, {}))
+    row = benchmark.run_case(
+        {
+            "id": "breaker",
+            "split": "train",
+            "task": "Read the file without edits",
+            "files": {"note.txt": "unchanged"},
+            "read_only": True,
+            "check": [
+                "{python}",
+                "-c",
+                "from pathlib import Path; assert Path('note.txt').read_text() == 'unchanged'",
+            ],
+        },
+        {"coding": "Read only.", "summary": "Keep facts."},
+        output=tmp_path,
+        budget=ExperimentBudget(10, 1000, 1),
+        max_wall_s=60,
+    )
+    # Verdict fields identical to the would-be-timeout FAIL.
+    assert not row["passed"]
+    assert row["score"] == 0.0
+    assert row["feedback"].startswith("exit=1; ")
+    assert "check=True" in row["feedback"]
+    assert row["head"] == row["base"]
+    # The breaker reason is preserved, not replaced by a wall or budget message.
+    assert "agent emitted 3 consecutive invalid actions" in row["feedback"]
+    assert "rollout wall budget exhausted" not in row["feedback"]
+    assert "experiment budget exhausted" not in row["feedback"]
+    # Prompt abort: bounded elapsed/calls/tokens instead of burning to the wall.
+    assert row["elapsed_s"] < 30
+    assert row["calls"] == 1
+    assert row["tokens"] == 10
+    assert json.loads((Path(row["directory"]) / "report.json").read_text()) == row
+
+
 def test_gepa_reflection_feedback_is_grounded_in_rendered_prompt_and_trajectory() -> None:
     pytest.importorskip("dspy")
     from cambium import prompt_optimize
@@ -202,6 +264,19 @@ def test_gepa_reflection_feedback_renders_summary_control_for_summary_component(
     assert "finding_preservation_contract" in feedback
     assert "You are Cambium's coding agent" not in feedback.split("<trajectory-digest>")[0]
     assert len(feedback) <= prompt_optimize._FEEDBACK_CHARS
+
+
+def test_prompt_metric_scores_malformed_predictions_zero() -> None:
+    from types import SimpleNamespace
+
+    from cambium import prompt_optimize
+
+    assert prompt_optimize.metric(None, SimpleNamespace(report="no score")).score == 0.0
+    assert prompt_optimize.metric(None, SimpleNamespace(score=None, report="r")).score == 0.0
+    assert prompt_optimize.metric(None, SimpleNamespace(score="bad", report="r")).score == 0.0
+    good = prompt_optimize.metric(None, SimpleNamespace(score=0.9, report="r"))
+    assert good.score == 0.9
+    assert good.feedback == "r"
 
 
 @pytest.mark.parametrize("no_deploy", [False, True])
