@@ -6374,7 +6374,8 @@ class _Runtime:
                     spec["assigned_provider"] = served
                     spec["fanout_config"] = {
                         **(spec.get("fanout_config") or {}),
-                        "model": msg.get("model", configured.model), "tier": configured.tier.value,
+                        "model": msg.get("model", configured.model),
+                        "tier": configured.tier.value,
                     }
                     self._lanes[served].in_flight += 1
                     spec["_lane_reserved"] = True
@@ -8368,7 +8369,8 @@ def _resolve_model_candidates(
             lane = lanes[provider.name]
             if lane.request_slots is not None and lane.request_slots < 1:
                 ready = max(
-                    ready, timestamp + (1 - lane.request_slots) * 60 / lane.requests_per_minute,
+                    ready,
+                    timestamp + (1 - lane.request_slots) * 60 / lane.requests_per_minute,
                 )
             if ready > timestamp:
                 resets.append(ready)

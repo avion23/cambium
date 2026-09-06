@@ -544,23 +544,37 @@ def _build_parser() -> argparse.ArgumentParser:
     optimize_command.add_argument("--component", choices=("coding", "summary"), default="coding")
     optimize_command.add_argument("--max-evals", type=int, default=12, help="GEPA rollout budget")
     optimize_command.add_argument(
-        "--max-calls", type=int, default=200, help="total experiment provider calls",
+        "--max-calls",
+        type=int,
+        default=200,
+        help="total experiment provider calls",
     )
     optimize_command.add_argument(
-        "--max-tokens", type=int, default=500000, help="total experiment reported tokens",
+        "--max-tokens",
+        type=int,
+        default=500000,
+        help="total experiment reported tokens",
     )
     optimize_command.add_argument("--max-turns", type=int, default=12, help="rollout turns")
     optimize_command.add_argument(
-        "--max-wall-s", type=float, default=300, help="rollout wall budget",
+        "--max-wall-s",
+        type=float,
+        default=300,
+        help="rollout wall budget",
     )
     optimize_command.add_argument("--max-workers", type=int, default=3, help="rollout worker limit")
     optimize_command.add_argument("--provider", help="primary provider; children can spread")
     optimize_command.add_argument("--reflection-provider", help="GEPA reflection provider")
     optimize_command.add_argument(
-        "--case", action="append", default=[], help="case id (repeatable)",
+        "--case",
+        action="append",
+        default=[],
+        help="case id (repeatable)",
     )
     optimize_command.add_argument(
-        "--no-deploy", action="store_true", help="save candidate without replacing active prompt",
+        "--no-deploy",
+        action="store_true",
+        help="save candidate without replacing active prompt",
     )
     candidate_source = optimize_command.add_mutually_exclusive_group()
     candidate_source.add_argument(

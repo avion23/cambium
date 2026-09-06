@@ -10,19 +10,28 @@ from cambium.supervisor import _child_spec
 
 def test_minimal_delegate_inherits_execution_without_pinning_spread(tmp_path: Path) -> None:
     parent = {
-        "task_id": "root", "task": "implement two independent changes",
-        "repo": str(tmp_path / "repo"), "worktree_path": str(tmp_path / "root"),
-        "branch": "cambium-root", "worker": "cambium.worker", "base_commit": "abc",
+        "task_id": "root",
+        "task": "implement two independent changes",
+        "repo": str(tmp_path / "repo"),
+        "worktree_path": str(tmp_path / "root"),
+        "branch": "cambium-root",
+        "worker": "cambium.worker",
+        "base_commit": "abc",
         "fanout_config": {"model": "model-a", "tier": "fast", "call_budget_s": 90},
-        "model_candidates": ["model-a", "model-b"], "assigned_provider": "a",
-        "authorized_providers": ["a", "b"], "authorized_providers_explicit": True,
-        "provider_env_keys": [], "max_tokens": 12000,
+        "model_candidates": ["model-a", "model-b"],
+        "assigned_provider": "a",
+        "authorized_providers": ["a", "b"],
+        "authorized_providers_explicit": True,
+        "provider_env_keys": [],
+        "max_tokens": 12000,
     }
     proposal = {
-        "child_task_id": "parser", "kind": "feature",
+        "child_task_id": "parser",
+        "kind": "feature",
         "spec": {
             "task": "Fix parser.py and verify it",
-            "context_mode": "semantic", "placement": "spread",
+            "context_mode": "semantic",
+            "placement": "spread",
         },
     }
     schema = next(s for s in TOOL_SCHEMAS if s["name"] == "delegate")
@@ -43,11 +52,14 @@ def test_minimal_delegate_inherits_execution_without_pinning_spread(tmp_path: Pa
 
 def test_child_path_cannot_escape_session(tmp_path: Path) -> None:
     parent = {
-        "task_id": "root", "repo": str(tmp_path / "repo"),
-        "worktree_path": str(tmp_path / "root"), "branch": "root",
+        "task_id": "root",
+        "repo": str(tmp_path / "repo"),
+        "worktree_path": str(tmp_path / "root"),
+        "branch": "root",
     }
     proposal = {
-        "child_task_id": "child", "kind": "investigation",
+        "child_task_id": "child",
+        "kind": "investigation",
         "spec": {"task": "read", "worktree_path": str(tmp_path.parent / "outside")},
     }
     with pytest.raises(ValueError, match="outside the session"):

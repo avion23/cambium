@@ -37,9 +37,7 @@ def test_can_run_heavy_respects_thresholds(
 
 def test_decide_heavy_work_skips_unreadable_memory() -> None:
     """macOS has no memory reading; heavy work must not be blocked by it."""
-    allowed, reasons = decide_heavy_work(
-        None, 0.5, 8, 10 * (1 << 30), {"mem_available_frac": 1.0}
-    )
+    allowed, reasons = decide_heavy_work(None, 0.5, 8, 10 * (1 << 30), {"mem_available_frac": 1.0})
 
     assert allowed is True
     assert reasons == []

@@ -3,6 +3,7 @@
 Fixtures and verification commands are operator-owned. Each rollout uses a
 private repository; only its accepted Git head is checked. No DSPy at runtime.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -42,17 +43,21 @@ class ExperimentBudget:
 
     def check(self) -> None:
         if (
-            self.calls >= self.max_calls or self.tokens >= self.max_tokens
+            self.calls >= self.max_calls
+            or self.tokens >= self.max_tokens
             or self.cost_usd >= self.max_usd
         ):
             raise ExperimentBudgetExceeded("experiment call, token, or cash budget exhausted")
 
     def record(self, usage: dict, cost: float = 0.0) -> None:
         self.calls += 1
-        self.tokens += int(usage.get("total_tokens", 0) or (
-            usage.get("prompt_tokens", usage.get("input_tokens", 0))
-            + usage.get("completion_tokens", usage.get("output_tokens", 0))
-        ))
+        self.tokens += int(
+            usage.get("total_tokens", 0)
+            or (
+                usage.get("prompt_tokens", usage.get("input_tokens", 0))
+                + usage.get("completion_tokens", usage.get("output_tokens", 0))
+            )
+        )
         self.cost_usd += max(0.0, float(cost))
 
 
@@ -83,7 +88,8 @@ def write_json_report(path: Path, payload: Any) -> None:
 def load_cases(path: Path) -> list[dict[str, Any]]:
     cases = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
     if (
-        not cases or not all(isinstance(c.get("id"), str) and c["id"] for c in cases)
+        not cases
+        or not all(isinstance(c.get("id"), str) and c["id"] for c in cases)
         or len({case["id"] for case in cases}) != len(cases)
     ):
         raise ValueError("benchmark cases need unique ids")
@@ -111,7 +117,9 @@ def load_cases(path: Path) -> list[dict[str, Any]]:
 
 def _git(repo: Path, *args: str) -> str:
     return subprocess.check_output(
-        ["git", "-C", str(repo), *args], text=True, stderr=subprocess.PIPE,
+        ["git", "-C", str(repo), *args],
+        text=True,
+        stderr=subprocess.PIPE,
     ).strip()
 
 
@@ -153,8 +161,14 @@ def _peak_pending_children(events: list[dict]) -> int:
 
 
 def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact checking
-    case: dict, policy: dict[str, str], *, output: Path, budget: ExperimentBudget,
-    provider: str | None = None, max_turns: int = 12, max_wall_s: float = 300,
+    case: dict,
+    policy: dict[str, str],
+    *,
+    output: Path,
+    budget: ExperimentBudget,
+    provider: str | None = None,
+    max_turns: int = 12,
+    max_wall_s: float = 300,
     max_workers: int = 3,
 ) -> dict[str, Any]:
     """Run, check and retain one real trajectory; never change the source repo."""
@@ -169,9 +183,15 @@ def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact che
     started = time.monotonic()
     before = (budget.calls, budget.tokens, budget.cost_usd)
     config = OneShotConfig(
-        prompt=case["task"], repo=repo, session_root=root / "session", provider=provider,
-        max_turns=max_turns, max_wall_s=max_wall_s, max_restarts=0,
-        max_tokens=max(1, budget.max_tokens - budget.tokens), prompt_policy=policy,
+        prompt=case["task"],
+        repo=repo,
+        session_root=root / "session",
+        provider=provider,
+        max_turns=max_turns,
+        max_wall_s=max_wall_s,
+        max_restarts=0,
+        max_tokens=max(1, budget.max_tokens - budget.tokens),
+        prompt_policy=policy,
     )
 
     async def execute() -> tuple[int, str]:
@@ -195,7 +215,8 @@ def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact che
 
             names = set(case["providers"])
             available = [
-                p for p in load_providers(resolved.provider_config_path)
+                p
+                for p in load_providers(resolved.provider_config_path)
                 if p.name in names and p.name in resolved.authorized_providers
             ]
             if {p.name for p in available} != names:
@@ -203,15 +224,19 @@ def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact che
             if resolved.assigned_provider and resolved.assigned_provider not in names:
                 raise ValueError("benchmark primary provider is outside its provider pool")
             resolved = replace(
-                resolved, authorized_providers=tuple(p.name for p in available),
+                resolved,
+                authorized_providers=tuple(p.name for p in available),
                 model_candidates=tuple(sorted({p.model for p in available})),
             )
         if case.get("followups"):
             from .interactive import InteractiveSession
 
-            session = InteractiveSession(replace(
-                resolved, routing_state_path=root / "routing.json",
-            ))
+            session = InteractiveSession(
+                replace(
+                    resolved,
+                    routing_state_path=root / "routing.json",
+                )
+            )
             session.acquire()
             try:
                 for number, prompt in enumerate([case["task"], *case["followups"]], 1):
@@ -223,7 +248,9 @@ def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact che
                         observe(event)
 
                     result = await session.run_turn(
-                        turn, on_event=live, max_concurrent_tasks=max_workers,
+                        turn,
+                        on_event=live,
+                        max_concurrent_tasks=max_workers,
                     )
                     session.complete_turn(turn, succeeded=result.exit_code == 0)
                     turn_heads.append(_git(repo, "rev-parse", "main"))
@@ -233,18 +260,25 @@ def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact che
                         session.compact()
                     if case.get("reconnect_between_turns"):
                         session.release()
-                        session = InteractiveSession(replace(
-                            resolved, routing_state_path=root / "routing.json",
-                        ))
+                        session = InteractiveSession(
+                            replace(
+                                resolved,
+                                routing_state_path=root / "routing.json",
+                            )
+                        )
                         session.acquire()
             finally:
                 session.release()
         else:
             plan = build_plan(resolved, repo, root / "session")
             result = await run_plan(
-                root / "session", plan, provider_environment=environment,
-                routing_state_path=root / "routing.json", on_event=observe,
-                max_concurrent_tasks=max_workers, context_reuse=True,
+                root / "session",
+                plan,
+                provider_environment=environment,
+                routing_state_path=root / "routing.json",
+                on_event=observe,
+                max_concurrent_tasks=max_workers,
+                context_reuse=True,
             )
             turn_heads.append(_git(repo, "rev-parse", "main"))
         return result.exit_code, "; ".join(r.reason for r in result.results if r.reason)
@@ -278,7 +312,12 @@ def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact che
     check_env = dict(os.environ, PYTHONPATH=str(verify / "src"))
     try:
         check = subprocess.run(
-            command, cwd=verify, env=check_env, capture_output=True, text=True, timeout=60,
+            command,
+            cwd=verify,
+            env=check_env,
+            capture_output=True,
+            text=True,
+            timeout=60,
         )
         checked = check.returncode == 0
         diagnostic = (check.stdout + check.stderr)[-4000:]
@@ -286,13 +325,17 @@ def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact che
         checked, diagnostic = False, "verification timed out"
     allowed = case.get("allowed_files")
     scope_ok = allowed is None or set(changed) <= set(allowed)
-    observed_tools = {e.get("payload", {}).get("tool") for e in events
-                      if e.get("kind") == "tool_event" and e.get("payload", {}).get("ok")}
+    observed_tools = {
+        e.get("payload", {}).get("tool")
+        for e in events
+        if e.get("kind") == "tool_event" and e.get("payload", {}).get("ok")
+    }
     missing_tools = set(case.get("required_tools", [])) - observed_tools
     children = [e.get("payload", {}) for e in events if e.get("kind") == "child_admitted"]
     peak_children = _peak_pending_children(events)
     trace_ok = (
-        not missing_tools and len(children) >= case.get("required_children", 0)
+        not missing_tools
+        and len(children) >= case.get("required_children", 0)
         and peak_children >= case.get("required_parallel_children", 0)
     )
     if case.get("read_only"):
@@ -301,7 +344,8 @@ def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact che
         trace_ok = trace_ok and bool(turn_heads) and all(h == turn_heads[0] for h in turn_heads)
     rollovers = sum(
         e.get("kind") == "context_epoch_advanced"
-        and e.get("payload", {}).get("reason") == "manual K0 rollover" for e in events
+        and e.get("payload", {}).get("reason") == "manual K0 rollover"
+        for e in events
     )
     trace_ok = trace_ok and rollovers >= case.get("required_rollovers", 0)
     passed = exit_code == 0 and checked and scope_ok and trace_ok
@@ -310,17 +354,20 @@ def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact che
     score = 0.0 if not passed else 0.9 + 0.1 / (1 + elapsed / 60 + tokens / 10000 + calls / 10)
     usage = [e.get("payload", {}) for e in events if e.get("kind") == "usage_event"]
     failures = [
-        e.get("payload", {}) for e in events
+        e.get("payload", {})
+        for e in events
         if e.get("kind") in {"child_rejected", "worker_failed", "merge_failed"}
         or (e.get("kind") == "result" and e.get("payload", {}).get("status") == "failed")
     ]
     task_providers: dict[str, set[str]] = {}
     for event in events:
-        if (event.get("kind") == "usage_event"
-                and not event.get("payload", {}).get("failure_reason")):
+        if event.get("kind") == "usage_event" and not event.get("payload", {}).get(
+            "failure_reason"
+        ):
             task_providers.setdefault(event.get("task_id", "unknown"), set()).add(
                 event.get("payload", {}).get("provider", "unknown")
             )
+
     def reported_tokens(key: str, alternate: str = "") -> int:
         return sum(
             (item.get("usage") or {}).get(key, (item.get("usage") or {}).get(alternate, 0)) or 0
@@ -328,15 +375,25 @@ def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact che
         )
 
     row = {
-        "id": case["id"], "split": case["split"], "passed": passed, "score": score,
-        "elapsed_s": round(elapsed, 3), "calls": calls, "tokens": tokens,
-        "cost_usd": budget.cost_usd - before[2], "head": accepted, "base": base,
-        "changed": changed, "providers": sorted({
-            name for names in task_providers.values() for name in names
-        }),
-        "children": len(children), "peak_pending_children": peak_children,
-        "directory": str(root), "turn_heads": turn_heads,
-        "source": case.get("source"), "family": case.get("family"), "rollovers": rollovers,
+        "id": case["id"],
+        "split": case["split"],
+        "passed": passed,
+        "score": score,
+        "elapsed_s": round(elapsed, 3),
+        "calls": calls,
+        "tokens": tokens,
+        "cost_usd": budget.cost_usd - before[2],
+        "head": accepted,
+        "base": base,
+        "changed": changed,
+        "providers": sorted({name for names in task_providers.values() for name in names}),
+        "children": len(children),
+        "peak_pending_children": peak_children,
+        "directory": str(root),
+        "turn_heads": turn_heads,
+        "source": case.get("source"),
+        "family": case.get("family"),
+        "rollovers": rollovers,
         "summary_calls": sum(e.get("call_kind") == "summary" for e in usage),
         "failed_provider_calls": sum(bool(e.get("failure_reason")) for e in usage),
         "malformed_actions": sum(
@@ -352,10 +409,16 @@ def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact che
         "cached_tokens": reported_tokens("cached_tokens", "cache_read_input_tokens"),
         "task_providers": {k: sorted(v) for k, v in task_providers.items()},
         "child_policies": [
-            {k: e["payload"].get(k) for k in (
-                "child_task_id", "resolved_context_mode", "resolved_placement",
-            )}
-            for e in events if e.get("kind") == "context_fork"
+            {
+                k: e["payload"].get(k)
+                for k in (
+                    "child_task_id",
+                    "resolved_context_mode",
+                    "resolved_placement",
+                )
+            }
+            for e in events
+            if e.get("kind") == "context_fork"
         ],
         "feedback": (
             f"exit={exit_code}; check={checked}; scope={scope_ok}; trace={trace_ok}; "

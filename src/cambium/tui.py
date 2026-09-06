@@ -988,7 +988,8 @@ async def _run_interactive(
     def _draw_cockpit(snapshot: Any, transcript_value: Transcript, **kwargs: Any) -> None:
         if isinstance(snapshot, SessionSnapshot):
             snapshot = replace(
-                snapshot, selected_task_id=getattr(cockpit, "selected_task_id", None),
+                snapshot,
+                selected_task_id=getattr(cockpit, "selected_task_id", None),
             )
         with cockpit_stream.frame():
             cockpit.draw(snapshot, transcript_value, **kwargs)
@@ -1165,8 +1166,11 @@ async def _run_interactive(
             from .terminal_input import TerminalInput
 
             editor = TerminalInput(
-                source.fileno(), cockpit, history_path,
-                interrupt=lambda: "/cancel" if turn_active else None, focus=focus_next,
+                source.fileno(),
+                cockpit,
+                history_path,
+                interrupt=lambda: "/cancel" if turn_active else None,
+                focus=focus_next,
             )
         with cockpit:
             while True:

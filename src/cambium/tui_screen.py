@@ -3341,7 +3341,8 @@ def _rail_rows(
     context = [_side_row("heading", " CONTEXT", panel_width)]
     # Byte counts and checkpoint paths are available through /context.
     context.extend(
-        row for index, row in enumerate(_context_rows(snapshot, panel_width, compact_epoch=True))
+        row
+        for index, row in enumerate(_context_rows(snapshot, panel_width, compact_epoch=True))
         if index in {0, 1, 3}
     )
     context.extend(_rail_fold_rows(snapshot, panel_width))
@@ -3356,7 +3357,7 @@ def _rail_rows(
             if len(quota) > 4:
                 resources.append(_side_row("dim", " more: /quota", panel_width))
     body_capacity = max(2, capacity - len(resources))
-    context = context[:max(0, body_capacity - 1 - min(4, len(agents)))]
+    context = context[: max(0, body_capacity - 1 - min(4, len(agents)))]
     if len(context) < 2:
         context = []
     lane_capacity = max(2, body_capacity - len(context))
@@ -3365,9 +3366,14 @@ def _rail_rows(
     slots = lane_capacity - 1
     if len(agents) > slots:
         slots = max(0, slots - 1)  # one row explains what is omitted
-    order = sorted(range(len(agents)), key=lambda i: (
-        agents[i] is not selected, getattr(agents[i], "state", "") in terminal, i,
-    ))
+    order = sorted(
+        range(len(agents)),
+        key=lambda i: (
+            agents[i] is not selected,
+            getattr(agents[i], "state", "") in terminal,
+            i,
+        ),
+    )
     visible = set(order[:slots])
     hidden = len(agents) - len(visible)
     rows = _rail_lane_rows(agents, panel_width) if agents else []
@@ -3382,14 +3388,18 @@ def _rail_rows(
         if crowded and agent is not selected and getattr(agent, "state", "") in terminal:
             continue
         room = max(0, lane_capacity - len(lines) - remaining - bool(hidden))
-        lines.extend(_rail_detail_rows(
-            agent, panel_width, activity_line=activity_line if agent is selected else "",
-        )[:room])
+        lines.extend(
+            _rail_detail_rows(
+                agent,
+                panel_width,
+                activity_line=activity_line if agent is selected else "",
+            )[:room]
+        )
     if not agents:
         lines.append(_side_row("dim", " no agents yet", panel_width))
     if hidden:
         lines.append(_side_row("dim", f" {hidden} more: /agents", panel_width))
-    return (lines + context + resources)[:max(1, capacity)]
+    return (lines + context + resources)[: max(1, capacity)]
 
 
 def _recent_rows(event: Any, width: int) -> list[tuple[str, str]]:
@@ -4613,9 +4623,11 @@ class Cockpit:
             label += f" {text.count(chr(10), 0, cursor) + 1}/{text.count(chr(10)) + 1}"
             start = text.rfind("\n", 0, cursor) + 1
             end = text.find("\n", cursor)
-            text, cursor = text[start:len(text) if end < 0 else end], cursor - start
+            text, cursor = text[start : len(text) if end < 0 else end], cursor - start
+
         def display(value: str) -> str:
             return _sanitize(value).replace("\r", " ").replace("\n", "↵").replace("\t", " ")
+
         before = display(text[:cursor])
         text = display(text)
         cursor = len(before)
@@ -4927,10 +4939,14 @@ class Cockpit:
             if self._fixed_frame:
                 self._draw_live_event_now(request)
                 capacity = max(1, self._last_size.lines - _frame_overhead(self._show_detail))
-                rows = tuple(_primary_rows(
-                    request[1], _frame_content_width(self._last_size.columns),
-                    color=self.color, include_stream=False,
-                ))
+                rows = tuple(
+                    _primary_rows(
+                        request[1],
+                        _frame_content_width(self._last_size.columns),
+                        color=self.color,
+                        include_stream=False,
+                    )
+                )
                 visible = rows[-capacity:]
                 self._redraw_rail(visible, self._last_rail_rows)
                 self._last_frame_conversation_rows = visible
@@ -5235,8 +5251,10 @@ class Cockpit:
             != (rail_rows[index] if index < len(rail_rows) else ("", ""))
             or (
                 self._last_frame_conversation_rows[index]
-                if index < len(self._last_frame_conversation_rows) else ("", "")
-            ) != (conversation_rows[index] if index < len(conversation_rows) else ("", ""))
+                if index < len(self._last_frame_conversation_rows)
+                else ("", "")
+            )
+            != (conversation_rows[index] if index < len(conversation_rows) else ("", ""))
         ]
         if not changed:
             return

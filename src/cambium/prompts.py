@@ -117,18 +117,30 @@ def save_policy(policy: Mapping[str, str], path: Path | None = None) -> Path:
 
 def coding_prompt(policy: Mapping[str, str] | None = None) -> str:
     selected = policy or {"coding": CODING_POLICY, "summary": SUMMARY_POLICY}
-    return "\n".join((
-        _ACTION_PROTOCOL, selected["coding"],
-        "A final <cambium-summary-control> requests summary JSON instead of an action; "
-        "follow its response contract. Earlier summaries are background, not new source evidence.",
-        "Available tools:",
-    ))
+    return "\n".join(
+        (
+            _ACTION_PROTOCOL,
+            selected["coding"],
+            "A final <cambium-summary-control> requests summary JSON instead of an action; "
+            "follow its response contract. Earlier summaries are background, "
+            "not new source evidence.",
+            "Available tools:",
+        )
+    )
 
 
 CODING_AGENT = coding_prompt()
 
 __all__ = [
-    "CODING_AGENT", "CODING_POLICY", "SUMMARY_POLICY", "PROMPTS_VERSION",
-    "SEMANTIC_SUMMARIZER", "SUMMARY_PROTOCOL_LINES", "coding_prompt", "load_policy",
-    "prompt_path", "save_policy", "validate_policy",
+    "CODING_AGENT",
+    "CODING_POLICY",
+    "SUMMARY_POLICY",
+    "PROMPTS_VERSION",
+    "SEMANTIC_SUMMARIZER",
+    "SUMMARY_PROTOCOL_LINES",
+    "coding_prompt",
+    "load_policy",
+    "prompt_path",
+    "save_policy",
+    "validate_policy",
 ]

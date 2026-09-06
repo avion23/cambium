@@ -595,7 +595,8 @@ def test_debt_aware_selection_balances_across_tasks_and_feeds_ledger(tmp_path, m
         ]
         # Concurrent workers may announce assignments in either order.
         assert sorted(payload["assigned_provider"] for payload in assigned) == [
-            "provider-a", "provider-b",
+            "provider-a",
+            "provider-b",
         ]
         assert {payload["model"] for payload in assigned} == {"m1", "m2"}
 

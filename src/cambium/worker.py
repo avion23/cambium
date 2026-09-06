@@ -2526,9 +2526,15 @@ _READ_TOOL_NAMES = frozenset({"read_file", "read_batch"})
 _EDIT_TOOL_NAMES = frozenset({"edit_file", "write_file"})
 # Allowlist, not a denylist: a batch runs concurrently only when EVERY call is
 # a known read-only tool. Anything new or unknown defaults to sequential.
-_CONCURRENT_TOOL_NAMES = frozenset({
-    "read_file", "read_batch", "repo_query", "branch_history", "inspect_state",
-})
+_CONCURRENT_TOOL_NAMES = frozenset(
+    {
+        "read_file",
+        "read_batch",
+        "repo_query",
+        "branch_history",
+        "inspect_state",
+    }
+)
 
 
 def _call_paths(name: str, arguments: dict[str, Any]) -> list[str]:
@@ -6856,9 +6862,14 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                             zip(tool_calls, denials, strict=True)
                         ):
                             await _emit_tool_event(
-                                writer, config, call["name"], call["arguments"], turn,
+                                writer,
+                                config,
+                                call["name"],
+                                call["arguments"],
+                                turn,
                                 ToolResult(
-                                    ok=False, error=denial or "batch contained a denied action",
+                                    ok=False,
+                                    error=denial or "batch contained a denied action",
                                 ),
                                 batch_index=index,
                             )
@@ -6866,13 +6877,19 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                     if trailing:
                         batch_messages.append({"role": "user", "content": _TRAILING_ACTION_NOTE})
                     for call, denial in zip(tool_calls, denials, strict=True):
-                        batch_messages.append({
-                            "role": "user",
-                            "content": _tool_observation(call["name"], ToolResult(
-                                ok=False,
-                                error=denial or "not executed: batch contained a denied action",
-                            )),
-                        })
+                        batch_messages.append(
+                            {
+                                "role": "user",
+                                "content": _tool_observation(
+                                    call["name"],
+                                    ToolResult(
+                                        ok=False,
+                                        error=denial
+                                        or "not executed: batch contained a denied action",
+                                    ),
+                                ),
+                            }
+                        )
                     if base_messages is None:
                         transcript.extend(batch_messages)
                     else:
@@ -7132,9 +7149,11 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                     batch_checkpoint: ContextCheckpoint | None = None
                     batch_checkpoint_was_emitted = False
                     if (
-                        base_messages is not None and config.checkpoint_root is not None
+                        base_messages is not None
+                        and config.checkpoint_root is not None
                         and any(
-                            name == "delegate" and value.ok
+                            name == "delegate"
+                            and value.ok
                             and args["spec"]["context_mode"] == "semantic"
                             for name, args, value in batch_results
                         )
@@ -7236,11 +7255,13 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                             turn=turn,
                             epoch=epoch_count,
                             provider_messages=copy.deepcopy(
-                                list(base_messages) if base_messages is not None
+                                list(base_messages)
+                                if base_messages is not None
                                 else sent_prompt["messages"]
                             ),
                             continuation_suffix=copy.deepcopy(
-                                context_continuation if base_messages is not None
+                                context_continuation
+                                if base_messages is not None
                                 else continuation_suffix
                             ),
                             provider=result.provider,

@@ -15,15 +15,24 @@ from cambium.worker import _context_message, _parse_provider_action
 
 def _provider() -> ProviderConfig:
     return ProviderConfig(
-        name="codex", tier=ProviderTier.FAST, base_url="https://example.invalid",
+        name="codex",
+        tier=ProviderTier.FAST,
+        base_url="https://example.invalid",
         api_key_env="CODEX_KEY",
     )
 
 
 def _message(phase: str, text: str) -> dict:
-    return {"type": "message", "phase": phase, "content": [{
-        "type": "output_text", "text": text,
-    }]}
+    return {
+        "type": "message",
+        "phase": phase,
+        "content": [
+            {
+                "type": "output_text",
+                "text": text,
+            }
+        ],
+    }
 
 
 def test_codex_selects_final_text_but_worker_executes_first_action() -> None:
@@ -33,12 +42,20 @@ def test_codex_selects_final_text_but_worker_executes_first_action() -> None:
     events = [
         {"type": "response.output_text.delta", "item_id": "comment", "delta": action},
         {"type": "response.output_text.delta", "item_id": "answer", "delta": finish},
-        {"type": "response.completed", "response": {"output": [
-            _message("commentary", action), _message("final_answer", finish),
-        ]}},
+        {
+            "type": "response.completed",
+            "response": {
+                "output": [
+                    _message("commentary", action),
+                    _message("final_answer", finish),
+                ]
+            },
+        },
     ]
     payload, text, error = _parse_codex_sse(
-        provider, "\n".join("data: " + json.dumps(e) for e in events), "unused",
+        provider,
+        "\n".join("data: " + json.dumps(e) for e in events),
+        "unused",
     )
     assert error is None
     assert text == finish  # General clients such as DSPy still get the final answer.
@@ -56,16 +73,26 @@ def test_sparse_completion_keeps_per_message_output() -> None:
     events = [
         {"type": "response.output_text.delta", "item_id": "one", "delta": "First"},
         {"type": "response.output_text.delta", "item_id": "two", "delta": "Second"},
-        {"type": "response.output_item.done", "item": {
-            "id": "one", **_message("commentary", "First"),
-        }},
-        {"type": "response.output_item.done", "item": {
-            "id": "two", **_message("final_answer", "Second"),
-        }},
+        {
+            "type": "response.output_item.done",
+            "item": {
+                "id": "one",
+                **_message("commentary", "First"),
+            },
+        },
+        {
+            "type": "response.output_item.done",
+            "item": {
+                "id": "two",
+                **_message("final_answer", "Second"),
+            },
+        },
         {"type": "response.completed", "response": {}},
     ]
     _, text, error = _parse_codex_sse(
-        _provider(), "\n".join("data: " + json.dumps(e) for e in events), "unused",
+        _provider(),
+        "\n".join("data: " + json.dumps(e) for e in events),
+        "unused",
     )
     assert error is None
     assert text == "Second"
@@ -78,16 +105,30 @@ def test_native_function_items_reach_the_existing_tool_dispatch(tmp_path) -> Non
     from cambium.worker import _native_tool_action
 
     (tmp_path / "sample.txt").write_text("exact observed content")
-    item = {"type": "function_call", "id": "fc-1", "call_id": "call-1",
-            "name": "read_batch", "arguments": '{"paths":["sample.txt"]}'}
+    item = {
+        "type": "function_call",
+        "id": "fc-1",
+        "call_id": "call-1",
+        "name": "read_batch",
+        "arguments": '{"paths":["sample.txt"]}',
+    }
     events = [
         {"type": "response.output_item.done", "item": item},
-        {"type": "response.completed", "response": {"usage": {
-            "input_tokens": 2, "output_tokens": 3, "total_tokens": 5,
-        }}},
+        {
+            "type": "response.completed",
+            "response": {
+                "usage": {
+                    "input_tokens": 2,
+                    "output_tokens": 3,
+                    "total_tokens": 5,
+                }
+            },
+        },
     ]
     payload, text, error = _parse_codex_sse(
-        _provider(), "\n".join("data: " + json.dumps(e) for e in events), "unused",
+        _provider(),
+        "\n".join("data: " + json.dumps(e) for e in events),
+        "unused",
     )
     assert error is None
     result = _CodexRawResponse(payload, 1.0, text).to_result(_provider(), {})

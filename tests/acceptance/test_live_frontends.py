@@ -41,8 +41,16 @@ def live_frontend(tmp_path: Path):
     env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2] / "src")
     session = tmp_path / "session"
     arguments = [
-        "--repo", str(repo), "--session-dir", str(session),
-        "--max-turns", "10", "--max-wall-s", "150", "--max-restarts", "0",
+        "--repo",
+        str(repo),
+        "--session-dir",
+        str(session),
+        "--max-turns",
+        "10",
+        "--max-wall-s",
+        "150",
+        "--max-restarts",
+        "0",
     ]
     return repo, session, env, config, arguments
 
@@ -57,8 +65,12 @@ _CODING_TASK = (
 def _check_code(repo: Path) -> None:
     code = subprocess.check_output(["git", "show", "main:calc.py"], cwd=repo, text=True)
     subprocess.run(
-        [sys.executable, "-c", code + "\nassert add(2, 3) == 5\n"
-         "assert add.__doc__ == 'Return the sum of two numbers.'\n"],
+        [
+            sys.executable,
+            "-c",
+            code + "\nassert add(2, 3) == 5\n"
+            "assert add.__doc__ == 'Return the sum of two numbers.'\n",
+        ],
         check=True,
     )
 
@@ -83,7 +95,10 @@ def test_live_cli_uses_navigation_and_publishes_code(live_frontend) -> None:
     repo, session, env, _config, arguments = live_frontend
     result = subprocess.run(
         [sys.executable, "-m", "cambium", "run", *arguments, "--json", _CODING_TASK],
-        env=env, capture_output=True, text=True, timeout=180,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
     )
     assert result.returncode == 0, (result.stderr or result.stdout)[-2000:]
     _check_code(repo)
@@ -118,7 +133,8 @@ def test_live_tui_codes_then_reopens_its_tool_evidence(live_frontend, tmp_path: 
         events = _events(session)
         assert any(
             row.get("payload", {}).get("tool") == "branch_history"
-            and row["payload"].get("ok") is True for row in events
+            and row["payload"].get("ok") is True
+            for row in events
         )
         assert any(
             "assistant_action:" in path.read_text()

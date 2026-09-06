@@ -172,20 +172,26 @@ def _write_advanced_checkpoint(session_dir: Path) -> dict[str, Any]:
     from dataclasses import asdict, replace
 
     config = replace(
-        worker._PROVIDER_TOOLS_CONFIG, task_id="task",
+        worker._PROVIDER_TOOLS_CONFIG,
+        task_id="task",
         checkpoint_root=session_dir / ".cambium" / "checkpoints",
     )
     checkpoint = worker._write_epoch_checkpoint(
-        config, turn=2, epoch=2,
+        config,
+        turn=2,
+        epoch=2,
         provider_messages=[
             {"role": "system", "content": "system"},
             {"role": "user", "content": "question"},
         ],
         continuation_suffix=[{"role": "assistant", "content": "folded"}],
-        provider="fake-provider", model="fake-model",
+        provider="fake-provider",
+        model="fake-model",
         tools_sha256=_provider_task_tools_hash(),
         provider_compat={"fake-provider": ("loopback", None)},
-        provider_boundary=_provider_boundary(), created_at=1.0, wall_deadline=10.0,
+        provider_boundary=_provider_boundary(),
+        created_at=1.0,
+        wall_deadline=10.0,
     )
     assert checkpoint is not None
     cache_key = asdict(checkpoint.cache_key)

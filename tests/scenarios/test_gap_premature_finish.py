@@ -15,14 +15,19 @@ from cambium import worker
 
 @pytest.mark.parametrize("objective_met", [False, True])
 def test_budget_advice_allows_last_check_and_preserves_verdict(
-    tmp_path: Path, objective_met: bool,
+    tmp_path: Path,
+    objective_met: bool,
 ) -> None:
     worktree = _make_worktree(tmp_path / "repo")
     config = _agent_config(worktree, max_tokens=20)
     check = {
         "name": "run_shell",
-        "arguments": {"cmd": [sys.executable, "-c",
-            "from pathlib import Path; assert Path('alpha.txt').read_text() == 'changed\\n'"],
+        "arguments": {
+            "cmd": [
+                sys.executable,
+                "-c",
+                "from pathlib import Path; assert Path('alpha.txt').read_text() == 'changed\\n'",
+            ],
         },
     }
     router = _UsageScriptedRouter(
@@ -57,8 +62,11 @@ def test_progress_hash_retains_only_recent_reads() -> None:
     detector = worker._ProgressDetector(max_no_progress_actions=2, progress_window=3)
     for index in range(worker.MAX_PROGRESS_CONTENT_HASHES + 2):
         detector.observe(
-            action={"type": "tool_call", "name": "read_batch",
-                    "arguments": {"paths": [f"file-{index}.txt"]}},
+            action={
+                "type": "tool_call",
+                "name": "read_batch",
+                "arguments": {"paths": [f"file-{index}.txt"]},
+            },
             result_content=f"body-{index}",
         )
     assert len(detector._recent_content_hashes) == worker.MAX_PROGRESS_CONTENT_HASHES
