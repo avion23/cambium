@@ -1133,7 +1133,6 @@ def test_restore_hashes_a_read_batch_as_one_joined_result() -> None:
     restored.restore(
         [
             worker._canonical_action_message(action),
-            {"role": "user", "content": worker._TRAILING_ACTION_NOTE},
             *(
                 {
                     "role": "user",
@@ -1282,27 +1281,20 @@ def test_plan_and_thought_round_trip_through_parser() -> None:
             '{"type":"finish","summary":"done","objective_met":true}'
             '{"type":"tool_call","name":"read_batch","arguments":{"paths":["a.py"]}}'
         )
-    assert worker._action_trailing(
-        '{"type":"finish","summary":"done","objective_met":true}'
-        '{"type":"tool_call","name":"read_batch","arguments":{"paths":["a.py"]}}'
-    ).startswith('{"type":"tool_call"')
-    assert worker._action_trailing('{"type":"plan","steps":["a"]}') == ""
-    assert worker._action_trailing('{"type":"plan"') == ""
-
     # ZAI has repeatedly emitted this exact closer typo after otherwise valid
-    # single-call batches. Normalize only that unambiguous structural defect.
+    # single-call batches. Normalize it only for read-only/inspection actions.
     assert worker._parse_agent_action(
-        '{"type":"tool_call","calls":[{"name":"run_shell","arguments":'
-        '{"cmd":["python","-c","assert 2 + 3 == 5"],"timeout_s":30}]}]}'
+        '{"type":"tool_call","calls":[{"name":"read_batch","arguments":'
+        '{"paths":["a.py"]}]}]}'
     ) == {
         "type": "tool_call",
-        "calls": [
-            {
-                "name": "run_shell",
-                "arguments": {"cmd": ["python", "-c", "assert 2 + 3 == 5"], "timeout_s": 30},
-            }
-        ],
+        "calls": [{"name": "read_batch", "arguments": {"paths": ["a.py"]}}],
     }
+    with pytest.raises(ValueError, match="action is not valid JSON"):
+        worker._parse_agent_action(
+            '{"type":"tool_call","calls":[{"name":"run_shell","arguments":'
+            '{"cmd":["python","-c","assert 2 + 3 == 5"],"timeout_s":30}]}]}'
+        )
 
     for bad in (
         '{"type":"plan"}',
@@ -1337,8 +1329,12 @@ def test_parse_agent_action_normalizes_observed_provider_shapes() -> None:
         worker._parse_agent_action(
             '[{"type":"plan","steps":["a"]},{"type":"plan","steps":["b"]}]'
         )
-    with pytest.raises(ValueError, match="unknown tool"):
+    with pytest.raises(ValueError, match="must carry exactly name/arguments"):
         worker._parse_agent_action('[{"calls":[{"name":"not_a_tool","action":"tree"}]}]')
+    with pytest.raises(ValueError, match="unknown tool"):
+        worker._parse_agent_action(
+            '[{"calls":[{"name":"not_a_tool","arguments":{"action":"tree"}}]}]'
+        )
     with pytest.raises(ValueError, match="must carry exactly name/arguments"):
         worker._parse_agent_action(
             '{"type":"tool_call","calls":[{"name":"repo_query",'
@@ -1348,6 +1344,27 @@ def test_parse_agent_action_normalizes_observed_provider_shapes() -> None:
         worker._parse_agent_action(
             '[{"calls":[{"name":"repo_query","arguments":3}]}]'
         )
+
+    assert worker._parse_agent_action(
+        '{"calls":['
+        '{"name":"read_batch","paths":["a.py"]},'
+        '{"name":"git_op","op":"status","args":"--short"}'
+        "]}"
+    ) == {
+        "type": "tool_call",
+        "calls": [
+            {"name": "read_batch", "arguments": {"paths": ["a.py"]}},
+            {"name": "git_op", "arguments": {"op": "status", "args": "--short"}},
+        ],
+    }
+    for mutating in (
+        '{"calls":[{"name":"edit_file","path":"a.py",'
+        '"old_string":"old","new_string":"new"}]}',
+        '{"calls":[{"name":"run_shell","cmd":["true"]}]}',
+        '{"calls":[{"name":"git_op","op":"add","args":"."}]}',
+    ):
+        with pytest.raises(ValueError, match="must carry exactly name/arguments"):
+            worker._parse_agent_action(mutating)
 
 
 def test_parse_agent_action_accepts_fenced_tool_call() -> None:
@@ -1395,10 +1412,6 @@ def test_lenient_parse_accepts_raw_control_characters_in_strings() -> None:
             }
         ],
     }
-    assert worker._action_trailing(action) == ""
-    assert worker._action_trailing(action + '{"type":"plan","steps":["a"]}').startswith(
-        '{"type":"plan"'
-    )
     with pytest.raises(ValueError):
         worker._parse_agent_action('{"type":"finish","summary":"broken\n-oops}')
 

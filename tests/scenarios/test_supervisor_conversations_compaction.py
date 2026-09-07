@@ -396,6 +396,14 @@ def test_compaction_events_are_strictly_validated_and_durable(tmp_path: Path) ->
         "epoch": 2,
         "reason": "canary failed",
     }
+    valid_deferred = {
+        "type": "compaction_deferred",
+        "request_id": "deferred-request",
+        "task_id": "task",
+        "generation": 1,
+        "epoch": 2,
+        "reason": "retry later",
+    }
     malformed_advanced = {**valid_advanced, "folded_from_epoch": 0}
     invalid_checkpoint = {
         **valid_advanced,
@@ -406,15 +414,24 @@ def test_compaction_events_are_strictly_validated_and_durable(tmp_path: Path) ->
         "folded_from_epoch": 2,
     }
     malformed_failed = {**valid_failed, "reason": ""}
+    malformed_deferred = {**valid_deferred, "reason": ""}
+    mismatched_deferred = {
+        **valid_deferred,
+        "request_id": "mismatched-deferred",
+        "task_id": "other",
+    }
     worker_path = tmp_path / "events_worker.py"
     _write_worker(
         worker_path,
         [
             valid_advanced,
             valid_failed,
+            valid_deferred,
             invalid_checkpoint,
             malformed_advanced,
             malformed_failed,
+            malformed_deferred,
+            mismatched_deferred,
         ],
     )
     event_store = _MemoryStore()
@@ -438,6 +455,7 @@ def test_compaction_events_are_strictly_validated_and_durable(tmp_path: Path) ->
         record for record in event_store.records if record["kind"] == "context_epoch_advanced"
     ]
     failed = [record for record in event_store.records if record["kind"] == "compaction_failed"]
+    deferred = [record for record in event_store.records if record["kind"] == "compaction_deferred"]
     assert len(advanced) == 1
     assert advanced[0]["request_id"] == "epoch-request"
     assert advanced[0]["payload"] == {
@@ -451,6 +469,9 @@ def test_compaction_events_are_strictly_validated_and_durable(tmp_path: Path) ->
     assert len(failed) == 1
     assert failed[0]["request_id"] == "failure-request"
     assert failed[0]["payload"] == {"epoch": 2, "reason": "canary failed"}
+    assert len(deferred) == 1
+    assert deferred[0]["request_id"] == "deferred-request"
+    assert deferred[0]["payload"] == {"epoch": 2, "reason": "retry later"}
     rejected = [record for record in event_store.records if record["kind"] == "protocol"]
     assert {
         record["payload"]["note"]
@@ -459,9 +480,18 @@ def test_compaction_events_are_strictly_validated_and_durable(tmp_path: Path) ->
     } == {
         "context_epoch_advanced rejected: invalid field(s)",
         "compaction_failed rejected: invalid field(s)",
+        "compaction_deferred rejected: invalid field(s)",
     }
     assert any(
         record["payload"].get("note") == "context_epoch_advanced rejected: invalid checkpoint"
+        for record in rejected
+    )
+    assert any(
+        record["payload"].get("note") == "compaction_deferred rejected: identity mismatch"
+        for record in rejected
+    )
+    assert not any(
+        record["payload"].get("note") == "unhandled message type 'compaction_deferred'"
         for record in rejected
     )
     assert "context_epoch_advanced" in CRITICAL_KINDS

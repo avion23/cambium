@@ -407,7 +407,7 @@ _CONTEXT_EPOCH_ADVANCED_FIELDS = frozenset(
         "reason",
     }
 )
-_COMPACTION_FAILED_FIELDS = frozenset(
+_COMPACTION_NOTICE_FIELDS = frozenset(
     {
         "type",
         "request_id",
@@ -517,13 +517,13 @@ def _invalid_context_epoch_advanced_fields(msg: dict[str, Any]) -> list[str]:
     return invalid
 
 
-def _invalid_compaction_failed_fields(msg: dict[str, Any]) -> list[str]:
-    """Return compaction_failed fields whose values are invalid."""
-    unknown = sorted(set(msg) - _COMPACTION_FAILED_FIELDS, key=str)
+def _invalid_compaction_notice_fields(msg: dict[str, Any], expected_type: str) -> list[str]:
+    """Return compaction notice fields whose values are invalid."""
+    unknown = sorted(set(msg) - _COMPACTION_NOTICE_FIELDS, key=str)
     if unknown:
         return unknown
     invalid: list[str] = []
-    if msg.get("type") != "compaction_failed":
+    if msg.get("type") != expected_type:
         invalid.append("type")
     for field in ("request_id", "task_id"):
         value = msg.get(field)
@@ -6336,16 +6336,16 @@ class _Runtime:
         )
         self._task_epochs[state.task_id] = dict(msg)
 
-    async def _handle_compaction_failed_message(
-        self, state: _GenerationState, msg: dict[str, Any]
+    async def _handle_compaction_notice_message(
+        self, state: _GenerationState, msg: dict[str, Any], event_type: str
     ) -> None:
-        invalid = _invalid_compaction_failed_fields(msg)
+        invalid = _invalid_compaction_notice_fields(msg, event_type)
         if invalid:
             await self.emit(
                 "protocol",
                 task_id=state.task_id,
                 generation=state.generation,
-                note="compaction_failed rejected: invalid field(s)",
+                note=f"{event_type} rejected: invalid field(s)",
                 fields=invalid,
             )
             return
@@ -6354,13 +6354,13 @@ class _Runtime:
                 "protocol",
                 task_id=state.task_id,
                 generation=state.generation,
-                note="compaction_failed rejected: identity mismatch",
+                note=f"{event_type} rejected: identity mismatch",
                 expected_task_id=state.task_id,
                 expected_generation=state.generation,
             )
             return
         await self.emit(
-            "compaction_failed",
+            event_type,
             task_id=state.task_id,
             generation=state.generation,
             request_id=msg["request_id"],
@@ -6672,8 +6672,8 @@ class _Runtime:
         if mtype == "context_epoch_advanced":
             await self._handle_context_epoch_advanced_message(state, msg)
             return False
-        if mtype == "compaction_failed":
-            await self._handle_compaction_failed_message(state, msg)
+        if mtype in {"compaction_failed", "compaction_deferred"}:
+            await self._handle_compaction_notice_message(state, msg, mtype)
             return False
         if mtype == "provider_boundary_degraded":
             await self._handle_provider_boundary_degraded_message(state, msg)

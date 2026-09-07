@@ -2001,6 +2001,17 @@ def _repair_tool_batch_closer(text: str) -> tuple[Any, int] | None:
         or not isinstance(parsed.get("calls"), list)
     ):
         return None
+    for call in parsed["calls"]:
+        if not isinstance(call, dict):
+            return None
+        name = call.get("name")
+        arguments = call.get("arguments")
+        if name in _CONCURRENT_TOOL_NAMES:
+            continue
+        op = arguments.get("op") if isinstance(arguments, dict) else call.get("op")
+        if name == "git_op" and op in INSPECTION_GIT_OPS:
+            continue
+        return None
     return parsed, len(text)
 
 
@@ -2057,9 +2068,17 @@ def _normalize_tool_calls(action: Mapping[str, Any]) -> list[dict[str, Any]]:
                 errors.append(f"tool_call calls[{index}] must be an object")
                 continue
             if set(raw_call) != {"name", "arguments"}:
-                if "arguments" not in raw_call and isinstance(raw_call.get("name"), str):
+                name = raw_call.get("name")
+                if (
+                    "arguments" not in raw_call
+                    and isinstance(name, str)
+                    and (
+                        name in _CONCURRENT_TOOL_NAMES
+                        or (name == "git_op" and raw_call.get("op") in INSPECTION_GIT_OPS)
+                    )
+                ):
                     raw_call = {
-                        "name": raw_call["name"],
+                        "name": name,
                         "arguments": {
                             key: value for key, value in raw_call.items() if key != "name"
                         },
@@ -2185,25 +2204,6 @@ def _parse_agent_action(content: str) -> dict[str, Any]:
             "objective_met": parsed["objective_met"],
         }
     raise ValueError(f"unknown agent action type: {action_type!r}")
-
-
-_TRAILING_ACTION_NOTE = (
-    "only the first action was executed; trailing JSON was ignored — "
-    "emit exactly one JSON action per turn"
-)
-
-
-def _action_trailing(content: str) -> str:
-    """Return the non-whitespace content AFTER the first complete JSON value,
-    or "" when there is none or the content cannot be parsed at all."""
-    text = content.strip()
-    if not text:
-        return ""
-    try:
-        _obj, end = _decode_action_json(text)
-    except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
-        return ""
-    return text[end:].strip()
 
 
 def _usage_prompt_tokens(usage: dict[str, Any] | None) -> int | None:
@@ -6660,7 +6660,6 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                     )
                 continue
             consecutive_invalid_actions = 0
-            trailing = _action_trailing(result.content)
             action_message = _canonical_action_message(action)
             phase = getattr(result, "assistant_phase", None)
             if phase in {"commentary", "final_answer"}:
@@ -6683,14 +6682,8 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
             if action["type"] == "plan":
                 if base_messages is None:
                     transcript.append(action_message)
-                    if trailing:
-                        transcript.append({"role": "user", "content": _TRAILING_ACTION_NOTE})
                 else:
                     context_continuation.append(action_message)
-                    if trailing:
-                        context_continuation.append(
-                            {"role": "user", "content": _TRAILING_ACTION_NOTE}
-                        )
                     context_continuation.append({"role": "user", "content": "Continue."})
                     transcript = _sync_context_transcript(
                         base_messages, context_continuation, transcript
@@ -6869,8 +6862,6 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                                 batch_index=index,
                             )
                     batch_messages: list[dict[str, Any]] = [action_message]
-                    if trailing:
-                        batch_messages.append({"role": "user", "content": _TRAILING_ACTION_NOTE})
                     for call, denial in zip(tool_calls, denials, strict=True):
                         batch_messages.append(
                             {
@@ -7035,8 +7026,6 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                         batch_index=batch_index,
                     )
                 batch_messages = [action_message]
-                if trailing:
-                    batch_messages.append({"role": "user", "content": _TRAILING_ACTION_NOTE})
                 result_contents: list[str] = []
                 for name, _arguments, tool_result in batch_results:
                     result_content = (
