@@ -219,6 +219,10 @@ MAX_TRANSCRIPT_CHARS = 120_000
 TRANSCRIPT_KEEP_TURNS = 6
 MAX_ENVELOPE_FIELD_CHARS = 2_000
 MAX_ENVELOPE_ITEMS = 16
+# Supervisor-authored correction appended to a resumed parent's context when
+# every child of one delegate batch was rejected before spawn. Bounded so a
+# pathological reject-retry loop cannot bloat the parent context.
+MAX_REJECTION_FEEDBACK_CHARS = 1_200
 MAX_CONTEXT_MESSAGES = 512
 CHECKPOINT_EPOCH_SCHEMA = 5
 _LEGACY_CHECKPOINT_EPOCH_SCHEMA = 4
@@ -410,6 +414,7 @@ _RESUME_KEYS = frozenset(
         "child_results",
         "child_results_truncated",
         "workspace_changed",
+        "rejection_feedback",
     }
 )
 _SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -628,12 +633,23 @@ def _validate_resume(value: Any) -> dict[str, Any] | None:
     workspace_changed = value.get("workspace_changed")
     if type(workspace_changed) is not bool:
         raise ContextForkError("resume 'workspace_changed' must be a boolean")
+    feedback = value.get("rejection_feedback")
+    if feedback is not None and (
+        not isinstance(feedback, str)
+        or not feedback
+        or len(feedback) > MAX_REJECTION_FEEDBACK_CHARS
+    ):
+        raise ContextForkError(
+            "resume 'rejection_feedback' must be None or a non-empty string "
+            f"of at most {MAX_REJECTION_FEEDBACK_CHARS} characters"
+        )
     return {
         "checkpoint_ref": checkpoint_ref,
         "epoch": epoch,
         "child_results": validated_results,
         "child_results_truncated": truncated,
         "workspace_changed": workspace_changed,
+        "rejection_feedback": feedback,
     }
 
 
@@ -6043,6 +6059,8 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
             )
             for child_result in resume["child_results"]:
                 transcript.append({"role": "user", "content": _child_result_lines(child_result)})
+            if resume["rejection_feedback"]:
+                transcript.append({"role": "user", "content": resume["rejection_feedback"]})
             compaction_deferred = turn_checkpoint["compaction_deferred"]
             consecutive_compaction_deferrals = turn_checkpoint["consecutive_compaction_deferrals"]
             outcome["commits_so_far"] = turn_checkpoint["commits_so_far"]
@@ -6086,6 +6104,8 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                     "content": "[note: some child results were truncated and omitted]",
                 }
             )
+        if resume["rejection_feedback"]:
+            context_continuation.append({"role": "user", "content": resume["rejection_feedback"]})
         workspace_changed = resume["workspace_changed"]
         code_changed = resume_checkpoint.code_changed or workspace_changed
         verified_after_change = resume_checkpoint.verified_after_change and not workspace_changed

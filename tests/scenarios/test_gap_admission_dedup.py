@@ -267,7 +267,7 @@ def test_new_generation_request_is_not_lost_to_stale_generation_filter(
         (2, second_generation),
     ]
 
-    async def scenario() -> list[str]:
+    async def scenario() -> tuple[list[str], list[tuple[str, str]]]:
         stale = runtime._take_generation_proposals("parent", 1)
         current = runtime._take_generation_proposals("parent", 2)
         assert stale == (first_generation,)
@@ -279,7 +279,9 @@ def test_new_generation_request_is_not_lost_to_stale_generation_filter(
             include_port=False,
         )
 
-    assert asyncio.run(scenario()) == ["child"]
+    admitted, rejections = asyncio.run(scenario())
+    assert admitted == ["child"]
+    assert rejections == []
     assert len([event for event in events if event["kind"] == "child_admitted"]) == 1
 
 

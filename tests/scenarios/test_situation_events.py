@@ -273,6 +273,7 @@ def test_resume_child_result_reaches_situation_frame(tmp_path: Path) -> None:
                 }
             ],
             "child_results_truncated": False,
+            "rejection_feedback": None,
             "workspace_changed": False,
         },
     )
