@@ -100,8 +100,8 @@ retained policy artifact back to the configured prompt path to revert it.
 
 ## Historical corpus
 
-`src/cambium/benchmarks/prompts.jsonl` contains eight frozen cases adapted from
-recorded Cambium sessions. Each records its source session and a task family.
+`src/cambium/benchmarks/prompts.jsonl` contains eleven frozen cases.
+Each records its source session and a task family.
 The loader rejects a family split across training and final evaluation. Derived
 variants are labelled as variants, not claimed to be transcripts that occurred.
 
@@ -109,8 +109,11 @@ variants are labelled as variants, not claimed to be transcripts that occurred.
 | --- | --- | --- |
 | Train | `arithmetic`, `parallel-modules` | Small repair and failed independent-module runs |
 | Train | `parallel-utilities` | The CSV/configuration join failure, with explicit semantic children |
-| Validation | `cambium-self-fix` | Repair `render_tokens_per_s(None)` at frozen Cambium commit `63034cc` |
+| Validation | `cambium-self-fix` | Synthetic fixture for `render_tokens_per_s(None)`, distilled from the recorded self-modification |
 | Validation | `blocking-child` | One read-only child sharing the current trunk/provider |
+| Validation | `finish-report` | Synthetic strict finish envelope and machine-readable completion report |
+| Validation | `calibration-memory` | Synthetic calibration facts that must survive context compaction |
+| Validation | `parallel-derive` | Synthetic parallel delegation over independent numeric utilities |
 | Test | `navigation-history` | Actual edit, check, and exact tool-evidence retrieval |
 | Test | `history-reconnect` | Derived continuation across frontend reconnect |
 | Test | `corrected-history` | Derived requirement change, semantic review, K0, reconnect and stale-check recall |
@@ -141,7 +144,7 @@ not a calibrated economic model.
 Keep train, validation and test cases disjoint. Do not repeatedly revise prompts
 against the final test cases and still call them held out. Repeat close
 comparisons and enlarge the corpus before treating small gains as general.
-The eight cases now exercise continuation, corrections, a semantic fold and K0,
+The eleven cases now exercise continuation, corrections, a semantic fold and K0,
 but remain a small development corpus, not a representative coding benchmark.
 Once a test case is used to repair the harness, it is a regression case, not
 independent evidence of generalization. Reserve fresh cases before making that
