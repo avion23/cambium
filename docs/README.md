@@ -32,6 +32,7 @@ the final authority.
 
 - [Agent driving loop](how-to/agent-driving-loop.md)
 - [Delegation workflow](how-to/context-branches.md)
+- [Production deployment](how-to/production-deployment.md)
 - [Codex OAuth activation](research/codex-activation.md)
 
 `WorkLedger` and `ResultCapsule-v2` are proposals. Shared recorded inspection
