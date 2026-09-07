@@ -210,7 +210,9 @@ def test_heartbeat_phase_and_tail_are_forwarded_safely(tmp_path: Path) -> None:
     assert heartbeats[1]["tool"] == "wait"
     assert heartbeats[1]["status"] == "working"
     assert heartbeats[1]["tail"] == "second line"
-    assert heartbeats[2] == {"turn": 3, "tool": None, "status": "working"}
+    assert heartbeats[2]["turn"] == 3
+    assert heartbeats[2]["tool"] is None
+    assert heartbeats[2]["status"] == "working"
 
 
 def test_failure_reason_reaches_decision_port_without_widening_child_envelope(

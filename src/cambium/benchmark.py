@@ -377,10 +377,16 @@ def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact che
     missing_tools = set(case.get("required_tools", [])) - observed_tools
     children = [e.get("payload", {}) for e in events if e.get("kind") == "child_admitted"]
     peak_children = _peak_pending_children(events)
+    summary_call_count = sum(
+        event.get("kind") == "usage_event"
+        and event.get("payload", {}).get("call_kind") == "summary"
+        for event in events
+    )
     trace_ok = (
         not missing_tools
         and len(children) >= case.get("required_children", 0)
         and peak_children >= case.get("required_parallel_children", 0)
+        and summary_call_count >= case.get("required_summary_calls", 0)
     )
     if case.get("read_only"):
         trace_ok = trace_ok and accepted == base
@@ -447,7 +453,7 @@ def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact che
         "source": case.get("source"),
         "family": case.get("family"),
         "rollovers": rollovers,
-        "summary_calls": sum(e.get("call_kind") == "summary" for e in usage),
+        "summary_calls": summary_call_count,
         "user_summary_chars": user_summary_chars,
         "user_summary_lines": user_summary_lines,
         "failed_provider_calls": sum(bool(e.get("failure_reason")) for e in usage),
@@ -479,6 +485,7 @@ def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact che
             f"exit={exit_code}; check={checked}; scope={scope_ok}; trace={trace_ok}; "
             f"missing_tools={sorted(missing_tools)}; "
             f"parallel_children={peak_children}/{case.get('required_parallel_children', 0)}; "
+            f"summary_calls={summary_call_count}/{case.get('required_summary_calls', 0)}; "
             f"{error}\n"
             f"{diagnostic}\n{json.dumps(json_finite(failures), allow_nan=False)[-3000:]}"
         ),

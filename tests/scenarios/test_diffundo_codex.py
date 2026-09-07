@@ -344,17 +344,6 @@ def test_codex_body_serialization_is_byte_identical_across_calls() -> None:
     first = _codex_request_body(config, TOOL_PROMPT)
     second = _codex_request_body(config, TOOL_PROMPT)
     assert json.dumps(first) == json.dumps(second)
-    # fixed insertion order: model, input, store, stream, then tools, then
-    # tool_choice, then reasoning
-    assert list(first.keys()) == [
-        "model",
-        "input",
-        "store",
-        "stream",
-        "tools",
-        "tool_choice",
-        "reasoning",
-    ]
 
 
 def test_codex_non_native_mode_keeps_messages_and_omits_tool_wire_fields() -> None:

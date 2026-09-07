@@ -367,3 +367,61 @@ def test_gepa_winner_is_automatically_deployed_unless_disabled(
     assert report["deployed"] is not no_deploy
     assert prompts.load_policy()["coding"] == ("baseline" if no_deploy else "improved")
     assert prompts.load_policy(args.output / "candidate.json")["coding"] == "improved"
+
+
+def test_summary_gepa_stops_when_validation_never_uses_summary_policy(
+    tmp_path: Path, monkeypatch
+) -> None:
+    pytest.importorskip("dspy")
+    import json
+    from types import SimpleNamespace
+
+    from cambium import prompt_optimize
+
+    monkeypatch.setenv("CAMBIUM_PROMPTS", str(tmp_path / "active.json"))
+    prompts.save_policy({"coding": "baseline", "summary": "keep findings"})
+    dataset = tmp_path / "cases.jsonl"
+    dataset.write_text(
+        "\n".join(
+            json.dumps({"id": split, "split": split, "task": split, "check": ["unused"]})
+            for split in ("train", "val", "test")
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    def rollout(case, policy, **kwargs):
+        row = {
+            "id": case["id"],
+            "score": 1.0,
+            "passed": True,
+            "feedback": "pass",
+            "elapsed_s": 1,
+            "calls": 1,
+            "tokens": 1,
+            "summary_calls": 0,
+        }
+        kwargs["budget"].record({"total_tokens": 1})
+        return row
+
+    monkeypatch.setattr(prompt_optimize, "run_case", rollout)
+    args = SimpleNamespace(
+        dataset=dataset,
+        output=tmp_path / "experiment",
+        component="summary",
+        optimizer="gepa",
+        max_evals=8,
+        max_calls=30,
+        max_tokens=100,
+        max_turns=8,
+        max_wall_s=10,
+        max_workers=2,
+        budget_usd=1,
+        provider=None,
+        case=[],
+        dry_run=False,
+        no_deploy=False,
+        seed=0,
+    )
+    with pytest.raises(ValueError, match="actually performs a summary call"):
+        prompt_optimize.run(args)

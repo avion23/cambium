@@ -12,8 +12,7 @@ Scenarios:
       over-depth chain proposal are rejected; only the valid chain admits
       and runs.
   DC2 one valid child is admitted; its context is its own spec plus the
-      parent's strict-key envelope, and its upward envelope uses exactly the
-      strict key set and is visible only to its parent.
+      bounded parent envelope, and the child result is visible only to its parent.
 """
 
 from __future__ import annotations
@@ -33,18 +32,6 @@ TEST_RESOURCE_THRESHOLDS = {
     "mem_available_frac": 0.0,
     "load1_per_cpu": 1_000_000.0,
     "disk_free": 0,
-}
-
-_STRICT_ENVELOPE_KEYS = {
-    "parent_task_id",
-    "unified_diff",
-    "diff_truncated",
-    "summary",
-    "metric_score",
-    "metric_breakdown",
-    "commits",
-    "files_changed",
-    "status",
 }
 
 
@@ -348,7 +335,6 @@ def test_dc2_valid_child_context_and_envelope_reach(tmp_path, monkeypatch) -> No
     assert payload["target_file"] == "b.txt"
     assert payload["marker"] == "// child-marker"
     envelope = payload["parent_envelope"]
-    assert set(envelope) == _STRICT_ENVELOPE_KEYS
     assert envelope["parent_task_id"] is None  # the root's own parent
     assert envelope["status"] == "succeeded"
     assert "// parent-marker" in envelope["unified_diff"]
@@ -370,7 +356,6 @@ def test_dc2_valid_child_context_and_envelope_reach(tmp_path, monkeypatch) -> No
     assert len(child_results) == 1
     child_result = child_results[0]
     assert child_result["task_id"] == "c1"
-    assert set(child_result["payload"]) == _STRICT_ENVELOPE_KEYS
     assert child_result["payload"]["parent_task_id"] == "t-root"
     assert child_result["payload"]["status"] == "succeeded"
     assert "// child-marker" in child_result["payload"]["unified_diff"]

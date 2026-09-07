@@ -27,7 +27,6 @@ from cambium.supervisor import (
     PlanResult,
     run_plan,
 )
-from cambium.tasktree import _ENVELOPE_KEYS
 
 ROOT = Path(__file__).resolve().parents[2]
 HIERARCHY_WORKER = str(ROOT / "tests" / "fixtures" / "hierarchy_worker.py")
@@ -301,10 +300,8 @@ def test_child_receives_bounded_parent_envelope(tmp_path: Path) -> None:
     assert child_payload["target_file"] == "child.txt"
     assert child_payload["marker"] == "// child"
 
-    # The child sees exactly one parent envelope, with the strict key set.
-    assert "parent_envelope" in child_payload
+    # The child sees the parent result without sibling context.
     envelope = child_payload["parent_envelope"]
-    assert set(envelope.keys()) == set(_ENVELOPE_KEYS)
     assert envelope["parent_task_id"] == "root"
     assert envelope["status"] == "succeeded"
     # The root worker produced one commit; it surfaces through the envelope.

@@ -55,8 +55,11 @@ GEPA uses `current_best` candidate selection, no candidate merging, and one
 rollout at a time. Reflection feedback contains the fully rendered production
 prompt plus a bounded trajectory digest, so the optimizer sees the actual fixed
 protocol around the candidate instead of optimizing an isolated sentence. The
-digest flags malformed/tool failures, timeout-shaped runs, and overlong
-user-facing summaries. The current verbosity signal is per operator turn: more
+digest includes summary-call count and flags malformed/tool failures,
+timeout-shaped runs, and overlong user-facing summaries. Summary GEPA stops
+before search when its validation baseline contains no summary call: a component
+that never ran cannot be optimized from task outcomes. The current verbosity
+signal is per operator turn: more
 than roughly 320 aggregate characters or three lines per turn is called out to
 reflection. This is guidance, not a correctness gate; executable task checks
 still dominate the score.
@@ -100,10 +103,13 @@ retained policy artifact back to the configured prompt path to revert it.
 
 ## Historical corpus
 
-`src/cambium/benchmarks/prompts.jsonl` contains eleven frozen cases.
-Each records its source session and a task family.
-The loader rejects a family split across training and final evaluation. Derived
-variants are labelled as variants, not claimed to be transcripts that occurred.
+Coding GEPA uses `src/cambium/benchmarks/prompts.jsonl`, with eleven frozen or
+explicitly synthetic cases. Summary GEPA uses `summary_prompts.jsonl`, with one
+train/validation/test semantic-transfer case each. Those cases erase a fact's
+source before a semantic child must use it and require an observed summary call,
+so summary policy is on the causal path. Each case records provenance and a task
+family. The loader rejects a family split across training and final evaluation.
+Derived variants are labelled as variants, not claimed to be transcripts that occurred.
 
 | Split | Cases | Historical basis |
 | --- | --- | --- |
@@ -144,8 +150,10 @@ not a calibrated economic model.
 Keep train, validation and test cases disjoint. Do not repeatedly revise prompts
 against the final test cases and still call them held out. Repeat close
 comparisons and enlarge the corpus before treating small gains as general.
-The eleven cases now exercise continuation, corrections, a semantic fold and K0,
-but remain a small development corpus, not a representative coding benchmark.
+The coding cases exercise continuation, corrections, semantic folding,
+compaction, strict finish output and parallel joins. The three summary cases
+exercise semantic transfer directly. Both corpora remain small development
+sets, not representative coding benchmarks.
 Once a test case is used to repair the harness, it is a regression case, not
 independent evidence of generalization. Reserve fresh cases before making that
 claim after a GEPA search.

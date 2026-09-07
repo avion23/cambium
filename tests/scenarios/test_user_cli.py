@@ -489,6 +489,31 @@ def test_session_readers_and_cli_expose_paths_and_result_data(capsys, tmp_path: 
     assert json.loads(capsys.readouterr().out)["summary"] == "new"
 
 
+def test_session_show_rejects_unrenderable_result_without_leaking_payload(
+    capsys, tmp_path: Path
+) -> None:
+    root = tmp_path / "sessions"
+    session_dir = root / "nan"
+    _write_events_db(session_dir)
+    state = session_dir / ".cambium"
+    (state / "result.json").write_text(
+        json.dumps(
+            {
+                "status": "done",
+                "exit_code": 0,
+                "metric_score": float("nan"),
+                "api_key": "secret-must-not-be-printed",
+            }
+        )
+    )
+
+    assert cli.main(["session", "show", "--session-dir", str(root), "nan"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "cambium session:" in captured.err
+    assert "secret-must-not-be-printed" not in captured.err
+
+
 def test_session_show_reads_result_without_event_db(capsys, tmp_path: Path) -> None:
     root = tmp_path / "sessions"
     _write_result(root / "incomplete", 1.0)

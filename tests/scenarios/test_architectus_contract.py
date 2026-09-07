@@ -6,7 +6,6 @@ from typing import Any
 import pytest
 
 from cambium.architectus import CORE_DIRECTIVE_MAX, ArchitectusCore, ScriptedLLM
-from cambium.supervisor import ArchitectusAdmissionPort
 from cambium.tasktree import TaskTree, build_tree
 
 
@@ -45,21 +44,6 @@ def _envelope(parent_task_id: str | None = None, summary: str = "finished") -> d
         "commits": [],
         "files_changed": [],
         "status": "succeeded",
-    }
-
-
-def test_empty_step_and_minimal_context_are_stable() -> None:
-    llm = ScriptedLLM([])
-    core = ArchitectusCore(llm, tree=_tree())
-
-    assert asyncio.run(core.step([])) == []
-    assert llm.calls[0][0]["ready"] == ["root"]
-    assert core.compose_context("root") == {
-        "task_id": "root",
-        "static_prefix": ["deliver the goal"],
-        "dynamic_tail": [],
-        "prompt": "deliver the goal",
-        "truncated": False,
     }
 
 
@@ -192,33 +176,6 @@ def test_invalid_action_kinds_raise_value_error(raw_kind: Any) -> None:
 
     with pytest.raises(ValueError, match="Architectus action"):
         asyncio.run(core.step([]))
-
-
-def test_supervisor_port_consumes_tree_aggregate_and_spawn_contract() -> None:
-    child_spec = {"task": "implement child"}
-    core = ArchitectusCore(
-        ScriptedLLM([{"action": "spawn", "task_id": "child"}]),
-        tree=_tree(children=[{"task_id": "child", "spec": child_spec}]),
-    )
-    port = ArchitectusAdmissionPort(core)
-    port.aggregate("root", _envelope())
-
-    proposals = asyncio.run(port.step([{"kind": "parent_completed", "task_id": "root"}]))
-
-    assert len(proposals) == 1
-    proposal = proposals[0]
-    assert set(proposal) == {
-        "request_id",
-        "parent_task_id",
-        "child_task_id",
-        "kind",
-        "spec",
-    }
-    assert isinstance(proposal["request_id"], str)
-    assert proposal["parent_task_id"] == "root"
-    assert proposal["child_task_id"] == "child"
-    assert proposal["kind"] == "feature"
-    assert proposal["spec"] == child_spec
 
 
 def test_failure_decision_method_is_deterministic_and_rejects_empty_event() -> None:

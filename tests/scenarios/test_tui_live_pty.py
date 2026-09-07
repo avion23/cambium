@@ -299,7 +299,7 @@ def test_live_tui_resize_preserves_one_input_prompt(tmp_path: Path) -> None:
         streamed = bytes(output[streamed_at:])
         assert b"THINKING" in streamed
         assert b"STREAMING" in streamed
-        assert b'objective_met' not in streamed
+        assert b"objective_met" not in streamed
         os.write(master_fd, b"\n")
         deadline = time.monotonic() + 5
         while len(server.requests) < 2 and time.monotonic() < deadline:

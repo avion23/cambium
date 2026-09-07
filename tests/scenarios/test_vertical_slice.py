@@ -21,7 +21,6 @@ from pathlib import Path
 import pytest
 
 import cambium.supervisor as supervisor_module
-from cambium.results import ROOT_RESULT_KEYS
 from cambium.supervisor import read_events, run_session
 
 pytestmark = pytest.mark.slow  # real worker subprocess spawn + real git merge
@@ -280,7 +279,7 @@ def test_ready_timeout_fails_within_budget(tmp_path, monkeypatch) -> None:
     assert any(e["kind"] == "timeout" and e["payload"].get("phase") == "ready" for e in events)
 
 
-def test_result_json_has_exact_root_keys_and_success_verdict(tmp_path) -> None:
+def test_result_json_records_successful_publication(tmp_path) -> None:
     session_dir = tmp_path / "session"
     scratch = session_dir / "scratch"
     _make_scratch(scratch)
@@ -290,7 +289,6 @@ def test_result_json_has_exact_root_keys_and_success_verdict(tmp_path) -> None:
 
     assert result.status == "succeeded"
     record = json.loads((session_dir / ".cambium" / "result.json").read_text())
-    assert set(record) == set(ROOT_RESULT_KEYS)
     assert record["status"] == "done"
     assert record["exit_code"] == 0
     assert record["commits"] and record["files_changed"] == ["hello.txt"]

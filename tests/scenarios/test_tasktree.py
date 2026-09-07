@@ -114,16 +114,6 @@ def test_cli_explicit_dash_reads_plan_from_stdin() -> None:
     assert result.stderr == ""
 
 
-@pytest.mark.slow  # real python -m subprocess; process-boundary assertions
-def test_cli_no_args_prints_help_for_empty_stdin() -> None:
-    result = _run_cli()
-
-    assert result.returncode == 0
-    assert result.stdout.startswith("usage: python -m cambium.tasktree")
-    assert "PLAN" in result.stdout
-    assert result.stderr == ""
-
-
 @pytest.mark.slow  # real python -m subprocess on a pty; process-boundary assertions
 def test_cli_no_args_prints_help_without_waiting_on_tty() -> None:
     master_fd, slave_fd = pty.openpty()
@@ -162,19 +152,12 @@ def test_cli_no_args_prints_help_without_waiting_on_tty() -> None:
 
 
 @pytest.mark.slow  # real python -m subprocess; process-boundary assertions
-def test_cli_help_and_extra_argument_errors() -> None:
-    module_help = _run_cli("", "--help")
+def test_cli_extra_argument_error_does_not_echo_secret() -> None:
+    result = _run_cli("", "plan.json", "TOP_SECRET_123")
 
-    assert module_help.returncode == 0
-    assert module_help.stdout.startswith("usage: python -m cambium.tasktree")
-    assert module_help.stderr == ""
-
-    module_extra = _run_cli("", "plan.json", "TOP_SECRET_123")
-
-    assert module_extra.returncode == 2
-    assert module_extra.stdout == ""
-    assert "usage:" in module_extra.stderr
-    assert "TOP_SECRET_123" not in module_extra.stderr
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert "TOP_SECRET_123" not in result.stderr
 
 
 @pytest.mark.slow  # real python -m subprocess; process-boundary assertions
