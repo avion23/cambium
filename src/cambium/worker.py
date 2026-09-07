@@ -2057,8 +2057,16 @@ def _normalize_tool_calls(action: Mapping[str, Any]) -> list[dict[str, Any]]:
                 errors.append(f"tool_call calls[{index}] must be an object")
                 continue
             if set(raw_call) != {"name", "arguments"}:
-                errors.append(f"tool_call calls[{index}] must carry exactly name/arguments")
-                continue
+                if "arguments" not in raw_call and isinstance(raw_call.get("name"), str):
+                    raw_call = {
+                        "name": raw_call["name"],
+                        "arguments": {
+                            key: value for key, value in raw_call.items() if key != "name"
+                        },
+                    }
+                else:
+                    errors.append(f"tool_call calls[{index}] must carry exactly name/arguments")
+                    continue
             name = raw_call.get("name")
             arguments = raw_call.get("arguments")
             entry_errors: list[str] = []
@@ -2092,15 +2100,17 @@ _FENCED_ACTION_RE = re.compile(r"^```[A-Za-z0-9_-]*\r?\n(.*)\r?\n?```\s*$", re.D
 
 def _parse_agent_action(content: str) -> dict[str, Any]:
     """Strictly parse ONE agent action; the response must be exactly one
-    top-level JSON object.  Any prose, trailing JSON, or concatenated
-    actions are rejected (the owner overrode trailing-prose tolerance).
+    top-level JSON object, or one top-level array containing exactly one
+    action object.  Any prose, trailing JSON, or concatenated actions are
+    rejected (the owner overrode trailing-prose tolerance).
     Raises ``ValueError`` on any deviation.
 
-    Exactly one well-formed markdown fence wrapping the object is unwrapped
+    Exactly one well-formed markdown fence wrapping the action is unwrapped
     first (```` ```json ... ``` ```` or a bare ```` ``` ... ``` ```` fence);
-    the body must still be exactly one JSON object.  Anything that does not
-    match that full fenced shape (prose outside the fence, two fences, an
-    unclosed fence) is rejected unchanged.
+    the body must still be exactly one JSON object or one singleton array of
+    one action object.  Anything that does not match that full fenced shape
+    (prose outside the fence, two fences, an unclosed fence) is rejected
+    unchanged.
 
     Accepted shapes (each may optionally carry a ``thought`` field for
     reasoning; the action fields themselves must be exact):
@@ -2123,6 +2133,10 @@ def _parse_agent_action(content: str) -> dict[str, Any]:
         parsed, _end = _decode_action_json(text)
     except (json.JSONDecodeError, UnicodeDecodeError, RecursionError) as exc:
         raise ValueError(f"action is not valid JSON: {exc}") from None
+    if isinstance(parsed, list):
+        if len(parsed) != 1 or not isinstance(parsed[0], dict):
+            raise ValueError("agent action must be exactly one JSON object")
+        parsed = parsed[0]
     if not isinstance(parsed, dict):
         raise ValueError("agent action must be exactly one JSON object")
     if text[_end:].strip():
@@ -2180,7 +2194,7 @@ _TRAILING_ACTION_NOTE = (
 
 
 def _action_trailing(content: str) -> str:
-    """Return the non-whitespace content AFTER the first complete JSON object,
+    """Return the non-whitespace content AFTER the first complete JSON value,
     or "" when there is none or the content cannot be parsed at all."""
     text = content.strip()
     if not text:

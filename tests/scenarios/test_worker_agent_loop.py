@@ -1318,6 +1318,38 @@ def test_plan_and_thought_round_trip_through_parser() -> None:
             worker._parse_agent_action(bad)
 
 
+def test_parse_agent_action_normalizes_observed_provider_shapes() -> None:
+    assert worker._parse_agent_action(
+        '[{"calls":[{"name":"repo_query","action":"tree","limit":100}]}]'
+    ) == {
+        "type": "tool_call",
+        "calls": [
+            {"name": "repo_query", "arguments": {"action": "tree", "limit": 100}}
+        ],
+    }
+
+    with pytest.raises(ValueError, match="no trailing content"):
+        worker._parse_agent_action(
+            '[{"calls":[{"name":"repo_query","action":"tree"}]}]'
+            '{"type":"finish","summary":"done","objective_met":true}'
+        )
+    with pytest.raises(ValueError, match="exactly one JSON object"):
+        worker._parse_agent_action(
+            '[{"type":"plan","steps":["a"]},{"type":"plan","steps":["b"]}]'
+        )
+    with pytest.raises(ValueError, match="unknown tool"):
+        worker._parse_agent_action('[{"calls":[{"name":"not_a_tool","action":"tree"}]}]')
+    with pytest.raises(ValueError, match="must carry exactly name/arguments"):
+        worker._parse_agent_action(
+            '{"type":"tool_call","calls":[{"name":"repo_query",'
+            '"arguments":{"action":"tree"},"action":"tree"}]}'
+        )
+    with pytest.raises(ValueError, match="arguments must be an object"):
+        worker._parse_agent_action(
+            '[{"calls":[{"name":"repo_query","arguments":3}]}]'
+        )
+
+
 def test_parse_agent_action_accepts_fenced_tool_call() -> None:
     fenced = '```json\n{"type":"tool_call","name":"read_batch","arguments":{"paths":["a.py"]}}\n```'
     assert worker._parse_agent_action(fenced) == {
