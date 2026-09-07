@@ -35,6 +35,57 @@ def test_delegate_defaults_depend_on_independent_batch() -> None:
     assert all(c["arguments"]["spec"]["placement"] == "spread" for c in batch["calls"])
 
 
+def test_read_only_investigation_delegates_default_to_fresh_inherit() -> None:
+    """Read-only probes must not depend on a parent checkpoint that a fresh or
+    redacted interactive session cannot offer; they complete to fresh+inherit."""
+
+    def call(name):
+        return {
+            "name": "delegate",
+            "arguments": {
+                "child_task_id": name,
+                "kind": "investigation",
+                "spec": {"task": f"Inspect {name}.py without edits and report defects"},
+            },
+        }
+
+    single = _parse_agent_action(json.dumps({"type": "tool_call", "calls": [call("a")]}))
+    args = single["calls"][0]["arguments"]
+    assert args["spec"]["context_mode"] == "fresh"
+    assert args["spec"]["placement"] == "inherit"
+
+    batch = _parse_agent_action(json.dumps({"type": "tool_call", "calls": [call("a"), call("b")]}))
+    assert all(c["arguments"]["spec"]["context_mode"] == "fresh" for c in batch["calls"])
+    assert all(c["arguments"]["spec"]["placement"] == "inherit" for c in batch["calls"])
+
+
+def test_investigation_delegates_keep_explicit_policy() -> None:
+    action = _parse_agent_action(
+        json.dumps(
+            {
+                "type": "tool_call",
+                "calls": [
+                    {
+                        "name": "delegate",
+                        "arguments": {
+                            "child_task_id": "probe",
+                            "kind": "investigation",
+                            "spec": {
+                                "task": "Inspect routing",
+                                "context_mode": "semantic",
+                                "placement": "spread",
+                            },
+                        },
+                    }
+                ],
+            }
+        )
+    )
+    spec = action["calls"][0]["arguments"]["spec"]
+    assert spec["context_mode"] == "semantic"
+    assert spec["placement"] == "spread"
+
+
 def test_suspended_parent_stays_live_and_resumes_after_child() -> None:
     state, transcript = ObservabilityState(), Transcript()
     events = [

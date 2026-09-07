@@ -42,13 +42,17 @@ proposal is recorded:
 | --- | --- |
 | One child, neither field supplied | `trunk + inherit` |
 | Several children in one batch, neither field supplied | `semantic + spread` |
+| Read-only (`kind=investigation`) delegate, context omitted | `fresh + inherit` |
 | `placement=spread`, context omitted | `semantic + spread` |
 | `context_mode=semantic` or `fresh`, placement omitted | `spread` |
 | `context_mode=trunk`, placement omitted | `inherit` |
 
 Explicit fields remain explicit. `trunk + spread` is contradictory. A requested
 exact fork that cannot establish compatibility is rejected, not silently made
-lossy. A batch is important: emitting one delegate on each later turn can
+lossy. A read-only `investigation` delegate defaults to `fresh` because `trunk`
+and `semantic` admission both require a usable parent checkpoint, which the
+first delegation of a fresh or redacted session cannot offer. A batch is
+important: emitting one delegate on each later turn can
 serialize work because the parent suspends at a successful delegation boundary.
 
 The supervisor supplies repository, private worktree, branch and inherited

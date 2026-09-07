@@ -442,6 +442,29 @@ def test_redacted_epoch_checkpoint_roundtrip(tmp_path: Path) -> None:
     assert reason == "checkpoint redacted"
 
 
+def test_email_shape_alone_marks_checkpoint_redacted(tmp_path: Path) -> None:
+    """No registered secret is needed: one email in the transcript (e.g. a git
+    author line from a read-only probe) redacts the checkpoint and therefore
+    defeats trunk and semantic admission for the rest of the session."""
+    config = _agent_config(tmp_path / "wt", checkpoint_root=tmp_path / "ckpts")
+    checkpoint = _write_epoch(
+        config,
+        messages=[
+            {"role": "system", "content": "You are the agent."},
+            {"role": "user", "content": "git log says: A. U. Thor <author@example.com>"},
+        ],
+    )
+
+    assert checkpoint.cache_key.redacted is True
+    compatible, reason = worker._fork_cache_compatible(
+        {"fanout_config": {"model": checkpoint.cache_key.model}},
+        {"cache_key": asdict(checkpoint.cache_key)},
+        frozenset({"loopback-provider"}),
+    )
+    assert not compatible
+    assert reason == "checkpoint redacted"
+
+
 def test_fork_cache_compatible_matrix() -> None:
     tools_sha = worker._provider_task_tools_hash()
     epoch: dict[str, Any] = {

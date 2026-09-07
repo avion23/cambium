@@ -3984,7 +3984,8 @@ class _Runtime:
                 if not self._pin_exact_fork(child_spec, epoch, parent_task_id, child_task_id, kind):
                     raise ChildPolicyError(
                         "child context_mode=trunk requires an exact compatible "
-                        "parent checkpoint; use semantic or fresh instead"
+                        "parent checkpoint; use semantic or fresh instead "
+                        "(semantic also needs an unredacted checkpoint; fresh needs none)"
                     )
                 if placement == "spread":
                     self._apply_spread(child_spec, parent_provider)
@@ -4008,7 +4009,11 @@ class _Runtime:
                     and isinstance(checkpoint_ref, str)
                 ):
                     raise ChildPolicyError(
-                        "child context_mode=semantic requires an unredacted parent checkpoint"
+                        "child context_mode=semantic requires an unredacted parent "
+                        "checkpoint; the parent epoch is missing or its checkpoint is "
+                        "redacted (redaction triggers include emails and "
+                        "credential-shaped transcript text); declare "
+                        "context_mode=fresh instead"
                     )
                 child_spec["summary_trunk_ref"] = checkpoint_ref
                 if placement == "spread":

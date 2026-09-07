@@ -875,7 +875,7 @@ async def _delegate(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
     from .child_policy import complete_child_policy
 
     try:
-        complete_child_policy(args["spec"])
+        complete_child_policy(args["spec"], read_only=kind == "investigation")
     except ChildPolicyError as exc:
         return _Outcome(ok=False, error=f"validation failed: {exc}")
     return _Outcome(

@@ -117,3 +117,72 @@ def test_parse_child_policy_rejects_trunk_spread_combination() -> None:
     """trunk+spread is contradictory and must be rejected."""
     with pytest.raises(ValueError, match="trunk requires placement=inherit"):
         parse_child_policy({"context_mode": "trunk", "placement": "spread"})
+
+
+def _redacted_epoch() -> dict[str, Any]:
+    epoch = _epoch()
+    epoch["cache_key"] = {**epoch["cache_key"], "redacted": True}
+    return epoch
+
+
+def test_redacted_parent_epoch_rejects_declared_semantic(tmp_path: Path) -> None:
+    """A redacted checkpoint (one redactor hit, e.g. an email in the transcript)
+    defeats semantic reuse; the error must name the working alternative."""
+    runtime = _Runtime(tmp_path, None)
+    runtime._task_epochs["parent"] = _redacted_epoch()
+
+    with pytest.raises(ValueError, match="context_mode=fresh"):
+        asyncio.run(
+            runtime._pin_fork_child(
+                {"context_mode": "semantic", "placement": "spread"},
+                "parent",
+                "child",
+                "investigation",
+            )
+        )
+
+
+def test_redacted_parent_epoch_rejects_declared_trunk(tmp_path: Path) -> None:
+    """A redacted checkpoint is never an exact fork; trunk stays a rejection."""
+    runtime = _Runtime(tmp_path, None)
+    runtime._task_epochs["parent"] = _redacted_epoch()
+    child_spec: dict[str, Any] = {
+        "context_mode": "trunk",
+        "placement": "inherit",
+        "fanout_config": {
+            "model": "model-a",
+            "protocol": "http",
+            "reasoning_effort": "high",
+        },
+        "authorized_providers": ["provider-a"],
+    }
+
+    with pytest.raises(ValueError, match="exact compatible parent checkpoint"):
+        asyncio.run(runtime._pin_fork_child(child_spec, "parent", "child", "investigation"))
+
+
+def test_missing_parent_epoch_rejects_declared_trunk(tmp_path: Path) -> None:
+    """The first delegation of a checkpoint-less parent cannot fork exactly."""
+    runtime = _Runtime(tmp_path, None)
+    child_spec: dict[str, Any] = {"context_mode": "trunk", "placement": "inherit"}
+
+    with pytest.raises(ValueError, match="exact compatible parent checkpoint"):
+        asyncio.run(runtime._pin_fork_child(child_spec, "missing", "child", "investigation"))
+
+
+def test_fresh_child_admits_with_missing_or_redacted_parent_epoch(tmp_path: Path) -> None:
+    """fresh has no checkpoint precondition: it is the usable first-batch mode."""
+    for epoch in (None, _redacted_epoch()):
+        runtime, events = _runtime(tmp_path)
+        if epoch is None:
+            runtime._task_epochs.clear()
+        child_spec: dict[str, Any] = {"context_mode": "fresh", "placement": "inherit"}
+
+        asyncio.run(runtime._pin_fork_child(child_spec, "parent", "child", "investigation"))
+
+        assert "summary_trunk_ref" not in child_spec
+        assert "context_fork" not in child_spec
+        fork_events = [e for e in events if e["kind"] == "context_fork"]
+        assert len(fork_events) == 1
+        assert fork_events[0]["resolved_context_mode"] == "fresh"
+        assert fork_events[0]["semantic_reuse"] is False

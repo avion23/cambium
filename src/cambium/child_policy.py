@@ -12,7 +12,9 @@ Child proposals resolve two orthogonal properties before admission:
 The supervisor still accepts an undeclared policy from harness-originated
 ``proposed_children`` fixtures. That internal automatic-compatibility path is
 represented by ``None``. Model calls use :func:`complete_child_policy`: one
-blocking child defaults to trunk/inherit; independent batches to semantic/spread.
+blocking child defaults to trunk/inherit; independent batches to semantic/spread;
+read-only (``kind=investigation``) delegates to fresh/inherit, which has no
+parent-checkpoint precondition at admission.
 """
 
 from __future__ import annotations
@@ -87,14 +89,29 @@ def require_child_policy(spec: Mapping[str, Any]) -> ChildPolicy:
     return policy
 
 
-def complete_child_policy(spec: Mapping[str, Any], *, siblings: int = 1) -> dict[str, Any]:
-    """Resolve omitted model policy before recording the actual proposal."""
+def complete_child_policy(
+    spec: Mapping[str, Any], *, siblings: int = 1, read_only: bool = False
+) -> dict[str, Any]:
+    """Resolve omitted model policy before recording the actual proposal.
+
+    ``read_only`` marks self-contained read-only work (``kind=investigation``).
+    Such children complete to ``fresh + inherit`` because neither ``trunk`` nor
+    ``semantic`` has an unconditional admission path: both require a usable
+    parent checkpoint that a fresh or redacted session cannot offer. Explicit
+    declarations always win; a declared spread placement stays spread.
+    """
     if not isinstance(spec, Mapping):
         raise ChildPolicyError("child spec must be an object")
     resolved = dict(spec)
-    mode = "semantic" if siblings > 1 or spec.get("placement") == "spread" else "trunk"
-    resolved.setdefault("context_mode", mode)
-    resolved.setdefault("placement", "inherit" if resolved["context_mode"] == "trunk" else "spread")
+    if read_only and resolved.get("context_mode") is None:
+        resolved.setdefault("context_mode", "fresh")
+        resolved.setdefault("placement", "inherit")
+    else:
+        mode = "semantic" if siblings > 1 or resolved.get("placement") == "spread" else "trunk"
+        resolved.setdefault("context_mode", mode)
+        resolved.setdefault(
+            "placement", "inherit" if resolved["context_mode"] == "trunk" else "spread"
+        )
     require_child_policy(resolved)
     return resolved
 
