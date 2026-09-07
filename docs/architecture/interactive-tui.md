@@ -65,4 +65,4 @@ this frontend retains a checkpoint.
   [TUI controller](../../src/cambium/tui.py)
 - [Real coding, read-only continuation and history inspection](../../tests/acceptance/test_live_frontends.py),
   [PTY input/resize/cancel tests](../../tests/scenarios/test_tui_live_pty.py),
-  [live usage projection tests](../../tests/scenarios/test_tui_live_usage.py)
+  [live usage projection tests](../../tests/scenarios/test_interactive_session.py)
