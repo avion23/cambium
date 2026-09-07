@@ -88,8 +88,7 @@ def grounded_feedback(component: str, selected: dict[str, str], row: dict[str, A
                 ),
                 "<trajectory-digest>\n"
                 + json.dumps(
-                    {key: row.get(key) for key in _DIGEST_KEYS}
-                    | {"derailment": _derailment(row)},
+                    {key: row.get(key) for key in _DIGEST_KEYS} | {"derailment": _derailment(row)},
                     ensure_ascii=False,
                     allow_nan=False,
                 ),

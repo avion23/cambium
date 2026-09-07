@@ -497,10 +497,14 @@ def test_session_show_rejects_unrenderable_result_without_leaking_payload(
     _write_events_db(session_dir)
     state = session_dir / ".cambium"
     (state / "result.json").write_text(
-        json.dumps({
-            "status": "done", "exit_code": 0, "metric_score": float("nan"),
-            "api_key": "secret-must-not-be-printed",
-        })
+        json.dumps(
+            {
+                "status": "done",
+                "exit_code": 0,
+                "metric_score": float("nan"),
+                "api_key": "secret-must-not-be-printed",
+            }
+        )
     )
 
     assert cli.main(["session", "show", "--session-dir", str(root), "nan"]) == 1

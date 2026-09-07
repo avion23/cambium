@@ -271,8 +271,7 @@ def test_make_dspy_metric_parses_predictions_and_accepts_boolean_scores() -> Non
             return self.score
 
     assert (
-        optimize.make_dspy_metric(ScoreProgram(True))(gold, {"decision": "do_not_decompose"})
-        == 1.0
+        optimize.make_dspy_metric(ScoreProgram(True))(gold, {"decision": "do_not_decompose"}) == 1.0
     )
     assert (
         optimize.make_dspy_metric(ScoreProgram(False))(gold, {"decision": "do_not_decompose"})
