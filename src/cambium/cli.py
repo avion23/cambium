@@ -1060,6 +1060,14 @@ def _import_or_fail(module_name: str, command: str):
         if exc.name == module_name:
             print(f"cambium {command}: {module_name} is not installed", file=sys.stderr)
             return None
+        if exc.name is not None and not exc.name.startswith("cambium"):
+            print(
+                f"cambium {command}: missing dependency {exc.name!r} — install the project "
+                "environment first (uv sync, or pip install -e .) and run through it "
+                "(uv run …, or .venv/bin/python), not a bare interpreter",
+                file=sys.stderr,
+            )
+            return None
         raise
 
 
