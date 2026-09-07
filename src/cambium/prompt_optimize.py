@@ -156,7 +156,10 @@ def metric(
     import dspy
 
     try:
-        score = float(pred.score)
+        raw = pred.score
+        if isinstance(raw, bool):
+            raise TypeError("bool score is not numeric")
+        score = float(raw)
     except (AttributeError, TypeError, ValueError):
         return dspy.Prediction(score=0.0, feedback=getattr(pred, "report", "") or "")
     return dspy.Prediction(score=score, feedback=pred.report)

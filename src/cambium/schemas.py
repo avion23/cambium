@@ -127,7 +127,12 @@ FINISH_ACTION_SCHEMA: dict[str, Any] = {
     ),
     "properties": {
         "type": {"type": "string", "enum": ["finish"]},
-        "summary": {"type": "string", "minLength": 1, "description": "Completion summary."},
+        "summary": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "description": "Completion summary.",
+        },
         "objective_met": {
             "type": "boolean",
             "description": "Whether the task objective was met.",
@@ -197,11 +202,13 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             {
                 "cmd": {
                     "type": "array",
+                    "minItems": 1,
                     "items": {"type": "string"},
                     "description": "Command argv to execute without a shell.",
                 },
                 "timeout_s": {
                     "type": "integer",
+                    "minimum": 1,
                     "default": 120,
                     "description": "Timeout in seconds.",
                 },
@@ -221,6 +228,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             {
                 "paths": {
                     "type": "array",
+                    "minItems": 1,
                     "items": {"type": "string"},
                     "description": "File paths to read, in order.",
                 },
@@ -322,10 +330,17 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 },
                 "kind": {
                     "type": "string",
-                    "minLength": 1,
+                    "enum": [
+                        "feature",
+                        "bugfix",
+                        "refactor",
+                        "test",
+                        "docs",
+                        "investigation",
+                    ],
                     "description": (
                         "Structural task-tree kind, default feature. It does not select a prompt. "
-                        "Use feature, investigation, bugfix, refactor, or docs."
+                        "Use feature, investigation, bugfix, refactor, test, or docs."
                     ),
                 },
                 "spec": {
