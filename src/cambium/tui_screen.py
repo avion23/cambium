@@ -1542,6 +1542,9 @@ class Transcript:
             message = f"{kind.replace('_', ' ')}: {child}"
             if isinstance(reason, str) and reason:
                 message += f" · {reason}"
+            detail = _activity_tail(data.get("message"))
+            if detail:
+                message += f" · {detail}"
             self.system(message)
             return
 
