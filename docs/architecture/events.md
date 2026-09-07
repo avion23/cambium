@@ -37,7 +37,7 @@ vocabulary.
 | `context_resume` | `supervisor.py` | Records a suspended parent resuming after bounded child results and join checks. |
 | `context_resume_failed` | `supervisor.py` | Records a parent resume after child join failing its budget/deadline checks. |
 | `compaction_failed` | `worker.py`; forwarded by `supervisor.py` | Records a context-compaction failure with its epoch and bounded reason. |
-| `compaction_deferred` | `worker.py` | Worker-wire notice for a malformed/invalid summary fold deferred before the bounded retry limit. |
+| `compaction_deferred` | `worker.py`; forwarded by `supervisor.py` | Records a malformed/invalid summary fold deferred before the bounded retry limit. |
 | `worktree_salvaged` | `supervisor.py` | Records a bounded dirty-worktree evidence artifact captured before recovery or cleanup. |
 | `worktree_pruned` | `supervisor.py` | Records successful removal of a task worktree and branch. |
 | `worktree_cleanup_deferred` | `supervisor.py` | Records cleanup being retained/deferred because a safety or removal step failed. |

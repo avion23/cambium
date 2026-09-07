@@ -6734,6 +6734,19 @@ class _Runtime:
                 f"(strike {msg.get('consecutive_invalid_actions')})",
             )
             return False
+        if mtype == "ok":
+            # check_health/cancel/shutdown acknowledgments are connection
+            # control, not user-visible task events. Accept only this
+            # generation's worker; stale/reused-worker acknowledgments stay
+            # visible as protocol evidence instead of being silently trusted.
+            if msg.get("task_id") != state.task_id or msg.get("generation") != state.generation:
+                await self.emit(
+                    "protocol",
+                    task_id=state.task_id,
+                    generation=state.generation,
+                    note="ok rejected: identity mismatch",
+                )
+            return False
         return None
 
     async def _handle_generation_message(

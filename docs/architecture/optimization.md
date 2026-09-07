@@ -115,11 +115,11 @@ Derived variants are labelled as variants, not claimed to be transcripts that oc
 | --- | --- | --- |
 | Train | `arithmetic`, `parallel-modules` | Small repair and failed independent-module runs |
 | Train | `parallel-utilities` | The CSV/configuration join failure, with explicit semantic children |
+| Train | `calibration-memory` | Synthetic calibration facts that must survive context compaction; demoted from validation because cross-turn serving-model stability is provider-sensitive |
+| Train | `parallel-derive` | Synthetic parallel delegation over independent numeric utilities; demoted from validation because malformed-action/provider variance made it unsuitable as a stable validation gate |
 | Validation | `cambium-self-fix` | Synthetic fixture for `render_tokens_per_s(None)`, distilled from the recorded self-modification |
 | Validation | `blocking-child` | One read-only child sharing the current trunk/provider |
 | Validation | `finish-report` | Synthetic strict finish envelope and machine-readable completion report |
-| Validation | `calibration-memory` | Synthetic calibration facts that must survive context compaction |
-| Validation | `parallel-derive` | Synthetic parallel delegation over independent numeric utilities |
 | Test | `navigation-history` | Actual edit, check, and exact tool-evidence retrieval |
 | Test | `history-reconnect` | Derived continuation across frontend reconnect |
 | Test | `corrected-history` | Derived requirement change, semantic review, K0, reconnect and stale-check recall |
