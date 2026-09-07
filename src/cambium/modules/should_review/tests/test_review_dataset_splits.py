@@ -1,8 +1,8 @@
-"""Split-aware dataset tests for the should_review module.
+"""Domain-specific dataset checks for the should_review module.
 
-Covers the v1 three-file splits (train/eval/canaries), canary exclusion
-from train/eval, the ``meta.json`` versions, a rule-engine smoke check over
-the transcript-derived records, and the committed-baseline anchor.
+The shared loader contract is exercised once by the reference example module.
+These tests keep only should_review's committed corpus, label, and baseline
+invariants.
 """
 
 from __future__ import annotations
@@ -10,421 +10,64 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import shutil
 from pathlib import Path
 
-import pytest
-
-from cambium.modules.base import DatasetError
-from cambium.modules.should_review import (
-    DatasetBundle,
-    ExampleDatasetLoader,
-    ShouldReviewModule,
-    Split,
-)
-from cambium.modules.should_review.metric import evaluate_split, evaluate_split_async
+from cambium.modules.should_review import ExampleDatasetLoader, ShouldReviewModule, Split
 
 DATASETS_DIR = Path(__file__).resolve().parents[1] / "datasets"
 BASELINE_PATH = Path(__file__).resolve().parents[1] / "tests" / "baselines" / "baseline.json"
-
 EXPECTED_COUNTS = {Split.TRAIN: 40, Split.EVAL: 11, Split.CANARIES: 6}
 EXPECTED_TOTAL = sum(EXPECTED_COUNTS.values())
 
 
-def _fresh_copy(tmp_path: Path) -> Path:
-    dst = tmp_path / "datasets"
-    shutil.copytree(DATASETS_DIR, dst)
-    return dst
-
-
-def test_split_loads_return_expected_counts() -> None:
-    loader = ExampleDatasetLoader(DATASETS_DIR)
-    for split, expected in EXPECTED_COUNTS.items():
-        assert len(loader.load_split(split)) == expected
-
-
-def test_load_all_bundle() -> None:
+def test_committed_splits_match_should_review_contract() -> None:
     loader = ExampleDatasetLoader(DATASETS_DIR)
     bundle = loader.load_all()
-    assert isinstance(bundle, DatasetBundle)
-    assert len(bundle.train) == EXPECTED_COUNTS[Split.TRAIN]
-    assert len(bundle.eval) == EXPECTED_COUNTS[Split.EVAL]
-    assert len(bundle.canaries) == EXPECTED_COUNTS[Split.CANARIES]
-    assert bundle.dataset_version == "2.0.0"
 
-
-def test_canaries_excluded_from_train_and_eval() -> None:
-    loader = ExampleDatasetLoader(DATASETS_DIR)
-    train = loader.load_split(Split.TRAIN)
-    eval_ = loader.load_split(Split.EVAL)
-    canaries = loader.load_split(Split.CANARIES)
-    assert all(not ex.canary for ex in train)
-    assert all(not ex.canary for ex in eval_)
-    assert all(ex.canary for ex in canaries)
-
-
-def test_canary_flag_filtered_from_train_file(tmp_path) -> None:
-    src = tmp_path / "datasets"
-    src.mkdir()
-    normal = {
-        "id": "n-1",
-        "input": {"task": "Fix the typo.", "context": ""},
-        "expected": {"review": False, "decompose": False, "reason": "atomic"},
-    }
-    trap = {
-        "id": "t-1",
-        "input": {"task": "Trap record.", "context": ""},
-        "expected": {"review": False, "decompose": False, "reason": "trap"},
-        "canary": True,
-    }
-    (src / "train.jsonl").write_text(
-        json.dumps(normal) + "\n" + json.dumps(trap) + "\n", encoding="utf-8"
-    )
-    examples = ExampleDatasetLoader(src).load_split(Split.TRAIN)
-    assert len(examples) == 1
-    assert not examples[0].canary
-
-
-def test_missing_split_files_are_rejected(tmp_path) -> None:
-    src = _fresh_copy(tmp_path)
-    for name in ("train.jsonl", "eval.jsonl", "canaries.jsonl"):
-        (src / name).unlink()
-    with pytest.raises(DatasetError, match="split file is missing"):
-        ExampleDatasetLoader(src).load_split(Split.TRAIN)
-
-
-def test_dataset_version_read_from_meta(tmp_path) -> None:
-    loader = ExampleDatasetLoader(_fresh_copy(tmp_path))
     assert loader.dataset_version == "2.0.0"
-
-
-def test_split_record_versions_match_meta() -> None:
-    meta = json.loads((DATASETS_DIR / "meta.json").read_text(encoding="utf-8"))
-    expected_schema_version = meta["schema_version"]
-    expected_dataset_version = meta["dataset_version"]
-    assert isinstance(expected_schema_version, int)
-    assert not isinstance(expected_schema_version, bool)
-    assert isinstance(expected_dataset_version, str)
+    assert {split: len(loader.load_split(split)) for split in EXPECTED_COUNTS} == EXPECTED_COUNTS
+    assert len(bundle.train) + len(bundle.eval) + len(bundle.canaries) == EXPECTED_TOTAL
+    assert all(not example.canary for example in (*bundle.train, *bundle.eval))
+    assert all(example.canary for example in bundle.canaries)
 
     for split in ("train", "eval", "canaries"):
-        path = DATASETS_DIR / f"{split}.jsonl"
-        for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-            record = json.loads(line)
-            assert isinstance(record["schema_version"], int)
-            assert not isinstance(record["schema_version"], bool)
-            assert record["schema_version"] == expected_schema_version, (
-                f"{path.name}:{line_no}: schema_version drifted from meta.json"
-            )
-            assert record["dataset_version"] == expected_dataset_version, (
-                f"{path.name}:{line_no}: dataset_version drifted from meta.json"
-            )
-            assert record["expected"]["review"] == record["expected"]["decompose"], (
-                f"{path.name}:{line_no}: class-balance mirror drifted"
-            )
-
-
-def test_split_record_version_drift_rejected_by_loader(tmp_path) -> None:
-    src = tmp_path / "datasets"
-    src.mkdir()
-    (src / "meta.json").write_text(
-        json.dumps({"schema_version": 1, "dataset_version": "1.0.0"}) + "\n",
-        encoding="utf-8",
-    )
-    record = {
-        "id": "train-1",
-        "schema_version": 999,
-        "dataset_version": "0.0.0",
-        "input": {"task": "Do a thing.", "context": ""},
-        "expected": {"review": False, "decompose": False, "reason": "atomic"},
-    }
-    train_path = src / "train.jsonl"
-    train_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
-
-    loader = ExampleDatasetLoader(src)
-    with pytest.raises(DatasetError, match="schema_version.*dataset_version"):
-        ExampleDatasetLoader(train_path).load()
-    with pytest.raises(DatasetError, match="schema_version.*dataset_version"):
-        loader.load_split(Split.TRAIN)
-
-    record["schema_version"] = 999
-    record["dataset_version"] = "1.0.0"
-    train_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
-    with pytest.raises(DatasetError, match="schema_version"):
-        loader.load_split(Split.TRAIN)
-
-
-def test_meta_directory_rejected_by_load_and_load_split(tmp_path) -> None:
-    src = tmp_path / "datasets"
-    src.mkdir()
-    (src / "meta.json").mkdir()
-    record = {
-        "id": "train-1",
-        "schema_version": 999,
-        "dataset_version": "0.0.0",
-        "input": {"task": "Do a thing.", "context": ""},
-        "expected": {"review": False, "decompose": False, "reason": "atomic"},
-    }
-    train_path = src / "train.jsonl"
-    train_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
-
-    with pytest.raises(DatasetError, match="cannot read metadata"):
-        ExampleDatasetLoader(train_path).load()
-    with pytest.raises(DatasetError, match="cannot read metadata"):
-        ExampleDatasetLoader(src).load_split(Split.TRAIN)
-
-
-def test_invalid_meta_rejected_by_load_and_load_split(tmp_path) -> None:
-    src = tmp_path / "datasets"
-    src.mkdir()
-    (src / "meta.json").write_text("{\n", encoding="utf-8")
-    record = {
-        "id": "train-1",
-        "input": {"task": "Do a thing.", "context": ""},
-        "expected": {"review": False, "decompose": False, "reason": "atomic"},
-    }
-    train_path = src / "train.jsonl"
-    train_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
-
-    with pytest.raises(DatasetError, match="invalid JSON"):
-        ExampleDatasetLoader(train_path).load()
-    with pytest.raises(DatasetError, match="invalid JSON"):
-        ExampleDatasetLoader(src).load_split(Split.TRAIN)
-
-
-@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
-def test_non_finite_meta_json_constants_rejected(tmp_path, constant) -> None:
-    src = _fresh_copy(tmp_path)
-    (src / "meta.json").write_text(f'{{"corrupt": {constant}}}\n', encoding="utf-8")
-
-    with pytest.raises(DatasetError, match="invalid JSON"):
-        ExampleDatasetLoader(src).load()
-
-
-@pytest.mark.parametrize("entrypoint", ["load", "load_split"])
-def test_metadata_deletion_race_cannot_disable_version_validation(
-    tmp_path, monkeypatch, entrypoint
-) -> None:
-    src = tmp_path / "datasets"
-    src.mkdir()
-    meta_path = src / "meta.json"
-    meta = {"schema_version": 1, "dataset_version": "1.0.0"}
-    meta_path.write_text(json.dumps(meta) + "\n", encoding="utf-8")
-    record = {
-        "id": "train-1",
-        "schema_version": 999,
-        "dataset_version": "0.0.0",
-        "input": {"task": "Do a thing.", "context": ""},
-        "expected": {"review": False, "decompose": False, "reason": "atomic"},
-    }
-    train_path = src / "train.jsonl"
-    train_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
-
-    loader = ExampleDatasetLoader(train_path if entrypoint == "load" else src)
-    reads = 0
-    real_read_meta = loader._read_meta
-
-    def read_meta_once_then_delete() -> dict:
-        nonlocal reads
-        data = real_read_meta()
-        reads += 1
-        if reads == 1:
-            meta_path.unlink()
-        return data
-
-    monkeypatch.setattr(loader, "_read_meta", read_meta_once_then_delete)
-    action = loader.load if entrypoint == "load" else lambda: loader.load_split(Split.TRAIN)
-    with pytest.raises(DatasetError, match="version drift"):
-        action()
-    assert reads == 1
-
-
-def test_dataset_version_defaults_when_meta_missing(tmp_path) -> None:
-    src = _fresh_copy(tmp_path)
-    (src / "meta.json").unlink()
-    loader = ExampleDatasetLoader(src)
-    assert loader.dataset_version == "0.1.0"
+        for line in (DATASETS_DIR / f"{split}.jsonl").read_text(encoding="utf-8").splitlines():
+            expected = json.loads(line)["expected"]
+            assert expected["review"] == expected["decompose"]
 
 
 def test_rule_engine_smoke_on_transcript_dataset() -> None:
     loader = ExampleDatasetLoader(DATASETS_DIR)
     module = ShouldReviewModule()
 
-    async def score(examples: list) -> list[str]:
-        bad = []
-        for example in examples:
-            prediction = await module.decide(example.input)
-            if module.metric(example.with_prediction(prediction)) != 1.0:
-                bad.append(example.input.task)
-        return bad
+    async def count_mismatches() -> int:
+        mismatches = 0
+        for split in EXPECTED_COUNTS:
+            for example in loader.load_split(split):
+                prediction = await module.decide(example.input)
+                mismatches += module.metric(example.with_prediction(prediction)) != 1.0
+        return mismatches
 
-    total = 0
-    mismatches = 0
-    for split in EXPECTED_COUNTS:
-        examples = loader.load_split(split)
-        total += len(examples)
-        bad = asyncio.run(score(examples))
-        mismatches += len(bad)
-    assert total == EXPECTED_TOTAL
-    assert mismatches > 0
-
-
-def test_evaluate_split_reports_mean_std_count() -> None:
-    module = ShouldReviewModule()
-    loader = ExampleDatasetLoader(DATASETS_DIR)
-    result = evaluate_split(module, loader, Split.TRAIN)
-    assert result["count"] == EXPECTED_COUNTS[Split.TRAIN]
-    assert 0.0 <= result["mean"] <= 1.0
-    assert result["std"] >= 0.0
-
-
-def test_evaluate_split_async_inside_event_loop() -> None:
-    module = ShouldReviewModule()
-    loader = ExampleDatasetLoader(DATASETS_DIR)
-
-    async def run() -> dict:
-        return await evaluate_split_async(module, loader, Split.EVAL)
-
-    result = asyncio.run(run())
-    assert result["count"] == EXPECTED_COUNTS[Split.EVAL]
-    assert 0.0 <= result["mean"] <= 1.0
-    assert result["std"] >= 0.0
-
-
-def test_duplicate_ids_rejected(tmp_path) -> None:
-    src = tmp_path / "datasets"
-    src.mkdir()
-    record = {
-        "id": "dup-1",
-        "input": {"task": "Do a thing.", "context": ""},
-        "expected": {"review": False, "decompose": False, "reason": "atomic"},
-    }
-    (src / "train.jsonl").write_text(
-        json.dumps(record) + "\n" + json.dumps(record) + "\n", encoding="utf-8"
-    )
-    loader = ExampleDatasetLoader(src)
-    try:
-        loader.load_split(Split.TRAIN)
-    except DatasetError as exc:
-        assert "duplicate id" in str(exc)
-    else:
-        raise AssertionError("expected DatasetError for duplicate ids")
-
-
-def test_missing_id_rejected_in_split_file(tmp_path) -> None:
-    src = tmp_path / "datasets"
-    src.mkdir()
-    record = {
-        "input": {"task": "Do a thing.", "context": ""},
-        "expected": {"review": False, "decompose": False, "reason": "atomic"},
-    }
-    (src / "eval.jsonl").write_text(json.dumps(record) + "\n", encoding="utf-8")
-    loader = ExampleDatasetLoader(src)
-    try:
-        loader.load_split(Split.EVAL)
-    except DatasetError as exc:
-        assert "non-empty string 'id'" in str(exc)
-    else:
-        raise AssertionError("expected DatasetError for a record without an id")
-
-
-def test_cross_split_collision_rejected(tmp_path) -> None:
-    src = tmp_path / "datasets"
-    src.mkdir()
-
-    def rec(record_id: str) -> dict:
-        return {
-            "id": record_id,
-            "input": {"task": "Fix the typo in the README title.", "context": ""},
-            "expected": {"review": False, "decompose": False, "reason": "atomic"},
-        }
-
-    (src / "train.jsonl").write_text(json.dumps(rec("train-1")) + "\n", encoding="utf-8")
-    (src / "eval.jsonl").write_text(json.dumps(rec("eval-1")) + "\n", encoding="utf-8")
-    canary = {
-        "id": "canary-1",
-        "input": {"task": "Trap record task.", "context": ""},
-        "expected": {"review": True, "decompose": True, "reason": "trap"},
-        "canary": True,
-    }
-    (src / "canaries.jsonl").write_text(json.dumps(canary) + "\n", encoding="utf-8")
-    loader = ExampleDatasetLoader(src)
-    try:
-        loader.load_all()
-    except DatasetError as exc:
-        assert "cross-split collision" in str(exc)
-    else:
-        raise AssertionError("expected DatasetError for a cross-split collision")
-
-
-def test_schema_version_mismatch_rejected(tmp_path) -> None:
-    src = _fresh_copy(tmp_path)
-    meta_path = src / "meta.json"
-    meta = json.loads(meta_path.read_text())
-    meta["schema_version"] = 2
-    meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
-    loader = ExampleDatasetLoader(src)
-    try:
-        loader.load_all()
-    except DatasetError as exc:
-        assert "schema_version" in str(exc)
-    else:
-        raise AssertionError("expected DatasetError for a schema_version mismatch")
-
-
-def test_meta_json_non_object_rejected(tmp_path) -> None:
-    src = _fresh_copy(tmp_path)
-    (src / "meta.json").write_text("[]\n", encoding="utf-8")
-    loader = ExampleDatasetLoader(src)
-    try:
-        loader.load_all()
-    except DatasetError as exc:
-        assert "JSON object" in str(exc)
-    else:
-        raise AssertionError("expected DatasetError for a non-object meta.json")
-
-
-def test_validation_errors_report_actual_file(tmp_path) -> None:
-    src = tmp_path / "datasets"
-    src.mkdir()
-    (src / "eval.jsonl").write_text(
-        '{"id": "e-1", "input": {"task": 42, "context": ""}, '
-        '"expected": {"review": false, "decompose": false, "reason": "atomic"}}\n'
-    )
-    loader = ExampleDatasetLoader(src)
-    try:
-        loader.load_split(Split.EVAL)
-    except DatasetError as exc:
-        assert "eval.jsonl" in str(exc)
-        assert "input.task must be a string" in str(exc)
-    else:
-        raise AssertionError("expected DatasetError for a schema-invalid eval record")
+    assert asyncio.run(count_mismatches()) > 0
 
 
 def test_baseline_anchors_metadata_and_content() -> None:
-    """The committed baseline must agree with meta.json and the exact split bytes."""
-    if not BASELINE_PATH.is_file():
-        pytest.skip("baseline not yet generated")
     baseline = json.loads(BASELINE_PATH.read_text(encoding="utf-8"))
     meta = json.loads((DATASETS_DIR / "meta.json").read_text(encoding="utf-8"))
+    actual_digests = {
+        split: hashlib.sha256((DATASETS_DIR / f"{split}.jsonl").read_bytes()).hexdigest()
+        for split in ("train", "eval", "canaries")
+    }
 
     assert baseline["schema_version"] == 1
     assert baseline["module"] == "should_review"
     assert baseline["dataset_version"] == meta["dataset_version"]
-    assert baseline["split_digests"] == meta["split_digests"]
-
-    actual = {
-        split: hashlib.sha256((DATASETS_DIR / f"{split}.jsonl").read_bytes()).hexdigest()
-        for split in ("train", "eval", "canaries")
-    }
-    assert actual == meta["split_digests"]
-
+    assert baseline["split_digests"] == meta["split_digests"] == actual_digests
     assert baseline["dataset"]["records"] == EXPECTED_TOTAL
     assert baseline["dataset"]["duplicate_ids"] == 0
     assert baseline["dataset"]["cross_split_leaks"] == 0
     assert baseline["dataset"]["canaries"] == EXPECTED_COUNTS[Split.CANARIES]
-    review_true = baseline["dataset"]["label_true"]
-    review_false = baseline["dataset"]["label_false"]
-    assert review_true + review_false == EXPECTED_TOTAL
+    assert baseline["dataset"]["label_true"] + baseline["dataset"]["label_false"] == EXPECTED_TOTAL
     assert baseline["canaries"]["failed"] == 3
     assert baseline["canaries"]["taxonomy_coverage"] > 0
     assert 0.0 <= baseline["metric"]["eval"]["mean"] <= 1.0

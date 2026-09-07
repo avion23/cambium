@@ -186,7 +186,7 @@ for deterministic rendering, not proof that the agent can code.
 Run focused checks before broader changes:
 
 ```sh
-python -m pytest -o addopts='' tests/scenarios/test_tui_screen.py tests/scenarios/test_tui_rail_detail.py tests/scenarios/test_resource_projection.py
+python -m pytest -o addopts='' tests/scenarios/test_tui_screen.py tests/scenarios/test_resource_projection.py
 python -m pytest -o addopts='' tests/scenarios/test_tui_live_pty.py
 python -m pytest -o addopts='' -m acceptance tests/acceptance/test_live_frontends.py
 ```

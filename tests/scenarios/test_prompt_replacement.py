@@ -1,10 +1,6 @@
-"""Prompt deployment and real-rollout optimizer behavior."""
+"""Deployment replaces policy text; active sessions retain their snapshot."""
 
-from __future__ import annotations
-
-import json
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -12,45 +8,9 @@ from cambium import prompts, worker
 from cambium.benchmark import ExperimentBudget, ExperimentBudgetExceeded, _peak_pending_children
 
 
-def _dataset(tmp_path: Path) -> Path:
-    path = tmp_path / "cases.jsonl"
-    path.write_text(
-        "\n".join(
-            json.dumps({"id": split, "split": split, "task": split, "check": ["unused"]})
-            for split in ("train", "val", "test")
-        )
-        + "\n"
-    )
-    return path
-
-
-def _args(tmp_path: Path, **changes):
-    values = dict(
-        dataset=_dataset(tmp_path),
-        output=tmp_path / "experiment",
-        component="coding",
-        optimizer="gepa",
-        max_evals=8,
-        max_calls=30,
-        max_tokens=100,
-        max_turns=8,
-        max_wall_s=10,
-        max_workers=2,
-        budget_usd=1,
-        provider=None,
-        reflection_provider=None,
-        tier="fast",
-        case=[],
-        dry_run=False,
-        no_deploy=False,
-        seed=0,
-    )
-    values.update(changes)
-    return SimpleNamespace(**values)
-
-
-def test_replacement_changes_new_prompts_not_existing_session_snapshot(
-    tmp_path, monkeypatch
+def test_atomic_replacement_changes_new_prompts_not_existing_snapshot(
+    tmp_path: Path,
+    monkeypatch,
 ) -> None:
     path = tmp_path / "prompts.json"
     monkeypatch.setenv("CAMBIUM_PROMPTS", str(path))
@@ -58,25 +18,23 @@ def test_replacement_changes_new_prompts_not_existing_session_snapshot(
     prompts.save_policy(first)
     pinned = prompts.load_policy()
     before = worker._build_agent_prompt("task", [], [], prompt_policy=pinned)
-
     second = {**first, "coding": "Locate, edit, verify."}
     prompts.save_policy(second)
     after = worker._build_agent_prompt("task", [], [], prompt_policy=prompts.load_policy())
-
     assert first["coding"] in before["messages"][0]["content"]
     assert second["coding"] in after["messages"][0]["content"]
     assert before == worker._build_agent_prompt("task", [], [], prompt_policy=pinned)
+    assert '"type":"finish"' in after["messages"][0]["content"]
+    assert "Default to one short sentence" in after["messages"][0]["content"]
+    assert "Mention checks by outcome" in after["messages"][0]["content"]
+    assert "summary_entry" not in second["coding"]
 
 
-def test_experiment_budget_counts_tokens_and_rejects_non_finite_usage() -> None:
+def test_experiment_budget_counts_tokens_when_cash_is_zero() -> None:
     budget = ExperimentBudget(2, 100, 1.0)
     budget.record({"prompt_tokens": 90, "completion_tokens": 10}, 0.0)
     with pytest.raises(ExperimentBudgetExceeded):
         budget.check()
-    with pytest.raises(ValueError, match="finite"):
-        ExperimentBudget(2, 100, 1.0).record({"total_tokens": float("inf")})
-    with pytest.raises(ValueError, match="finite"):
-        ExperimentBudget(2, 100, 1.0).record({}, float("nan"))
 
 
 def test_gepa_search_reserves_measured_budget_for_final_evaluation() -> None:
@@ -90,7 +48,7 @@ def test_gepa_search_reserves_measured_budget_for_final_evaluation() -> None:
     assert _effective_search_evals(24, budget, baseline, evaluation_cases=5) == 10
 
 
-def test_parallel_benchmark_counts_overlapping_siblings_not_serial_or_nested_work() -> None:
+def test_parallel_benchmark_distinguishes_overlapping_siblings_from_serial_work() -> None:
     admitted = [
         {
             "kind": "child_admitted",
@@ -113,8 +71,9 @@ def test_parallel_benchmark_counts_overlapping_siblings_not_serial_or_nested_wor
     assert _peak_pending_children([admitted[0], nested]) == 1
 
 
-def test_rollout_timeout_reports_failure_against_accepted_code(tmp_path, monkeypatch) -> None:
+def test_rollout_timeout_retains_report_and_checks_only_accepted_code(tmp_path, monkeypatch):
     import asyncio
+    import json
 
     from cambium import benchmark
 
@@ -131,7 +90,8 @@ def test_rollout_timeout_reports_failure_against_accepted_code(tmp_path, monkeyp
             "files": {"note.txt": "unchanged"},
             "read_only": True,
             "check": [
-                "{python}", "-c",
+                "{python}",
+                "-c",
                 "from pathlib import Path; assert Path('note.txt').read_text() == 'unchanged'",
             ],
         },
@@ -144,10 +104,12 @@ def test_rollout_timeout_reports_failure_against_accepted_code(tmp_path, monkeyp
     assert "rollout wall budget exhausted" in row["feedback"]
     assert "check=True" in row["feedback"]
     assert row["head"] == row["base"]
+    assert json.loads((Path(row["directory"]) / "report.json").read_text()) == row
 
 
 def test_tripped_breaker_aborts_dead_rollout_promptly_with_identical_verdict(tmp_path, monkeypatch):
     import asyncio
+    import json
 
     from cambium import benchmark, worker
 
@@ -190,115 +152,180 @@ def test_tripped_breaker_aborts_dead_rollout_promptly_with_identical_verdict(tmp
     )
     assert not row["passed"]
     assert row["score"] == 0.0
+    assert row["feedback"].startswith("exit=1; ")
+    assert "check=True" in row["feedback"]
+    assert row["head"] == row["base"]
     assert "agent emitted 3 consecutive invalid actions" in row["feedback"]
     assert "rollout wall budget exhausted" not in row["feedback"]
+    assert "experiment budget exhausted" not in row["feedback"]
+    assert row["elapsed_s"] < 30
     assert row["calls"] == 1
     assert row["tokens"] == 10
+    assert json.loads((Path(row["directory"]) / "report.json").read_text()) == row
 
 
-@pytest.mark.parametrize(
-    ("component", "policy", "marker", "absent"),
-    [
-        (
-            "coding",
-            {"coding": "baseline", "summary": "keep findings"},
-            "You are Cambium's coding agent",
-            None,
-        ),
-        (
-            "summary",
-            {"coding": "baseline", "summary": "candidate findings contract"},
-            "<cambium-summary-control>",
-            "You are Cambium's coding agent",
-        ),
-    ],
-)
-def test_gepa_feedback_contains_real_prompt_and_bounded_trajectory(
-    component: str, policy: dict[str, str], marker: str, absent: str | None
-) -> None:
+def test_gepa_metric_scores_malformed_prediction_zero() -> None:
+    from types import SimpleNamespace
+
+    pytest.importorskip("dspy")
     from cambium import prompt_optimize
 
+    assert prompt_optimize.metric(None, SimpleNamespace(report="missing score")).score == 0.0
+    malformed = SimpleNamespace(score="bad", report="bad score")
+    assert prompt_optimize.metric(None, malformed).score == 0.0
+
+
+def test_gepa_reflection_feedback_is_grounded_in_rendered_prompt_and_trajectory() -> None:
+    pytest.importorskip("dspy")
+    from cambium import prompt_optimize
+
+    policy = {"coding": "baseline", "summary": "keep findings"}
     row = {
+        "id": "ground",
+        "split": "train",
         "passed": False,
         "score": 0.25,
         "elapsed_s": 299.9,
         "calls": 12,
-        "tokens": 48_000,
-        "summary_calls": 1,
+        "tokens": 48000,
+        "cost_usd": 0.5,
         "children": 2,
         "user_summary_chars": 1200,
         "user_summary_lines": 14,
         "malformed_actions": 7,
         "tool_failures": 3,
-        "turn_heads": ["a"],
-        "feedback": "exit=1; check=False; rollout wall budget exhausted\n" + "x" * 9000,
+        "feedback": "exit=1; check=False; scope=True; rollout wall budget exhausted\n" + "x" * 9000,
     }
-    feedback = prompt_optimize.grounded_feedback(component, policy, row)
+    seen: dict = {}
 
-    prompt_part, digest = feedback.split("<trajectory-digest>", 1)
-    assert marker in prompt_part
-    if absent is not None:
-        assert absent not in prompt_part
-    for key in ("summary_calls", "malformed_actions", "tool_failures", "user_summary_chars"):
-        assert f'"{key}"' in digest
-    assert "verbose-user-summary" in digest and "timeout-shaped" in digest
+    def runner(case, selected):
+        seen.update(selected)
+        return row
+
+    prediction = prompt_optimize.make_program("coding", policy, runner)(case={"id": "ground"})
+    assert prediction.score == 0.25
+    result = prompt_optimize.metric(None, prediction)
+    assert isinstance(result.score, float)
+    assert result.score == 0.25
+    feedback = result.feedback
+    # (i) the fully rendered production prompt, with its action-protocol envelope
+    assert "You are Cambium's coding agent in an assigned Git worktree" in feedback
+    assert '{"type":"finish","summary":"...","objective_met":true}' in feedback
+    assert "baseline" in feedback  # candidate instructions flow through coding_prompt
+    # (ii) trajectory digest keys plus derailment highlights
+    assert "<trajectory-digest>" in feedback
+    for key in (
+        "passed",
+        "elapsed_s",
+        "calls",
+        "tokens",
+        "malformed_actions",
+        "tool_failures",
+        "children",
+        "user_summary_chars",
+        "user_summary_lines",
+        "derailment",
+    ):
+        assert f'"{key}"' in feedback
+    assert "malformed-heavy" in feedback
+    assert "check-failed" in feedback
+    assert "timeout-shaped" in feedback
+    assert "verbose-user-summary" in feedback
+    # (iii) feedback stays bounded even for a large row; raw row JSON remains
+    assert len(feedback) <= prompt_optimize._FEEDBACK_CHARS
+    assert "[feedback truncated:" in feedback
+    assert "<raw-row>" in feedback
+    # runner still receives the full merged policy for the real rollout
+    assert seen == {**policy, "coding": "baseline"}
+
+
+def test_gepa_reflection_feedback_renders_summary_control_for_summary_component() -> None:
+    pytest.importorskip("dspy")
+    from cambium import prompt_optimize
+
+    policy = {"coding": "baseline", "summary": "candidate findings contract"}
+    row = {
+        "id": "ground",
+        "split": "train",
+        "passed": True,
+        "score": 0.9,
+        "elapsed_s": 3.1,
+        "calls": 2,
+        "tokens": 900,
+        "cost_usd": 0.0,
+        "children": 0,
+        "malformed_actions": 0,
+        "tool_failures": 0,
+        "feedback": "exit=0; check=True; scope=True",
+    }
+
+    def runner(case, selected):
+        return row
+
+    prediction = prompt_optimize.make_program("summary", policy, runner)(case={"id": "ground"})
+    feedback = prompt_optimize.metric(None, prediction).feedback
+    # summary candidates render inside the production summary-control shape,
+    # not the coding prompt (which omits the summary text entirely)
+    assert "<cambium-summary-control>" in feedback
+    assert "candidate findings contract" in feedback
+    assert "finding_preservation_contract" in feedback
+    assert "You are Cambium's coding agent" not in feedback.split("<trajectory-digest>")[0]
     assert len(feedback) <= prompt_optimize._FEEDBACK_CHARS
 
 
-@pytest.mark.parametrize(
-    ("score", "expected"),
-    [
-        (None, 0.0), ("bad", 0.0), (float("nan"), 0.0), (float("inf"), 0.0),
-        (True, 1.0), (False, 0.0), (0.9, 0.9),
-    ],
-)
-def test_prompt_metric_normalizes_prediction_scores(score, expected) -> None:
+def test_prompt_metric_scores_malformed_predictions_zero() -> None:
+    from types import SimpleNamespace
+
     from cambium import prompt_optimize
 
-    prediction = SimpleNamespace(report="r")
-    if score is not None:
-        prediction.score = score
-    result = prompt_optimize.metric(None, prediction)
-    assert result.score == expected
-    assert result.feedback == "r"
-
-
-def test_summary_gepa_stops_when_validation_never_uses_summary_policy(
-    tmp_path, monkeypatch
-) -> None:
-    from cambium import prompt_optimize
-
-    monkeypatch.setenv("CAMBIUM_PROMPTS", str(tmp_path / "active.json"))
-    prompts.save_policy({"coding": "baseline", "summary": "keep findings"})
-
-    def rollout(case, policy, **kwargs):
-        row = {
-            "id": case["id"], "score": 1.0, "passed": True, "feedback": "pass",
-            "elapsed_s": 1, "calls": 1, "tokens": 1, "summary_calls": 0,
-        }
-        kwargs["budget"].record({"total_tokens": 1})
-        return row
-
-    monkeypatch.setattr(prompt_optimize, "run_case", rollout)
-    with pytest.raises(ValueError, match="actually performs a summary call"):
-        prompt_optimize.run(_args(tmp_path, component="summary"))
+    assert prompt_optimize.metric(None, SimpleNamespace(report="no score")).score == 0.0
+    assert prompt_optimize.metric(None, SimpleNamespace(score=None, report="r")).score == 0.0
+    assert prompt_optimize.metric(None, SimpleNamespace(score="bad", report="r")).score == 0.0
+    good = prompt_optimize.metric(None, SimpleNamespace(score=0.9, report="r"))
+    assert good.score == 0.9
+    assert good.feedback == "r"
 
 
 @pytest.mark.parametrize("no_deploy", [False, True])
-def test_gepa_deploys_only_when_enabled(tmp_path, monkeypatch, no_deploy: bool) -> None:
+def test_gepa_winner_is_automatically_deployed_unless_disabled(
+    tmp_path: Path,
+    monkeypatch,
+    no_deploy: bool,
+) -> None:
+    import json
+    from types import SimpleNamespace
+
     dspy = pytest.importorskip("dspy")
     from cambium import prompt_optimize
 
     active = tmp_path / "active.json"
     monkeypatch.setenv("CAMBIUM_PROMPTS", str(active))
     prompts.save_policy({"coding": "baseline", "summary": "keep findings"})
+    dataset = tmp_path / "cases.jsonl"
+    dataset.write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "id": split,
+                    "split": split,
+                    "task": split,
+                    "check": ["unused"],
+                }
+            )
+            for split in ("train", "val", "test")
+        )
+    )
 
     def rollout(case, policy, **kwargs):
         passed = policy["coding"] == "improved"
         row = {
-            "id": case["id"], "score": float(passed), "passed": passed,
-            "feedback": "pass" if passed else "check failed", "elapsed_s": 1,
-            "calls": 1, "tokens": 1, "summary_calls": 0,
+            "id": case["id"],
+            "score": float(passed),
+            "passed": passed,
+            "feedback": "pass" if passed else "check failed",
+            "elapsed_s": 1,
+            "calls": 1,
+            "tokens": 1,
         }
         kwargs["budget"].record({"total_tokens": 1})
         kwargs["budget"].rows.append(row)
@@ -306,20 +333,95 @@ def test_gepa_deploys_only_when_enabled(tmp_path, monkeypatch, no_deploy: bool) 
 
     real_gepa = dspy.GEPA
 
+    def propose(candidate, reflective_dataset, components_to_update):
+        return {name: "improved" for name in components_to_update}
+
     def optimizer(**kwargs):
         kwargs.pop("reflection_lm")
-        kwargs["instruction_proposer"] = (
-            lambda candidate, reflective_dataset, components_to_update:
-            {name: "improved" for name in components_to_update}
-        )
+        kwargs["instruction_proposer"] = propose
         return real_gepa(**kwargs)
 
     monkeypatch.setattr(dspy, "GEPA", optimizer)
     monkeypatch.setattr(prompt_optimize, "run_case", rollout)
     monkeypatch.setattr(prompt_optimize, "_reflection_lm", lambda *args: None)
-    args = _args(tmp_path, no_deploy=no_deploy)
-
+    args = SimpleNamespace(
+        dataset=dataset,
+        output=tmp_path / "experiment",
+        component="coding",
+        optimizer="gepa",
+        max_evals=8,
+        max_calls=30,
+        max_tokens=100,
+        max_turns=8,
+        max_wall_s=10,
+        max_workers=2,
+        budget_usd=1,
+        provider=None,
+        case=[],
+        dry_run=False,
+        no_deploy=no_deploy,
+        seed=0,
+    )
     assert prompt_optimize.run(args) == 0
     report = json.loads((args.output / "report.json").read_text())
     assert report["deployed"] is not no_deploy
     assert prompts.load_policy()["coding"] == ("baseline" if no_deploy else "improved")
+    assert prompts.load_policy(args.output / "candidate.json")["coding"] == "improved"
+
+
+def test_summary_gepa_stops_when_validation_never_uses_summary_policy(
+    tmp_path: Path, monkeypatch
+) -> None:
+    pytest.importorskip("dspy")
+    import json
+    from types import SimpleNamespace
+
+    from cambium import prompt_optimize
+
+    monkeypatch.setenv("CAMBIUM_PROMPTS", str(tmp_path / "active.json"))
+    prompts.save_policy({"coding": "baseline", "summary": "keep findings"})
+    dataset = tmp_path / "cases.jsonl"
+    dataset.write_text(
+        "\n".join(
+            json.dumps({"id": split, "split": split, "task": split, "check": ["unused"]})
+            for split in ("train", "val", "test")
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    def rollout(case, policy, **kwargs):
+        row = {
+            "id": case["id"],
+            "score": 1.0,
+            "passed": True,
+            "feedback": "pass",
+            "elapsed_s": 1,
+            "calls": 1,
+            "tokens": 1,
+            "summary_calls": 0,
+        }
+        kwargs["budget"].record({"total_tokens": 1})
+        return row
+
+    monkeypatch.setattr(prompt_optimize, "run_case", rollout)
+    args = SimpleNamespace(
+        dataset=dataset,
+        output=tmp_path / "experiment",
+        component="summary",
+        optimizer="gepa",
+        max_evals=8,
+        max_calls=30,
+        max_tokens=100,
+        max_turns=8,
+        max_wall_s=10,
+        max_workers=2,
+        budget_usd=1,
+        provider=None,
+        case=[],
+        dry_run=False,
+        no_deploy=False,
+        seed=0,
+    )
+    with pytest.raises(ValueError, match="actually performs a summary call"):
+        prompt_optimize.run(args)

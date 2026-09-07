@@ -254,6 +254,7 @@ def _write_epoch(
 
 _DIGEST = "a" * 64
 _REF = f"epoch-agent/epoch-001-{'a' * 16}-{'b' * 16}.json"
+_REMEDIY_SENTINEL = "declare context_mode=fresh with placement=inherit"
 
 
 def _provider_boundary(provider: str = "p1", model: str = "m1") -> dict[str, Any]:
@@ -319,6 +320,7 @@ def test_validate_resume_strict() -> None:
         "epoch": 1,
         "child_results": [_strict_child_envelope()],
         "child_results_truncated": False,
+        "rejection_feedback": None,
         "workspace_changed": False,
     }
     assert worker._validate_resume(payload) == payload
@@ -338,6 +340,20 @@ def test_validate_resume_strict() -> None:
         worker._validate_resume({**payload, "child_results": [{"status": "succeeded"}]})
     with pytest.raises(ContextForkError, match="child_results_truncated"):
         worker._validate_resume({**payload, "child_results_truncated": "yes"})
+    bounded_feedback = "Delegation feedback: all 2 children were rejected." + "x" * (
+        worker.MAX_REJECTION_FEEDBACK_CHARS
+    )
+    with pytest.raises(ContextForkError, match="rejection_feedback"):
+        worker._validate_resume({**payload, "rejection_feedback": ""})
+    with pytest.raises(ContextForkError, match="rejection_feedback"):
+        worker._validate_resume({**payload, "rejection_feedback": 7})
+    with pytest.raises(ContextForkError, match="rejection_feedback"):
+        worker._validate_resume({**payload, "rejection_feedback": bounded_feedback})
+    validated = worker._validate_resume(
+        {**payload, "rejection_feedback": "Delegation feedback: rejected."}
+    )
+    assert validated is not None
+    assert validated["rejection_feedback"] == "Delegation feedback: rejected."
 
 
 def test_epoch_checkpoint_roundtrip_and_tamper(tmp_path: Path) -> None:
@@ -407,6 +423,29 @@ def test_redacted_epoch_checkpoint_roundtrip(tmp_path: Path) -> None:
         for message in [*loaded.provider_messages, *loaded.continuation_suffix]
     )
 
+    compatible, reason = worker._fork_cache_compatible(
+        {"fanout_config": {"model": checkpoint.cache_key.model}},
+        {"cache_key": asdict(checkpoint.cache_key)},
+        frozenset({"loopback-provider"}),
+    )
+    assert not compatible
+    assert reason == "checkpoint redacted"
+
+
+def test_email_shape_alone_marks_checkpoint_redacted(tmp_path: Path) -> None:
+    """No registered secret is needed: one email in the transcript (e.g. a git
+    author line from a read-only probe) redacts the checkpoint and therefore
+    defeats trunk and semantic admission for the rest of the session."""
+    config = _agent_config(tmp_path / "wt", checkpoint_root=tmp_path / "ckpts")
+    checkpoint = _write_epoch(
+        config,
+        messages=[
+            {"role": "system", "content": "You are the agent."},
+            {"role": "user", "content": "git log says: A. U. Thor <author@example.com>"},
+        ],
+    )
+
+    assert checkpoint.cache_key.redacted is True
     compatible, reason = worker._fork_cache_compatible(
         {"fanout_config": {"model": checkpoint.cache_key.model}},
         {"cache_key": asdict(checkpoint.cache_key)},
@@ -646,6 +685,7 @@ def test_resume_seeds_transcript_and_usage_epoch(tmp_path: Path) -> None:
             "epoch": checkpoint.epoch,
             "child_results": [_strict_child_envelope()],
             "child_results_truncated": False,
+            "rejection_feedback": None,
             "workspace_changed": False,
         },
     )
@@ -668,6 +708,79 @@ def test_resume_seeds_transcript_and_usage_epoch(tmp_path: Path) -> None:
     assert "fork_of" not in usage[0]
 
 
+def test_resume_rejection_feedback_reaches_parent_context_once(tmp_path: Path) -> None:
+    worktree = _make_worktree(tmp_path / "repo")
+    config = _agent_config(worktree, checkpoint_root=tmp_path / "ckpts")
+    checkpoint = _write_epoch(config)
+    feedback = (
+        "Delegation feedback: all 3 children proposed in the last delegate "
+        "batch were rejected before spawn; none ran. "
+        "Reasons: DuplicateTaskError (task t-root already exists). "
+        f"Remedy: {_REMEDIY_SENTINEL}"
+    )
+    resume_config = _agent_config(
+        worktree,
+        checkpoint_root=tmp_path / "ckpts",
+        context_reuse=True,
+        resume={
+            "checkpoint_ref": checkpoint.checkpoint_ref,
+            "epoch": checkpoint.epoch,
+            "child_results": [],
+            "child_results_truncated": False,
+            "workspace_changed": False,
+            "rejection_feedback": feedback,
+        },
+    )
+    writer = _FakeWriter()
+    router = _ScriptedRouter(
+        ['{"type":"finish","summary":"resumed and done","objective_met":true}']
+    )
+
+    outcome = asyncio.run(_drive_loop(resume_config, worktree, router, writer))
+
+    assert outcome["status"] == "succeeded"
+    first = router.prompts[0]["messages"]
+    feedback_messages = [
+        m for m in first if isinstance(m.get("content"), str) and _REMEDIY_SENTINEL in m["content"]
+    ]
+    assert len(feedback_messages) == 1
+    assert feedback_messages[0]["role"] == "user"
+    assert feedback in feedback_messages[0]["content"]
+
+
+def test_resume_without_rejection_feedback_adds_no_correction(tmp_path: Path) -> None:
+    worktree = _make_worktree(tmp_path / "repo")
+    config = _agent_config(worktree, checkpoint_root=tmp_path / "ckpts")
+    checkpoint = _write_epoch(config)
+    resume_config = _agent_config(
+        worktree,
+        checkpoint_root=tmp_path / "ckpts",
+        context_reuse=True,
+        resume={
+            "checkpoint_ref": checkpoint.checkpoint_ref,
+            "epoch": checkpoint.epoch,
+            "child_results": [],
+            "child_results_truncated": False,
+            "workspace_changed": False,
+            "rejection_feedback": None,
+        },
+    )
+    writer = _FakeWriter()
+    router = _ScriptedRouter(
+        ['{"type":"finish","summary":"resumed and done","objective_met":true}']
+    )
+
+    outcome = asyncio.run(_drive_loop(resume_config, worktree, router, writer))
+
+    assert outcome["status"] == "succeeded"
+    first = router.prompts[0]["messages"]
+    assert not [
+        m
+        for m in first
+        if isinstance(m.get("content"), str) and "Delegation feedback" in m["content"]
+    ]
+
+
 def test_resume_continuation_guard_preserves_checkpoint_prefix(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -687,6 +800,7 @@ def test_resume_continuation_guard_preserves_checkpoint_prefix(
             "epoch": checkpoint.epoch,
             "child_results": [_strict_child_envelope()],
             "child_results_truncated": False,
+            "rejection_feedback": None,
             "workspace_changed": False,
         },
     )
@@ -744,6 +858,7 @@ def test_resume_missing_checkpoint_fails_closed(tmp_path: Path) -> None:
             "epoch": 1,
             "child_results": [],
             "child_results_truncated": False,
+            "rejection_feedback": None,
             "workspace_changed": False,
         },
     )
@@ -771,6 +886,7 @@ def test_rolling_compact_fold_advances_epoch_and_preserves_head(
             _strict_child_envelope(summary="b" * 140),
         ],
         "child_results_truncated": False,
+        "rejection_feedback": None,
         "workspace_changed": False,
     }
     config = _agent_config(
@@ -834,6 +950,7 @@ def test_rolling_compact_fold_advances_epoch_and_preserves_head(
             "epoch": folded.epoch,
             "child_results": [],
             "child_results_truncated": False,
+            "rejection_feedback": None,
             "workspace_changed": False,
         },
         max_turns=4,
@@ -860,6 +977,7 @@ def test_rolling_compact_hysteresis_does_not_refold_below_low(
             _strict_child_envelope(summary="b" * 500),
         ],
         "child_results_truncated": False,
+        "rejection_feedback": None,
         "workspace_changed": False,
     }
     config = _agent_config(
@@ -909,6 +1027,7 @@ def test_rolling_compact_failure_is_fail_closed_and_preserves_checkpoint(
         "epoch": checkpoint.epoch,
         "child_results": [_strict_child_envelope(summary="x" * 300)] * 2,
         "child_results_truncated": False,
+        "rejection_feedback": None,
         "workspace_changed": False,
     }
     config = _agent_config(
@@ -966,6 +1085,7 @@ def test_rolling_compact_internal_opt_out_keeps_existing_epoch_path(
         "epoch": checkpoint.epoch,
         "child_results": [_strict_child_envelope(summary="x" * 300)] * 2,
         "child_results_truncated": False,
+        "rejection_feedback": None,
         "workspace_changed": False,
     }
     config = _agent_config(
@@ -1141,6 +1261,7 @@ def test_redacted_resume_fails_without_seeding_transcript(tmp_path: Path) -> Non
             "epoch": checkpoint.epoch,
             "child_results": [_strict_child_envelope()],
             "child_results_truncated": False,
+            "rejection_feedback": None,
             "workspace_changed": False,
         },
     )
@@ -1614,6 +1735,69 @@ def test_suspend_resume_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     assert resume_init["resume"]["child_results"]
     assert resume_init["resume"]["child_results"][0]["status"] == "succeeded"
     assert resume_init["resume"]["child_results"][0]["files_changed"] == ["b.txt"]
+    # An admitted batch adds no rejection correction to the parent context.
+    assert resume_init["resume"]["rejection_feedback"] is None
+
+
+@pytest.mark.slow
+def test_fully_rejected_batch_produces_one_bounded_parent_correction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When every child of one delegate batch is rejected, the resumed parent
+    carries exactly one bounded correction naming the rejection reasons;
+    the admission verdicts themselves are unchanged."""
+    session_dir = tmp_path / "session"
+    repo = session_dir / "repo"
+    base = _make_repo(repo, {"a.txt": "file a\n"})
+
+    suspend_worker = tmp_path / "suspend_worker.py"
+    _write_suspend_worker(suspend_worker)
+    context_dump = tmp_path / "parent-inits.jsonl"
+    monkeypatch.setenv("CONTEXT_DUMP_PATH", str(context_dump))
+
+    root = _task(
+        session_dir,
+        repo,
+        base,
+        "t-root",
+        worktree="wt-root",
+        branch="wt-root",
+        target_file="a.txt",
+        marker="// parent-marker",
+        worker_path=str(suspend_worker),
+        provider_env_keys=["FAKE_MODE", "CONTEXT_DUMP_PATH"],
+        proposed_children=[
+            # Duplicate of the parent's own task id: DuplicateTaskError.
+            {"child_task_id": "t-root", "kind": "test", "spec": {"task": "duplicate"}},
+            # Below the minimum wall budget: ValueError.
+            {"child_task_id": "b1", "kind": "test", "spec": {"task": "x", "max_wall_s": 10}},
+        ],
+    )
+
+    result = asyncio.run(run_plan(session_dir, {"tasks": [root]}, context_reuse=True))
+
+    assert result.exit_code == 0, result.results
+    events = read_events(session_dir)
+    rejected = _kinds(events, "child_rejected")
+    assert {e["payload"]["reason"] for e in rejected} == {"DuplicateTaskError", "ValueError"}
+    assert not _kinds(events, "child_admitted")
+    resumes = _kinds(events, "context_resume")
+    assert len(resumes) == 1
+    assert resumes[0]["payload"]["child_count"] == 0
+
+    lines = context_dump.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 2
+    assert "resume" not in json.loads(lines[0])
+    resume_init = json.loads(lines[1])
+    feedback = resume_init["resume"]["rejection_feedback"]
+    assert isinstance(feedback, str)
+    assert "all 2 children proposed" in feedback
+    assert "DuplicateTaskError" in feedback
+    assert "ValueError" in feedback
+    assert len(feedback) <= worker.MAX_REJECTION_FEEDBACK_CHARS
+    # Exactly one correction across the whole session dump.
+    assert context_dump.read_text(encoding="utf-8").count("Delegation feedback:") == 1
+    assert resume_init["resume"]["child_results"] == []
 
 
 @pytest.mark.slow

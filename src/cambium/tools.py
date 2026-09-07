@@ -739,12 +739,11 @@ def _git_schema_ops() -> frozenset[str]:
 
 
 GIT_OPS = _git_schema_ops()
-UNSAFE_GIT_OPS = frozenset({"checkout", "reset"})
 
 
 async def _git_op(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
     op = args["op"]
-    if op not in GIT_OPS and op not in UNSAFE_GIT_OPS:
+    if op not in GIT_OPS:
         raise _ToolFailure(f"git operation is not allowlisted: {op!r}")
     try:
         argument_tokens = shlex.split(args["args"])
@@ -875,7 +874,7 @@ async def _delegate(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
     from .child_policy import complete_child_policy
 
     try:
-        complete_child_policy(args["spec"])
+        complete_child_policy(args["spec"], read_only=kind == "investigation")
     except ChildPolicyError as exc:
         return _Outcome(ok=False, error=f"validation failed: {exc}")
     return _Outcome(

@@ -48,8 +48,9 @@ There is one worker implementation; a child is an ordinary worker task owned by
 its parent. The model decides to delegate inside its ordinary action call, and
 each delegate spec declares `context_mode` (`trunk`, `semantic`, `fresh`) and
 `placement` (`inherit`, `spread`), with deterministic defaults when omitted: a
-single child defaults to `trunk+inherit`, an independent batch to
-`semantic+spread`. `trunk+spread` is rejected. Children run in isolated
+single child defaults to `trunk+inherit`, a multi-child batch to
+`semantic+spread`, and a read-only `investigation` delegate to `fresh+inherit`.
+`trunk+spread` is rejected. Children run in isolated
 worktrees; the supervisor integrates accepted child commits into the parent
 before the parent resumes.
 
@@ -140,8 +141,6 @@ Focused documents:
   `BranchState`/`SituationFrame` inspection and remaining state proposals.
 - [`docs/how-to/agent-driving-loop.md`](docs/how-to/agent-driving-loop.md) —
   driving sessions from another coding agent.
-- [`docs/research/agent-system-evaluation.md`](docs/research/agent-system-evaluation.md)
-  — evaluating the runtime end to end.
 
 ## License
 

@@ -198,7 +198,12 @@ class _FakeIssuerHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(encoded)))
         self.send_header("Connection", "close")
         self.end_headers()
-        self.wfile.write(encoded)
+        try:
+            self.wfile.write(encoded)
+        except BrokenPipeError:
+            # Timeout tests intentionally close the client before the delayed
+            # fake issuer replies; that is expected harness behavior.
+            pass
 
     def log_message(self, format: str = "", *args: object) -> None:
         pass

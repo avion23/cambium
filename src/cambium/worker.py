@@ -219,6 +219,10 @@ MAX_TRANSCRIPT_CHARS = 120_000
 TRANSCRIPT_KEEP_TURNS = 6
 MAX_ENVELOPE_FIELD_CHARS = 2_000
 MAX_ENVELOPE_ITEMS = 16
+# Supervisor-authored correction appended to a resumed parent's context when
+# every child of one delegate batch was rejected before spawn. Bounded so a
+# pathological reject-retry loop cannot bloat the parent context.
+MAX_REJECTION_FEEDBACK_CHARS = 1_200
 MAX_CONTEXT_MESSAGES = 512
 CHECKPOINT_EPOCH_SCHEMA = 5
 _LEGACY_CHECKPOINT_EPOCH_SCHEMA = 4
@@ -410,6 +414,7 @@ _RESUME_KEYS = frozenset(
         "child_results",
         "child_results_truncated",
         "workspace_changed",
+        "rejection_feedback",
     }
 )
 _SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -628,12 +633,23 @@ def _validate_resume(value: Any) -> dict[str, Any] | None:
     workspace_changed = value.get("workspace_changed")
     if type(workspace_changed) is not bool:
         raise ContextForkError("resume 'workspace_changed' must be a boolean")
+    feedback = value.get("rejection_feedback")
+    if feedback is not None and (
+        not isinstance(feedback, str)
+        or not feedback
+        or len(feedback) > MAX_REJECTION_FEEDBACK_CHARS
+    ):
+        raise ContextForkError(
+            "resume 'rejection_feedback' must be None or a non-empty string "
+            f"of at most {MAX_REJECTION_FEEDBACK_CHARS} characters"
+        )
     return {
         "checkpoint_ref": checkpoint_ref,
         "epoch": epoch,
         "child_results": validated_results,
         "child_results_truncated": truncated,
         "workspace_changed": workspace_changed,
+        "rejection_feedback": feedback,
     }
 
 
@@ -1996,8 +2012,7 @@ _LENIENT_ACTION_DECODER = json.JSONDecoder(strict=False)
 def _repair_tool_batch_closer(text: str) -> tuple[Any, int] | None:
     """Normalize one observed provider typo without guessing action semantics."""
     if not (
-        text.startswith('{"type":"tool_call","calls":[')
-        or text.startswith('{"calls":[')
+        text.startswith('{"type":"tool_call","calls":[') or text.startswith('{"calls":[')
     ) or not text.endswith("}]}]}"):
         return None
     repaired = text[:-5] + "}}]}"
@@ -2037,7 +2052,11 @@ def _complete_delegates(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         arguments = dict(call["arguments"])
         if isinstance(arguments.get("spec"), dict):
-            arguments["spec"] = complete_child_policy(arguments["spec"], siblings=siblings)
+            arguments["spec"] = complete_child_policy(
+                arguments["spec"],
+                siblings=siblings,
+                read_only=arguments.get("kind") == "investigation",
+            )
         arguments.setdefault("kind", "feature")
         call["arguments"] = arguments
     return calls
@@ -2062,16 +2081,11 @@ def _normalize_tool_calls(action: Mapping[str, Any]) -> list[dict[str, Any]]:
             if not isinstance(raw_call, dict):
                 errors.append(f"tool_call calls[{index}] must be an object")
                 continue
+            if set(raw_call) != {"name", "arguments"}:
+                errors.append(f"tool_call calls[{index}] must carry exactly name/arguments")
+                continue
             name = raw_call.get("name")
-            if "arguments" in raw_call:
-                if set(raw_call) != {"name", "arguments"}:
-                    errors.append(
-                        f"tool_call calls[{index}] must not mix arguments with flattened fields"
-                    )
-                    continue
-                arguments = raw_call.get("arguments")
-            else:
-                arguments = {key: value for key, value in raw_call.items() if key != "name"}
+            arguments = raw_call.get("arguments")
             entry_errors: list[str] = []
             if not isinstance(name, str) or not name:
                 entry_errors.append("name must be a non-empty string")
@@ -2091,12 +2105,6 @@ def _normalize_tool_calls(action: Mapping[str, Any]) -> list[dict[str, Any]]:
     arguments = action.get("arguments")
     if not isinstance(name, str) or not name:
         raise ValueError("tool_call name must be a non-empty string")
-    if arguments is None:
-        arguments = {
-            key: value
-            for key, value in action.items()
-            if key not in {"type", "name", "thought"}
-        }
     if not isinstance(arguments, dict):
         raise ValueError("tool_call arguments must be an object")
     if name not in _ALL_TOOL_NAMES:
@@ -2108,11 +2116,10 @@ _FENCED_ACTION_RE = re.compile(r"^```[A-Za-z0-9_-]*\r?\n(.*)\r?\n?```\s*$", re.D
 
 
 def _parse_agent_action(content: str) -> dict[str, Any]:
-    """Parse one unambiguous agent action and reject competing action content.
-
-    A complete JSON object may follow provider commentary, but nothing may
-    follow that object. The parsed action still passes the normal structural
-    and tool-schema checks; concatenated or ambiguous actions are rejected.
+    """Strictly parse ONE agent action; the response must be exactly one
+    top-level JSON object.  Any prose, trailing JSON, or concatenated
+    actions are rejected (the owner overrode trailing-prose tolerance).
+    Raises ``ValueError`` on any deviation.
 
     Exactly one well-formed markdown fence wrapping the object is unwrapped
     first (```` ```json ... ``` ```` or a bare ```` ``` ... ``` ```` fence);
@@ -2140,14 +2147,7 @@ def _parse_agent_action(content: str) -> dict[str, Any]:
     try:
         parsed, _end = _decode_action_json(text)
     except (json.JSONDecodeError, UnicodeDecodeError, RecursionError) as exc:
-        object_start = text.find("{")
-        if object_start <= 0 or "```" in text[:object_start]:
-            raise ValueError(f"action is not valid JSON: {exc}") from None
-        try:
-            parsed, relative_end = _decode_action_json(text[object_start:])
-        except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
-            raise ValueError(f"action is not valid JSON: {exc}") from None
-        _end = object_start + relative_end
+        raise ValueError(f"action is not valid JSON: {exc}") from None
     if not isinstance(parsed, dict):
         raise ValueError("agent action must be exactly one JSON object")
     if text[_end:].strip():
@@ -2173,18 +2173,6 @@ def _parse_agent_action(content: str) -> dict[str, Any]:
             required = frozenset({"type", "calls"})
             shape = "type/calls"
         else:
-            if "arguments" not in parsed:
-                flattened = {
-                    key: value
-                    for key, value in parsed.items()
-                    if key not in {"type", "name", "thought"}
-                }
-                parsed = {
-                    "type": "tool_call",
-                    "name": parsed.get("name"),
-                    "arguments": flattened,
-                    **({"thought": parsed["thought"]} if "thought" in parsed else {}),
-                }
             required = frozenset({"type", "name", "arguments"})
             shape = "type/name/arguments"
         if not _action_keys(parsed, required):
@@ -3103,8 +3091,9 @@ def _build_agent_prompt(
     if model_identity:
         system_lines.insert(
             -1,
-            f"Configured route: {model_identity}. A later Cambium fallback note names the "
-            "actual serving provider/model and overrides this route hint.",
+            f"You are running as the configured model {model_identity}. When "
+            "asked what model or provider you are, answer truthfully from this "
+            "identity and never guess.",
         )
     system_lines.append(json.dumps(tools, sort_keys=True))
     messages = [
@@ -6074,6 +6063,8 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
             )
             for child_result in resume["child_results"]:
                 transcript.append({"role": "user", "content": _child_result_lines(child_result)})
+            if resume["rejection_feedback"]:
+                transcript.append({"role": "user", "content": resume["rejection_feedback"]})
             compaction_deferred = turn_checkpoint["compaction_deferred"]
             consecutive_compaction_deferrals = turn_checkpoint["consecutive_compaction_deferrals"]
             outcome["commits_so_far"] = turn_checkpoint["commits_so_far"]
@@ -6117,6 +6108,8 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                     "content": "[note: some child results were truncated and omitted]",
                 }
             )
+        if resume["rejection_feedback"]:
+            context_continuation.append({"role": "user", "content": resume["rejection_feedback"]})
         workspace_changed = resume["workspace_changed"]
         code_changed = resume_checkpoint.code_changed or workspace_changed
         verified_after_change = resume_checkpoint.verified_after_change and not workspace_changed
@@ -6598,13 +6591,12 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                     {
                         "role": "user",
                         "content": _bounded_text(
-                            f"invalid action: {exc}. Each tool call needs name and arguments "
-                            "at the same level. Keep independent delegates in one calls array: "
-                            "the parent waits after each delegation batch. For ordinary tools, "
-                            "retry one call: "
-                            '{"name":"TOOL","arguments":{...}} using the actual tool name. '
-                            "JSON-escape string values. For completion, use the finish shape. "
-                            "No prose or markdown.",
+                            f"invalid action: {exc}. Return exactly one JSON object. Tool "
+                            "actions use "
+                            '{"calls":[{"name":"TOOL","arguments":{}}]}; put every tool '
+                            "field inside arguments. Batch only independent work. JSON-escape "
+                            "string values. For completion, use the finish shape. No prose or "
+                            "markdown.",
                             MAX_OBSERVATION_BYTES,
                         ),
                     },
@@ -6824,7 +6816,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                         "provider_messages": terminal_messages,
                         "continuation_suffix": terminal_suffix,
                         "provider": terminal_provider,
-                        "model": result.model,
+                        "model": model,
                         "tools_sha256": _sha256_hex(
                             json.dumps(tools, sort_keys=True).encode("utf-8")
                         ),
@@ -7756,33 +7748,35 @@ async def _heartbeat_loop(
     published_phase: str | None = None
     published_tail: str | None = None
     published_revision = 0
+    published_progress: tuple[Any, ...] | None = None
     last_phase_emit = float("-inf")
     drain_ok = True
     while not stop.is_set():
         now = time.monotonic()
         heartbeat_due = now >= next_heartbeat
-        phase_due = False
+        progress_due = False
         provider = model = None
         cache_hit: bool | None = None
+        tool = progress.tool if progress is not None else None
         if progress is not None:
             phase, tail, revision, provider, model, cache_hit = progress.phase_snapshot()
-            phase_due = (
+            visible_progress = (phase, tail, provider, model, cache_hit, tool)
+            changed = visible_progress != published_progress
+            repeated_phase_due = (
                 phase is not None
                 and revision > published_revision
-                and (
-                    (phase != published_phase and heartbeat_due)
-                    or now - last_phase_emit >= PHASE_HEARTBEAT_INTERVAL_S
-                )
+                and now - last_phase_emit >= PHASE_HEARTBEAT_INTERVAL_S
             )
-            if phase_due:
+            progress_due = changed or repeated_phase_due
+            if progress_due:
+                published_progress = visible_progress
                 published_phase, published_tail = phase, tail
                 published_revision = revision
                 last_phase_emit = now
-        if not heartbeat_due and not phase_due:
+        if not heartbeat_due and not progress_due:
             await asyncio.sleep(min(0.05, next_heartbeat - now))
             continue
         turn = progress.turn if progress is not None else 0
-        tool = progress.tool if progress is not None else None
         status = progress.status if progress is not None else "working"
         heartbeat: dict[str, Any] = {
             "type": "heartbeat",

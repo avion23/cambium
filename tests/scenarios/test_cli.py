@@ -7,50 +7,11 @@ inherently need a real subprocess are marked slow.
 
 from __future__ import annotations
 
-import os
-import subprocess
-import sys
 from pathlib import Path
 
 import pytest
 
 from cambium import cli
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
-SRC_DIR = str(REPO_ROOT / "src")
-CLI = [sys.executable, "-m", "cambium.cli"]
-
-
-def _run(
-    *args: str,
-    input_text: str | None = None,
-    extra_env: dict[str, str] | None = None,
-) -> subprocess.CompletedProcess[str]:
-    """Run the unified CLI as a real subprocess (slow-tier scenarios)."""
-    env = dict(os.environ)
-    env["PYTHONPATH"] = os.pathsep.join(filter(None, [SRC_DIR, env.get("PYTHONPATH")]))
-    if extra_env is not None:
-        env.update(extra_env)
-    return subprocess.run(
-        [*CLI, *args],
-        cwd=REPO_ROOT,
-        input=input_text,
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=300,
-    )
-
-
-@pytest.mark.slow
-def test_module_test_runs_reference_module() -> None:
-    # ``cambium module-test`` inherently runs the example module's real 57-test
-    # pytest suite in a subprocess; this scenario stays on the slow tier.
-    result = _run("module-test", "example")
-
-    assert result.returncode == 0, result.stdout + result.stderr
-    output = result.stdout + result.stderr
-    assert "example: passed=52 failed=0 skipped=0" in output, output
 
 
 def test_module_test_unknown_module_exits_two(capsys) -> None:

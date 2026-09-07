@@ -359,7 +359,8 @@ def test_delegate_validates_kind_and_explicit_policy_at_call_time(tmp_path: Path
         ToolContext(tmp_path),
     )
 
-    assert "unknown task kind message" in (invalid_kind.error or "")
+    assert not invalid_kind.ok
+    assert "must be one of" in (invalid_kind.error or "")
     assert invalid_policy.error == (
         "validation failed: child context_mode=trunk requires placement=inherit"
     )

@@ -115,11 +115,11 @@ Derived variants are labelled as variants, not claimed to be transcripts that oc
 | --- | --- | --- |
 | Train | `arithmetic`, `parallel-modules` | Small repair and failed independent-module runs |
 | Train | `parallel-utilities` | The CSV/configuration join failure, with explicit semantic children |
-| Validation | `cambium-self-fix` | Repair `render_tokens_per_s(None)` at frozen Cambium commit `63034cc` |
+| Validation | `cambium-self-fix` | Synthetic fixture for `render_tokens_per_s(None)`, distilled from the recorded self-modification |
 | Validation | `blocking-child` | One read-only child sharing the current trunk/provider |
-| Validation | `finish-report` | Strict accepted output plus machine-readable completion report |
-| Validation | `calibration-memory` | Fact retention across a semantic fold/compaction |
-| Validation | `parallel-derive` | Two independent children and combined verification |
+| Validation | `finish-report` | Synthetic strict finish envelope and machine-readable completion report |
+| Validation | `calibration-memory` | Synthetic calibration facts that must survive context compaction |
+| Validation | `parallel-derive` | Synthetic parallel delegation over independent numeric utilities |
 | Test | `navigation-history` | Actual edit, check, and exact tool-evidence retrieval |
 | Test | `history-reconnect` | Derived continuation across frontend reconnect |
 | Test | `corrected-history` | Derived requirement change, semantic review, K0, reconnect and stale-check recall |
@@ -135,10 +135,9 @@ parallel work. `peak_pending_children` counts admitted, unfinished siblings,
 including queued work; it does not claim simultaneous provider calls or speedup.
 Provider lists report successful serving calls, not failed attempts alone.
 
-The raw source sessions are development artifacts under the earlier worktree's
-`.cambium` directories. The fixtures contain the minimum task/input/check,
-not credentials or entire private transcripts. Source provenance and negative
-runs are described in [the audit](../research/harness-audit-2026-09-04.md).
+The fixtures contain only the minimum task/input/check, not credentials or
+entire private transcripts. Optimization reports retain source provenance and
+negative outcomes; they are evidence for an experiment, not runtime contracts.
 
 ## Metrics and limitations
 

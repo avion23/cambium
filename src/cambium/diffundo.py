@@ -55,11 +55,11 @@ half-open probe);
 the sliding-window failure-rate escalation is a secondary safety net that only
 fires once the window is full.
 
-Every ``call`` is bounded by a wall-clock deadline (``call_budget_s``): the
-per-attempt HTTP timeout is capped
-at the remaining budget, retries are skipped when the backoff no longer fits,
-and the cascade aborts (``AllProvidersFailed``) once the budget is spent — the
-deadline is not just a candidate-waiting bound.
+Every ``call`` is bounded by a wall-clock deadline (``call_budget_s``), and
+each provider wire request/stream is wall-bounded by its reasoning-adjusted
+``timeout_s``. Retry backoff still uses the whole call budget, and the cascade
+aborts only once that budget is spent — the deadline is not just a
+candidate-waiting bound.
 
 Stdlib only. HTTP calls use urllib against an OpenAI-compatible
 ``/chat/completions`` endpoint; the API key is read from the environment (name
@@ -1056,6 +1056,19 @@ def _read_provider_response(response: Any, provider: str) -> bytes:
     return body
 
 
+def _notify_observer(
+    callback: Callable[[Mapping[str, Any]], None] | None,
+    event: Mapping[str, Any],
+) -> None:
+    """Keep read-only progress observers outside provider call correctness."""
+    if callback is None:
+        return
+    try:
+        callback(event)
+    except Exception:
+        pass
+
+
 def _read_provider_sse(
     response: Any,
     provider: str,
@@ -1082,11 +1095,7 @@ def _read_provider_sse(
         if not isinstance(value, dict):
             return
         events.append(value)
-        if on_event is not None:
-            try:
-                on_event(value)
-            except Exception:
-                pass  # Observability must not turn a valid provider response into failure.
+        _notify_observer(on_event, value)
 
     while True:
         chunk = cast(bytes, reader(min(16 * 1024, MAX_PROVIDER_RESPONSE_BYTES + 1 - len(body))))
@@ -2784,14 +2793,14 @@ class Diffundo:
             pending = list(candidates)
             while pending:
                 provider = pending.pop(0)
-                if on_status is not None:
-                    on_status(
-                        {
-                            "kind": "provider_attempt",
-                            "provider": provider.name,
-                            "model": provider.model,
-                        }
-                    )
+                _notify_observer(
+                    on_status,
+                    {
+                        "kind": "provider_attempt",
+                        "provider": provider.name,
+                        "model": provider.model,
+                    },
+                )
                 try:
                     attempt_deadline = min(
                         deadline,
@@ -2802,16 +2811,16 @@ class Diffundo:
                         provider, prompt, deadline=attempt_deadline, on_delta=on_delta
                     )
                 except ProviderError as exc:
-                    if on_status is not None:
-                        on_status(
-                            {
-                                "kind": "provider_failed",
-                                "provider": provider.name,
-                                "model": provider.model,
-                                "outcome": exc.outcome.value,
-                                "retry_after_s": exc.retry_after_s,
-                            }
-                        )
+                    _notify_observer(
+                        on_status,
+                        {
+                            "kind": "provider_failed",
+                            "provider": provider.name,
+                            "model": provider.model,
+                            "outcome": exc.outcome.value,
+                            "retry_after_s": exc.retry_after_s,
+                        },
+                    )
                     if exc.probe_already_in_flight:
                         probe_rejected = True
                         continue
@@ -2858,19 +2867,23 @@ class Diffundo:
                         if fallback_candidates:
                             pending.extend(fallback_candidates)
                             fallback_triggered = True
-                    if exc.budget_exhausted and not fallback_triggered:
+                    if (
+                        exc.budget_exhausted
+                        and self._remaining(deadline) <= 0
+                        and not fallback_triggered
+                    ):
                         raise AllProvidersFailed(tried, last_error) from exc
                     continue
                 self._record_provider_success()
-                if on_status is not None:
-                    on_status(
-                        {
-                            "kind": "provider_succeeded",
-                            "provider": result.provider,
-                            "model": result.model,
-                            "provider_cache_hit": result.provider_cache_hit,
-                        }
-                    )
+                _notify_observer(
+                    on_status,
+                    {
+                        "kind": "provider_succeeded",
+                        "provider": result.provider,
+                        "model": result.model,
+                        "provider_cache_hit": result.provider_cache_hit,
+                    },
+                )
                 if budget_usd is not None and result.estimated_cost_usd > budget_usd:
                     raise CostBudgetExceeded(result.provider, result.estimated_cost_usd, budget_usd)
                 self._primary_provider = provider.name
@@ -3501,8 +3514,9 @@ class Diffundo:
 
         When ``deadline`` is given it bounds the whole attempt: the per-attempt
         HTTP timeout is capped at the remaining budget, retry backoff is skipped
-        when it no longer fits, and a spent budget raises a ``budget_exhausted``
-        ``ProviderError`` so the cascade aborts (cascade-design §2.2).
+        when it no longer fits, and a spent attempt raises a typed timeout. The
+        caller may continue to another provider while the overall call deadline
+        still has budget (cascade-design §2.2).
         """
         runtime = self._runtime(provider.name)
         async with runtime.lock.get():
@@ -3547,12 +3561,16 @@ class Diffundo:
                     timeout_s = provider.timeout_s
                     if remaining is not None:
                         timeout_s = min(timeout_s, remaining)
+                    request_deadline = min(
+                        deadline,
+                        time.monotonic() + _attempt_budget(provider.timeout_s, provider),
+                    )
                     try:
                         raw = await self._post_with_deadline(
                             provider,
                             prompt,
                             timeout_s=timeout_s,
-                            deadline=deadline,
+                            deadline=request_deadline,
                             on_delta=on_delta,
                         )
                         result = raw.to_result(
@@ -3695,9 +3713,7 @@ class Diffundo:
     ) -> _RawResponse:
         """Run one threaded HTTP operation under the call's wall deadline."""
         if deadline is None:
-            return await self._post(
-                provider, prompt, timeout_s=timeout_s, on_delta=on_delta
-            )
+            return await self._post(provider, prompt, timeout_s=timeout_s, on_delta=on_delta)
         remaining = self._remaining(deadline)
         if remaining is None or remaining <= 0:
             raise ProviderError(

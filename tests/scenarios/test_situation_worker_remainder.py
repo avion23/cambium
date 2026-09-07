@@ -225,6 +225,7 @@ def test_summary_only_resume_restores_admitted_child_branch_ids(tmp_path: Path) 
             "epoch": checkpoint.epoch,
             "child_results": [_child_result(admitted_branch_id)],
             "child_results_truncated": False,
+            "rejection_feedback": None,
             "workspace_changed": False,
         },
     )

@@ -212,11 +212,9 @@ def _seq_of(grouped: dict[str, list[tuple[int, str]]], task_id: str, kind: str) 
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("max_width,children,delay", [(2, 3, "1.00000"), (1, 3, None)])
 @pytest.mark.slow
-def test_width_bound_caps_concurrent_dispatch(
-    tmp_path: Path, max_width: int, children: int, delay: str | None
-) -> None:
+def test_width_bound_caps_concurrent_dispatch(tmp_path: Path) -> None:
+    max_width, children, delay = 2, 3, "0.20000"
     # The wave-overlap assertion needs symmetric worker boots: the session
     # warm pool (default size 1) would let one child pop root's pooled worker
     # instantly while its sibling cold-boots, so no overlap is ever observed
@@ -390,7 +388,7 @@ def test_flat_plan_ignores_max_width_and_preserves_canary(tmp_path: Path) -> Non
         ]
     }
 
-    os.environ["WORKER_DELAY_S"] = "0.30000"
+    os.environ["WORKER_DELAY_S"] = "0.10000"
     try:
         result = asyncio.run(run_plan(session_dir, plan, max_width=1))
     finally:

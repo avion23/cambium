@@ -127,10 +127,10 @@ class _StreamingScriptedRouter(_ScriptedRouter):
                     "model": "loopback-model",
                 }
             )
-        if self.delta_delay_s:
-            await asyncio.sleep(self.delta_delay_s)
         if on_delta is not None:
             for kind, fragment in self.deltas:
+                if self.delta_delay_s:
+                    await asyncio.sleep(self.delta_delay_s)
                 on_delta(kind, fragment)
         await asyncio.sleep(self.hold_s)
         if on_status is not None:
@@ -1252,22 +1252,6 @@ def test_plan_and_thought_round_trip_through_parser() -> None:
     assert worker._parse_agent_action(
         '{"type":"finish","summary":"done","objective_met":true,"thought":"verified"}'
     ) == {"type": "finish", "summary": "done", "objective_met": True}
-    assert worker._parse_agent_action(
-        'I will inspect the file now. {"name":"repo_query","action":"tree"}'
-    ) == {
-        "type": "tool_call",
-        "calls": [{"name": "repo_query", "arguments": {"action": "tree"}}],
-    }
-    assert worker._parse_agent_action(
-        '{"calls":[{"name":"branch_history","action":"tools","limit":8},'
-        '{"name":"inspect_state"}]}'
-    ) == {
-        "type": "tool_call",
-        "calls": [
-            {"name": "branch_history", "arguments": {"action": "tools", "limit": 8}},
-            {"name": "inspect_state", "arguments": {}},
-        ],
-    }
     verbose = worker._parse_agent_action(
         json.dumps(
             {
@@ -1353,10 +1337,10 @@ def test_parse_agent_action_accepts_fenced_finish_with_backticks_in_body() -> No
 
 def test_parse_agent_action_rejects_fenced_with_prose_or_unclosed_fence() -> None:
     prose = 'Here is the action:\n```json\n{"type":"plan","steps":["a"]}\n```'
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="not valid JSON"):
         worker._parse_agent_action(prose)
     unclosed = '```json\n{"type":"plan","steps":["a"]}\n'
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="not valid JSON"):
         worker._parse_agent_action(unclosed)
     two_fences = (
         '```json\n{"type":"plan","steps":["a"]}\n```\n```json\n{"type":"plan","steps":["b"]}\n```'
@@ -1689,25 +1673,17 @@ def test_lint_feedback_visible_in_transcript(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("deltas", "expected_phases"),
-    (
-        ([("text", "answer fragment")], {"waiting", "streaming"}),
-        ([], {"waiting"}),
-    ),
-)
-def test_heartbeats_report_provider_and_phase(
+def test_heartbeats_publish_visible_provider_transitions_without_waiting_for_cadence(
     tmp_path: Path,
-    deltas: list[tuple[str, str]],
-    expected_phases: set[str],
 ) -> None:
     repo = tmp_path / "repo"
     worktree = _make_worktree(repo)
-    config = _agent_config(worktree)
+    config = _agent_config(worktree, heartbeat_interval_s=15.0)
     router = _StreamingScriptedRouter(
         ['{"type":"finish","summary":"done","objective_met":true}'],
-        deltas,
-        delta_delay_s=0.15 if deltas else 0.0,
+        [("thinking", "consider"), ("text", "answer fragment")],
+        delta_delay_s=0.08,
+        hold_s=0.05,
     )
 
     outcome, messages = asyncio.run(_drive_loop_with_heartbeats(config, worktree, router))
@@ -1715,20 +1691,16 @@ def test_heartbeats_report_provider_and_phase(
     assert outcome["status"] == "succeeded"
     heartbeats = [message for message in messages if message["type"] == "heartbeat"]
     phases = [heartbeat.get("phase") for heartbeat in heartbeats]
-    assert heartbeats
-    assert set(phases) == expected_phases
+    assert phases[:3] == ["waiting", "thinking", "streaming"]
     assert any(
         heartbeat.get("provider") == "loopback-provider"
         and heartbeat.get("model") == "loopback-model"
         for heartbeat in heartbeats
     )
-    if "streaming" in expected_phases:
-        assert phases.index("waiting") < phases.index("streaming")
     # Provider responses are internal JSON actions; the cockpit shows stream
     # state/rate, not protocol fragments.
     assert not any(
-        heartbeat.get("phase") == "streaming" and heartbeat.get("tail")
-        for heartbeat in heartbeats
+        heartbeat.get("phase") == "streaming" and heartbeat.get("tail") for heartbeat in heartbeats
     )
 
 
@@ -1883,7 +1855,11 @@ def test_three_invalid_actions_fail_fast_with_no_progress(tmp_path: Path) -> Non
     assert [m["turn"] for m in checkpoints] == [1, 2, 3]
     recorded = json.loads(Path(checkpoints[-1]["state_ref"]).read_text())["transcript"]
     assert recorded[-2] == {"role": "assistant", "content": "not-json-three"}
-    assert "invalid action: action is not valid JSON" in recorded[-1]["content"]
+    correction = recorded[-1]["content"]
+    assert "invalid action: action is not valid JSON" in correction
+    assert '{"calls":[{"name":"TOOL","arguments":{}}]}' in correction
+    # exactly one occurrence: nested inside calls, never as a bare top-level shape
+    assert correction.count('{"name":"TOOL"') == 1
 
 
 def test_valid_action_resets_consecutive_invalid_action_bound(tmp_path: Path) -> None:

@@ -51,34 +51,41 @@ class ExperimentBudget:
             raise ExperimentBudgetExceeded("experiment call, token, or cash budget exhausted")
 
     def record(self, usage: dict, cost: float = 0.0) -> None:
-        total = usage.get("total_tokens")
-        if total in (None, 0):
-            prompt = usage.get("prompt_tokens", usage.get("input_tokens", 0))
-            completion = usage.get("completion_tokens", usage.get("output_tokens", 0))
-            for value in (prompt, completion):
-                if (
-                    isinstance(value, bool)
-                    or not isinstance(value, int | float)
-                    or not math.isfinite(float(value))
-                    or value < 0
-                ):
-                    raise ValueError(
-                        "experiment token usage must be a finite non-negative number"
-                    )
-            total = prompt + completion
-        if (
-            isinstance(total, bool)
-            or not isinstance(total, int | float)
-            or not math.isfinite(float(total))
-            or total < 0
-        ):
-            raise ValueError("experiment token usage must be a finite non-negative number")
-        cost_value = float(cost)
-        if not math.isfinite(cost_value) or cost_value < 0:
-            raise ValueError("experiment cost must be a finite non-negative number")
         self.calls += 1
-        self.tokens += int(total)
-        self.cost_usd += cost_value
+        self.tokens += int(
+            usage.get("total_tokens", 0)
+            or (
+                usage.get("prompt_tokens", usage.get("input_tokens", 0))
+                + usage.get("completion_tokens", usage.get("output_tokens", 0))
+            )
+        )
+        self.cost_usd += max(0.0, float(cost))
+
+
+def json_finite(value: Any) -> Any:
+    """Copy value with non-finite floats mapped to 0.0 so strict JSON cannot fail.
+
+    Provider-reported numbers can be non-finite (an ``inf`` ``estimated_cost_usd``
+    genuinely accumulates into ``budget.cost_usd``; nan/-inf are clamped to 0.0
+    by ``ExperimentBudget.record``), which ``json.dumps(allow_nan=False)``
+    rejects and strict readers refuse. Dicts and lists are rebuilt; ordinary
+    JSON scalars pass through unchanged.
+    """
+    if isinstance(value, float):
+        return value if math.isfinite(value) else 0.0
+    if isinstance(value, dict):
+        return {key: json_finite(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [json_finite(item) for item in value]
+    return value
+
+
+def write_json_report(path: Path, payload: Any) -> None:
+    """Write an experiment report as strict JSON; non-finite floats become 0.0."""
+    path.write_text(
+        json.dumps(json_finite(payload), indent=2, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
 
 
 def load_cases(path: Path) -> list[dict[str, Any]]:
@@ -166,7 +173,7 @@ def _peak_pending_children(events: list[dict]) -> int:
 
 
 def _breaker_strike(event: dict) -> bool:
-    """True when the supervisor logged the agent loop's final invalid-action strike."""
+    """Return whether the agent loop has already decided this rollout failed."""
     if event.get("kind") != "log":
         return False
     message = event.get("payload", {}).get("message")
@@ -178,25 +185,25 @@ def _breaker_strike(event: dict) -> bool:
 
 
 def _case_provider_pool(resolved: Any, case: dict) -> Any:
-    """Restrict one case's resolved provider to its declared credential-ready pool."""
+    """Restrict one benchmark case to its declared credential-ready providers."""
     if not case.get("providers"):
         return resolved
     from .provider_config import load_providers
 
     names = set(case["providers"])
     available = [
-        p
-        for p in load_providers(resolved.provider_config_path)
-        if p.name in names and p.name in resolved.authorized_providers
+        provider
+        for provider in load_providers(resolved.provider_config_path)
+        if provider.name in names and provider.name in resolved.authorized_providers
     ]
-    if {p.name for p in available} != names:
+    if {provider.name for provider in available} != names:
         raise ValueError("benchmark provider pool is not credential-ready")
     if resolved.assigned_provider and resolved.assigned_provider not in names:
         raise ValueError("benchmark primary provider is outside its provider pool")
     return replace(
         resolved,
-        authorized_providers=tuple(p.name for p in available),
-        model_candidates=tuple(sorted({p.model for p in available})),
+        authorized_providers=tuple(provider.name for provider in available),
+        model_candidates=tuple(sorted({provider.model for provider in available})),
     )
 
 
@@ -242,12 +249,8 @@ def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact che
             nonlocal abort_reason
             events.append(event)
             if abort_reason is None and _breaker_strike(event):
-                # The agent-loop breaker has decided this rollout FAILED: the
-                # worker returns failed immediately and no later result can
-                # un-fail the plan (any non-succeeded task forces exit 1).
-                # Cancel like the budget path below instead of burning provider
-                # calls to the wall; the verdict fields, including the breaker
-                # reason, are unchanged.
+                # The worker has already decided the rollout failed. Cancel the
+                # remaining harness work instead of burning provider quota.
                 abort_reason = (
                     f"agent emitted {MAX_CONSECUTIVE_INVALID_ACTIONS} consecutive invalid actions"
                 )
@@ -406,14 +409,7 @@ def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact che
         0.0
         if not passed
         else 0.9
-        + 0.1
-        / (
-            1
-            + elapsed / 60
-            + tokens / 10000
-            + calls / 10
-            + user_summary_chars / 1000
-        )
+        + 0.1 / (1 + elapsed / 60 + tokens / 10000 + calls / 10 + user_summary_chars / 1000)
     )
     usage = [e.get("payload", {}) for e in events if e.get("kind") == "usage_event"]
     failures = [
@@ -491,11 +487,9 @@ def run_case(  # noqa: C901 - one rollout owns setup, execution and artifact che
             f"parallel_children={peak_children}/{case.get('required_parallel_children', 0)}; "
             f"summary_calls={summary_call_count}/{case.get('required_summary_calls', 0)}; "
             f"{error}\n"
-            f"{diagnostic}\n{json.dumps(failures, allow_nan=False)[-3000:]}"
+            f"{diagnostic}\n{json.dumps(json_finite(failures), allow_nan=False)[-3000:]}"
         ),
     }
     budget.rows.append(row)
-    (root / "report.json").write_text(
-        json.dumps(row, indent=2, allow_nan=False) + "\n", encoding="utf-8"
-    )
+    write_json_report(root / "report.json", row)
     return row

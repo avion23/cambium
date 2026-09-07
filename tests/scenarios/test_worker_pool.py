@@ -30,6 +30,8 @@ import sys
 from pathlib import Path
 from typing import cast
 
+import pytest
+
 from cambium import supervisor as supervisor_module
 from cambium.fencing import write_generation
 from cambium.ipc import MAX_LINE_BYTES, read_message
@@ -39,6 +41,8 @@ ROOT = Path(__file__).resolve().parents[2]
 MARKER = "// cambium-pool"
 HEARTBEAT_INTERVAL_S = 0.05
 FAKE_WORKER = ROOT / "scripts" / "fake_worker.py"
+
+pytestmark = pytest.mark.slow
 
 
 def _make_repo(repo: Path, files: dict[str, str]) -> str:

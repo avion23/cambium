@@ -102,12 +102,7 @@ def test_resource_rail_keeps_throughput_and_quota_visible_in_a_short_terminal() 
                 provider_cache_hit=False,
                 quota_windows=[_window("one", 300)],
             ),
-            {
-                "seq": 2,
-                "kind": "result",
-                "task_id": "one",
-                "payload": {"status": "succeeded"},
-            },
+            {"seq": 2, "kind": "result", "task_id": "one", "payload": {"status": "succeeded"}},
         ]
     )
     rows = _rail_rows(

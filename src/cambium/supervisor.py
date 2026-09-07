@@ -153,6 +153,7 @@ from .worker import (
     _SHA256_HEX_RE,
     MAX_ENVELOPE_FIELD_CHARS,
     MAX_ENVELOPE_ITEMS,
+    MAX_REJECTION_FEEDBACK_CHARS,
     _cap_utf8,
     _safe_task_id,
     _validate_checkpoint_ref_shape,
@@ -227,6 +228,51 @@ def _invalid_propose_child_fields(msg: dict[str, Any]) -> list[str]:
     if not isinstance(msg.get("spec"), dict):
         invalid.append("spec")
     return invalid
+
+
+# Reflection remedy for a fully-rejected delegate batch. ``fresh`` children
+# have no checkpoint precondition (_pin_fork_child), while ``trunk`` needs an
+# exact compatible parent checkpoint and ``semantic`` an unredacted one.
+_REJECTION_REMEDY_TEXT = (
+    "Remedy: independent children should declare context_mode=fresh with "
+    "placement=inherit (no parent-checkpoint precondition); context_mode=trunk "
+    "requires an exact compatible parent checkpoint and context_mode=semantic "
+    "an unredacted one; a retry must use a fresh child_task_id and file "
+    "ownership disjoint from every admitted task."
+)
+
+_MAX_REJECTION_FEEDBACK_REASONS = 4
+_MAX_REJECTION_FEEDBACK_MESSAGE_CHARS = 160
+
+
+def _batch_rejection_feedback(
+    proposal_count: int,
+    admitted_count: int,
+    rejections: Sequence[tuple[str, str]],
+) -> str | None:
+    """Build the one bounded correction a parent sees for a rejected batch.
+
+    Feedback only: admission verdicts are never changed. Returns None unless
+    every proposal of the batch was rejected, so partially-admitted and clean
+    batches add nothing to the parent context.
+    """
+    if proposal_count < 1 or admitted_count > 0:
+        return None
+    distinct: list[str] = []
+    for reason, message in rejections:
+        entry = f"{reason} ({message[:_MAX_REJECTION_FEEDBACK_MESSAGE_CHARS]})"
+        if entry not in distinct:
+            distinct.append(entry)
+    reasons = "; ".join(distinct[:_MAX_REJECTION_FEEDBACK_REASONS])
+    omitted = len(distinct) - _MAX_REJECTION_FEEDBACK_REASONS
+    if omitted > 0:
+        reasons += f"; (+{omitted} distinct reasons omitted)"
+    text = (
+        f"Delegation feedback: all {proposal_count} children proposed in the "
+        f"last delegate batch were rejected before spawn; none ran. "
+        f"Reasons: {reasons}. {_REJECTION_REMEDY_TEXT}"
+    )
+    return _cap_utf8(text, MAX_REJECTION_FEEDBACK_CHARS)
 
 
 def _validate_child_budget_fields(spec: Mapping[str, Any]) -> None:
@@ -947,6 +993,37 @@ def _status_line_is_fence(line: str) -> bool:
     if path == ".cambium" or path.startswith(".cambium/"):
         return True
     return is_cache_artifact_path(path)
+
+
+def _discard_cache_artifacts(worktree: Path, status_lines: Sequence[str]) -> None:
+    """Delete only cache paths Git just reported inside ``worktree``.
+
+    Normal cleanup deliberately treats these paths as disposable. Remove them
+    before asking Git for a non-forced worktree removal so Git and Cambium use
+    the same definition of a clean terminal tree.
+    """
+    root = worktree.resolve()
+    for line in status_lines:
+        if len(line) < 4 or line[2] != " ":
+            continue
+        relative = line[3:].strip()
+        if not is_cache_artifact_path(relative):
+            continue
+        target = worktree / relative
+        try:
+            target.parent.resolve().relative_to(root)
+        except (OSError, ValueError):
+            continue
+        try:
+            if target.is_symlink() or target.is_file():
+                target.unlink(missing_ok=True)
+            elif target.is_dir():
+                shutil.rmtree(target)
+        except OSError:
+            # Keep the non-forced Git removal as the final safety check. A
+            # cache path that cannot be removed therefore leaves the worktree
+            # registered instead of escalating cleanup to a destructive force.
+            continue
 
 
 def _bounded_salvage_diff(diff: bytes) -> tuple[bytes, bool]:
@@ -3021,6 +3098,7 @@ class _Runtime:
             "child_results": [],
             "child_results_truncated": False,
             "workspace_changed": False,
+            "rejection_feedback": None,
         }
 
     async def _reuse_worktree(self, spec: dict[str, Any], generation: int) -> int:
@@ -3237,9 +3315,10 @@ class _Runtime:
                         _deferred_observers=deferred,
                     )
                     return
+                status_lines = status.stdout.splitlines()
                 if not force and (
                     spec.get("_defer_cleanup") is True
-                    or any(not _status_line_is_fence(line) for line in status.stdout.splitlines())
+                    or any(not _status_line_is_fence(line) for line in status_lines)
                 ):
                     await self.emit(
                         "worktree_cleanup_deferred",
@@ -3268,6 +3347,8 @@ class _Runtime:
                 fence_dir = worktree / ".cambium"
                 if fence_dir.is_dir():
                     shutil.rmtree(fence_dir, ignore_errors=True)
+                if not force:
+                    await asyncio.to_thread(_discard_cache_artifacts, worktree, status_lines)
                 remove_args = (
                     ("worktree", "remove", "--force", str(worktree))
                     if force
@@ -3472,6 +3553,7 @@ class _Runtime:
         parent_envelope: dict[str, Any],
         *,
         private_integration_base: str | None = None,
+        rejections: list[tuple[str, str]] | None = None,
     ) -> list[str]:
         """Validate one child revision, record it durably, then spawn it.
 
@@ -3479,6 +3561,10 @@ class _Runtime:
         proposal). A compatible cached-epoch child is pinned to the epoch's
         (provider, model) and carries the ``context_fork`` descriptor; an
         incompatible one runs the legacy summary-passing path.
+
+        When ``rejections`` is a list, every rejection appends one bounded
+        ``(reason, message)`` pair so the caller can reflect the batch outcome
+        to the parent; admission verdicts themselves are never changed.
 
         The revision is validated with ``tasktree.build_tree`` over the
         accumulated session tasks plus the proposed child. A duplicate,
@@ -3503,6 +3589,8 @@ class _Runtime:
         try:
             proposal, budget_decision = _prepare_child_budget(parent_spec, proposal)
         except ValueError as exc:
+            if rejections is not None:
+                rejections.append((exc.__class__.__name__, str(exc)))
             await self.emit(
                 "child_rejected",
                 task_id=parent_task_id,
@@ -3526,6 +3614,8 @@ class _Runtime:
         try:
             parse_child_policy(proposal.get("spec", {}))
         except ChildPolicyError as exc:
+            if rejections is not None:
+                rejections.append((exc.__class__.__name__, str(exc)))
             await self.emit(
                 "child_rejected",
                 task_id=parent_task_id,
@@ -3555,6 +3645,8 @@ class _Runtime:
         try:
             build_tree({"tasks": [*self._session_tasks, candidate]})
         except TaskTreeError as exc:
+            if rejections is not None:
+                rejections.append((exc.__class__.__name__, str(exc)))
             await self.emit(
                 "child_rejected",
                 task_id=parent_task_id,
@@ -3583,6 +3675,8 @@ class _Runtime:
                 child_spec["base_commit"] = private_integration_base
                 child_spec["_private_parent_integration"] = True
         except ValueError as exc:
+            if rejections is not None:
+                rejections.append((exc.__class__.__name__, str(exc)))
             await self.emit(
                 "child_rejected",
                 task_id=parent_task_id,
@@ -3608,6 +3702,8 @@ class _Runtime:
                 [*(task["spec"] for task in self._session_tasks), child_spec]
             )
         except (KeyError, TypeError, ValueError) as exc:
+            if rejections is not None:
+                rejections.append((exc.__class__.__name__, str(exc)))
             await self.emit(
                 "child_rejected",
                 task_id=parent_task_id,
@@ -3630,6 +3726,8 @@ class _Runtime:
             return []
         if self._task_group is None:
             no_task_group_error = RuntimeError("no active task group")
+            if rejections is not None:
+                rejections.append(("NoActiveTaskGroup", str(no_task_group_error)))
             await self.emit(
                 "child_rejected",
                 task_id=parent_task_id,
@@ -3688,6 +3786,8 @@ class _Runtime:
             await self.emit("child_admitted", **admitted_payload)
         except ChildPolicyError as admission_error:
             self._rollback_child_admission(parent_task_id, child_task_id, child_spec)
+            if rejections is not None:
+                rejections.append((admission_error.__class__.__name__, str(admission_error)))
             await self.emit(
                 "child_rejected",
                 task_id=parent_task_id,
@@ -3710,6 +3810,8 @@ class _Runtime:
             return []
         except BaseException as admission_error:
             self._rollback_child_admission(parent_task_id, child_task_id, child_spec)
+            if rejections is not None:
+                rejections.append(("AdmissionPersistenceFailed", str(admission_error)))
             try:
                 await self.emit(
                     "child_rejected",
@@ -3748,6 +3850,8 @@ class _Runtime:
         except BaseException as create_error:
             child_coroutine.close()
             self._rollback_child_admission(parent_task_id, child_task_id, child_spec)
+            if rejections is not None:
+                rejections.append(("ChildSpawnFailed", str(create_error)))
             try:
                 await self.emit(
                     "child_rejected",
@@ -3805,6 +3909,7 @@ class _Runtime:
         *,
         checkpoint_ref: Any,
         epoch: Any,
+        rejection_feedback: str | None = None,
     ) -> dict[str, Any]:
         """One bounded resume payload: every admitted child's strict envelope.
 
@@ -3814,7 +3919,8 @@ class _Runtime:
         to the strict parent-envelope caps (the worker re-validates each
         child result as a strict envelope), and the list is capped at
         ``MAX_ENVELOPE_ITEMS`` with ``child_results_truncated`` set when
-        dropped.
+        dropped. ``rejection_feedback`` carries the one bounded per-batch
+        correction for a fully-rejected delegate batch (None otherwise).
         """
         child_results: list[dict[str, Any]] = []
         truncated = False
@@ -3859,6 +3965,7 @@ class _Runtime:
             "child_results": child_results,
             "child_results_truncated": truncated,
             "workspace_changed": workspace_changed,
+            "rejection_feedback": rejection_feedback,
         }
 
     async def _await_suspend_children(self, parent_task_id: str, remaining: float) -> None:
@@ -3912,7 +4019,8 @@ class _Runtime:
                 if not self._pin_exact_fork(child_spec, epoch, parent_task_id, child_task_id, kind):
                     raise ChildPolicyError(
                         "child context_mode=trunk requires an exact compatible "
-                        "parent checkpoint; use semantic or fresh instead"
+                        "parent checkpoint; use semantic or fresh instead "
+                        "(semantic also needs an unredacted checkpoint; fresh needs none)"
                     )
                 if placement == "spread":
                     self._apply_spread(child_spec, parent_provider)
@@ -3936,7 +4044,11 @@ class _Runtime:
                     and isinstance(checkpoint_ref, str)
                 ):
                     raise ChildPolicyError(
-                        "child context_mode=semantic requires an unredacted parent checkpoint"
+                        "child context_mode=semantic requires an unredacted parent "
+                        "checkpoint; the parent epoch is missing or its checkpoint is "
+                        "redacted (redaction triggers include emails and "
+                        "credential-shaped transcript text); declare "
+                        "context_mode=fresh instead"
                     )
                 child_spec["summary_trunk_ref"] = checkpoint_ref
                 if placement == "spread":
@@ -4316,9 +4428,14 @@ class _Runtime:
         include_port: bool,
         failure_reason: str | None = None,
         private_integration_base: str | None = None,
-    ) -> list[str]:
-        """Admit proposals after the permitted parent lifecycle verdict."""
+    ) -> tuple[list[str], list[tuple[str, str]]]:
+        """Admit proposals after the permitted parent lifecycle verdict.
+
+        Returns the admitted child ids plus the batch's bounded rejection
+        ``(reason, message)`` pairs (feedback only; verdicts are unchanged).
+        """
         admitted: list[str] = []
+        rejections: list[tuple[str, str]] = []
         for proposal in proposals:
             admitted.extend(
                 await self._admit_child(
@@ -4326,6 +4443,7 @@ class _Runtime:
                     proposal,
                     parent_envelope,
                     private_integration_base=private_integration_base,
+                    rejections=rejections,
                 )
             )
         if include_port and self._admission_port is not None:
@@ -4336,7 +4454,7 @@ class _Runtime:
                     failure_reason=failure_reason,
                 )
             )
-        return admitted
+        return admitted, rejections
 
     async def _admit_port_proposal(
         self,
@@ -5065,12 +5183,20 @@ class _Runtime:
                         )
                         _release_lane(self._lanes, spec)
                         self._lane_changed.set()
-                        child_ids = await self._admit_generation_children(
+                        child_ids, batch_rejections = await self._admit_generation_children(
                             spec,
                             parent_envelope,
                             outcome.proposals,
                             include_port=False,
                             private_integration_base=snapshot_head,
+                        )
+                        # Per-batch reflection: when every proposal of this
+                        # delegate batch was rejected, the resumed parent gets
+                        # one bounded correction naming the reasons and the
+                        # applicable remedy. Feedback only — the verdicts and
+                        # the emitted events above are unchanged.
+                        rejection_feedback = _batch_rejection_feedback(
+                            len(outcome.proposals), len(child_ids), batch_rejections
                         )
                         remaining = deadline - time.monotonic()
                         if remaining > 0:
@@ -5121,6 +5247,7 @@ class _Runtime:
                                 "checkpoint_ref"
                             ),
                             epoch=cast(dict[str, Any], outcome.envelope).get("epoch"),
+                            rejection_feedback=rejection_feedback,
                         )
                         # This critical lifecycle event is the last durable
                         # barrier before the next worker spawn.  A store
@@ -5918,6 +6045,17 @@ class _Runtime:
         return False
 
     async def _handle_generation_eof(self, state: _GenerationState) -> None:
+        # Stream EOF can race the child watcher. Give an actually exited child
+        # one short scheduling window to publish its return code; reserve the
+        # expensive EOF grace/probe for the exceptional case where stdout
+        # closed but the process is still alive.
+        if state.proc.returncode is None:
+            try:
+                await asyncio.wait_for(state.proc.wait(), 0.05)
+            except TimeoutError:
+                pass
+        if state.proc.returncode is not None:
+            return
         await self.emit(
             "log",
             task_id=state.task_id,

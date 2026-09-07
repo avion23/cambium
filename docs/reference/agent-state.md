@@ -124,10 +124,9 @@ entries, `BranchState`, child result envelopes, tool observations, and Git joins
 already own the current data. Do not add a second state database or mandatory
 event family merely to mirror a proposal.
 
-Future experiments belong in
-[agent-system evaluation](../research/agent-system-evaluation.md). A proposed
-shape moves into this reference only after source and an executable consumer
-land.
+A proposed shape moves into this reference only after source and an executable
+consumer land. Keep experimental scoring plans outside the active runtime
+contract until then.
 
 ## Sources
 

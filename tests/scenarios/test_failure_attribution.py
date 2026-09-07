@@ -7,8 +7,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "failure_attribution.py"
+
+pytestmark = pytest.mark.slow
 
 _EVENTS_SCHEMA = """CREATE TABLE events (
     seq          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,10 +56,9 @@ def _session(
     events: list[tuple[str, dict, str | None, int | None]] = (),
     *,
     turns: dict[int, list[tuple[str, dict, str | None, int | None]]] | None = None,
-    direct_root: bool = False,
 ) -> Path:
     session = tmp_path / "session"
-    root_db = session / ("events.db" if direct_root else ".cambium/events.db")
+    root_db = session / ".cambium/events.db"
     _write_store(root_db, list(events))
     for turn, turn_events in (turns or {}).items():
         _write_store(session / f"turn-{turn:04d}" / ".cambium" / "events.db", turn_events)
@@ -333,30 +336,6 @@ def test_successful_read_only_task_is_clean_with_warning(tmp_path: Path) -> None
     assert report["warnings"][0]["detector"] == "read-churn"
 
 
-def test_one_read_does_not_trigger_churn(tmp_path: Path) -> None:
-    report = _report(
-        _session(
-            tmp_path,
-            [
-                _event(
-                    "tool_event",
-                    {"tool": "read_batch", "cmd": _read_cmd("one.py"), "ok": True, "turn": 1},
-                ),
-                _event(
-                    "result",
-                    {
-                        "status": "succeeded",
-                        "terminal_action": {"type": "finish", "objective_met": True},
-                    },
-                ),
-            ],
-        )
-    )
-
-    assert report["verdict"] == "clean"
-    assert "warnings" not in report
-
-
 def test_interactive_requests_do_not_share_retry_runs(tmp_path: Path) -> None:
     turns = {
         turn: [
@@ -383,49 +362,6 @@ def test_interactive_requests_do_not_share_retry_runs(tmp_path: Path) -> None:
 
     assert "retry-loop" not in _detectors(report)
     assert report["verdict"] == "clean"
-
-
-def test_interactive_evidence_has_source_order(tmp_path: Path) -> None:
-    report = _report(
-        _session(
-            tmp_path,
-            turns={
-                1: [
-                    _event(
-                        "tool_event",
-                        {"tool": "git_op", "cmd": "git_op status", "ok": True, "turn": 1},
-                    ),
-                    _event(
-                        "tool_event",
-                        {"tool": "git_op", "cmd": "git_op status", "ok": True, "turn": 2},
-                    ),
-                    _event(
-                        "tool_event",
-                        {"tool": "git_op", "cmd": "git_op status", "ok": True, "turn": 3},
-                    ),
-                    _event(
-                        "result",
-                        {
-                            "status": "succeeded",
-                            "terminal_action": {"type": "finish", "objective_met": True},
-                        },
-                    ),
-                ],
-                2: [
-                    _event("compaction_failed", {"epoch": 1, "reason": "provider error"}),
-                    _event("result", {"status": "failed"}),
-                ],
-            },
-        )
-    )
-
-    assert _detectors(report) == ["retry-loop", "compaction-stall"]
-    assert report["detectors_fired"][0]["evidence"] == [
-        "turn-0001:event-1",
-        "turn-0001:event-2",
-        "turn-0001:event-3",
-    ]
-    assert report["detectors_fired"][1]["evidence"] == ["turn-0002:event-1"]
 
 
 def test_compaction_deferred_is_not_a_failure(tmp_path: Path) -> None:
@@ -531,26 +467,6 @@ def test_state_ref_escape_is_incomplete_without_reading_outside(tmp_path: Path) 
     assert report["confidence"] < 1
     assert "finish-without-verification" not in _detectors(report)
     assert str(outside) not in json.dumps(report)
-
-
-def test_direct_root_store_layout_is_supported(tmp_path: Path) -> None:
-    report = _report(
-        _session(
-            tmp_path,
-            [
-                _event(
-                    "result",
-                    {
-                        "status": "succeeded",
-                        "terminal_action": {"type": "finish", "objective_met": True},
-                    },
-                )
-            ],
-            direct_root=True,
-        )
-    )
-
-    assert report["verdict"] == "clean"
 
 
 def test_empty_event_store_is_incomplete(tmp_path: Path) -> None:

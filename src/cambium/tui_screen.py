@@ -65,31 +65,11 @@ _MINT = "\x1b[38;5;84m"
 _STEEL = "\x1b[38;5;110m"
 _BRIGHT = "\x1b[38;5;255m"
 
-# Rich styles remain a closed set. Model text is sanitized before Rich adds
-# these sequences; provider-supplied escapes are never trusted as renderer output.
+# Model/provider text is sanitized before Rich adds terminal styling. Keep only
+# harmless SGR text attributes/foreground colors after that boundary; cursor,
+# background, OSC, and other control sequences remain forbidden.
 _MD_BOLD = "\x1b[1m"
-_RICH_ANSI = frozenset(
-    {
-        "\x1b[34m",
-        "\x1b[36m",
-        "\x1b[90m",
-        "\x1b[92m",
-        "\x1b[94m",
-        "\x1b[95m",
-        "\x1b[96m",
-        "\x1b[1;33m",
-        "\x1b[1;37m",
-        "\x1b[1;92m",
-        "\x1b[1;93m",
-        "\x1b[1;94m",
-        "\x1b[1;95m",
-        "\x1b[1;96m",
-        "\x1b[1;97m",
-        "\x1b[2;36m",
-        "\x1b[3;95m",
-        "\x1b[4;94m",
-    }
-)
+_SAFE_SGR_ATTRIBUTES = frozenset({1, 2, 3, 4, 9, 21, 53})
 _STATUS_PALETTE = {
     "cyan": (_CYAN, _TEAL),
     "dim": (_DIM, _DIM),
@@ -102,31 +82,6 @@ _STATUS_PALETTE = {
     "pink": (_MAGENTA, _PINK),
     "bold": (_MD_BOLD, _MD_BOLD),
 }
-_CONTROLLED_ANSI = frozenset(
-    {
-        _RESET,
-        _DIM,
-        _CYAN,
-        _DIM_CYAN,
-        _BLUE,
-        _GREEN,
-        _YELLOW,
-        _RED,
-        _MAGENTA,
-        _WHITE,
-        _SKY,
-        _TEAL,
-        _VIOLET,
-        _AMBER,
-        _CORAL,
-        _PINK,
-        _MINT,
-        _STEEL,
-        _BRIGHT,
-        _MD_BOLD,
-        *_RICH_ANSI,
-    }
-)
 _ANSI_STYLE = re.compile(r"\x1b\[[0-9;]*m")
 
 _ROLE_COLORS = {
@@ -400,14 +355,35 @@ def _activity_tail(value: Any) -> str:
     return _clip(clean, _ACTIVITY_TAIL_MAX_CHARS) if clean else ""
 
 
+def _safe_sgr(code: str) -> bool:
+    """Accept only text-style/foreground SGR emitted after source sanitization."""
+    if code == _RESET:
+        return True
+    match = _ANSI_STYLE.fullmatch(code)
+    if match is None:
+        return False
+    try:
+        values = [int(value) for value in code[2:-1].split(";")]
+    except ValueError:
+        return False
+    while values and values[0] in _SAFE_SGR_ATTRIBUTES:
+        values.pop(0)
+    if not values:
+        return True
+    if len(values) == 1:
+        return values[0] == 39 or 30 <= values[0] <= 37 or 90 <= values[0] <= 97
+    if len(values) == 3 and values[:2] == [38, 5]:
+        return 0 <= values[2] <= 255
+    if len(values) == 5 and values[:2] == [38, 2]:
+        return all(0 <= component <= 255 for component in values[2:])
+    return False
+
+
 def _safe_rendered(text: Any) -> str:
-    """Sanitize text while retaining only ANSI codes emitted by this module."""
+    """Sanitize text while retaining safe renderer-owned foreground styling."""
     parts: list[str] = []
     for part in re.split(r"(\x1b\[[0-9;]*m)", str(text)):
-        if part in _CONTROLLED_ANSI:
-            parts.append(part)
-        else:
-            parts.append(_sanitize(part))
+        parts.append(part if _safe_sgr(part) else _sanitize(part))
     return "".join(parts)
 
 
@@ -437,7 +413,7 @@ def _take_display_width(text: str, width: int) -> tuple[str, str]:
         match = _ANSI_STYLE.match(rendered, index)
         if match is not None:
             code = match.group(0)
-            if code in _CONTROLLED_ANSI:
+            if _safe_sgr(code):
                 left.append(code)
                 index = match.end()
                 continue
@@ -462,7 +438,8 @@ def _clip(text: str, width: int) -> str:
     if width == 1:
         return _sanitize("…")
     head, _ = _take_display_width(clean, width - 1)
-    return head + _sanitize("…") + (_RESET if head.endswith(tuple(_CONTROLLED_ANSI)) else "")
+    reset = _RESET if _ANSI_STYLE.search(head) and not head.endswith(_RESET) else ""
+    return head + _sanitize("…") + reset
 
 
 def _pad(text: str, width: int) -> str:
@@ -1565,6 +1542,9 @@ class Transcript:
             message = f"{kind.replace('_', ' ')}: {child}"
             if isinstance(reason, str) and reason:
                 message += f" · {reason}"
+            detail = _activity_tail(data.get("message"))
+            if detail:
+                message += f" · {detail}"
             self.system(message)
             return
 
@@ -1988,8 +1968,10 @@ class ActivityState:
 
         provider = "/".join(part for part in (self._provider, self._model) if part)
         cache = (
-            " · cache HIT" if self._cache_hit is True
-            else " · cache MISS" if self._cache_hit is False
+            " · cache HIT"
+            if self._cache_hit is True
+            else " · cache MISS"
+            if self._cache_hit is False
             else ""
         )
         owner = f" · {provider}" if provider else ""
@@ -2175,12 +2157,13 @@ def _narrow_table_ranges(text: str, width: int) -> list[tuple[int, int]]:
     return ranges
 
 
-def _render_markdown_lines_rich_document(text: str, width: int, color: bool) -> list[str]:
-    """Use the same in-process Rich renderer as one-shot/REPL output."""
-    return _shared_markdown_lines(text, width=width, color_depth=16 if color else 0)
+def _render_markdown_lines_rich_document(text: str, width: int, color: bool | int) -> list[str]:
+    """Use the shared Rich renderer at the caller's actual terminal color depth."""
+    color_depth = color if type(color) is int else (16 if color else 0)
+    return _shared_markdown_lines(text, width=width, color_depth=color_depth)
 
 
-def _render_markdown_lines_rich(text: str, width: int, color: bool) -> list[str]:
+def _render_markdown_lines_rich(text: str, width: int, color: bool | int) -> list[str]:
     """Render sanitized Markdown through Rich, falling back for narrow tables."""
     table_ranges = _narrow_table_ranges(text, width)
     if not table_ranges:
@@ -2204,7 +2187,7 @@ def _render_markdown_lines_rich(text: str, width: int, color: bool) -> list[str]
 
 
 @lru_cache(maxsize=512)
-def _render_markdown_lines_cached(text: str, width: int, color: bool) -> tuple[str, ...]:
+def _render_markdown_lines_cached(text: str, width: int, color: bool | int) -> tuple[str, ...]:
     """Cache immutable per-entry Markdown rows by source, width, and color."""
     return tuple(_render_markdown_lines_rich(text, width, color))
 
@@ -2213,7 +2196,7 @@ def render_markdown_lines(
     text: str,
     width: int = 80,
     *,
-    color: bool = True,
+    color: bool | int = True,
 ) -> list[str]:
     """Render sanitized Markdown through the shared Rich theme and narrow-table adapter."""
     width = max(1, width)
@@ -2605,13 +2588,11 @@ def _live_window_lines(
         )
     elif phase == "thinking":
         row_one = (
-            f"{_ACTIVITY_PHASE_GLYPHS['thinking']} THINKING · "
-            f"{_fmt_secs(transcript._live_age_s)}"
+            f"{_ACTIVITY_PHASE_GLYPHS['thinking']} THINKING · {_fmt_secs(transcript._live_age_s)}"
         )
     elif phase == "streaming":
         row_one = (
-            f"{_ACTIVITY_PHASE_GLYPHS['streaming']} STREAMING · "
-            f"{_fmt_secs(transcript._live_age_s)}"
+            f"{_ACTIVITY_PHASE_GLYPHS['streaming']} STREAMING · {_fmt_secs(transcript._live_age_s)}"
         )
     else:
         row_one = "⠋ ORCHESTRATING"
@@ -2786,9 +2767,7 @@ def _usage_rows(
         _usage_float(getattr(snapshot, "estimated_cost_usd", 0.0)),
     )
     lane = _current_lane(snapshot)
-    last_cache_hit = (
-        getattr(lane, "last_provider_cache_hit", None) if lane is not None else None
-    )
+    last_cache_hit = getattr(lane, "last_provider_cache_hit", None) if lane is not None else None
     cache_rate = _cache_rate(cached_tokens, input_tokens)
     cache_share = f"{cache_rate:.0%}" if cache_rate is not None else "n/a"
     if last_cache_hit is True:
@@ -2863,9 +2842,7 @@ def _usage_rows(
         row("cost", _format_cost(cost)),
     ]
     if cache_rate is not None or last_cache_hit is not None:
-        rows.append(
-            _side_row(cache_kind, f" {'cache':<7}{cache_share} · last {cache_last}", width)
-        )
+        rows.append(_side_row(cache_kind, f" {'cache':<7}{cache_share} · last {cache_last}", width))
     return rows
 
 
@@ -3080,10 +3057,7 @@ def _context_bar(context: Any, width: int) -> str:
         counts[index] += 1
     head_label = "H" if head_known else "H?"
     semantic_label = "S" if head_known else "S?"
-    return (
-        f" {head_label}{'█' * counts[0]} "
-        f"{semantic_label}{'▓' * counts[1]} R{'░' * counts[2]}"
-    )
+    return f" {head_label}{'█' * counts[0]} {semantic_label}{'▓' * counts[1]} R{'░' * counts[2]}"
 
 
 def _context_rows(
@@ -3934,9 +3908,12 @@ def _detail_status_line(
         )
     )
     cache_style = (
-        "green" if last_cache_hit is True
-        else "yellow" if last_cache_hit is False
-        else "green" if cache_rate is not None and cache_rate >= 0.5
+        "green"
+        if last_cache_hit is True
+        else "yellow"
+        if last_cache_hit is False
+        else "green"
+        if cache_rate is not None and cache_rate >= 0.5
         else "yellow"
     )
     cache_text = _status_paint(cache, cache_style, color) if cache_rate is not None else cache

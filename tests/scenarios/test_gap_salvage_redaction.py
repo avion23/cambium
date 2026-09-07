@@ -50,7 +50,6 @@ def _checkpoint_worker(path: Path, *, redaction: str | None = None) -> None:
             import os
             import subprocess
             import sys
-            import time
             from pathlib import Path
 
             init = json.loads(sys.stdin.readline())
@@ -77,7 +76,7 @@ def _checkpoint_worker(path: Path, *, redaction: str | None = None) -> None:
                 checkpoint_dir.mkdir(parents=True, exist_ok=True)
                 (checkpoint_dir / 'turn-001.json').write_text(
                     json.dumps(checkpoint), encoding='utf-8')
-                time.sleep(1000)
+                raise SystemExit(7)
             if init.get('resume') is not None:
                 (worktree.parent / 'resume.json').write_text(
                     json.dumps(init['resume']), encoding='utf-8')
@@ -129,7 +128,9 @@ def _task(session: Path, repo: Path, base: str, worker: Path, task_id: str) -> d
     ["none", "missing"],
     ids=["workspace_hash_none", "workspace_hash_missing"],
 )
-def test_redacted_checkpoint_salvages_before_failure_prune(tmp_path: Path, redaction: str) -> None:
+def test_redacted_checkpoint_salvages_before_failure_prune(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, redaction: str
+) -> None:
     session = tmp_path / "session"
     repo = session / "repo"
     base = _make_repo(repo)
@@ -137,6 +138,7 @@ def test_redacted_checkpoint_salvages_before_failure_prune(tmp_path: Path, redac
     _checkpoint_worker(worker, redaction=redaction)
     task_id = f"redacted-{redaction}"
     task = _task(session, repo, base, worker, task_id)
+    monkeypatch.setattr("cambium.supervisor.RESTART_BASE_DELAY_S", 0.01)
 
     result = asyncio.run(run_plan(session, {"tasks": [task]}))
 
@@ -160,7 +162,9 @@ def test_redacted_checkpoint_salvages_before_failure_prune(tmp_path: Path, redac
     assert not (session / "worktree").exists()
 
 
-def test_normal_checkpoint_resumes_by_workspace_hash_without_salvage(tmp_path: Path) -> None:
+def test_normal_checkpoint_resumes_by_workspace_hash_without_salvage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     session = tmp_path / "session"
     repo = session / "repo"
     base = _make_repo(repo)
@@ -168,6 +172,7 @@ def test_normal_checkpoint_resumes_by_workspace_hash_without_salvage(tmp_path: P
     _checkpoint_worker(worker)
     task_id = "normal"
     task = _task(session, repo, base, worker, task_id)
+    monkeypatch.setattr("cambium.supervisor.RESTART_BASE_DELAY_S", 0.01)
 
     result = asyncio.run(run_plan(session, {"tasks": [task]}))
 
@@ -182,6 +187,7 @@ def test_normal_checkpoint_resumes_by_workspace_hash_without_salvage(tmp_path: P
         "epoch": 1,
         "child_results": [],
         "child_results_truncated": False,
+        "rejection_feedback": None,
         "workspace_changed": False,
     }
     events = read_events(session)

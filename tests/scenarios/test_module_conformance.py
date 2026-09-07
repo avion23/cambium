@@ -2,12 +2,13 @@
 
 The offline-environment probes must spawn real child interpreters and
 command shims to verify network denial, credential stripping, and isolated
-Python flags, so they are marked ``slow`` and run in the second tier. Pure
-loader-validation checks stay in the first tier.
+Python flags, so they are marked ``slow`` and run in the second tier.  The
+pure file/digest and frozen-content checks stay in the first tier.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import socket
@@ -24,6 +25,13 @@ from cambium.modules.base import (
     load_jsonl,
     load_module_manifest,
 )
+
+
+def _one_discovered_module() -> str:
+    names = module_conformance.discover_modules()
+    if not names:
+        pytest.skip("no decision modules are installed")
+    return names[0]
 
 
 def test_jsonl_loader_rejects_duplicate_keys_and_nonstandard_constants(
@@ -49,6 +57,16 @@ def test_manifest_loader_wraps_malformed_utf8(tmp_path: Path) -> None:
 
     with pytest.raises(ModuleContractError, match="invalid"):
         load_module_manifest(module_dir)
+
+
+def test_gate_accepts_module_scoped_baseline() -> None:
+    if "example" not in module_conformance.discover_modules():
+        pytest.skip("reference module cambium.modules.example is absent")
+    name = _one_discovered_module()
+    spec = module_conformance.validate_module(name)
+
+    assert spec.name == "example"
+    assert spec.name == name
 
 
 @pytest.mark.slow
@@ -300,3 +318,56 @@ def test_offline_child_rejects_python_flag_after_option_argument_with_executable
     assert result.returncode != 0
     assert not connected
     assert "isolated Python flag denied during module conformance: -I" in result.stderr
+
+
+def test_freeze_check_survives_unrelated_tip_commit(tmp_path: Path, monkeypatch) -> None:
+    module_path = tmp_path / "src" / "cambium" / "modules" / "example"
+    datasets = module_path / "datasets"
+    baselines = module_path / "tests" / "baselines"
+    datasets.mkdir(parents=True)
+    baselines.mkdir(parents=True)
+    eval_path = datasets / "eval.jsonl"
+    meta_path = datasets / "meta.json"
+    baseline_path = baselines / "baseline.json"
+    eval_path.write_text('{"id":"before"}\n', encoding="utf-8")
+    meta = {"dataset_version": "1.0.0"}
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+    def git(*args: str) -> None:
+        subprocess.run(
+            ["git", "-c", "user.name=Cambium Test", "-c", "user.email=test@example.invalid", *args],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+        )
+
+    git("init", "-q")
+    git("add", ".")
+    git("commit", "-qm", "base datasets")
+    baseline_path.write_text("{}\n", encoding="utf-8")
+    git("add", ".")
+    git("commit", "-qm", "baseline")
+    eval_path.write_text('{"id":"after"}\n', encoding="utf-8")
+    git("add", ".")
+    git("commit", "-qm", "change frozen eval without bump")
+    (tmp_path / "unrelated.txt").write_text("tip\n", encoding="utf-8")
+    git("add", ".")
+    git("commit", "-qm", "unrelated tip")
+
+    relative_baseline = baseline_path.relative_to(tmp_path)
+    spec = module_conformance.ModuleSpec(
+        name="example",
+        path=module_path,
+        tracked_files=(),
+        python_files=(),
+        test_files=(),
+        baseline_files=(relative_baseline,),
+        dataset_files=(),
+    )
+    monkeypatch.setattr(module_conformance, "REPO_ROOT", tmp_path)
+
+    findings = module_conformance._frozen_content_findings(spec, meta)
+
+    assert len(findings) == 1
+    assert findings[0].symbol == "eval"
+    assert "without dataset_version bump (1.0.0)" in findings[0].detail

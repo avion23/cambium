@@ -50,10 +50,9 @@ def _derailment(row: dict[str, Any]) -> list[str]:
     if row.get("tool_failures"):
         flags.append(f"tool-failures: {row['tool_failures']} failed tool events")
     turns = max(1, len(row.get("turn_heads") or ()))
-    if (
-        (row.get("user_summary_chars") or 0) > 320 * turns
-        or (row.get("user_summary_lines") or 0) > 3 * turns
-    ):
+    if (row.get("user_summary_chars") or 0) > 320 * turns or (
+        row.get("user_summary_lines") or 0
+    ) > 3 * turns:
         flags.append(
             "verbose-user-summary: "
             f"{row.get('user_summary_chars', 0)} chars / {row.get('user_summary_lines', 0)} lines "
@@ -148,17 +147,14 @@ def metric(
 ) -> Any:
     import dspy
 
-    raw_score = getattr(pred, "score", None)
-    if isinstance(raw_score, bool):
-        score = float(raw_score)
-    else:
-        try:
-            score = float(raw_score)
-        except (TypeError, ValueError):
-            score = 0.0
-    if not math.isfinite(score):
-        score = 0.0
-    return dspy.Prediction(score=score, feedback=getattr(pred, "report", "") or "")
+    try:
+        raw = pred.score
+        if isinstance(raw, bool):
+            raise TypeError("bool score is not numeric")
+        score = float(raw)
+    except (AttributeError, TypeError, ValueError):
+        return dspy.Prediction(score=0.0, feedback=getattr(pred, "report", "") or "")
+    return dspy.Prediction(score=score, feedback=pred.report)
 
 
 def _reflection_lm(args: Any, budget: ExperimentBudget) -> Any:

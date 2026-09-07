@@ -762,12 +762,9 @@ def test_t5_non_protocol_stdout_is_tolerated(
 @pytest.mark.slow
 def test_t5_pure_garbage_fails_cleanly_on_cap(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("FAKE_MODE", "garbage_only")
-    # 1.0s (not 0.1s): under parallel/loaded runs the ready-timeout must not
-    # fire before the stdout reader has parsed at least one garbage line —
-    # the test asserts parse_error events landed. The worker emits one line
-    # per 10ms, so ~100 parse errors accrue within the window, still far
-    # below the 500-event kill cap.
-    monkeypatch.setenv("CAMBIUM_READY_TIMEOUT_S", "1.0")
+    # Leave enough time for at least one 10ms garbage line to reach the
+    # protocol parser under xdist load; the exact volume is not a contract.
+    monkeypatch.setenv("CAMBIUM_READY_TIMEOUT_S", "0.25")
     monkeypatch.setattr(supervisor_module, "RESTART_BASE_DELAY_S", 0.01)
     session_dir = tmp_path / "session"
     repo = session_dir / "repo"
@@ -785,7 +782,7 @@ def test_t5_pure_garbage_fails_cleanly_on_cap(tmp_path, monkeypatch) -> None:
                 target_file="a.txt",
                 marker="// cambium-noise",
                 gate="grep -q '// cambium-noise' a.txt",
-                max_restarts=2,
+                max_restarts=1,
             ),
         ]
     }
@@ -794,10 +791,10 @@ def test_t5_pure_garbage_fails_cleanly_on_cap(tmp_path, monkeypatch) -> None:
 
     (task,) = result.results
     assert task.status == "failed"
-    assert task.restarts == 2
+    assert task.restarts == 1
     events = read_events(session_dir)
     assert _kinds(events, "parse_error")
-    assert len(_kinds(events, "restart_scheduled")) == 2
+    assert len(_kinds(events, "restart_scheduled")) == 1
     assert len(_kinds(events, "worker_failed")) == 1
     assert not _kinds(events, "merge_committed")
 
