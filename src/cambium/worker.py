@@ -3091,9 +3091,8 @@ def _build_agent_prompt(
     if model_identity:
         system_lines.insert(
             -1,
-            f"You are running as the configured model {model_identity}. When "
-            "asked what model or provider you are, answer truthfully from this "
-            "identity and never guess.",
+            f"Configured route: {model_identity}. A later Cambium fallback note names the "
+            "actual serving provider/model and overrides this route hint.",
         )
     system_lines.append(json.dumps(tools, sort_keys=True))
     messages = [
@@ -6816,7 +6815,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                         "provider_messages": terminal_messages,
                         "continuation_suffix": terminal_suffix,
                         "provider": terminal_provider,
-                        "model": model,
+                        "model": result.model,
                         "tools_sha256": _sha256_hex(
                             json.dumps(tools, sort_keys=True).encode("utf-8")
                         ),
