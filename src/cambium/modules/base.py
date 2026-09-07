@@ -817,7 +817,12 @@ async def evaluate_split_async(module: Module, loader, split) -> dict:
         if is_parse_failure_prediction(prediction):
             parse_failures += 1
             continue
-        scores.append(module.metric(example.with_prediction(prediction)))
+        score = module.metric(example.with_prediction(prediction))
+        if isinstance(score, bool) or not isinstance(score, int | float):
+            raise TypeError("module metric is not numeric")
+        if not math.isfinite(score) or not 0.0 <= score <= 1.0:
+            raise ValueError("module metric is outside [0.0, 1.0]")
+        scores.append(score)
     if not scores:
         empty = count == 0
         return {
@@ -891,6 +896,11 @@ def _reject_duplicate_module_fields(pairs: list[tuple[str, Any]]) -> dict[str, A
             raise json.JSONDecodeError(f"duplicate JSON object field: {name!r}", "", 0)
         fields[name] = value
     return fields
+
+
+def _reject_module_json_constant(value: str) -> Any:
+    """Reject non-standard JSON constants on the module wire boundary."""
+    raise InputValidationError(f"invalid JSON constant {value!r}")
 
 
 def _serialize_module_output(
@@ -1008,7 +1018,9 @@ def run_module_entrypoint(
 
     try:
         payload = json.loads(
-            sys.stdin.buffer.read(), object_pairs_hook=_reject_duplicate_module_fields
+            sys.stdin.buffer.read(),
+            object_pairs_hook=_reject_duplicate_module_fields,
+            parse_constant=_reject_module_json_constant,
         )
         module = module_type()
         if isinstance(payload, dict) and "operation" in payload:
