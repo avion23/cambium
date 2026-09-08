@@ -1591,6 +1591,61 @@ def test_call_budget_outer_deadline_bounds_threaded_post(monkeypatch) -> None:
     asyncio.run(scenario())
 
 
+def test_cancelled_post_consumes_late_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = ProviderConfig(
+        name="p_cancelled_post",
+        tier=ProviderTier.FAST,
+        base_url="http://127.0.0.1:1",
+        api_key_env="K_CANCELLED_POST",
+        api_key="sk-test-cancelled-post",
+        timeout_s=1.0,
+        max_retries=0,
+    )
+    router = Diffundo((provider,), pause_timeout_s=0.01)
+
+    async def scenario() -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        consumed = asyncio.Event()
+        original_consumer = Diffundo._consume_post_task
+
+        async def delayed_post(
+            _self: Diffundo,
+            _provider: ProviderConfig,
+            _prompt: dict[str, Any],
+            *,
+            timeout_s: float,
+            on_delta: Any = None,
+        ) -> _RawResponse:
+            del timeout_s, on_delta
+            started.set()
+            await release.wait()
+            raise RuntimeError("late transport failure")
+
+        def consume(task: asyncio.Task[Any]) -> None:
+            original_consumer(task)
+            consumed.set()
+
+        monkeypatch.setattr(Diffundo, "_post", delayed_post)
+        monkeypatch.setattr(Diffundo, "_consume_post_task", staticmethod(consume))
+        operation = asyncio.create_task(
+            router._post_with_deadline(
+                provider,
+                PROMPT,
+                timeout_s=1.0,
+                deadline=time.monotonic() + 1.0,
+            )
+        )
+        await started.wait()
+        operation.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await operation
+        release.set()
+        await asyncio.wait_for(consumed.wait(), timeout=1.0)
+
+    asyncio.run(scenario())
+
+
 def test_max_call_budget_cap_does_not_extend_configured_budget(monkeypatch) -> None:
     provider = ProviderConfig(
         name="p_budget_cap",

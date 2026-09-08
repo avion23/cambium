@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from cambium.child_policy import parse_child_policy
+from cambium.routing import LaneCapacityExhausted, LaneState
 from cambium.supervisor import _Runtime
 from cambium.worker import _provider_task_tools_hash
 
@@ -98,6 +99,62 @@ def test_exact_compatible_child_inherits_provider_and_model(tmp_path: Path) -> N
     assert len(fork_events) == 1
     assert fork_events[0]["semantic_reuse"] is False
     assert fork_events[0]["compatible"] is True
+
+
+@pytest.mark.parametrize("context_mode", ["trunk", "semantic", "fresh"])
+def test_inherited_children_respect_provider_lane_capacity(
+    tmp_path: Path, context_mode: str
+) -> None:
+    runtime, _events = _runtime(tmp_path)
+    runtime._lanes["provider-a"] = LaneState(in_flight=1, max_concurrency=1)
+    child_spec: dict[str, Any] = {
+        "context_mode": context_mode,
+        "placement": "inherit",
+        "fanout_config": {
+            "model": "model-a",
+            "protocol": "http",
+            "reasoning_effort": "high",
+        },
+        "authorized_providers": ["provider-a"],
+    }
+
+    asyncio.run(runtime._pin_fork_child(child_spec, "parent", "child", "investigation"))
+
+    assert child_spec["assigned_provider"] == "provider-a"
+    assert child_spec["_supervisor_pinned_lane"] is True
+    # Context pinning itself does not bypass or consume capacity.
+    assert runtime._lanes["provider-a"].in_flight == 1
+    with pytest.raises(LaneCapacityExhausted):
+        runtime._resolve_assignment(child_spec)
+
+    runtime._lanes["provider-a"].release()
+    runtime._resolve_assignment(child_spec)
+    assert child_spec["_lane_reserved"] is True
+    assert runtime._lanes["provider-a"].in_flight == 1
+
+
+def test_suspended_parent_reacquires_lane_without_overbooking(tmp_path: Path) -> None:
+    runtime, _events = _runtime(tmp_path)
+    runtime._lanes["provider-a"] = LaneState(in_flight=1, max_concurrency=1)
+    spec: dict[str, Any] = {
+        "task_id": "parent",
+        "assigned_provider": "provider-a",
+        "_lane_reserved": False,
+    }
+
+    async def scenario() -> None:
+        task = asyncio.create_task(
+            runtime._await_reacquire_lane(spec, asyncio.get_running_loop().time() + 1.0)
+        )
+        await asyncio.sleep(0.01)
+        assert not task.done()
+        runtime._lanes["provider-a"].release()
+        runtime._lane_changed.set()
+        await task
+
+    asyncio.run(scenario())
+    assert spec["_lane_reserved"] is True
+    assert runtime._lanes["provider-a"].in_flight == 1
 
 
 def test_missing_parent_epoch_rejects_declared_semantic(tmp_path: Path) -> None:

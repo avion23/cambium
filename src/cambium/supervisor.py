@@ -735,6 +735,35 @@ def _result_identity_note(msg: Mapping[str, Any], task_id: str, generation: int)
     return f"result {identity_field} mismatch" if identity_field is not None else None
 
 
+def _invalid_result_envelope_fields(msg: Mapping[str, Any]) -> list[str]:
+    """Validate only terminal fields consumed after the worker wire boundary.
+
+    Omitted fields remain compatible with older/custom workers. A present field
+    must have the canonical type so malformed worker output cannot survive into
+    merge/result construction and fail later at a less precise boundary.
+    """
+    invalid: list[str] = []
+    if msg.get("status") not in {"succeeded", "failed", "cancelled", "suspended", "unresolvable"}:
+        invalid.append("status")
+    for field in ("summary", "diff", "unified_diff"):
+        if field in msg and not isinstance(msg[field], str):
+            invalid.append(field)
+    if "failure_reason" in msg and not (
+        msg["failure_reason"] is None or isinstance(msg["failure_reason"], str)
+    ):
+        invalid.append("failure_reason")
+    for field in ("diff_truncated", "requires_commit"):
+        if field in msg and type(msg[field]) is not bool:
+            invalid.append(field)
+    for field in ("commits", "files_changed"):
+        value = msg.get(field)
+        if field in msg and (
+            not isinstance(value, list) or not all(isinstance(item, str) for item in value)
+        ):
+            invalid.append(field)
+    return sorted(set(invalid))
+
+
 def _claimed_identity_mismatch(
     msg: Mapping[str, Any], task_id: str, generation: int
 ) -> str | None:
@@ -4204,10 +4233,10 @@ class _Runtime:
         fanout["model"] = descriptor["model"]
         child_spec["assigned_provider"] = provider
         child_spec["context_fork"] = descriptor
-        lane = self._lanes.get(provider)
-        if lane is not None and not child_spec.get("_lane_reserved", False):
-            lane.in_flight += 1
-            child_spec["_lane_reserved"] = True
+        # The exact-fork provider pin is supervisor-owned. Admission must
+        # still pass through the provider lane; pinning context compatibility
+        # is not permission to exceed concurrent or request-slot capacity.
+        child_spec["_supervisor_pinned_lane"] = True
 
     def _pin_parent_provider(
         self,
@@ -4222,6 +4251,7 @@ class _Runtime:
         if not isinstance(model, str):
             return
         child_spec["assigned_provider"] = parent_provider
+        child_spec["_supervisor_pinned_lane"] = True
         fanout = child_spec.get("fanout_config")
         if not isinstance(fanout, dict):
             fanout = child_spec["fanout_config"] = {}
@@ -4571,18 +4601,82 @@ class _Runtime:
                     reason=reason,
                 )
 
+    def _reserve_assigned_lane(self, spec: dict[str, Any]) -> None:
+        """Reserve the task's already-selected provider lane or raise temporary capacity."""
+        if spec.get("_lane_reserved"):
+            return
+        provider_name = spec.get("assigned_provider")
+        if not isinstance(provider_name, str) or not provider_name:
+            raise ValueError("assigned provider lane reservation requires a provider")
+        lane = self._lanes.get(provider_name)
+        if lane is None:
+            providers = load_providers(_provider_config_path(os.environ, spec))
+            configured = next(
+                (provider for provider in providers if provider.name == provider_name),
+                None,
+            )
+            if configured is None:
+                # Custom/external workers can carry provider identities that
+                # are intentionally outside Cambium's configured lane set.
+                # There is no supervisor-owned capacity contract to enforce
+                # for those identities, so preserve that compatibility path
+                # instead of inventing a lane from incomplete information.
+                spec.pop("_supervisor_pinned_lane", None)
+                return
+            _ensure_lanes(self._lanes, [configured])
+            lane = self._lanes[provider_name]
+        if lane.reserve():
+            spec["_lane_reserved"] = True
+            return
+        retry_at: float | None = None
+        lane.has_request_slot()
+        if (
+            lane.request_slots is not None
+            and lane.requests_per_minute is not None
+            and lane.requests_per_minute > 0
+            and lane.request_slots < 1.0
+        ):
+            retry_at = time.time() + (1.0 - lane.request_slots) * 60.0 / lane.requests_per_minute
+        raise LaneCapacityExhausted(
+            f"waiting for assigned provider lane {provider_name!r}",
+            retry_at=retry_at,
+        )
+
+    async def _await_reacquire_lane(self, spec: dict[str, Any], deadline: float) -> None:
+        """Reacquire a lane released by a suspended parent without exceeding capacity."""
+        while True:
+            self._lane_changed.clear()
+            try:
+                self._reserve_assigned_lane(spec)
+                return
+            except LaneCapacityExhausted as exc:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("provider capacity wait exceeded task wall budget") from exc
+                delay = remaining
+                if exc.retry_at is not None:
+                    delay = min(delay, max(0.001, exc.retry_at - time.time()))
+                try:
+                    await asyncio.wait_for(self._lane_changed.wait(), timeout=delay)
+                except TimeoutError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            "provider capacity wait exceeded task wall budget"
+                        ) from exc
+
     def _resolve_assignment(self, spec: dict[str, Any]) -> None:
         """Admission-time (provider, model) selection for un-pinned tasks.
 
         Mutates ``spec`` when it declares ``model_candidates`` and its
         fanout_config has no pinned model (solution C), and books the chosen
-        provider's lane +1 in_flight (H1). Tasks pre-assigned by
-        ``_preassign_lanes`` already carry ``fanout_config.model`` and
-        ``assigned_provider``, so this is a no-op for them — their lane slot
-        was reserved in the batch pass. Tasks that arrive without
-        pre-assignment (dynamic children proposed mid-session) resolve against
-        the live ledger and current lanes and book their slot here.
+        provider's lane +1 in_flight (H1). Supervisor-owned exact/inherit pins
+        reserve their already-selected provider through the same lane before
+        worker admission. Tasks pre-assigned by ``_preassign_lanes`` already
+        hold their lane reservation.
         """
+        if spec.get("_supervisor_pinned_lane"):
+            self._reserve_assigned_lane(spec)
+            return
         if self._debt_store is None:
             return
         if _resolve_model_candidates(
@@ -5277,8 +5371,7 @@ class _Runtime:
                             workspace_changed=resume_payload["workspace_changed"],
                         )
                         if leased_lane is not None:
-                            leased_lane.in_flight += 1
-                            spec["_lane_reserved"] = True
+                            await self._await_reacquire_lane(spec, deadline)
                         spec["resume"] = resume_payload
                         spec.pop("context_fork", None)
                         continue
@@ -6166,6 +6259,17 @@ class _Runtime:
             )
             await _kill_worker(state.proc)
             return True
+        if state.phase != "ready":
+            state.protocol_reason = "duplicate_ready"
+            await self.emit(
+                "protocol",
+                task_id=state.task_id,
+                generation=state.generation,
+                request_id=msg.get("request_id"),
+                note="ready received outside ready phase",
+            )
+            await _kill_worker(state.proc)
+            return True
         state.phase = "run"
         state.last_heartbeat = state.loop.time()
         state.handle.state = "RUNNING"
@@ -6250,7 +6354,23 @@ class _Runtime:
             generation=state.generation,
             **result_payload,
         )
-        accepted = state.correlated and identity_note is None and state.envelope is None
+        invalid_fields = _invalid_result_envelope_fields(msg)
+        if invalid_fields:
+            state.protocol_failure = "INVALID_RESULT_ENVELOPE"
+            await self.emit(
+                "protocol",
+                task_id=state.task_id,
+                generation=state.generation,
+                note="result rejected: invalid field(s)",
+                fields=invalid_fields,
+            )
+        accepted = (
+            state.correlated
+            and identity_note is None
+            and state.envelope is None
+            and not invalid_fields
+            and state.protocol_failure is None
+        )
         if accepted:
             if state.sandbox_failure_reason is not None and msg.get("status") != "succeeded":
                 msg = {**msg, "failure_reason": state.sandbox_failure_reason}
@@ -6696,10 +6816,20 @@ class _Runtime:
             return await self._handle_ready_message(state, msg)
         if mtype in ("result", "result_envelope"):
             await self._handle_result_message(state, msg)
-            return False
+            return state.protocol_failure is not None
         if mtype == "fatal_error":
-            state.protocol_failure = msg.get("error_type", "fatal_error")
-            return False
+            error_type = msg.get("error_type")
+            state.protocol_failure = (
+                error_type if isinstance(error_type, str) and error_type else "fatal_error"
+            )
+            await self.emit(
+                "protocol",
+                task_id=state.task_id,
+                generation=state.generation,
+                error_type=state.protocol_failure,
+                note="worker fatal_error",
+            )
+            return True
         if mtype == "context_checkpoint":
             await self._handle_context_checkpoint_message(state, msg)
             return False
@@ -6878,7 +7008,8 @@ class _Runtime:
             and state.envelope.get("status")
             in ("succeeded", "failed", "cancelled", "suspended", "unresolvable")
         )
-        if state.reuse_ready and not state.message_too_long:
+        protocol_failed = state.protocol_failure is not None or state.protocol_reason is not None
+        if state.reuse_ready and not state.message_too_long and not protocol_failed:
             # The worker stays alive and owns no task state; the handle no
             # longer owns the process (the pool does). The generation verdict
             # is clean exactly when the terminal envelope is correlated.
@@ -6899,7 +7030,8 @@ class _Runtime:
         state.handle.exit_code = exit_code
         state.handle.state = "EXITED"
         clean = (
-            state.exit_reason is not None
+            not protocol_failed
+            and state.exit_reason is not None
             and terminal_verdict
             and (
                 exit_code == 0 or cast(dict[str, Any], state.envelope).get("status") != "succeeded"
@@ -6943,9 +7075,7 @@ class _Runtime:
             )
         return _GenOutcome(
             clean=clean,
-            fatal=state.protocol_failure is not None
-            or state.protocol_reason
-            in {"ready_request_id_mismatch", "ready_identity_mismatch"},
+            fatal=protocol_failed,
             reason=state.protocol_failure or state.protocol_reason or reason,
             timeout_phase=state.timeout_phase,
             exit_code=exit_code,

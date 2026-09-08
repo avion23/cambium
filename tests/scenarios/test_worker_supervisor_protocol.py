@@ -422,3 +422,135 @@ def test_generation_events_without_identity_remain_compatible(
 
     assert state.turn == 7
     assert [kind for kind, _payload in runtime.records] == [message_type]
+
+
+def test_duplicate_ready_is_terminal_protocol_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    runtime = _DispatchProbe()
+    killed: list[Any] = []
+
+    async def kill(proc: Any) -> None:
+        killed.append(proc)
+
+    monkeypatch.setattr(supervisor, "_kill_worker", kill)
+    state = SimpleNamespace(
+        task_id="task",
+        generation=3,
+        init_rid="init",
+        phase="run",
+        protocol_reason=None,
+        proc="worker",
+    )
+
+    handled = asyncio.run(
+        runtime._handle_generation_message(
+            state,
+            {
+                "type": "ready",
+                "request_id": "init",
+                "task_id": "task",
+                "generation": 3,
+                "proto": 1,
+            },
+        )
+    )
+
+    assert handled is True
+    assert state.protocol_reason == "duplicate_ready"
+    assert killed == ["worker"]
+    assert runtime.records[-1][1]["note"] == "ready received outside ready phase"
+
+
+def _result_state() -> SimpleNamespace:
+    return SimpleNamespace(
+        task_id="task",
+        generation=3,
+        turn=0,
+        run_rid="run-1",
+        correlated=False,
+        envelope=None,
+        sandbox_failure_reason=None,
+        protocol_failure=None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("status", "mystery"),
+        ("summary", ["not", "text"]),
+        ("diff", {"bad": "shape"}),
+        ("diff_truncated", 1),
+        ("requires_commit", "yes"),
+        ("commits", [1]),
+        ("files_changed", "a.py"),
+        ("failure_reason", {"bad": "shape"}),
+    ],
+)
+def test_malformed_result_envelope_fails_at_wire_boundary(field: str, value: Any) -> None:
+    runtime = _DispatchProbe()
+    message: dict[str, Any] = {
+        "type": "result_envelope",
+        "request_id": "run-1",
+        "task_id": "task",
+        "generation": 3,
+        "status": "succeeded",
+        "summary": "done",
+        "diff": "",
+        "diff_truncated": False,
+        "commits": [],
+        "files_changed": [],
+    }
+    message[field] = value
+    state = _result_state()
+
+    handled = asyncio.run(runtime._handle_generation_message(state, message))
+
+    assert handled is True
+    assert state.envelope is None
+    assert state.protocol_failure == "INVALID_RESULT_ENVELOPE"
+    rejection = next(
+        payload
+        for kind, payload in runtime.records
+        if kind == "protocol" and payload.get("note") == "result rejected: invalid field(s)"
+    )
+    assert field in rejection["fields"]
+
+
+def test_fatal_error_cannot_be_superseded_by_late_success() -> None:
+    runtime = _DispatchProbe()
+    state = _result_state()
+
+    fatal = asyncio.run(
+        runtime._handle_generation_message(
+            state,
+            {
+                "type": "fatal_error",
+                "task_id": "task",
+                "generation": 3,
+                "error_type": {"malformed": True},
+            },
+        )
+    )
+    assert fatal is True
+    assert state.protocol_failure == "fatal_error"
+
+    late = asyncio.run(
+        runtime._handle_generation_message(
+            state,
+            {
+                "type": "result_envelope",
+                "request_id": "run-1",
+                "task_id": "task",
+                "generation": 3,
+                "status": "succeeded",
+                "summary": "late success",
+                "diff": "",
+                "diff_truncated": False,
+                "commits": [],
+                "files_changed": [],
+            },
+        )
+    )
+    assert late is True
+    assert state.envelope is None
+    assert state.protocol_failure == "fatal_error"

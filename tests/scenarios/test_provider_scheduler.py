@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from multiprocessing import get_context
@@ -161,6 +162,73 @@ def test_busy_reservation_fails_structured_after_bounded_backoff(
     assert isinstance(excinfo.value.__cause__, sqlite3.OperationalError)
     with sqlite3.connect(tmp_path / "quota.db") as connection:
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert connection.execute("SELECT COUNT(*) FROM quota_reservations").fetchone()[0] == 0
+
+
+def test_busy_reservation_honors_shorter_caller_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ledger = QuotaLedger(tmp_path / "quota.db")
+    real_connect = ledger._connect
+    failures = {"BEGIN IMMEDIATE": 1_000_000}
+
+    def connect_always_busy() -> _ExecuteFaultConnection:
+        return _ExecuteFaultConnection(real_connect(), failures)
+
+    monkeypatch.setattr(ledger, "_connect", connect_always_busy)
+    monkeypatch.setattr(provider_state, "_BUSY_RETRY_S", 1.0)
+    started = time.monotonic()
+    with pytest.raises(QuotaLedgerBusyError, match="remained busy"):
+        ledger.reserve(
+            "p",
+            (QuotaWindowSpec("requests", 60, request_allowance=1),),
+            0,
+            deadline=time.monotonic() + 0.05,
+        )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.3
+    with sqlite3.connect(tmp_path / "quota.db") as connection:
+        assert connection.execute("SELECT COUNT(*) FROM quota_reservations").fetchone()[0] == 0
+
+
+def test_busy_reservation_cancellation_wakes_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ledger = QuotaLedger(tmp_path / "quota.db")
+    real_connect = ledger._connect
+    failures = {"BEGIN IMMEDIATE": 1_000_000}
+    cancel = threading.Event()
+    finished = threading.Event()
+    errors: list[BaseException] = []
+
+    def connect_always_busy() -> _ExecuteFaultConnection:
+        return _ExecuteFaultConnection(real_connect(), failures)
+
+    def reserve() -> None:
+        try:
+            ledger.reserve(
+                "p",
+                (QuotaWindowSpec("requests", 60, request_allowance=1),),
+                0,
+                cancel_event=cancel,
+            )
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(ledger, "_connect", connect_always_busy)
+    monkeypatch.setattr(provider_state, "_BUSY_RETRY_S", 1.0)
+    thread = threading.Thread(target=reserve)
+    thread.start()
+    time.sleep(0.03)
+    cancel.set()
+
+    assert finished.wait(0.3)
+    thread.join(timeout=0.1)
+    assert len(errors) == 1 and isinstance(errors[0], InterruptedError)
+    with sqlite3.connect(tmp_path / "quota.db") as connection:
         assert connection.execute("SELECT COUNT(*) FROM quota_reservations").fetchone()[0] == 0
 
 

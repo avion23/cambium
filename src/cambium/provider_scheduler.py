@@ -20,6 +20,7 @@ from __future__ import annotations
 import math
 import os
 import sqlite3
+import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
@@ -686,23 +687,42 @@ class QuotaLedger:
         self,
         operation: str,
         action: Callable[[sqlite3.Connection], _ResultT],
+        *,
+        deadline: float | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> _ResultT:
-        """Run one SQLite action with bounded, whole-operation busy retries."""
-        deadline = time.monotonic() + _BUSY_RETRY_S
+        """Run one SQLite action with bounded, whole-operation busy retries.
+
+        ``deadline`` is a monotonic caller deadline. It can shorten the
+        ledger's own busy-retry window but never extend it. ``cancel_event``
+        wakes a busy retry promptly; an already-running SQLite transaction is
+        still allowed to finish so reservation accounting cannot be torn in
+        half.
+        """
+        retry_deadline = time.monotonic() + _BUSY_RETRY_S
+        if deadline is not None:
+            retry_deadline = min(retry_deadline, deadline)
         delay = _BUSY_RETRY_INITIAL_SLEEP_S
         while True:
+            if cancel_event is not None and cancel_event.is_set():
+                raise InterruptedError(f"quota ledger {operation} cancelled")
             connection: sqlite3.Connection | None = None
             try:
                 connection = self._connect()
                 return action(connection)
             except (sqlite3.Error, OSError) as exc:
                 if self._is_busy(exc):
-                    remaining = deadline - time.monotonic()
+                    remaining = retry_deadline - time.monotonic()
                     if remaining <= 0:
                         raise QuotaLedgerBusyError(
-                            f"quota ledger {operation} remained busy for {_BUSY_RETRY_S}s"
+                            f"quota ledger {operation} remained busy until its deadline"
                         ) from exc
-                    time.sleep(min(delay, remaining))
+                    sleep_for = min(delay, remaining)
+                    if cancel_event is not None:
+                        if cancel_event.wait(sleep_for):
+                            raise InterruptedError(f"quota ledger {operation} cancelled") from exc
+                    else:
+                        time.sleep(sleep_for)
                     delay = min(delay * 2, _BUSY_RETRY_MAX_SLEEP_S)
                     continue
                 raise self._storage_failure(operation, exc) from exc
@@ -714,6 +734,9 @@ class QuotaLedger:
         self,
         operation: str,
         action: Callable[[sqlite3.Connection], _ResultT],
+        *,
+        deadline: float | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> _ResultT:
         """Run ``action`` in a retryable ``BEGIN IMMEDIATE`` transaction."""
 
@@ -728,7 +751,12 @@ class QuotaLedger:
                     connection.rollback()
                 raise
 
-        return self._run_with_retry(operation, transactional)
+        return self._run_with_retry(
+            operation,
+            transactional,
+            deadline=deadline,
+            cancel_event=cancel_event,
+        )
 
     def _initialize(self) -> None:
         def initialize(connection: sqlite3.Connection) -> None:
@@ -812,6 +840,8 @@ class QuotaLedger:
         *,
         requests: int = 1,
         now: float | None = None,
+        deadline: float | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> QuotaReservation | None:
         """Atomically reserve every configured window or reserve none of them."""
 
@@ -891,7 +921,12 @@ class QuotaLedger:
             )
             return QuotaReservation(reservation_id, provider, estimated_tokens, requests)
 
-        return self._run_transaction("reserve", reserve_transaction)
+        return self._run_transaction(
+            "reserve",
+            reserve_transaction,
+            deadline=deadline,
+            cancel_event=cancel_event,
+        )
 
     def reconcile(
         self,
@@ -1013,7 +1048,9 @@ class QuotaLedger:
 
         self._run_transaction("observe", observe_transaction)
 
-    def snapshots(self, provider: str | None = None) -> tuple[QuotaWindowSnapshot, ...]:
+    def snapshots(
+        self, provider: str | None = None, *, deadline: float | None = None
+    ) -> tuple[QuotaWindowSnapshot, ...]:
         sql = _QUOTA_SNAPSHOT_SQL
         params: tuple[Any, ...] = ()
         if provider is not None:
@@ -1023,6 +1060,7 @@ class QuotaLedger:
         rows = self._run_with_retry(
             "snapshot",
             lambda connection: connection.execute(sql, params).fetchall(),
+            deadline=deadline,
         )
         return tuple(QuotaWindowSnapshot(*row) for row in rows)
 

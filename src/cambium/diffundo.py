@@ -131,6 +131,7 @@ from .provider_scheduler import (
     CacheCapability,
     ProviderLease,
     QuotaLedger,
+    QuotaLedgerBusyError,
     QuotaWindowSpec,
     quota_snapshot_json,
 )
@@ -3466,17 +3467,25 @@ class Diffundo:
                 // 4
                 + 4096,
             )
+            reserve_cancel = threading.Event()
             reserve_task = asyncio.create_task(
                 asyncio.to_thread(
-                    ledger.reserve, policy.name, policy.quota_windows, estimated_tokens
+                    ledger.reserve,
+                    policy.name,
+                    policy.quota_windows,
+                    estimated_tokens,
+                    deadline=deadline,
+                    cancel_event=reserve_cancel,
                 )
             )
             try:
-                # ``to_thread`` cannot be stopped once the SQLite transaction has
-                # started. Shield the worker so cancellation can still clean up a
-                # reservation that commits after the caller is cancelled.
+                # ``to_thread`` cannot interrupt an SQLite statement already
+                # executing. Shield the transaction, but let cancellation wake
+                # its bounded busy-retry loop so cleanup is not needlessly held
+                # for the ledger's independent two-second window.
                 reservation = await asyncio.shield(reserve_task)
             except asyncio.CancelledError:
+                reserve_cancel.set()
                 try:
                     reservation = await asyncio.shield(reserve_task)
                 except BaseException:
@@ -3484,6 +3493,17 @@ class Diffundo:
                 if reservation is not None:
                     await asyncio.to_thread(ledger.reconcile, reservation, policy.quota_windows, 0)
                 raise
+            except QuotaLedgerBusyError as exc:
+                exhausted = deadline is not None and self._remaining(deadline) <= 0
+                raise ProviderError(
+                    policy.name,
+                    ProviderOutcome.TIMEOUT if exhausted else ProviderOutcome.ERROR,
+                    "quota ledger reservation deadline exceeded"
+                    if exhausted
+                    else "quota ledger reservation is busy",
+                    exc,
+                    budget_exhausted=exhausted,
+                ) from exc
             if reservation is None:
                 raise ProviderError(
                     policy.name,
@@ -3504,11 +3524,22 @@ class Diffundo:
             if isinstance(total, bool) or not isinstance(total, int | float) or total < 0:
                 total = estimated_tokens
             await asyncio.to_thread(ledger.reconcile, reservation, policy.quota_windows, int(total))
-            snapshots = await asyncio.to_thread(ledger.snapshots, policy.name)
-            result = replace(
-                result,
-                quota_windows=tuple(quota_snapshot_json(snapshot) for snapshot in snapshots),
-            )
+            # Reconciliation is correctness-critical and must complete even if
+            # the provider consumed the remaining logical budget. Snapshot
+            # projection is observability only: cap its busy wait by the call
+            # deadline and omit it when no budget remains.
+            remaining = self._remaining(deadline)
+            if remaining is None or remaining > 0:
+                try:
+                    snapshots = await asyncio.to_thread(
+                        ledger.snapshots, policy.name, deadline=deadline
+                    )
+                except QuotaLedgerBusyError:
+                    snapshots = ()
+                result = replace(
+                    result,
+                    quota_windows=tuple(quota_snapshot_json(snapshot) for snapshot in snapshots),
+                )
         return result
 
     async def _quota_wrapped_attempt(
@@ -3745,6 +3776,13 @@ class Diffundo:
             # Shield the task so wait_for returns at the deadline even though
             # cancellation cannot stop the underlying executor thread.
             result = await asyncio.wait_for(asyncio.shield(post_task), timeout=remaining)
+        except asyncio.CancelledError:
+            # The blocking transport may outlive its logical asyncio caller.
+            # Consume any late failure so cancellation never leaves an
+            # unobserved task exception; the subprocess remains the hard kill
+            # boundary for the underlying thread/socket.
+            post_task.add_done_callback(self._consume_post_task)
+            raise
         except TimeoutError as exc:
             post_task.add_done_callback(self._consume_post_task)
             raise ProviderError(

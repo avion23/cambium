@@ -6226,6 +6226,12 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
             progress.turn = turn
             progress.status = "working"
             final_synthesis_call = finalized
+            # Messages learned only after the provider response (notably the
+            # serving-provider fallback correction) are absent from
+            # ``sent_prompt``. Preserve them in any checkpoint created from
+            # that prompt so exact children/resume never inherit stale routing
+            # context after a turn-checkpoint restart.
+            post_call_messages: list[dict[str, Any]] = []
             if stop.is_set():
                 return _loop_result(
                     outcome, "cancelled", None, turn - 1, cumulative_usage, transcript
@@ -6507,6 +6513,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                 }
                 if base_messages is None:
                     transcript.append(correction)
+                    post_call_messages.append(copy.deepcopy(correction))
                 else:
                     context_continuation.append(correction)
                     transcript = _sync_context_transcript(
@@ -6799,7 +6806,10 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                 terminal_messages = _strip_finalization_directive(
                     copy.deepcopy(sent_prompt["messages"])
                 )
-                terminal_suffix = [copy.deepcopy(action_message)]
+                terminal_suffix = [
+                    *copy.deepcopy(post_call_messages),
+                    copy.deepcopy(action_message),
+                ]
                 if base_messages is not None:
                     terminal_messages = copy.deepcopy(list(base_messages))
                     terminal_suffix = copy.deepcopy(context_continuation)
@@ -7075,7 +7085,10 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                         {"role": "user", "content": "not executed: wall budget exceeded"}
                         for _tool_call in tool_calls[len(batch_results) :]
                     )
-                continuation_suffix = copy.deepcopy(batch_messages)
+                continuation_suffix = [
+                    *copy.deepcopy(post_call_messages),
+                    *copy.deepcopy(batch_messages),
+                ]
                 if base_messages is None:
                     transcript.extend(batch_messages)
                 else:

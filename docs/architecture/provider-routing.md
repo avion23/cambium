@@ -60,12 +60,20 @@ not a proven global optimum, and need no provider preflight request.
 
 Diffundo owns the subsequent provider call and its fallback behavior. Keep task
 assignment and call-time lease evidence distinct: an initial assignment does
-not prove which provider ultimately served every request. Summaries and child
-calls must pass through the same accounting rather than becoming invisible
-side traffic. A successful fallback moves the task's lane reservation to the
-provider that actually served it; repeated calls do not reserve it again. A
-failed attempt does not move that reservation. Persisted Retry-After timestamps
-expire naturally; a past 429 is not a permanent ban.
+not prove which provider ultimately served every request. The configured logical
+call budget is capped by the worker task's remaining wall time; summary headroom
+can lengthen the configured summary budget relative to ordinary calls, but never
+past that remaining task wall. A timed-out blocking transport may still finish
+inside its executor thread, so the worker subprocess remains the hard kill
+boundary; the logical call and fallback do not wait for that late transport.
+
+Summaries and child calls pass through the same accounting rather than becoming
+invisible side traffic. A successful fallback moves the task's lane reservation
+to the provider that actually served it; repeated calls do not reserve it again.
+Exact and `inherit` children also reserve the selected provider lane before a
+worker starts: context compatibility is not permission to exceed provider
+capacity. A failed attempt does not move that reservation. Persisted Retry-After
+timestamps expire naturally; a past 429 is not a permanent ban.
 
 OpenAI-compatible Chat Completions use SSE streaming when the endpoint returns
 `text/event-stream`; Codex Responses uses the same bounded SSE reader. Reasoning
@@ -95,10 +103,15 @@ reset**. Do not display or reason about them as an account quota.
 
 **Quota windows:** `QuotaLedger` reserves and reconciles declared token/request
 windows across processes. A provider can have several windows, such as a short
-request window and a weekly token window. Observations include provider, window,
-allowance, use, and reset time. Unknown allowance does not mean unlimited quota.
-The accounting must follow that provider's actual rules; cached input is not
-assumed exempt from token limits.
+request window and a weekly token window. Reservation busy retries are capped by
+the provider call's logical deadline and can be woken by cancellation. Once a
+reservation or provider request succeeds, reconciliation remains mandatory even
+if the logical deadline has expired; dropping that write would corrupt shared
+quota accounting. Snapshot projection is observability-only and may be omitted
+when its read cannot fit the remaining deadline. Observations include provider,
+window, allowance, use, and reset time. Unknown allowance does not mean unlimited
+quota. The accounting must follow that provider's actual rules; cached input is
+not assumed exempt from token limits.
 
 **Cash:** reported cost is an estimate under configured tariffs. Numeric zero
 alone does not prove a free service. Explicit free/subscription billing labels

@@ -485,6 +485,93 @@ def test_agent_call_receives_remaining_wall_cap(tmp_path: Path) -> None:
     assert isinstance(budget, float) and 0.0 < budget <= config.max_wall_s
 
 
+def test_turn_resume_fallback_note_survives_delegate_checkpoint(tmp_path: Path) -> None:
+    worktree = _make_worktree(tmp_path / "repo")
+    checkpoint_root = tmp_path / "checkpoints"
+    initial = _agent_config(
+        worktree,
+        context_reuse=True,
+        checkpoint_root=checkpoint_root,
+        max_turns=4,
+    )
+    state_ref = worker._write_checkpoint_file(
+        initial,
+        1,
+        [{"role": "user", "content": "prior turn evidence"}],
+        {},
+        [],
+    )
+    assert state_ref is not None
+    resume = worker._validate_resume(
+        {
+            "checkpoint_ref": "loop-agent/turn-001.json",
+            "epoch": 1,
+            "child_results": [],
+            "child_results_truncated": False,
+            "workspace_changed": False,
+            "rejection_feedback": None,
+        }
+    )
+    config = _agent_config(
+        worktree,
+        context_reuse=True,
+        checkpoint_root=checkpoint_root,
+        resume=resume,
+        max_turns=4,
+    )
+
+    class _FallbackDelegateRouter(_ScriptedRouter):
+        async def call(
+            self,
+            tier: ProviderTier,
+            prompt: dict[str, Any],
+            *,
+            model: str | None = None,
+            budget_usd: float | None = None,
+            allow_model_substitution: bool = False,
+            max_call_budget_s: float | None = None,
+        ) -> _FakeCallResult:
+            del tier, model, budget_usd, allow_model_substitution, max_call_budget_s
+            self.prompts.append(prompt)
+            return _FakeCallResult(
+                self.responses.pop(0),
+                provider="healthy-substitute",
+                model="healthy-model",
+                fell_back_from="dead-primary",
+            )
+
+    router = _FallbackDelegateRouter(
+        [
+            json.dumps(
+                {
+                    "name": "delegate",
+                    "arguments": {
+                        "child_task_id": "review",
+                        "kind": "investigation",
+                        "spec": {
+                            "task": "Review alpha.txt",
+                            "context_mode": "trunk",
+                            "placement": "inherit",
+                        },
+                    },
+                }
+            )
+        ]
+    )
+    writer = _FakeWriter()
+
+    outcome = asyncio.run(_drive_loop(config, worktree, router, writer, "resume-fallback"))
+
+    assert outcome["status"] == "suspended"
+    event = next(
+        message for message in writer.messages() if message["type"] == "context_checkpoint"
+    )
+    checkpoint = worker._load_epoch_checkpoint(config, event["checkpoint_ref"], expect_task_id=True)
+    rendered = json.dumps(checkpoint.full_messages)
+    assert "healthy-substitute/healthy-model" in rendered
+    assert "assigned provider was unavailable" in rendered
+
+
 def test_finish_keeps_raw_evidence_without_summary_call(tmp_path: Path) -> None:
     worktree = _make_worktree(tmp_path / "repo")
     config = _agent_config(
