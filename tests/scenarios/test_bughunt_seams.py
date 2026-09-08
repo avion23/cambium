@@ -19,13 +19,7 @@ import pytest
 from diffundo_helpers import PROMPT, FakeServer, _config, _error_payload, _ok_payload
 
 from cambium import tui, worker
-from cambium.diffundo import (
-    AllProvidersFailed,
-    Diffundo,
-    ProviderError,
-    ProviderOutcome,
-    ProviderTier,
-)
+from cambium.diffundo import Diffundo, ProviderTier
 from cambium.observability import snapshot_from_events
 from cambium.oneshot import OneShotConfig
 from cambium.supervisor import run_plan
@@ -232,18 +226,17 @@ def test_resume_at_turn_two_restores_no_progress_history(tmp_path: Path) -> None
     assert len(router.prompts) == 1
 
 
-def test_bound_provider_lease_stays_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
-    # ponytail: margins fit a loaded loopback (attempt ~35ms here).
+def test_bound_provider_lease_rotates_on_timeout_failover(monkeypatch: pytest.MonkeyPatch) -> None:
     primary = FakeServer(
         [
             (200, _ok_payload("first", model="m-a"), 0.0),
-            (200, _ok_payload("late", model="m-a"), 2.0),
+            (200, _ok_payload("late", model="m-a"), 0.1),
         ]
     )
     sibling = FakeServer([(200, _ok_payload("fallback", model="m-b"), 0.0)])
     router = Diffundo(
         (
-            _config("a", primary, "BUGHUNT_A", model="m-a", timeout_s=0.5, priority=0),
+            _config("a", primary, "BUGHUNT_A", model="m-a", timeout_s=0.03, priority=0),
             _config("b", sibling, "BUGHUNT_B", model="m-b", priority=1),
         ),
         primary_provider="a",
@@ -253,14 +246,47 @@ def test_bound_provider_lease_stays_on_timeout(monkeypatch: pytest.MonkeyPatch) 
     try:
         first = asyncio.run(router.call(ProviderTier.FAST, PROMPT, model="m-a"))
         router.bind_provider(first.provider, first.model)
-        # ponytail: timeout is soft; the lease stays instead of spending on Luna.
-        with pytest.raises(AllProvidersFailed) as raised:
-            asyncio.run(router.call(ProviderTier.FAST, PROMPT, model="m-a"))
-        error = cast(ProviderError, raised.value.last_error)
-        assert error.outcome is ProviderOutcome.TIMEOUT
-        assert router.provider_lease is not None
-        assert router.provider_lease.provider == "a"
-        assert sibling.calls == []
+        fallback = asyncio.run(router.call(ProviderTier.FAST, PROMPT, model="m-a"))
+        assert fallback.provider == "b"
+        router.bind_provider(fallback.provider, fallback.model)
+    finally:
+        primary.close()
+        sibling.close()
+
+
+def test_timeout_fallback_does_not_reclaim_a_recovered_old_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary = FakeServer(
+        [
+            (200, _ok_payload("first", model="m-a"), 0.0),
+            (200, _ok_payload("late", model="m-a"), 0.1),
+            (200, _ok_payload("recovered", model="m-a"), 0.0),
+        ]
+    )
+    sibling = FakeServer(
+        [
+            (200, _ok_payload("fallback", model="m-b"), 0.0),
+            (200, _ok_payload("stay-on-sibling", model="m-b"), 0.0),
+        ]
+    )
+    router = Diffundo(
+        (
+            _config("a", primary, "BUGHUNT_A2", model="m-a", timeout_s=0.03, priority=0),
+            _config("b", sibling, "BUGHUNT_B2", model="m-b", priority=1),
+        ),
+        primary_provider="a",
+        call_budget_s=1.0,
+        pause_timeout_s=0.01,
+    )
+    try:
+        first = asyncio.run(router.call(ProviderTier.FAST, PROMPT, model="m-a"))
+        router.bind_provider(first.provider, first.model)
+        fallback = asyncio.run(router.call(ProviderTier.FAST, PROMPT, model="m-a"))
+        assert fallback.provider == "b"
+        router._runtime("a").cooldown_until = __import__("time").monotonic() - 1
+        next_call = asyncio.run(router.call(ProviderTier.FAST, PROMPT, model="m-a"))
+        assert next_call.provider == "b"
     finally:
         primary.close()
         sibling.close()

@@ -60,7 +60,16 @@ not a proven global optimum, and need no provider preflight request.
 
 Diffundo owns the subsequent provider call and its fallback behavior. Keep task
 assignment and call-time lease evidence distinct: an initial assignment does
-not prove which provider ultimately served every request. The configured logical
+not prove which provider ultimately served every request. An explicit provider
+selection is sticky: normal turns and soft unavailability such as cooldown,
+Retry-After, or rate limiting do not proactively move the task to a sibling
+provider/model merely because substitution is allowed. An actual attempted
+provider timeout or hard endpoint-death failure may trigger the bounded fallback
+path; once fallback serves, the new provider remains the task's incumbent.
+Persisted cooldown evidence is excluded during admission as well as call-time
+selection.
+
+The configured logical
 call budget is capped by the worker task's remaining wall time; summary headroom
 can lengthen the configured summary budget relative to ordinary calls, but never
 past that remaining task wall. A timed-out blocking transport may still finish

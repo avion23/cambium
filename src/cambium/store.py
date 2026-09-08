@@ -86,6 +86,7 @@ CRITICAL_KINDS = frozenset(
         "worker_terminated",
         "task_assigned",
         "merge_committed",
+        "main_worktree_stale",
         "join_invariant_failed",
         "parent_snapshot",
         "child_integration_prepared",

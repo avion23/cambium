@@ -1037,6 +1037,16 @@ def _status_line_is_fence(line: str) -> bool:
     return is_cache_artifact_path(path)
 
 
+def _porcelain_path(line: str) -> str:
+    """Return the path portion of one v1 porcelain status line."""
+    if len(line) < 4 or line[2] != " ":
+        return ""
+    path = line[3:].strip()
+    if line[:2] in {"R ", "C "} and " -> " in path:
+        path = path.rsplit(" -> ", 1)[-1]
+    return path.strip('"')[:MAX_ENVELOPE_FIELD_CHARS]
+
+
 def _discard_cache_artifacts(worktree: Path, status_lines: Sequence[str]) -> None:
     """Delete only cache paths Git just reported inside ``worktree``.
 
@@ -3006,23 +3016,69 @@ class _Runtime:
         )
         return result.stdout if result.returncode == 0 else b""
 
+    async def _snapshot_primary_worktree(self, repo: Path) -> dict[str, Any] | None:
+        """Capture caller-owned primary-main state before ref publication."""
+        branch = await self._git_stdout(
+            repo, "symbolic-ref", "--quiet", "--short", "HEAD", check=False
+        )
+        if branch != "main":
+            return None
+        status = await self._git(
+            repo,
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignored=matching",
+            check=False,
+        )
+        if status.returncode != 0:
+            return {"repo": str(repo), "error": "status_failed", "lines": []}
+        lines = [
+            line for line in status.stdout.splitlines() if line and not _status_line_is_fence(line)
+        ]
+        return {"repo": str(repo), "error": None, "lines": lines}
+
     async def _resync_primary_worktree(
         self,
         repo: Path,
         old_ref: str,
         new_ref: str,
         *,
+        snapshot: dict[str, Any] | None,
         task_id: str,
         generation: int,
         deferred_observers: list[tuple[dict[str, Any], bool]],
     ) -> None:
-        # ponytail: clean-only refresh; read-tree fails closed on collisions.
-        state: dict[str, Any] = {"repo": str(repo), "stale": False, "resynced": False}
+        """Refresh a clean checked-out ``main`` without touching caller state."""
+        if snapshot is None:
+            return
+        state: dict[str, Any] = {
+            "repo": str(repo),
+            "stale": False,
+            "resynced": False,
+            "dirty_paths": [],
+        }
         self._primary_worktree_states[task_id] = state
 
         async def stale(reason: str, lines: Sequence[str] = ()) -> None:
-            paths = [line[3:].strip()[:256] for line in lines if len(line) > 3][:16]
-            state.update({"stale": True, "reason": reason, "dirty_paths": paths})
+            paths = list(
+                dict.fromkeys(path for line in lines if (path := _porcelain_path(line)))
+            )[:MAX_ENVELOPE_ITEMS]
+            summary = _cap_utf8(
+                "main worktree is stale after publishing "
+                f"refs/heads/main {old_ref[:12]} -> {new_ref[:12]}; "
+                "caller-owned edits were preserved"
+                + (f" ({'; '.join(lines[:MAX_ENVELOPE_ITEMS])})" if lines else ""),
+                MAX_ENVELOPE_FIELD_CHARS,
+            )
+            state.update(
+                {
+                    "stale": True,
+                    "reason": reason,
+                    "dirty_paths": paths,
+                    "summary": summary,
+                }
+            )
             await self.emit(
                 "main_worktree_stale",
                 task_id=task_id,
@@ -3032,16 +3088,25 @@ class _Runtime:
                 reason=reason,
                 dirty=True,
                 dirty_paths=paths,
+                files_changed=paths,
+                summary=summary,
                 generation=generation,
                 _deferred_observers=deferred_observers,
             )
 
         try:
+            if snapshot.get("error") is not None:
+                await stale(str(snapshot["error"]))
+                return
+            initial_lines = snapshot.get("lines")
+            if isinstance(initial_lines, list) and initial_lines:
+                await stale("caller_changes", initial_lines)
+                return
             branch = await self._git_stdout(
                 repo, "symbolic-ref", "--quiet", "--short", "HEAD", check=False
             )
             if branch != "main":
-                await stale("branch")
+                await stale("branch_changed")
                 return
             for args in (
                 ("diff", "--no-ext-diff", "--quiet", old_ref, "--"),
@@ -3057,18 +3122,41 @@ class _Runtime:
                         "status",
                         "--porcelain=v1",
                         "--untracked-files=all",
+                        "--ignored=matching",
                         check=False,
                     )
-                    lines = status.stdout.splitlines() if status.returncode == 0 else []
-                    await stale("dirty", lines)
+                    lines = (
+                        [
+                            line
+                            for line in status.stdout.splitlines()
+                            if line and not _status_line_is_fence(line)
+                        ]
+                        if status.returncode == 0
+                        else []
+                    )
+                    await stale("caller_changes_after_snapshot", lines)
                     return
-            refreshed = await self._git(repo, "read-tree", "-m", "-u", "main", check=False)
+            for args in (
+                ("ls-files", "--others", "--exclude-standard", "-z"),
+                ("ls-files", "--others", "--ignored", "--exclude-standard", "-z"),
+            ):
+                untracked = await self._git(repo, *args, check=False)
+                if untracked.returncode != 0:
+                    await stale("untracked_check_failed")
+                    return
+                paths = [
+                    path
+                    for path in untracked.stdout.split("\0")
+                    if path and not _status_line_is_fence(f"?? {path}")
+                ]
+                if paths:
+                    await stale("caller_changes_after_snapshot", [f"?? {path}" for path in paths])
+                    return
+            refreshed = await self._git(
+                repo, "read-tree", "-m", "-u", old_ref, new_ref, check=False
+            )
             if refreshed.returncode != 0:
-                status = await self._git(
-                    repo, "status", "--porcelain=v1", "--untracked-files=all", check=False
-                )
-                lines = status.stdout.splitlines() if status.returncode == 0 else []
-                await stale("read_tree_failed", lines)
+                await stale("read_tree_failed")
                 return
             state["resynced"] = True
         except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
@@ -8289,6 +8377,7 @@ class _Runtime:
                 if hasattr(seq, "ensure_staging_clean") and not spec.get("_resolver_child"):
                     await asyncio.to_thread(seq.ensure_staging_clean, repo)
                     await self._flush_sequencer_events(seq, deferred_observers=deferred)
+                primary_snapshot = await self._snapshot_primary_worktree(repo)
                 await asyncio.to_thread(seq.publish_merge, repo, staging_tip, current_main)
                 ref_published = True
                 await self.emit(
@@ -8306,6 +8395,7 @@ class _Runtime:
                     repo,
                     current_main,
                     staging_tip,
+                    snapshot=primary_snapshot,
                     task_id=task_id,
                     generation=handle.generation,
                     deferred_observers=deferred,
@@ -9326,16 +9416,39 @@ def _build_session_result(
         unified_diff = ""
         diff_truncated = False
         summary = ""
-    for result in results:
-        state = runtime._primary_worktree_states.get(result.task_id)
-        if isinstance(state, dict) and state.get("stale") is True:
-            reason = state.get("reason") or "unknown"
-            summary = (
-                f"{summary.rstrip()} | primary worktree stale ({reason}); "
-                "caller-owned edits preserved"
-                if summary.strip()
-                else f"primary worktree stale ({reason}); caller-owned edits preserved"
+    stale_states = [
+        runtime._primary_worktree_states.get(result.task_id)
+        for result in results
+    ]
+    stale_states = [
+        state
+        for state in stale_states
+        if isinstance(state, dict) and state.get("stale") is True
+    ]
+    if stale_states:
+        stale_paths = [
+            path
+            for state in stale_states
+            for path in state.get("dirty_paths", ())
+            if isinstance(path, str) and path
+        ]
+        if isinstance(files_changed, list | tuple):
+            files_changed = tuple(dict.fromkeys((*files_changed, *stale_paths)))
+        if "content matches HEAD exactly" in summary:
+            summary = summary.replace(
+                "content matches HEAD exactly",
+                "worker worktree content matches HEAD exactly",
             )
+        stale_summary = next(
+            (
+                state.get("summary")
+                for state in stale_states
+                if isinstance(state.get("summary"), str) and state.get("summary")
+            ),
+            None,
+        )
+        if stale_summary is not None:
+            summary = f"{summary.rstrip()} | {stale_summary}" if summary.strip() else stale_summary
     return Result(
         status=status,
         exit_code=EXIT_CODES[status],

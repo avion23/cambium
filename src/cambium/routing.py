@@ -598,6 +598,18 @@ def _normalized_utilization(provider: Any, debt: Mapping[str, ProviderDebt] | No
     return tokens / _window_allowance(provider)
 
 
+def _retry_at(entry: Any) -> float | None:
+    """Read a persisted cooldown deadline from either debt representation."""
+    value = (
+        entry.get("retry_at")
+        if isinstance(entry, Mapping)
+        else getattr(entry, "retry_at", None)
+    )
+    if type(value) not in (int, float) or not math.isfinite(value):
+        return None
+    return float(value)
+
+
 def _provider_is_quarantined(provider_name: str, debt: Mapping[str, Any] | None) -> bool:
     """Return whether routing debt carries a proven auth/config quarantine."""
     if debt is None:
@@ -707,7 +719,7 @@ def resolve_assignment(
         for p in pool
         if (
             quota_status(p.name, quota_windows, now=timestamp)[1] is None
-            and not ((debt or {}).get(p.name, ProviderDebt()).retry_at or 0) > timestamp
+            and not (_retry_at((debt or {}).get(p.name)) or 0) > timestamp
         )
     ]
     if not pool:
@@ -771,6 +783,7 @@ def select_primary(
             isinstance(model, str)
             and model in candidates
             and not _provider_is_quarantined(provider.name, debt)
+            and not (_retry_at((debt or {}).get(provider.name)) or 0) > time.time()
         ):
             serving.append((index, provider))
     if not serving:
@@ -1047,7 +1060,7 @@ def select_lane(
         current = debt.get(provider.name) if debt is not None else None
         if (
             _provider_is_quarantined(provider.name, debt)
-            or (getattr(current, "retry_at", None) or 0) > time.time()
+            or (_retry_at(current) or 0) > time.time()
             or quota_status(provider.name, quota_windows)[1] is not None
         ):
             continue
@@ -1265,7 +1278,7 @@ def score_providers(
         current = (debt or {}).get(provider.name)
         if (
             _provider_is_quarantined(provider.name, debt)
-            or (getattr(current, "retry_at", None) or 0) > timestamp
+            or (_retry_at(current) or 0) > timestamp
             or quota_status(provider.name, quota_windows, now=timestamp)[1] is not None
         ):
             continue

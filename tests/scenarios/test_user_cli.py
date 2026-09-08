@@ -1005,3 +1005,37 @@ def test_run_parser_combined_provider_model_forms() -> None:
         parser.parse_args(["run", "--provider", "demo:", "p"])
     with pytest.raises(SystemExit):
         parser.parse_args(["run", "--provider", "demo!bad:model", "p"])
+
+
+def test_task_provider_environment_is_default_but_cli_provider_wins(
+    monkeypatch, tmp_path: Path
+) -> None:
+    captured: list[oneshot.OneShotConfig] = []
+
+    async def fake_run(config: oneshot.OneShotConfig, on_event=None) -> PlanResult:
+        captured.append(config)
+        return _plan_result()
+
+    monkeypatch.setattr(oneshot, "run_oneshot", fake_run)
+    monkeypatch.setenv("CAMBIUM_TASK_PROVIDER", "env-provider:env-model")
+
+    assert cli.main(["run", "--repo", str(tmp_path), "--json", "env task"]) == 0
+    assert captured[-1].provider == "env-provider"
+    assert captured[-1].model == "env-model"
+
+    assert (
+        cli.main(
+            [
+                "run",
+                "--repo",
+                str(tmp_path),
+                "--provider",
+                "cli-provider:cli-model",
+                "--json",
+                "cli task",
+            ]
+        )
+        == 0
+    )
+    assert captured[-1].provider == "cli-provider"
+    assert captured[-1].model == "cli-model"

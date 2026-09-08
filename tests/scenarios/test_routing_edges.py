@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Any, cast
 
 import pytest
@@ -15,6 +16,7 @@ from cambium.routing import (
     resolve_assignment,
     score_providers,
     select_lane,
+    select_primary,
     validate_requirements,
 )
 
@@ -70,6 +72,24 @@ def test_select_lane_does_not_call_a_non_matching_pool_exhausted() -> None:
 
     assert type(exc_info.value) is ValueError
     assert str(exc_info.value) == ("model_candidates ['m1'] match no enabled configured provider")
+
+
+def test_select_primary_excludes_persisted_cooldown_entries() -> None:
+    providers = [_provider("cooldown", "m1"), _provider("ready", "m1")]
+    debt = {"cooldown": {"retry_at": time.time() + 60.0}}
+
+    assert select_primary(providers, ["m1"], debt) == ("ready", "m1")
+
+
+def test_resolve_assignment_excludes_mapping_cooldown_entries() -> None:
+    providers = [_provider("cooldown", "m1"), _provider("ready", "m1")]
+    lanes = {provider.name: LaneState() for provider in providers}
+    debt = {"cooldown": {"retry_at": time.time() + 60.0}}
+
+    assignment = resolve_assignment(providers, ["m1"], debt, lanes)
+
+    assert assignment is not None
+    assert assignment.provider == "ready"
 
 
 def test_native_tool_capability_does_not_exclude_a_provider() -> None:

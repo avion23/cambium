@@ -1852,10 +1852,22 @@ def _reduce_artifact(state: BranchState, values: Mapping[str, Any]) -> BranchSta
             status = "integrated"
         elif kind in {"merge_committed", "merge_reconciled"}:
             status = "published"
+        child_result = child.result
+        if kind == "main_worktree_stale" and child_result is not None:
+            stale_files = _strings_value(values, "files_changed", "dirty_paths", "files")
+            stale_summary = _optional_string(values.get("summary"))
+            child_result = replace(
+                child_result,
+                files_changed=(
+                    stale_files if stale_files is not None else child_result.files_changed
+                ),
+                summary=stale_summary if stale_summary is not None else child_result.summary,
+            )
         child = replace(
             child,
             artifact_status=status,
             accepted_artifact_head=new_head or child.accepted_artifact_head,
+            result=child_result,
         )
         state = _replace_child(state, task_id, child)
         if kind == "child_integrated" and new_head is not None:
@@ -1896,6 +1908,19 @@ def _reduce_artifact(state: BranchState, values: Mapping[str, Any]) -> BranchSta
     if kind == "worktree_salvaged":
         artifacts = replace(artifacts, dirty=True)
     state = replace(state, artifacts=artifacts)
+    if kind == "main_worktree_stale" and state.result is not None:
+        stale_files = _strings_value(values, "files_changed", "dirty_paths", "files")
+        stale_summary = _optional_string(values.get("summary"))
+        state = replace(
+            state,
+            result=replace(
+                state.result,
+                files_changed=(
+                    stale_files if stale_files is not None else state.result.files_changed
+                ),
+                summary=stale_summary if stale_summary is not None else state.result.summary,
+            ),
+        )
     state = _add_blocker(
         state,
         _optional_string(_value(values, "reason", "message"))

@@ -175,6 +175,13 @@ def _agent_model_argument(value: str) -> str:
     return value
 
 
+def _task_provider_argument(explicit: str | None) -> str | None:
+    """Use the task-provider environment default when the CLI flag is absent."""
+    if explicit is not None:
+        return explicit
+    return os.environ.get("CAMBIUM_TASK_PROVIDER") or None
+
+
 def _positive_int(value: str, *, allow_zero: bool = False) -> int:
     try:
         parsed = int(value)
@@ -1091,7 +1098,7 @@ async def _run_oneshot(args: argparse.Namespace) -> int:
     from .supervisor import SessionAlreadyRunningError
 
     try:
-        provider, model = _split_provider_model(args.provider, args.model)
+        provider, model = _split_provider_model(_task_provider_argument(args.provider), args.model)
         config = oneshot.OneShotConfig(
             prompt=_prompt_text(args.prompt),
             repo=args.repo,
@@ -1150,7 +1157,7 @@ async def _run_repl(args: argparse.Namespace) -> int:
     from . import oneshot
 
     try:
-        provider, model = _split_provider_model(args.provider, args.model)
+        provider, model = _split_provider_model(_task_provider_argument(args.provider), args.model)
     except ValueError as exc:
         print(f"cambium repl: {exc}", file=sys.stderr)
         return 2
@@ -1175,7 +1182,7 @@ async def _run_tui(args: argparse.Namespace) -> int:
     from . import oneshot
 
     try:
-        provider, model = _split_provider_model(args.provider, args.model)
+        provider, model = _split_provider_model(_task_provider_argument(args.provider), args.model)
         session_root = args.session_dir
         continue_session = getattr(args, "continue_session", None)
         if continue_session is not None:
@@ -1562,7 +1569,7 @@ async def _run_architectus(args: argparse.Namespace) -> int:
     else:
         try:
             llm, provider_name, tier_label = _live_architectus_llm(
-                args.provider, args.model, args.tier
+                _task_provider_argument(args.provider), args.model, args.tier
             )
         except (AuthError, OSError, ValueError) as exc:
             print(f"cambium architectus: {exc}", file=sys.stderr)

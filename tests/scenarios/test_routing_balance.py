@@ -391,21 +391,20 @@ def test_primary_provider_kwarg_presets_sticky_binding(monkeypatch) -> None:
         second.close()
 
 
-def test_primary_provider_kwarg_absent_name_falls_back_to_seeded_pick(
-    monkeypatch,
-) -> None:
+def test_primary_provider_kwarg_absent_name_fails_closed() -> None:
     first = FakeServer([(200, _ok_payload("first", model="m"), 0.0)])
     second = FakeServer([(200, _ok_payload("second", model="m"), 0.0)])
-    router = Diffundo(
-        (
-            _config("p_first", first, "K_FIRST", priority=0),
-            _config("p_second", second, "K_SECOND", priority=0),
-        ),
-        primary_provider="p_missing",
-    )
     try:
-        result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
-        assert result.provider == "p_first"  # seeded first pick
+        with pytest.raises(ValueError, match="primary provider 'p_missing' is not configured"):
+            Diffundo(
+                (
+                    _config("p_first", first, "K_FIRST", priority=0),
+                    _config("p_second", second, "K_SECOND", priority=0),
+                ),
+                primary_provider="p_missing",
+            )
+        assert first.calls == []
+        assert second.calls == []
     finally:
         first.close()
         second.close()

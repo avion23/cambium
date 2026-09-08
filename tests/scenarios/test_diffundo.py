@@ -339,8 +339,7 @@ def test_pinned_death_stays_on_sibling_on_next_call() -> None:
         healthy.close()
 
 
-def test_pinned_timeout_stays_on_pinned_lane() -> None:
-    # ponytail: timeout is soft; a pinned lane waits instead of spending on Luna.
+def test_pinned_timeout_falls_back_after_actual_failure() -> None:
     pinned = FakeServer([(200, _ok_payload("late", model="m-pinned"), 0.1)])
     sibling = FakeServer([(200, _ok_payload("served by sibling", model="m-sibling"), 0.0)])
     router = Diffundo(
@@ -359,12 +358,11 @@ def test_pinned_timeout_stays_on_pinned_lane() -> None:
         pause_timeout_s=0.01,
     )
     try:
-        with pytest.raises(AllProvidersFailed) as raised:
-            asyncio.run(router.call(ProviderTier.FAST, PROMPT, model="m-pinned"))
-        error = cast(ProviderError, raised.value.last_error)
-        assert error.outcome is ProviderOutcome.TIMEOUT
+        result = asyncio.run(router.call(ProviderTier.FAST, PROMPT, model="m-pinned"))
+        assert result.provider == "p_sibling"
+        assert result.fell_back_from == "p_timeout"
         assert len(pinned.calls) == 1
-        assert sibling.calls == []
+        assert len(sibling.calls) == 1
         assert router.health("p_timeout") is HealthState.COOLDOWN
     finally:
         pinned.close()
@@ -662,6 +660,53 @@ def test_model_pin_does_not_authorize_provider_global_substitution() -> None:
     try:
         with pytest.raises(AllProvidersFailed):
             asyncio.run(router.call(ProviderTier.FAST, PROMPT, model="m2"))
+        assert len(bad.calls) == 1
+        assert sibling.calls == []
+    finally:
+        bad.close()
+        sibling.close()
+
+
+def test_model_pin_soft_unavailability_does_not_substitute_sibling() -> None:
+    bad = FakeServer([(429, _error_payload("busy"), 0.0, {"Retry-After": "60"})])
+    sibling = FakeServer([(200, _ok_payload("must not serve", model="m-other"), 0.0)])
+    router = Diffundo(
+        (
+            _config("p_m2", bad, "K_M2_SOFT", model="m2", cooldown_s=60),
+            _config(
+                "p_other",
+                sibling,
+                "K_OTHER_SOFT",
+                model="m-other",
+                allow_model_substitution=True,
+            ),
+        ),
+        pause_timeout_s=0.01,
+    )
+    try:
+        with pytest.raises(AllProvidersFailed) as raised:
+            asyncio.run(
+                router.call(
+                    ProviderTier.FAST,
+                    PROMPT,
+                    model="m2",
+                    allow_model_substitution=True,
+                )
+            )
+        error = cast(ProviderError, raised.value.last_error)
+        assert error.outcome is ProviderOutcome.QUOTA
+        assert len(bad.calls) == 1
+        assert sibling.calls == []
+
+        with pytest.raises(AllProvidersFailed):
+            asyncio.run(
+                router.call(
+                    ProviderTier.FAST,
+                    PROMPT,
+                    model="m2",
+                    allow_model_substitution=True,
+                )
+            )
         assert len(bad.calls) == 1
         assert sibling.calls == []
     finally:

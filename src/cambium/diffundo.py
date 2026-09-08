@@ -2655,13 +2655,12 @@ class Diffundo:
         self._rotation = rotation_seed
         self._primary_provider: str | None = None
         if primary_provider is not None:
-            # Supervisor-level admission balancing (solution C) presets the
-            # per-subagent sticky primary from the task's assigned provider;
-            # an absent name falls back to the seeded first pick below.
-            for provider in self._providers:
-                if provider.name == primary_provider:
-                    self._primary_provider = provider.name
-                    break
+            # An explicit task provider is a pin, not a preference.  Fail
+            # closed if the name is stale instead of silently seeding another
+            # provider and spending against the wrong account.
+            if not any(provider.name == primary_provider for provider in self._providers):
+                raise ValueError(f"primary provider {primary_provider!r} is not configured")
+            self._primary_provider = primary_provider
         self._pinned_provider = self._primary_provider
         self._fallback_origin: str | None = None
         self._active_tier: ProviderTier | None = None
@@ -2845,7 +2844,13 @@ class Diffundo:
                         lease is not None
                         and lease.provider == provider.name
                         and lease.model == provider.model
-                        and exc.is_real_death
+                        and (
+                            exc.is_real_death
+                            or (
+                                exc.outcome is ProviderOutcome.TIMEOUT
+                                and provider.name == self._pinned_provider
+                            )
+                        )
                     ):
                         # A lease keeps a healthy incumbent sticky, but a
                         # terminally dead holder no longer owns the semantic
@@ -2855,12 +2860,14 @@ class Diffundo:
                         self._provider_lease = None
                     tried.append(provider.name)
                     last_error = exc
-                    pinned_fallback = exc.is_real_death and (
-                        (
-                            self._pinned_provider is not None
-                            and provider.name == self._pinned_provider
-                        )
-                        or (model is not None and allow_model_substitution)
+                    pinned_fallback = (
+                        self._pinned_provider is not None
+                        and provider.name == self._pinned_provider
+                        and (exc.is_real_death or exc.outcome is ProviderOutcome.TIMEOUT)
+                    ) or (
+                        exc.is_real_death
+                        and model is not None
+                        and allow_model_substitution
                     )
                     if pinned_fallback:
                         fallback_origin = provider.name
@@ -3141,6 +3148,17 @@ class Diffundo:
             candidates = [
                 provider for provider in candidates if provider.name != self._fallback_origin
             ]
+        elif self._pinned_provider is not None:
+            pinned = [
+                provider for provider in candidates if provider.name == self._pinned_provider
+            ]
+            if pinned:
+                candidates = pinned
+            elif self._pinned_provider_is_waiting():
+                # A soft circuit state is not permission to spend on a sibling.
+                # The bounded recovery wait owns this case; actual timeout/death
+                # fallback is triggered only after an attempted call fails.
+                candidates = []
         requested_model = model
         if isinstance(requested_model, str) and requested_model:
             exact = [provider for provider in candidates if provider.model == requested_model]
@@ -3168,6 +3186,19 @@ class Diffundo:
                 return []
             return substitutes
         return candidates
+
+    def _pinned_provider_is_waiting(self) -> bool:
+        """Whether the explicit provider pin is only temporarily unavailable."""
+        if self._pinned_provider is None:
+            return False
+        if self._pinned_provider in self._terminal_death_providers:
+            return False
+        return self.status(self._pinned_provider) in {
+            ProviderStatus.OPEN,
+            ProviderStatus.COOLDOWN,
+            ProviderStatus.HALF_OPEN,
+            ProviderStatus.RATE_LIMITED,
+        }
 
     def _candidates_unleased(
         self,
