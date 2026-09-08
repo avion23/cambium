@@ -481,16 +481,17 @@ def test_leased_provider_death_releases_lease_for_healthy_sibling() -> None:
 
 
 def test_successful_fallback_becomes_timeout_failover_incumbent() -> None:
+    # ponytail: margins fit a loaded loopback (attempt ~35ms here).
     original = FakeServer(
         [
-            (200, _ok_payload("late original", model="m-original"), 0.1),
+            (200, _ok_payload("late original", model="m-original"), 2.0),
             (200, _ok_payload("recovered original", model="m-original"), 0.0),
         ]
     )
     replacement = FakeServer(
         [
             (200, _ok_payload("replacement", model="m-replacement"), 0.0),
-            (200, _ok_payload("late replacement", model="m-replacement"), 0.1),
+            (200, _ok_payload("late replacement", model="m-replacement"), 2.0),
             (200, _ok_payload("recovered replacement", model="m-replacement"), 0.0),
         ]
     )
@@ -507,7 +508,7 @@ def test_successful_fallback_becomes_timeout_failover_incumbent() -> None:
                 original,
                 "K_CHAIN_ORIGINAL",
                 model="m-original",
-                timeout_s=0.03,
+                timeout_s=0.5,
                 priority=0,
             ),
             _config(
@@ -515,7 +516,7 @@ def test_successful_fallback_becomes_timeout_failover_incumbent() -> None:
                 replacement,
                 "K_CHAIN_REPLACEMENT",
                 model="m-replacement",
-                timeout_s=0.03,
+                timeout_s=0.5,
                 priority=1,
             ),
             _config("p_final", final, "K_CHAIN_FINAL", model="m-final", priority=2),
