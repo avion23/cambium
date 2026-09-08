@@ -2,18 +2,14 @@
 
 from __future__ import annotations
 
-import json
 import math
 import random
-import sqlite3
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypeGuard
-from urllib.parse import quote
 
 _USAGE_EVENT_KIND = "usage_event"
-_EVENTS_DB_REL = Path(".cambium") / "events.db"
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,68 +178,21 @@ def usage_stats_from_events(events: Sequence[Mapping[str, Any]]) -> UsageStats |
     return None if acc.calls == 0 else _stats_from_accumulator(acc)
 
 
-def _events_table_exists(connection: sqlite3.Connection) -> bool:
-    row = connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
-    ).fetchone()
-    return row is not None
+def _session_events(session_dir: str | Path) -> list[Mapping[str, Any]]:
+    """Read a session through the supervisor's canonical event replay."""
+    from . import supervisor
 
-
-def _read_usage_rows(db: Path, *, with_task_id: bool) -> list[Mapping[str, Any]] | None:
-    """Read usage_event rows from ``db``; None when the events table is absent.
-
-    Connects read-only and returns None only for a missing ``events`` table
-    (equivalent to no usage rows). Any other database error — corrupt file,
-    unreadable rows, or inaccessible storage — propagates so callers can tell
-    corruption apart from absence. A row whose payload is not valid JSON is
-    corruption and raises ``ValueError`` rather than disappearing.
-    """
-    uri = f"file:{quote(str(db.resolve()), safe='/:')}?mode=ro"
-    connection = sqlite3.connect(uri, uri=True)
-    try:
-        if not _events_table_exists(connection):
-            return None
-        if with_task_id:
-            rows = connection.execute(
-                "SELECT kind, task_id, payload FROM events WHERE kind = ? ORDER BY seq",
-                (_USAGE_EVENT_KIND,),
-            ).fetchall()
-        else:
-            rows = connection.execute(
-                "SELECT kind, payload FROM events WHERE kind = ? ORDER BY seq",
-                (_USAGE_EVENT_KIND,),
-            ).fetchall()
-    finally:
-        connection.close()
-    events: list[Mapping[str, Any]] = []
-    for row in rows:
-        kind = row[0]
-        raw_payload = row[-1]
-        payload = json.loads(raw_payload)
-        if not isinstance(payload, Mapping):
-            raise ValueError("usage_event payload is not a JSON object")
-        record: dict[str, Any] = {"kind": kind, "payload": payload}
-        if with_task_id and row[1] is not None:
-            record["task_id"] = row[1]
-        events.append(record)
-    return events
+    return supervisor.read_events(Path(session_dir))
 
 
 def session_usage_stats(session_dir: str | Path) -> UsageStats | None:
     """Aggregate the usage_event rows of one session's durable event log.
 
-    Opens ``<session_dir>/.cambium/events.db`` read-only and returns None when
-    the file or the events table is absent (no usage rows). Corrupt or
-    inaccessible databases, and rows whose payload is not valid JSON, raise
-    instead of being hidden. Never writes or creates files.
+    Reads the session through ``cambium.supervisor.read_events`` so interactive
+    turn stores are merged with the root store. Missing stores produce no rows;
+    corrupt or inaccessible stores raise instead of being hidden.
     """
-    db = Path(session_dir) / _EVENTS_DB_REL
-    if not db.is_file():
-        return None
-    events = _read_usage_rows(db, with_task_id=False)
-    if events is None:
-        return None
-    return usage_stats_from_events(events)
+    return usage_stats_from_events(_session_events(session_dir))
 
 
 @dataclass(frozen=True, slots=True)
@@ -311,18 +260,11 @@ def usage_breakdown_from_events(events: Sequence[Mapping[str, Any]]) -> UsageBre
 def session_usage_breakdown(session_dir: str | Path) -> UsageBreakdown | None:
     """Aggregate a session's usage_event rows grouped by task and provider.
 
-    Opens ``<session_dir>/.cambium/events.db`` read-only and returns None when
-    the file or the events table is absent (no usage rows). Corrupt or
-    inaccessible databases, and rows whose payload is not valid JSON, raise
-    instead of being hidden. Never writes or creates files.
+    Reads the session through ``cambium.supervisor.read_events`` so interactive
+    turn stores are merged with the root store. Missing stores produce no rows;
+    corrupt or inaccessible stores raise instead of being hidden.
     """
-    db = Path(session_dir) / _EVENTS_DB_REL
-    if not db.is_file():
-        return None
-    events = _read_usage_rows(db, with_task_id=True)
-    if events is None:
-        return None
-    return usage_breakdown_from_events(events)
+    return usage_breakdown_from_events(_session_events(session_dir))
 
 
 def _paired_values(results_a: Sequence[bool], results_b: Sequence[bool]) -> list[int]:

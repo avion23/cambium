@@ -102,8 +102,8 @@ uv run cambium inspect-state /path/to/session
 
 ```bash
 uv run ruff check src tests
-uv run pytest -m "not slow" -q
-uv run pytest -m slow -q
+uv run pytest -q
+uv run pytest -m "slow and not acceptance" -q
 ```
 
 Credential-gated acceptance checks use real provider configuration/accounts and

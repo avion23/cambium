@@ -1378,31 +1378,33 @@ def _run_session(args: argparse.Namespace) -> int:
         return 0
     if args.session_command == "status":
         from . import supervisor
+        from .store import StoreError
 
         candidate = Path(args.session_id).expanduser()
         path = candidate if candidate.is_absolute() else root / candidate
-        if not (path / ".cambium" / "events.db").is_file():
+        try:
+            events = supervisor.read_events(path)
+        except (OSError, StoreError, ValueError, sqlite3.Error) as exc:
+            print(f"cambium session: {exc}", file=sys.stderr)
+            return 1
+        if not events:
             print(
                 f"cambium session: event log is missing: {path / '.cambium' / 'events.db'}",
                 file=sys.stderr,
             )
-            return 1
-        try:
-            events = supervisor.read_events(path)
-        except (OSError, ValueError, sqlite3.Error) as exc:
-            print(f"cambium session: {exc}", file=sys.stderr)
             return 1
         text = render.render_subagent_status(events)
         print(text)
         return 0
     if args.session_command == "usage":
         from . import stats as stats_module
+        from .store import StoreError
 
         candidate = Path(args.session_id).expanduser()
         path = candidate if candidate.is_absolute() else root / candidate
         try:
             breakdown = stats_module.session_usage_breakdown(path)
-        except (OSError, ValueError, sqlite3.Error) as exc:
+        except (OSError, StoreError, ValueError, sqlite3.Error) as exc:
             print(f"cambium session: {exc}", file=sys.stderr)
             return 1
         if breakdown is None:

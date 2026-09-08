@@ -784,7 +784,7 @@ async def _run_legacy(
                 stats_line = render.render_usage_stats_line(
                     stats.session_usage_stats(session_dir), worktree=worktree
                 )
-            except (OSError, ValueError, sqlite3.Error) as exc:
+            except (OSError, StoreError, ValueError, sqlite3.Error) as exc:
                 _write_line(
                     err,
                     _safe(f"cambium tui: usage stats unavailable: {exc}", single_line=True),

@@ -595,6 +595,71 @@ def test_session_status_renders_per_subagent_lifecycle(capsys, tmp_path: Path) -
     assert "cost=$0.000000" in totals
 
 
+def test_session_status_and_usage_read_turn_store_only_session(capsys, tmp_path: Path) -> None:
+    root = tmp_path / "sessions"
+    session_dir = root / "interactive"
+    event_db = session_dir / "turn-0001" / ".cambium" / "events.db"
+    store = EventStore(event_db, fsync_interval_s=0.01)
+    try:
+        store.append({"kind": "spawned", "task_id": "alpha", "payload": {}})
+        store.append(
+            {
+                "kind": "usage_event",
+                "task_id": "alpha",
+                "payload": {
+                    "provider": "p1",
+                    "turn": 1,
+                    "usage": {"total_tokens": 5},
+                },
+            }
+        )
+    finally:
+        store.close()
+
+    assert not (session_dir / ".cambium" / "events.db").exists()
+
+    assert cli.main(["session", "status", "--session-dir", str(root), "interactive"]) == 0
+    status = capsys.readouterr()
+    assert "alpha" in status.out
+    assert status.err == ""
+
+    assert cli.main(["session", "usage", "--session-dir", str(root), "interactive"]) == 0
+    usage = capsys.readouterr()
+    assert "calls=1" in usage.out
+    assert "tokens=5" in usage.out
+    assert usage.err == ""
+
+
+@pytest.mark.parametrize("command", ("status", "usage"))
+def test_session_commands_reject_corrupt_turn_store(
+    command: str, capsys, tmp_path: Path
+) -> None:
+    root = tmp_path / "sessions"
+    session_dir = root / "corrupt"
+    event_db = session_dir / "turn-0001" / ".cambium" / "events.db"
+    event_db.parent.mkdir(parents=True)
+    event_db.write_bytes(b"not a valid event store\n")
+
+    assert cli.main(["session", command, "--session-dir", str(root), "corrupt"]) == 1
+    captured = capsys.readouterr()
+    assert "cambium session:" in captured.err
+    assert "corrupt event store" in captured.err
+    assert "Traceback" not in captured.err
+    assert captured.out == ""
+
+
+def test_session_status_rejects_empty_turn_store(capsys, tmp_path: Path) -> None:
+    root = tmp_path / "sessions"
+    event_db = root / "empty" / "turn-0001" / ".cambium" / "events.db"
+    event_db.parent.mkdir(parents=True)
+    event_db.touch()
+
+    assert cli.main(["session", "status", "--session-dir", str(root), "empty"]) == 1
+    captured = capsys.readouterr()
+    assert "event log is missing" in captured.err
+    assert captured.out == ""
+
+
 @pytest.mark.parametrize(
     ("command", "expected_message"),
     (("status", "event log is missing"), ("usage", "no usage event log")),

@@ -30,6 +30,6 @@ jobs:
       - name: Ruff
         run: ruff check
       - name: Fast tests
-        run: python -m pytest -m "not slow" -q
+        run: python -m pytest -q
       - name: Slow tests
-        run: python -m pytest -m slow -q
+        run: python -m pytest -m "slow and not acceptance" -q

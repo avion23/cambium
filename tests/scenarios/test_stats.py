@@ -14,6 +14,7 @@ from cambium.stats import (
     usage_breakdown_from_events,
     usage_stats_from_events,
 )
+from cambium.store import EventStore, StoreError
 
 _EVENTS_SCHEMA = """CREATE TABLE events (
     seq          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -257,22 +258,23 @@ def test_session_usage_stats_missing_db_is_none_and_creates_nothing(tmp_path) ->
     assert not (session_dir / ".cambium" / "events.db").exists()
 
 
-def test_session_usage_stats_missing_table_is_none(tmp_path) -> None:
+def test_session_usage_stats_missing_table_is_corrupt(tmp_path) -> None:
     session_dir = tmp_path / "session"
     db = session_dir / ".cambium" / "events.db"
     db.parent.mkdir(parents=True)
     with sqlite3.connect(db) as connection:
         connection.execute("CREATE TABLE other (id INTEGER PRIMARY KEY)")
-    assert session_usage_stats(session_dir) is None
+    with pytest.raises(StoreError, match="no such table: events"):
+        session_usage_stats(session_dir)
 
 
 def test_session_usage_stats_corrupt_database_raises(tmp_path) -> None:
     session_dir = tmp_path / "session"
     db = session_dir / ".cambium" / "events.db"
     db.parent.mkdir(parents=True)
-    db.write_bytes(b"not a sqlite database")
+    db.write_bytes(b"SQLite format 3\x00not a sqlite database")
 
-    with pytest.raises(sqlite3.DatabaseError):
+    with pytest.raises(StoreError):
         session_usage_stats(session_dir)
 
 
@@ -321,6 +323,33 @@ def test_session_usage_stats_aggregates_durable_log(tmp_path) -> None:
     assert not db.exists()
 
 
+def test_session_usage_stats_merges_interactive_turn_stores(tmp_path) -> None:
+    for turn, total in ((1, 100), (2, 50)):
+        db = tmp_path / f"turn-{turn:04d}" / ".cambium" / "events.db"
+        store = EventStore(db)
+        try:
+            store.append(
+                {
+                    "kind": "usage_event",
+                    "task_id": "interactive-main",
+                    "payload": {
+                        "turn": turn,
+                        "provider": "p",
+                        "model": "m",
+                        "usage": {"total_tokens": total},
+                    },
+                }
+            )
+        finally:
+            store.close()
+
+    stats = session_usage_stats(tmp_path)
+    assert stats is not None
+    assert stats.calls == 2
+    assert stats.turns == 2
+    assert stats.total_tokens == 150
+
+
 def test_session_usage_stats_ignores_non_usage_kinds(tmp_path) -> None:
     session_dir = tmp_path / "session"
     db = session_dir / ".cambium" / "events.db"
@@ -363,7 +392,7 @@ def test_session_usage_stats_rejects_undecodable_payloads(tmp_path) -> None:
             {"turn": 1, "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}},
             seq=2,
         )
-    with pytest.raises(json.JSONDecodeError):
+    with pytest.raises(StoreError, match="invalid JSON payload"):
         session_usage_stats(session_dir)
 
 
@@ -378,7 +407,7 @@ def test_session_usage_stats_rejects_non_object_payload(tmp_path) -> None:
             (1, "usage_event", "[]"),
         )
 
-    with pytest.raises(ValueError, match="not a JSON object"):
+    with pytest.raises(StoreError, match="payload must be an object"):
         session_usage_stats(session_dir)
 
 
@@ -537,18 +566,48 @@ def test_session_usage_breakdown_aggregates_durable_log(tmp_path) -> None:
     assert breakdown.total.estimated_cost_usd == pytest.approx(0.0015)
 
 
+def test_session_usage_breakdown_merges_interactive_turn_stores(tmp_path) -> None:
+    for turn, task_id, provider, total in (
+        (1, "alpha", "p1", 100),
+        (2, "beta", "p2", 50),
+    ):
+        db = tmp_path / f"turn-{turn:04d}" / ".cambium" / "events.db"
+        store = EventStore(db)
+        try:
+            store.append(
+                {
+                    "kind": "usage_event",
+                    "task_id": task_id,
+                    "payload": {
+                        "turn": turn,
+                        "provider": provider,
+                        "usage": {"total_tokens": total},
+                    },
+                }
+            )
+        finally:
+            store.close()
+
+    breakdown = session_usage_breakdown(tmp_path)
+    assert breakdown is not None
+    assert breakdown.total.total_tokens == 150
+    assert [name for name, _ in breakdown.by_task] == ["alpha", "beta"]
+    assert [name for name, _ in breakdown.by_provider] == ["p1", "p2"]
+
+
 def test_session_usage_breakdown_missing_db_is_none(tmp_path) -> None:
     assert session_usage_breakdown(tmp_path) is None
 
 
-def test_session_usage_breakdown_missing_table_is_none(tmp_path) -> None:
+def test_session_usage_breakdown_missing_table_is_corrupt(tmp_path) -> None:
     db = tmp_path / ".cambium" / "events.db"
     db.parent.mkdir()
     connection = sqlite3.connect(db)
     connection.execute("CREATE TABLE other (x TEXT)")
     connection.commit()
     connection.close()
-    assert session_usage_breakdown(tmp_path) is None
+    with pytest.raises(StoreError, match="no such table: events"):
+        session_usage_breakdown(tmp_path)
 
 
 def test_render_usage_breakdown_none_is_empty() -> None:
