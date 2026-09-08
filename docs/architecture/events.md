@@ -41,6 +41,7 @@ vocabulary.
 | `worktree_salvaged` | `supervisor.py` | Records a bounded dirty-worktree evidence artifact captured before recovery or cleanup. |
 | `worktree_pruned` | `supervisor.py` | Records successful removal of a task worktree and branch. |
 | `worktree_cleanup_deferred` | `supervisor.py` | Records cleanup being retained/deferred because a safety or removal step failed. |
+| `main_worktree_stale` | `supervisor.py` | Records a checked-out main worktree left unrefreshed after publish to preserve caller-owned edits. |
 | `provider_infeasible` | `supervisor.py` | Records a provider rejected at admission because its required credential is unavailable. |
 | `resource_denied` | `supervisor.py` | Records a heavy-resource gate denial with bounded reasons before provider feasibility. |
 | `merge_started` | `supervisor.py` | Records start of private child integration or ref-only publication. |

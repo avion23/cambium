@@ -2030,6 +2030,7 @@ _GLOSSARY_KINDS = frozenset(
         "worktree_salvaged",
         "worktree_pruned",
         "worktree_cleanup_deferred",
+        "main_worktree_stale",
         "provider_infeasible",
         "resource_denied",
         "merge_started",
@@ -2118,6 +2119,7 @@ def _handler_for(kind: str) -> Callable[[BranchState, Mapping[str, Any]], Branch
         "worktree_salvaged",
         "worktree_pruned",
         "worktree_cleanup_deferred",
+        "main_worktree_stale",
     }:
         return _reduce_artifact
     if kind in {

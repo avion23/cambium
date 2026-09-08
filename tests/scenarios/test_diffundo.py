@@ -339,7 +339,8 @@ def test_pinned_death_stays_on_sibling_on_next_call() -> None:
         healthy.close()
 
 
-def test_pinned_timeout_falls_back_to_sibling_and_records_origin() -> None:
+def test_pinned_timeout_stays_on_pinned_lane() -> None:
+    # ponytail: timeout is soft; a pinned lane waits instead of spending on Luna.
     pinned = FakeServer([(200, _ok_payload("late", model="m-pinned"), 0.1)])
     sibling = FakeServer([(200, _ok_payload("served by sibling", model="m-sibling"), 0.0)])
     router = Diffundo(
@@ -358,11 +359,12 @@ def test_pinned_timeout_falls_back_to_sibling_and_records_origin() -> None:
         pause_timeout_s=0.01,
     )
     try:
-        result = asyncio.run(router.call(ProviderTier.FAST, PROMPT, model="m-pinned"))
-        assert result.provider == "p_sibling"
-        assert result.fell_back_from == "p_timeout"
+        with pytest.raises(AllProvidersFailed) as raised:
+            asyncio.run(router.call(ProviderTier.FAST, PROMPT, model="m-pinned"))
+        error = cast(ProviderError, raised.value.last_error)
+        assert error.outcome is ProviderOutcome.TIMEOUT
         assert len(pinned.calls) == 1
-        assert len(sibling.calls) == 1
+        assert sibling.calls == []
         assert router.health("p_timeout") is HealthState.COOLDOWN
     finally:
         pinned.close()

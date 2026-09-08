@@ -2536,6 +2536,7 @@ class _Runtime:
         self._merge_lock = asyncio.Lock()
         self._rid = 0
         self._last_envelope: dict[str, Any] | None = None
+        self._primary_worktree_states: dict[str, dict[str, Any]] = {}
         # Dynamic child admission state (implementation-plan step 2).
         self._session_tasks: list[dict[str, Any]] = []
         # Each proposal is tagged with the generation that emitted it. A
@@ -3004,6 +3005,74 @@ class _Runtime:
             start_new_session=True,
         )
         return result.stdout if result.returncode == 0 else b""
+
+    async def _resync_primary_worktree(
+        self,
+        repo: Path,
+        old_ref: str,
+        new_ref: str,
+        *,
+        task_id: str,
+        generation: int,
+        deferred_observers: list[tuple[dict[str, Any], bool]],
+    ) -> None:
+        # ponytail: clean-only refresh; read-tree fails closed on collisions.
+        state: dict[str, Any] = {"repo": str(repo), "stale": False, "resynced": False}
+        self._primary_worktree_states[task_id] = state
+
+        async def stale(reason: str, lines: Sequence[str] = ()) -> None:
+            paths = [line[3:].strip()[:256] for line in lines if len(line) > 3][:16]
+            state.update({"stale": True, "reason": reason, "dirty_paths": paths})
+            await self.emit(
+                "main_worktree_stale",
+                task_id=task_id,
+                repo=str(repo),
+                old=old_ref,
+                new=new_ref,
+                reason=reason,
+                dirty=True,
+                dirty_paths=paths,
+                generation=generation,
+                _deferred_observers=deferred_observers,
+            )
+
+        try:
+            branch = await self._git_stdout(
+                repo, "symbolic-ref", "--quiet", "--short", "HEAD", check=False
+            )
+            if branch != "main":
+                await stale("branch")
+                return
+            for args in (
+                ("diff", "--no-ext-diff", "--quiet", old_ref, "--"),
+                ("diff", "--cached", "--no-ext-diff", "--quiet", old_ref, "--"),
+            ):
+                result = await self._git(repo, *args, check=False)
+                if result.returncode not in (0, 1):
+                    await stale("diff_failed")
+                    return
+                if result.returncode == 1:
+                    status = await self._git(
+                        repo,
+                        "status",
+                        "--porcelain=v1",
+                        "--untracked-files=all",
+                        check=False,
+                    )
+                    lines = status.stdout.splitlines() if status.returncode == 0 else []
+                    await stale("dirty", lines)
+                    return
+            refreshed = await self._git(repo, "read-tree", "-m", "-u", "main", check=False)
+            if refreshed.returncode != 0:
+                status = await self._git(
+                    repo, "status", "--porcelain=v1", "--untracked-files=all", check=False
+                )
+                lines = status.stdout.splitlines() if status.returncode == 0 else []
+                await stale("read_tree_failed", lines)
+                return
+            state["resynced"] = True
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+            await stale("resync_failed")
 
     def _retain_salvage_ref(self, task_id: str, salvage_ref: str) -> None:
         self._salvage_refs[task_id] = salvage_ref
@@ -8233,6 +8302,14 @@ class _Runtime:
                     _deferred_observers=deferred,
                 )
                 committed_persisted = True
+                await self._resync_primary_worktree(
+                    repo,
+                    current_main,
+                    staging_tip,
+                    task_id=task_id,
+                    generation=handle.generation,
+                    deferred_observers=deferred,
+                )
                 parent_task_id = spec.get("parent_task_id")
                 if isinstance(parent_task_id, str) and staging_tip is not None:
                     self._accepted_integration_heads[parent_task_id] = staging_tip
@@ -9249,6 +9326,16 @@ def _build_session_result(
         unified_diff = ""
         diff_truncated = False
         summary = ""
+    for result in results:
+        state = runtime._primary_worktree_states.get(result.task_id)
+        if isinstance(state, dict) and state.get("stale") is True:
+            reason = state.get("reason") or "unknown"
+            summary = (
+                f"{summary.rstrip()} | primary worktree stale ({reason}); "
+                "caller-owned edits preserved"
+                if summary.strip()
+                else f"primary worktree stale ({reason}); caller-owned edits preserved"
+            )
     return Result(
         status=status,
         exit_code=EXIT_CODES[status],

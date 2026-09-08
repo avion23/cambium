@@ -2845,13 +2845,7 @@ class Diffundo:
                         lease is not None
                         and lease.provider == provider.name
                         and lease.model == provider.model
-                        and (
-                            exc.is_real_death
-                            or (
-                                exc.outcome is ProviderOutcome.TIMEOUT
-                                and provider.name == self._pinned_provider
-                            )
-                        )
+                        and exc.is_real_death
                     ):
                         # A lease keeps a healthy incumbent sticky, but a
                         # terminally dead holder no longer owns the semantic
@@ -2861,13 +2855,15 @@ class Diffundo:
                         self._provider_lease = None
                     tried.append(provider.name)
                     last_error = exc
-                    pinned_fallback = (
-                        self._pinned_provider is not None
-                        and provider.name == self._pinned_provider
-                        and (exc.is_real_death or exc.outcome is ProviderOutcome.TIMEOUT)
+                    pinned_fallback = exc.is_real_death and (
+                        (
+                            self._pinned_provider is not None
+                            and provider.name == self._pinned_provider
+                        )
+                        or (model is not None and allow_model_substitution)
                     )
                     if pinned_fallback:
-                        fallback_origin = self._pinned_provider
+                        fallback_origin = provider.name
                         existing = {item.name for item in pending}
                         if existing:
                             fallback_triggered = True
@@ -3155,7 +3151,22 @@ class Diffundo:
                 and provider.model != requested_model
                 and provider.allow_model_substitution
             ]
-            candidates = [*exact, *substitutes]
+            if exact:
+                # ponytail: exact lane wins; a sibling serves only via the
+                # hard-death fallback in call(), never by silent switch.
+                return exact
+            declared = any(
+                item.tier is tier
+                and item.enabled
+                and item.model == requested_model
+                and item.name not in self._terminal_death_providers
+                for item in self._providers
+            )
+            if declared:
+                # ponytail: exact lane exists but is softly unavailable
+                # (cooldown/open/rate-limit) -> wait, don't spend on Luna.
+                return []
+            return substitutes
         return candidates
 
     def _candidates_unleased(
