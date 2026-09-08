@@ -98,6 +98,19 @@ class _DispatchProbe(supervisor._Runtime):
         self.records.append((kind, payload))
 
 
+def _generation_state() -> SimpleNamespace:
+    """Return the mutable state fields used by generation event handlers."""
+    return SimpleNamespace(
+        task_id="task",
+        generation=3,
+        turn=0,
+        loop=asyncio.get_running_loop(),
+        heartbeat_phase=None,
+        last_heartbeat=None,
+        handle=SimpleNamespace(last_heartbeat=None),
+    )
+
+
 def test_ok_ack_is_known_but_unknown_wire_type_stays_visible() -> None:
     runtime = _DispatchProbe()
     state = SimpleNamespace(task_id="task", generation=3)
@@ -128,6 +141,22 @@ def test_ok_ack_is_known_but_unknown_wire_type_stays_visible() -> None:
         },
     )
 
+    handled = asyncio.run(
+        runtime._handle_generation_message(
+            state,
+            {"type": "synthetic_external_probe", "task_id": "other", "generation": 2},
+        )
+    )
+    assert handled is False
+    assert runtime.records[-1] == (
+        "protocol",
+        {
+            "task_id": "task",
+            "generation": 3,
+            "note": "synthetic_external_probe rejected: identity mismatch",
+        },
+    )
+
 
 def test_ok_ack_rejects_stale_worker_identity() -> None:
     runtime = _DispatchProbe()
@@ -150,3 +179,246 @@ def test_ok_ack_rejects_stale_worker_identity() -> None:
             },
         )
     ]
+
+
+def test_ready_identity_fence_runs_after_request_correlation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _DispatchProbe()
+    state = SimpleNamespace(task_id="task", generation=3, init_rid="init", proc=None)
+    killed: list[Any] = []
+
+    async def kill(proc: Any) -> None:
+        killed.append(proc)
+
+    monkeypatch.setattr(supervisor, "_kill_worker", kill)
+    handled = asyncio.run(
+        runtime._handle_generation_message(
+            state,
+            {
+                "type": "ready",
+                "request_id": "init",
+                "task_id": "other",
+                "generation": 2,
+                "proto": 1,
+            },
+        )
+    )
+
+    assert handled is True
+    assert state.protocol_reason == "ready_identity_mismatch"
+    assert killed == [None]
+    assert runtime.records == [
+        (
+            "protocol",
+            {
+                "task_id": "task",
+                "generation": 3,
+                "request_id": "init",
+                "note": "ready identity mismatch",
+                "expected_task_id": "task",
+                "expected_generation": 3,
+            },
+        )
+    ]
+
+
+def test_eof_probe_rejects_mismatched_pong_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _DispatchProbe()
+    runtime._next_rid = lambda: "pong-rid"  # type: ignore[method-assign]
+
+    async def write_json(*_args: Any, **_kwargs: Any) -> bool:
+        return True
+
+    monkeypatch.setattr(supervisor, "_write_json", write_json)
+    async def scenario() -> bool:
+        loop = asyncio.get_running_loop()
+        state = SimpleNamespace(
+            task_id="task",
+            generation=3,
+            proc=SimpleNamespace(returncode=None),
+            loop=loop,
+            wall_deadline=loop.time() + 1.0,
+            messages=asyncio.Queue(),
+        )
+        state.messages.put_nowait(
+            {
+                "type": "pong",
+                "request_id": "pong-rid",
+                "task_id": "other",
+                "generation": 2,
+            }
+        )
+        state.messages.put_nowait(None)
+        return await runtime._probe_after_eof(state)
+
+    assert asyncio.run(scenario()) is False
+    assert [kind for kind, _payload in runtime.records] == ["ping", "protocol", "protocol"]
+    assert runtime.records[1][1]["note"] == "pong rejected: identity mismatch"
+    assert runtime.records[2][1]["note"] == "missing correlated pong after EOF"
+
+
+@pytest.mark.parametrize(
+    ("message_type", "message"),
+    [
+        (
+            "tool_event",
+            {
+                "type": "tool_event",
+                "task_id": "other",
+                "generation": 3,
+                "tool": "run_shell",
+                "turn": 7,
+                "ok": True,
+                "duration_ms": 1,
+            },
+        ),
+        (
+            "tool_event",
+            {
+                "type": "tool_event",
+                "task_id": "task",
+                "generation": 2,
+                "tool": "run_shell",
+                "turn": 7,
+                "ok": True,
+                "duration_ms": 1,
+            },
+        ),
+        (
+            "heartbeat",
+            {
+                "type": "heartbeat",
+                "task_id": "other",
+                "generation": 3,
+                "turn": 7,
+                "status": "working",
+            },
+        ),
+        (
+            "heartbeat",
+            {
+                "type": "heartbeat",
+                "task_id": "task",
+                "generation": 2,
+                "turn": 7,
+                "status": "working",
+            },
+        ),
+        (
+            "heartbeat",
+            {
+                "type": "heartbeat",
+                "task_id": "task",
+                "generation": True,
+                "turn": 7,
+                "status": "working",
+            },
+        ),
+    ],
+)
+def test_stale_generation_events_cannot_mutate_or_persist_as_current(
+    message_type: str, message: dict[str, Any]
+) -> None:
+    runtime = _DispatchProbe()
+
+    async def scenario() -> SimpleNamespace:
+        state = _generation_state()
+        handled = await runtime._handle_generation_message(state, message)
+        assert handled is False
+        return state
+
+    state = asyncio.run(scenario())
+
+    assert state.turn == 0
+    assert state.last_heartbeat is None
+    assert state.handle.last_heartbeat is None
+    assert [kind for kind, _payload in runtime.records] == ["protocol"]
+    kind, payload = runtime.records[0]
+    assert kind == "protocol"
+    assert payload["task_id"] == "task"
+    assert payload["generation"] == 3
+    assert payload["note"] == f"{message_type} rejected: identity mismatch"
+
+
+@pytest.mark.parametrize(
+    ("message_type", "message"),
+    [
+        (
+            "tool_event",
+            {
+                "type": "tool_event",
+                "task_id": "task",
+                "generation": 3,
+                "tool": "run_shell",
+                "turn": 7,
+                "ok": True,
+                "duration_ms": 1,
+            },
+        ),
+        (
+            "heartbeat",
+            {
+                "type": "heartbeat",
+                "task_id": "task",
+                "generation": 3,
+                "turn": 7,
+                "status": "working",
+            },
+        ),
+    ],
+)
+def test_current_generation_events_mutate_and_persist(
+    message_type: str, message: dict[str, Any]
+) -> None:
+    runtime = _DispatchProbe()
+
+    async def scenario() -> SimpleNamespace:
+        state = _generation_state()
+        handled = await runtime._handle_generation_message(state, message)
+        assert handled is False
+        return state
+
+    state = asyncio.run(scenario())
+
+    assert state.turn == 7
+    if message_type == "heartbeat":
+        assert state.last_heartbeat is not None
+        assert state.handle.last_heartbeat == state.last_heartbeat
+    else:
+        assert state.last_heartbeat is None
+    assert [kind for kind, _payload in runtime.records] == [message_type]
+    kind, payload = runtime.records[0]
+    assert kind == message_type
+    assert payload["task_id"] == "task"
+    assert payload["generation"] == 3
+    assert payload["turn"] == 7
+
+
+@pytest.mark.parametrize(
+    ("message_type", "message"),
+    [
+        (
+            "tool_event",
+            {"type": "tool_event", "tool": "run_shell", "turn": 7, "ok": True},
+        ),
+        ("heartbeat", {"type": "heartbeat", "turn": 7, "status": "working"}),
+    ],
+)
+def test_generation_events_without_identity_remain_compatible(
+    message_type: str, message: dict[str, Any]
+) -> None:
+    runtime = _DispatchProbe()
+
+    async def scenario() -> SimpleNamespace:
+        state = _generation_state()
+        handled = await runtime._handle_generation_message(state, message)
+        assert handled is False
+        return state
+
+    state = asyncio.run(scenario())
+
+    assert state.turn == 7
+    assert [kind for kind, _payload in runtime.records] == [message_type]

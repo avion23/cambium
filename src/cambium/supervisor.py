@@ -731,16 +731,29 @@ def _protocol_version_mismatch(msg: dict[str, Any]) -> bool:
 
 def _result_identity_note(msg: Mapping[str, Any], task_id: str, generation: int) -> str | None:
     """Return why a result envelope fails worker identity, or None."""
+    identity_field = _claimed_identity_mismatch(msg, task_id, generation)
+    return f"result {identity_field} mismatch" if identity_field is not None else None
+
+
+def _claimed_identity_mismatch(
+    msg: Mapping[str, Any], task_id: str, generation: int
+) -> str | None:
+    """Return a claimed identity field that does not match this generation.
+
+    Worker identity fields are optional for compatibility with older/custom
+    workers. A non-null claim must still be exact; malformed generation values
+    are claims too and fail closed.
+    """
     claimed_task = msg.get("task_id")
     if claimed_task is not None and claimed_task != task_id:
-        return "result task_id mismatch"
+        return "task_id"
     claimed_generation = msg.get("generation")
     if claimed_generation is not None and (
         isinstance(claimed_generation, bool)
         or not isinstance(claimed_generation, int)
         or claimed_generation != generation
     ):
-        return "result generation mismatch"
+        return "generation"
     return None
 
 
@@ -6027,6 +6040,14 @@ class _Runtime:
                     got=response.get("request_id"),
                 )
                 continue
+            if _claimed_identity_mismatch(response, state.task_id, state.generation) is not None:
+                await self.emit(
+                    "protocol",
+                    task_id=state.task_id,
+                    generation=state.generation,
+                    note="pong rejected: identity mismatch",
+                )
+                continue
             await self.emit(
                 "pong",
                 task_id=state.task_id,
@@ -6129,6 +6150,19 @@ class _Runtime:
                 note="ready request_id mismatch",
                 expected=state.init_rid,
                 got=msg.get("request_id"),
+            )
+            await _kill_worker(state.proc)
+            return True
+        if _claimed_identity_mismatch(msg, state.task_id, state.generation) is not None:
+            state.protocol_reason = "ready_identity_mismatch"
+            await self.emit(
+                "protocol",
+                task_id=state.task_id,
+                generation=state.generation,
+                request_id=msg.get("request_id"),
+                note="ready identity mismatch",
+                expected_task_id=state.task_id,
+                expected_generation=state.generation,
             )
             await _kill_worker(state.proc)
             return True
@@ -6765,6 +6799,20 @@ class _Runtime:
             )
             await _kill_worker(state.proc)
             return True
+        # Identity is optional for compatibility workers, but any non-null
+        # claim must belong to this task generation. Result keeps its existing
+        # request-correlation path; ready performs its request check before
+        # its dedicated identity fence.
+        if mtype not in ("ready", "result", "result_envelope"):
+            identity_field = _claimed_identity_mismatch(msg, state.task_id, state.generation)
+            if identity_field is not None:
+                await self.emit(
+                    "protocol",
+                    task_id=state.task_id,
+                    generation=state.generation,
+                    note=f"{mtype} rejected: identity mismatch",
+                )
+                return False
         handled = await self._handle_generation_protocol_message(state, msg)
         if handled is not None:
             return handled
@@ -6896,7 +6944,8 @@ class _Runtime:
         return _GenOutcome(
             clean=clean,
             fatal=state.protocol_failure is not None
-            or state.protocol_reason == "ready_request_id_mismatch",
+            or state.protocol_reason
+            in {"ready_request_id_mismatch", "ready_identity_mismatch"},
             reason=state.protocol_failure or state.protocol_reason or reason,
             timeout_phase=state.timeout_phase,
             exit_code=exit_code,
