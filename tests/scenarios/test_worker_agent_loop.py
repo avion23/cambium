@@ -185,6 +185,7 @@ class _SummaryFlushRouter:
         )
         self.prompts: list[dict[str, Any]] = []
         self.allow_model_substitution: list[bool] = []
+        self.max_call_budget_s: list[float | None] = []
 
     def declared_model(self, name: str) -> str:
         return ""
@@ -197,10 +198,12 @@ class _SummaryFlushRouter:
         model: str | None = None,
         budget_usd: float | None = None,
         allow_model_substitution: bool = False,
+        max_call_budget_s: float | None = None,
     ) -> _FakeCallResult:
         del tier, model, budget_usd
         self.prompts.append(prompt)
         self.allow_model_substitution.append(allow_model_substitution)
+        self.max_call_budget_s.append(max_call_budget_s)
         messages = prompt.get("messages")
         control_content = None
         if isinstance(messages, list):
@@ -454,12 +457,32 @@ def test_semantic_child_summary_substitution_and_failure(tmp_path: Path, all_dea
     )
     outcome = asyncio.run(_drive_loop(config, worktree, router))
     assert router.allow_model_substitution == [False, True]
+    assert len(router.max_call_budget_s) == 2
+    assert all(
+        isinstance(value, float) and 0.0 < value <= config.max_wall_s
+        for value in router.max_call_budget_s
+    )
     if all_dead:
         assert outcome["status"] == "failed"
         assert "summary provider call failed" in outcome["failure_reason"]
     else:
         assert outcome["status"] == "suspended"
         assert outcome["provider"] == "healthy-substitute"
+
+
+def test_agent_call_receives_remaining_wall_cap(tmp_path: Path) -> None:
+    worktree = _make_worktree(tmp_path / "repo")
+    config = _agent_config(worktree, context_reuse=False, max_wall_s=1.0)
+    router = _SummaryFlushRouter(
+        responses=['{"type":"finish","summary":"done","objective_met":true}']
+    )
+
+    outcome = asyncio.run(_drive_loop(config, worktree, router))
+
+    assert outcome["status"] == "succeeded"
+    assert len(router.max_call_budget_s) == 1
+    budget = router.max_call_budget_s[0]
+    assert isinstance(budget, float) and 0.0 < budget <= config.max_wall_s
 
 
 def test_finish_keeps_raw_evidence_without_summary_call(tmp_path: Path) -> None:

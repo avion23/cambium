@@ -1765,7 +1765,11 @@ def _delta_callback_keyword(caller: Callable[..., Any]) -> str | None:
 
 
 async def _call_provider(
-    caller: Callable[..., Any], progress: AgentProgress, *args: Any, **kwargs: Any
+    caller: Callable[..., Any],
+    progress: AgentProgress,
+    *args: Any,
+    remaining_wall_s: float | None = None,
+    **kwargs: Any,
 ) -> Any:
     progress.begin_provider_call()
     callback_keyword = _delta_callback_keyword(caller)
@@ -1774,6 +1778,9 @@ async def _call_provider(
     status_keyword = _callback_keyword(caller, "on_status")
     if status_keyword is not None:
         kwargs[status_keyword] = _progress_status_callback(progress)
+    max_budget_keyword = _callback_keyword(caller, "max_call_budget_s")
+    if max_budget_keyword is not None and remaining_wall_s is not None:
+        kwargs[max_budget_keyword] = remaining_wall_s
     return await caller(*args, **kwargs)
 
 
@@ -5589,6 +5596,9 @@ async def _bound_context_continuation(
         summary_entry: SummaryEntry | None = None
         for summary_attempt in range(2):
             sent_summary_prompt = copy.deepcopy(summary_prompt)
+            remaining_wall_s = wall_deadline - time.monotonic()
+            if remaining_wall_s <= 0:
+                raise ContextForkError("wall budget exceeded during summary flush")
             try:
                 summary_caller = getattr(router, "summary_call", None)
                 if callable(summary_caller):
@@ -5600,6 +5610,7 @@ async def _bound_context_continuation(
                         summary_prompt,
                         model=model,
                         budget_usd=budget_usd,
+                        remaining_wall_s=remaining_wall_s,
                         # Summary entries are provider-neutral semantic state;
                         # unlike the agent transcript, they may be generated
                         # by a configured sibling when the pinned endpoint is
@@ -5614,6 +5625,7 @@ async def _bound_context_continuation(
                         summary_prompt,
                         model=model,
                         budget_usd=budget_usd,
+                        remaining_wall_s=remaining_wall_s,
                         allow_model_substitution=True,
                     )
             except Exception as exc:
@@ -5640,6 +5652,8 @@ async def _bound_context_continuation(
                     continue
                 if content_flagged:
                     raise ContextForkError("summary flagged by provider content filter") from exc
+                if time.monotonic() >= wall_deadline:
+                    raise ContextForkError("wall budget exceeded during summary flush") from exc
                 detail = exc.__class__.__name__
                 if isinstance(exc, AllProvidersFailed) and exc.last_error is not None:
                     inner = exc.last_error
@@ -5972,6 +5986,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
     finalized = False
     forced_finalization = False
     finalization_grace_used = False
+    final_synthesis_call = False
     transcript: list[dict[str, Any]] = []
     tools = _exposed_tool_schemas(config)
     repository, branch = _situation_git_identity(worktree)
@@ -6387,6 +6402,16 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
             # A provider adapter is allowed to normalize its local request, but
             # the epoch must describe the exact object Cambium submitted.
             sent_prompt = copy.deepcopy(prompt)
+            remaining_wall_s = wall_deadline - time.monotonic()
+            if remaining_wall_s <= 0:
+                return _loop_result(
+                    outcome,
+                    "failed",
+                    _phase_failure("wall budget exceeded", final_synthesis=final_synthesis_call),
+                    turn - 1,
+                    cumulative_usage,
+                    transcript,
+                )
             try:
                 result = await _call_provider(
                     router.call,
@@ -6395,6 +6420,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                     prompt,
                     model=model,
                     budget_usd=budget_usd,
+                    remaining_wall_s=remaining_wall_s,
                 )
             except Exception as exc:
                 failure_event = _failure_usage_event(
@@ -6407,8 +6433,11 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                     situation_provenance=situation_provenance,
                 )
                 budget_failure = final_synthesis_call and budget_new_tokens >= soft_cap
+                wall_failure = time.monotonic() >= wall_deadline
                 failure_reason = (
-                    "token budget exceeded"
+                    "wall budget exceeded"
+                    if wall_failure
+                    else "token budget exceeded"
                     if budget_failure
                     else _provider_call_failure_reason(exc)
                 )
@@ -7293,6 +7322,16 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
             outcome,
             "failed",
             f"no terminal action before turn limit ({config.max_turns})",
+            progress.turn,
+            cumulative_usage,
+            transcript,
+        )
+    except ContextForkError as exc:
+        reason = str(exc).strip() or "context continuation failed"
+        return _loop_result(
+            outcome,
+            "failed",
+            _phase_failure(reason, final_synthesis=final_synthesis_call),
             progress.turn,
             cumulative_usage,
             transcript,

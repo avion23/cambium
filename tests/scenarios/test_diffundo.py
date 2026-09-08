@@ -31,8 +31,10 @@ from typing import Any, cast
 import pytest
 from diffundo_helpers import PROMPT, FakeServer, _config, _error_payload, _ok_payload
 
+from cambium import diffundo as diffundo_module
 from cambium.diffundo import (
     AllProvidersFailed,
+    CallResult,
     Diffundo,
     HealthState,
     PromptStructureError,
@@ -993,6 +995,41 @@ def test_403_invalid_credential_is_quarantined_until_key_changes() -> None:
         server.close()
 
 
+def test_environment_credential_rotation_reopens_auth_quarantine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env_name = "K_ROTATE_ENV"
+    first_key = "sk-test-K_ROTATE_ENV-first"
+    second_key = "sk-test-K_ROTATE_ENV-second"
+    monkeypatch.setenv(env_name, first_key)
+    provider = ProviderConfig(
+        name="p_rotate_env",
+        tier=ProviderTier.FAST,
+        base_url="http://127.0.0.1",
+        api_key_env=env_name,
+        api_key=None,
+        model="m-rotate-env",
+    )
+    router = Diffundo((provider,))
+
+    # Exercise the same auth-quarantine bookkeeping used for an AUTH_ERROR,
+    # without opening a socket or making a provider request.
+    router._record_disable(provider, auth_quarantine=True)
+    runtime = router._runtime(provider.name)
+    fingerprint = runtime.auth_quarantine_fingerprint
+    assert fingerprint is not None
+    assert first_key not in fingerprint
+    assert second_key not in fingerprint
+    assert router.status(provider.name) is ProviderStatus.DISABLED
+
+    # Diffundo resolves environment credentials at call time. A rotation must
+    # release the quarantine while keeping the credential out of stored state.
+    monkeypatch.setenv(env_name, second_key)
+    assert router.status(provider.name) is ProviderStatus.AVAILABLE
+    assert runtime.auth_quarantine_fingerprint is None
+    assert router.health(provider.name) is HealthState.UNKNOWN
+
+
 def test_403_missing_model_entitlement_is_config_error() -> None:
     server = FakeServer(
         [
@@ -1552,6 +1589,97 @@ def test_call_budget_outer_deadline_bounds_threaded_post(monkeypatch) -> None:
         assert await asyncio.to_thread(finished.wait, 1.0)
 
     asyncio.run(scenario())
+
+
+def test_max_call_budget_cap_does_not_extend_configured_budget(monkeypatch) -> None:
+    provider = ProviderConfig(
+        name="p_budget_cap",
+        tier=ProviderTier.FAST,
+        base_url="http://127.0.0.1:1",
+        api_key_env="K_BUDGET_CAP",
+        api_key="sk-test-budget-cap",
+        model="budget-model",
+    )
+    router = Diffundo((provider,), call_budget_s=0.2, pause_timeout_s=0.0)
+    observed: list[float] = []
+    monkeypatch.setattr(diffundo_module.time, "monotonic", lambda: 100.0)
+
+    async def capture_attempt(
+        _self: Diffundo,
+        _provider: ProviderConfig,
+        _prompt: dict[str, Any],
+        *,
+        deadline: float | None = None,
+        on_delta: Any = None,
+    ) -> CallResult:
+        del on_delta
+        assert deadline is not None
+        observed.append(deadline - time.monotonic())
+        return CallResult(
+            provider=_provider.name,
+            model=_provider.model,
+            tier=_provider.tier,
+            content="ok",
+            latency_s=0.0,
+            usage={"total_tokens": 1},
+        )
+
+    monkeypatch.setattr(Diffundo, "_attempt", capture_attempt)
+    result = asyncio.run(router.call(ProviderTier.FAST, PROMPT, max_call_budget_s=1.0))
+
+    assert result.content == "ok"
+    assert len(observed) == 1
+    # A cap above the configured logical budget must not extend that budget.
+    assert observed == [pytest.approx(0.2)]
+
+
+def test_summary_call_keeps_headroom_and_honors_wall_cap(monkeypatch) -> None:
+    provider = ProviderConfig(
+        name="p_summary_budget",
+        tier=ProviderTier.FAST,
+        base_url="http://127.0.0.1:1",
+        api_key_env="K_SUMMARY_BUDGET",
+        api_key="sk-test-summary-budget",
+        model="summary-model",
+    )
+    router = Diffundo(
+        (provider,),
+        call_budget_s=0.05,
+        summary_call_budget_s=0.2,
+        pause_timeout_s=0.0,
+    )
+    observed: list[float] = []
+    monkeypatch.setattr(diffundo_module.time, "monotonic", lambda: 100.0)
+
+    async def capture_attempt(
+        _self: Diffundo,
+        _provider: ProviderConfig,
+        _prompt: dict[str, Any],
+        *,
+        deadline: float | None = None,
+        on_delta: Any = None,
+    ) -> CallResult:
+        del on_delta
+        assert deadline is not None
+        observed.append(deadline - time.monotonic())
+        return CallResult(
+            provider=_provider.name,
+            model=_provider.model,
+            tier=_provider.tier,
+            content="ok",
+            latency_s=0.0,
+            usage={"total_tokens": 1},
+        )
+
+    monkeypatch.setattr(Diffundo, "_attempt", capture_attempt)
+    asyncio.run(router.summary_call(ProviderTier.FAST, PROMPT, max_call_budget_s=1.0))
+    asyncio.run(router.summary_call(ProviderTier.FAST, PROMPT, max_call_budget_s=0.07))
+
+    assert len(observed) == 2
+    # Summary calls retain their configured headroom when the cap permits it.
+    assert observed[0] == pytest.approx(0.2)
+    # A short worker-wall cap bounds the larger summary budget.
+    assert observed[1] == pytest.approx(0.07)
 
 
 @pytest.mark.slow  # 0.3s scripted provider delays; timing assertion

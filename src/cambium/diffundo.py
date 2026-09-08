@@ -2722,6 +2722,7 @@ class Diffundo:
         allow_model_substitution: bool = False,
         requirements: Mapping[str, Any] | None = None,
         call_budget_s: float | None = None,
+        max_call_budget_s: float | None = None,
         on_delta: Callable[[str, str], None] | None = None,
         on_status: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> CallResult:
@@ -2737,7 +2738,8 @@ class Diffundo:
         authorizes a task to switch models. When every tier provider is
         unavailable the dispatch pauses on an ``asyncio.Event`` and a recovery
         monitor wakes it (D8f); if nothing recovers within the bounded pause
-        window, raises ``AllProvidersFailed``.
+        window, raises ``AllProvidersFailed``. ``max_call_budget_s`` can impose
+        an outer cap without extending the configured logical budget.
         """
         validate_prompt_structure(prompt)
         effective_call_budget_s = self._call_budget_s if call_budget_s is None else call_budget_s
@@ -2748,6 +2750,15 @@ class Diffundo:
             or effective_call_budget_s <= 0
         ):
             raise ValueError("call_budget_s must be a finite positive number")
+        if max_call_budget_s is not None:
+            if (
+                isinstance(max_call_budget_s, bool)
+                or not isinstance(max_call_budget_s, int | float)
+                or not math.isfinite(float(max_call_budget_s))
+                or max_call_budget_s <= 0
+            ):
+                raise ValueError("max_call_budget_s must be a finite positive number")
+            effective_call_budget_s = min(float(effective_call_budget_s), float(max_call_budget_s))
         routing_model = None if self._fallback_origin is not None else model
         request = self._routing_request(
             prompt,
@@ -2906,6 +2917,7 @@ class Diffundo:
         budget_usd: float | None = None,
         allow_model_substitution: bool = False,
         requirements: Mapping[str, Any] | None = None,
+        max_call_budget_s: float | None = None,
         on_delta: Callable[[str, str], None] | None = None,
         on_status: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> CallResult:
@@ -2915,7 +2927,10 @@ class Diffundo:
         must produce a structured entry, so they can take materially longer
         than the short action calls that precede them.  This remains the same
         router (and therefore the same provider lease/cascade); only its
-        bounded transport deadline is extended for the summary call.
+        bounded transport deadline is extended for the summary call.  A
+        caller-supplied maximum acts as an upper bound so a worker task wall
+        deadline can cap the extra summary headroom without removing it when
+        the wall budget is ample.
         """
         return await self.call(
             tier,
@@ -2925,6 +2940,7 @@ class Diffundo:
             allow_model_substitution=allow_model_substitution,
             requirements=requirements,
             call_budget_s=self._summary_call_budget_s,
+            max_call_budget_s=max_call_budget_s,
             on_delta=on_delta,
             on_status=on_status,
         )
@@ -3932,9 +3948,9 @@ class Diffundo:
                 )
         else:
             api_key = provider.api_key
-            material = (
-                b"api-key:missing" if api_key is None else b"api-key:" + api_key.encode("utf-8")
-            )
+            if api_key is None:
+                api_key = os.environ.get(provider.api_key_env, "")
+            material = b"api-key:" + api_key.encode("utf-8")
         return hashlib.sha256(material).hexdigest()
 
     def _release_auth_quarantine(self, runtime: _ProviderRuntime) -> None:
