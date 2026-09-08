@@ -3447,6 +3447,40 @@ class Diffundo:
 
     # -- provider attempt ---------------------------------------------------- #
 
+    @staticmethod
+    async def _reconcile_quota(
+        ledger: QuotaLedger,
+        reservation: Any,
+        windows: Sequence[QuotaWindowSpec],
+        actual_tokens: int,
+    ) -> None:
+        """Complete one quota reconciliation before surfacing cancellation."""
+        reconcile_task = asyncio.create_task(
+            asyncio.to_thread(ledger.reconcile, reservation, windows, actual_tokens)
+        )
+        try:
+            await asyncio.shield(reconcile_task)
+        except asyncio.CancelledError:
+            try:
+                await asyncio.shield(reconcile_task)
+            except BaseException as exc:
+                # Accounting failure is more important than reporting a clean
+                # cancellation with an unreconciled shared reservation.
+                raise exc
+            raise
+
+    @staticmethod
+    def _quota_timeout(
+        provider: ProviderConfig, cause: BaseException | None = None
+    ) -> ProviderError:
+        return ProviderError(
+            provider.name,
+            ProviderOutcome.TIMEOUT,
+            "call budget exhausted",
+            cause,
+            budget_exhausted=True,
+        )
+
     async def _attempt(
         self,
         provider: ProviderConfig,
@@ -3491,7 +3525,7 @@ class Diffundo:
                 except BaseException:
                     reservation = None
                 if reservation is not None:
-                    await asyncio.to_thread(ledger.reconcile, reservation, policy.quota_windows, 0)
+                    await self._reconcile_quota(ledger, reservation, policy.quota_windows, 0)
                 raise
             except QuotaLedgerBusyError as exc:
                 exhausted = deadline is not None and self._remaining(deadline) <= 0
@@ -3510,36 +3544,45 @@ class Diffundo:
                     ProviderOutcome.QUOTA,
                     "configured subscription quota window is exhausted",
                 )
+            if deadline is not None and self._remaining(deadline) <= 0:
+                await self._reconcile_quota(ledger, reservation, policy.quota_windows, 0)
+                raise self._quota_timeout(policy)
         try:
             result = await self._quota_wrapped_attempt(
                 provider, prompt, deadline=deadline, on_delta=on_delta
             )
         except BaseException:
             if reservation is not None and ledger is not None:
-                await asyncio.to_thread(ledger.reconcile, reservation, policy.quota_windows, 0)
+                await self._reconcile_quota(ledger, reservation, policy.quota_windows, 0)
             raise
         if reservation is not None and ledger is not None:
             usage = result.usage if isinstance(result.usage, dict) else {}
             total = usage.get("total_tokens")
             if isinstance(total, bool) or not isinstance(total, int | float) or total < 0:
                 total = estimated_tokens
-            await asyncio.to_thread(ledger.reconcile, reservation, policy.quota_windows, int(total))
-            # Reconciliation is correctness-critical and must complete even if
-            # the provider consumed the remaining logical budget. Snapshot
-            # projection is observability only: cap its busy wait by the call
-            # deadline and omit it when no budget remains.
-            remaining = self._remaining(deadline)
-            if remaining is None or remaining > 0:
-                try:
-                    snapshots = await asyncio.to_thread(
-                        ledger.snapshots, policy.name, deadline=deadline
-                    )
-                except QuotaLedgerBusyError:
-                    snapshots = ()
-                result = replace(
-                    result,
-                    quota_windows=tuple(quota_snapshot_json(snapshot) for snapshot in snapshots),
+            await self._reconcile_quota(
+                ledger,
+                reservation,
+                policy.quota_windows,
+                int(total),
+            )
+            # Reconciliation is correctness-critical and may finish after the
+            # logical budget, but a late cleanup cannot turn an expired call
+            # into success. Snapshot projection is observability-only.
+            if deadline is not None and self._remaining(deadline) <= 0:
+                raise self._quota_timeout(policy)
+            try:
+                snapshots = await asyncio.to_thread(
+                    ledger.snapshots, policy.name, deadline=deadline
                 )
+            except QuotaLedgerBusyError:
+                snapshots = ()
+            if deadline is not None and self._remaining(deadline) <= 0:
+                raise self._quota_timeout(policy)
+            result = replace(
+                result,
+                quota_windows=tuple(quota_snapshot_json(snapshot) for snapshot in snapshots),
+            )
         return result
 
     async def _quota_wrapped_attempt(

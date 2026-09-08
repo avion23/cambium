@@ -192,6 +192,21 @@ def test_busy_reservation_honors_shorter_caller_deadline(
         assert connection.execute("SELECT COUNT(*) FROM quota_reservations").fetchone()[0] == 0
 
 
+def test_expired_reservation_deadline_does_not_open_sqlite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ledger = QuotaLedger(tmp_path / "quota.db")
+    window = QuotaWindowSpec("requests", 60, request_allowance=1)
+    monkeypatch.setattr(provider_state.time, "monotonic", lambda: 10.0)
+
+    def unexpected_connect() -> None:
+        raise AssertionError("expired quota admission must not open SQLite")
+
+    monkeypatch.setattr(ledger, "_connect", unexpected_connect)
+    with pytest.raises(QuotaLedgerBusyError, match="before its deadline"):
+        ledger.reserve("p", (window,), 0, deadline=9.0)
+
+
 def test_busy_reservation_cancellation_wakes_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

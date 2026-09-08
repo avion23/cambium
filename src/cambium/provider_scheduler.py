@@ -701,7 +701,17 @@ class QuotaLedger:
         """
         retry_deadline = time.monotonic() + _BUSY_RETRY_S
         if deadline is not None:
-            retry_deadline = min(retry_deadline, deadline)
+            if (
+                isinstance(deadline, bool)
+                or not isinstance(deadline, int | float)
+                or not math.isfinite(float(deadline))
+            ):
+                raise ValueError("quota retry deadline must be finite")
+            retry_deadline = min(retry_deadline, float(deadline))
+            if retry_deadline <= time.monotonic():
+                raise QuotaLedgerBusyError(
+                    f"quota ledger {operation} remained busy before its deadline"
+                )
         delay = _BUSY_RETRY_INITIAL_SLEEP_S
         while True:
             if cancel_event is not None and cancel_event.is_set():

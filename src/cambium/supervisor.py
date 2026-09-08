@@ -4625,11 +4625,16 @@ class _Runtime:
                 return
             _ensure_lanes(self._lanes, [configured])
             lane = self._lanes[provider_name]
-        if lane.reserve():
+        retry_after_count = 0
+        if self._debt_store is not None:
+            current = self._debt_store.as_mapping().get(provider_name)
+            if current is not None:
+                retry_after_count = current.retry_after_count
+        if lane.reserve(retry_after_count):
             spec["_lane_reserved"] = True
             return
         retry_at: float | None = None
-        lane.has_request_slot()
+        lane.has_request_slot(retry_after_count)
         if (
             lane.request_slots is not None
             and lane.requests_per_minute is not None
@@ -6364,6 +6369,7 @@ class _Runtime:
                 note="result rejected: invalid field(s)",
                 fields=invalid_fields,
             )
+            await _kill_worker(state.proc)
         accepted = (
             state.correlated
             and identity_note is None
@@ -6829,6 +6835,7 @@ class _Runtime:
                 error_type=state.protocol_failure,
                 note="worker fatal_error",
             )
+            await _kill_worker(state.proc)
             return True
         if mtype == "context_checkpoint":
             await self._handle_context_checkpoint_message(state, msg)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -131,6 +132,32 @@ def test_inherited_children_respect_provider_lane_capacity(
     runtime._resolve_assignment(child_spec)
     assert child_spec["_lane_reserved"] is True
     assert runtime._lanes["provider-a"].in_flight == 1
+
+
+def test_inherited_lane_reservation_honors_retry_after_pressure(tmp_path: Path) -> None:
+    runtime, _events = _runtime(tmp_path)
+    debt = SimpleNamespace(retry_after_count=50)
+    runtime._debt_store = SimpleNamespace(as_mapping=lambda: {"provider-a": debt})
+    runtime._lanes["provider-a"] = LaneState(
+        in_flight=1,
+        rpm_allowance=2,
+        max_concurrency=2,
+    )
+    spec: dict[str, Any] = {
+        "task_id": "child",
+        "assigned_provider": "provider-a",
+        "_supervisor_pinned_lane": True,
+    }
+
+    # Retry-After pressure halves the legacy lane cap from two to one.
+    with pytest.raises(LaneCapacityExhausted):
+        runtime._resolve_assignment(spec)
+    assert runtime._lanes["provider-a"].in_flight == 1
+
+    debt.retry_after_count = 0
+    runtime._resolve_assignment(spec)
+    assert spec["_lane_reserved"] is True
+    assert runtime._lanes["provider-a"].in_flight == 2
 
 
 def test_suspended_parent_reacquires_lane_without_overbooking(tmp_path: Path) -> None:

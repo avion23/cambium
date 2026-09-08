@@ -470,6 +470,7 @@ def _result_state() -> SimpleNamespace:
         envelope=None,
         sandbox_failure_reason=None,
         protocol_failure=None,
+        proc=None,
     )
 
 
@@ -486,8 +487,15 @@ def _result_state() -> SimpleNamespace:
         ("failure_reason", {"bad": "shape"}),
     ],
 )
-def test_malformed_result_envelope_fails_at_wire_boundary(field: str, value: Any) -> None:
+def test_malformed_result_envelope_fails_at_wire_boundary(
+    field: str, value: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
     runtime = _DispatchProbe()
+
+    async def kill(_proc: Any) -> None:
+        return None
+
+    monkeypatch.setattr(supervisor, "_kill_worker", kill)
     message: dict[str, Any] = {
         "type": "result_envelope",
         "request_id": "run-1",
@@ -516,9 +524,16 @@ def test_malformed_result_envelope_fails_at_wire_boundary(field: str, value: Any
     assert field in rejection["fields"]
 
 
-def test_fatal_error_cannot_be_superseded_by_late_success() -> None:
+def test_fatal_error_cannot_be_superseded_by_late_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     runtime = _DispatchProbe()
     state = _result_state()
+
+    async def kill(_proc: Any) -> None:
+        return None
+
+    monkeypatch.setattr(supervisor, "_kill_worker", kill)
 
     fatal = asyncio.run(
         runtime._handle_generation_message(

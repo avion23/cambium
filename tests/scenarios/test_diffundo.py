@@ -49,6 +49,7 @@ from cambium.diffundo import (
     prompt_prefix_estimate_tokens,
     validate_prompt_structure,
 )
+from cambium.provider_scheduler import QuotaWindowSpec
 
 
 def _sse(*events: dict[str, Any]) -> bytes:
@@ -1642,6 +1643,134 @@ def test_cancelled_post_consumes_late_failure(monkeypatch: pytest.MonkeyPatch) -
             await operation
         release.set()
         await asyncio.wait_for(consumed.wait(), timeout=1.0)
+
+    asyncio.run(scenario())
+
+
+def test_late_quota_reconciliation_withholds_provider_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ProviderConfig(
+        name="p_late_reconcile",
+        tier=ProviderTier.FAST,
+        base_url="http://127.0.0.1:1",
+        api_key_env="K_LATE_RECONCILE",
+        api_key="sk-test-late-reconcile",
+        model="m-late",
+        max_retries=0,
+        quota_windows=(QuotaWindowSpec("tokens", 60, token_allowance=100_000),),
+    )
+    router = Diffundo((provider,), call_budget_s=0.03, pause_timeout_s=0.0)
+
+    class _Ledger:
+        reconciled: int | None = None
+
+        def reserve(self, *_args: Any, **_kwargs: Any) -> Any:
+            return object()
+
+        def reconcile(self, _reservation: Any, _windows: Any, actual: int) -> None:
+            time.sleep(0.06)
+            self.reconciled = actual
+
+        def snapshots(self, *_args: Any, **_kwargs: Any) -> tuple[Any, ...]:
+            return ()
+
+    ledger = _Ledger()
+    router._quota_ledger = cast(Any, ledger)
+
+    async def successful_attempt(
+        _self: Diffundo,
+        _provider: ProviderConfig,
+        _prompt: dict[str, Any],
+        *,
+        deadline: float | None = None,
+        on_delta: Any = None,
+    ) -> CallResult:
+        del deadline, on_delta
+        return CallResult(
+            provider=_provider.name,
+            model=_provider.model,
+            tier=_provider.tier,
+            content="provider-success",
+            latency_s=0.0,
+            usage={"total_tokens": 7},
+        )
+
+    monkeypatch.setattr(Diffundo, "_quota_wrapped_attempt", successful_attempt)
+    started = time.monotonic()
+    with pytest.raises(AllProvidersFailed) as raised:
+        asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+    elapsed = time.monotonic() - started
+
+    assert elapsed >= 0.05
+    assert ledger.reconciled == 7
+    error = cast(ProviderError, raised.value.last_error)
+    assert error.outcome is ProviderOutcome.TIMEOUT
+    assert error.budget_exhausted is True
+
+
+def test_quota_reconciliation_finishes_before_cancellation_surfaces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ProviderConfig(
+        name="p_cancel_reconcile",
+        tier=ProviderTier.FAST,
+        base_url="http://127.0.0.1:1",
+        api_key_env="K_CANCEL_RECONCILE",
+        api_key="sk-test-cancel-reconcile",
+        model="m-cancel",
+        max_retries=0,
+        quota_windows=(QuotaWindowSpec("tokens", 60, token_allowance=100_000),),
+    )
+    router = Diffundo((provider,), call_budget_s=1.0, pause_timeout_s=0.0)
+    reconcile_started = threading.Event()
+    release = threading.Event()
+    reconciled = threading.Event()
+
+    class _Ledger:
+        def reserve(self, *_args: Any, **_kwargs: Any) -> Any:
+            return object()
+
+        def reconcile(self, _reservation: Any, _windows: Any, _actual: int) -> None:
+            reconcile_started.set()
+            release.wait(timeout=1.0)
+            reconciled.set()
+
+        def snapshots(self, *_args: Any, **_kwargs: Any) -> tuple[Any, ...]:
+            return ()
+
+    router._quota_ledger = cast(Any, _Ledger())
+
+    async def successful_attempt(
+        _self: Diffundo,
+        _provider: ProviderConfig,
+        _prompt: dict[str, Any],
+        *,
+        deadline: float | None = None,
+        on_delta: Any = None,
+    ) -> CallResult:
+        del deadline, on_delta
+        return CallResult(
+            provider=_provider.name,
+            model=_provider.model,
+            tier=_provider.tier,
+            content="provider-success",
+            latency_s=0.0,
+            usage={"total_tokens": 5},
+        )
+
+    monkeypatch.setattr(Diffundo, "_quota_wrapped_attempt", successful_attempt)
+
+    async def scenario() -> None:
+        task = asyncio.create_task(router.call(ProviderTier.FAST, PROMPT))
+        assert await asyncio.to_thread(reconcile_started.wait, 1.0)
+        task.cancel()
+        await asyncio.sleep(0.02)
+        assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert reconciled.is_set()
 
     asyncio.run(scenario())
 
