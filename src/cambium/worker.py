@@ -3158,6 +3158,12 @@ def _native_tool_action(result: CallResult) -> dict[str, Any] | None:
                 ) from exc
         if not isinstance(arguments, dict):
             raise ValueError(f"provider native tool call {index} arguments must be an object")
+        schema = next(schema for schema in TOOL_SCHEMAS if schema["name"] == name)
+        validation_errors = validate_tool_call(schema, arguments)
+        if validation_errors:
+            raise ValueError(
+                f"provider native tool call {index} {validation_errors[0]}"
+            )
         normalized.append({"name": name, "arguments": arguments})
     return {"type": "tool_call", "calls": _normalize_tool_calls({"calls": normalized})}
 

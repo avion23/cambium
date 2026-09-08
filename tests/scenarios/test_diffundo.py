@@ -392,6 +392,39 @@ def test_pinned_429_retry_after_does_not_trigger_fallback() -> None:
         sibling.close()
 
 
+def test_persisted_retry_at_blocks_call_time_pin_until_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [1_000_000.0]
+    monkeypatch.setattr(diffundo_module.time, "time", lambda: now[0])
+    pinned = FakeServer([(200, _ok_payload("pinned", model="m-pinned"), 0.0)])
+    sibling = FakeServer([(200, _ok_payload("must not serve", model="m-sibling"), 0.0)])
+    router = Diffundo(
+        (
+            _config("p_persisted", pinned, "K_PERSISTED_PIN", model="m-pinned"),
+            _config("p_sibling", sibling, "K_PERSISTED_SIBLING", model="m-sibling"),
+        ),
+        primary_provider="p_persisted",
+        debt={"p_persisted": {"retry_at": now[0] + 60.0}},
+        pause_timeout_s=0.01,
+    )
+    try:
+        with pytest.raises(AllProvidersFailed) as raised:
+            asyncio.run(router.call(ProviderTier.FAST, PROMPT, model="m-pinned"))
+        assert raised.value.providers_tried == ()
+        assert pinned.calls == []
+        assert sibling.calls == []
+
+        now[0] += 61.0
+        result = asyncio.run(router.call(ProviderTier.FAST, PROMPT, model="m-pinned"))
+        assert result.provider == "p_persisted"
+        assert len(pinned.calls) == 1
+        assert sibling.calls == []
+    finally:
+        pinned.close()
+        sibling.close()
+
+
 def test_pinned_endpoint_death_without_alternative_remains_fatal() -> None:
     dead = FakeServer([(503, _error_payload("server_error"), 0.0)])
     router = Diffundo(
@@ -445,6 +478,74 @@ def test_leased_provider_death_releases_lease_for_healthy_sibling() -> None:
     finally:
         incumbent.close()
         sibling.close()
+
+
+def test_successful_fallback_becomes_timeout_failover_incumbent() -> None:
+    original = FakeServer(
+        [
+            (200, _ok_payload("late original", model="m-original"), 0.1),
+            (200, _ok_payload("recovered original", model="m-original"), 0.0),
+        ]
+    )
+    replacement = FakeServer(
+        [
+            (200, _ok_payload("replacement", model="m-replacement"), 0.0),
+            (200, _ok_payload("late replacement", model="m-replacement"), 0.1),
+            (200, _ok_payload("recovered replacement", model="m-replacement"), 0.0),
+        ]
+    )
+    final = FakeServer(
+        [
+            (200, _ok_payload("final", model="m-final"), 0.0),
+            (200, _ok_payload("stay final", model="m-final"), 0.0),
+        ]
+    )
+    router = Diffundo(
+        (
+            _config(
+                "p_original",
+                original,
+                "K_CHAIN_ORIGINAL",
+                model="m-original",
+                timeout_s=0.03,
+                priority=0,
+            ),
+            _config(
+                "p_replacement",
+                replacement,
+                "K_CHAIN_REPLACEMENT",
+                model="m-replacement",
+                timeout_s=0.03,
+                priority=1,
+            ),
+            _config("p_final", final, "K_CHAIN_FINAL", model="m-final", priority=2),
+        ),
+        primary_provider="p_original",
+        call_budget_s=1.0,
+        pause_timeout_s=0.01,
+    )
+    try:
+        first = asyncio.run(router.call(ProviderTier.FAST, PROMPT, model="m-original"))
+        assert first.provider == "p_replacement"
+        assert first.fell_back_from == "p_original"
+        router.bind_provider(first.provider, first.model, root_task_id="chain-task")
+
+        second = asyncio.run(router.call(ProviderTier.FAST, PROMPT, model="m-original"))
+        assert second.provider == "p_final"
+        assert second.fell_back_from == "p_replacement"
+        router.bind_provider(second.provider, second.model, root_task_id="chain-task")
+
+        router._runtime("p_original").cooldown_until = time.monotonic() - 1.0
+        router._runtime("p_replacement").cooldown_until = time.monotonic() - 1.0
+        third = asyncio.run(router.call(ProviderTier.FAST, PROMPT, model="m-original"))
+        assert third.provider == "p_final"
+        assert len(original.calls) == 1
+        assert len(replacement.calls) == 2
+        assert len(final.calls) == 2
+    finally:
+        original.close()
+        replacement.close()
+        final.close()
 
 
 def test_healthy_incumbent_keeps_lease_sticky() -> None:

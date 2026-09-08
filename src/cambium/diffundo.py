@@ -1765,24 +1765,16 @@ def _codex_input_item(message: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _codex_tools(tools: Any) -> list[dict[str, Any]]:
-    """Flatten chat tool entries to the Responses-API function-tool shape.
-
-    Chat ``{"type": "function", "function": {name, description, parameters}}``
-    becomes ``{"type": "function", name, description, parameters}``; non-function
-    tool types are dropped (the responses endpoint accepts function tools only).
-    """
+    """Convert Cambium's canonical flat tool schema to Responses function tools."""
     if not isinstance(tools, list):
         return []
     converted: list[dict[str, Any]] = []
     for tool in tools:
-        if not isinstance(tool, Mapping) or tool.get("type") != "function":
+        if not isinstance(tool, Mapping) or not isinstance(tool.get("name"), str):
             continue
-        function = tool.get("function")
-        if not isinstance(function, Mapping):
-            continue
-        item: dict[str, Any] = {"type": "function"}
-        for key in ("name", "description", "parameters"):
-            value = function.get(key)
+        item: dict[str, Any] = {"type": "function", "name": tool["name"]}
+        for key in ("description", "parameters"):
+            value = tool.get(key)
             if value is not None:
                 item[key] = value
         converted.append(item)
@@ -2835,34 +2827,35 @@ class Diffundo:
                     if exc.probe_already_in_flight:
                         probe_rejected = True
                         continue
-                    if exc.is_real_death:
-                        self._terminal_death_providers = self._terminal_death_providers | {
-                            provider.name
-                        }
                     lease = self._provider_lease
-                    if (
+                    lease_matches_provider = (
                         lease is not None
                         and lease.provider == provider.name
                         and lease.model == provider.model
-                        and (
-                            exc.is_real_death
-                            or (
-                                exc.outcome is ProviderOutcome.TIMEOUT
-                                and provider.name == self._pinned_provider
-                            )
-                        )
-                    ):
-                        # A lease keeps a healthy incumbent sticky, but a
-                        # terminally dead holder no longer owns the semantic
-                        # branch. Release only this lease state; the
-                        # pinned/fallback history remains needed for
-                        # provenance and dead-provider avoidance.
+                    )
+                    incumbent_timeout = exc.outcome is ProviderOutcome.TIMEOUT and (
+                        provider.name == self._pinned_provider or lease_matches_provider
+                    )
+                    if exc.is_real_death or incumbent_timeout:
+                        # Once a hard failure or real attempted timeout moves
+                        # this semantic branch away from a provider, do not
+                        # bounce back to it merely because its local cooldown
+                        # later expires. A fresh router remains the recovery
+                        # boundary for reconsidering that lane.
+                        self._terminal_death_providers = self._terminal_death_providers | {
+                            provider.name
+                        }
+                    if lease_matches_provider and (exc.is_real_death or incumbent_timeout):
+                        # A lease keeps a healthy incumbent sticky, but a hard-
+                        # failed or timed-out holder no longer owns the branch.
                         self._provider_lease = None
                     tried.append(provider.name)
                     last_error = exc
                     pinned_fallback = (
-                        self._pinned_provider is not None
-                        and provider.name == self._pinned_provider
+                        (
+                            provider.name == self._pinned_provider
+                            or lease_matches_provider
+                        )
                         and (exc.is_real_death or exc.outcome is ProviderOutcome.TIMEOUT)
                     ) or (
                         exc.is_real_death
@@ -3187,12 +3180,23 @@ class Diffundo:
             return substitutes
         return candidates
 
+    def _persisted_retry_blocked(self, provider_name: str) -> bool:
+        """Whether durable Retry-After evidence still excludes this provider."""
+        if self._debt is None:
+            return False
+        from .routing import _retry_at
+
+        retry_at = _retry_at(dict(self._debt).get(provider_name))
+        return retry_at is not None and retry_at > time.time()
+
     def _pinned_provider_is_waiting(self) -> bool:
         """Whether the explicit provider pin is only temporarily unavailable."""
         if self._pinned_provider is None:
             return False
         if self._pinned_provider in self._terminal_death_providers:
             return False
+        if self._persisted_retry_blocked(self._pinned_provider):
+            return True
         return self.status(self._pinned_provider) in {
             ProviderStatus.OPEN,
             ProviderStatus.COOLDOWN,
@@ -3229,6 +3233,8 @@ class Diffundo:
         for runtime in self._runtimes:
             provider = runtime.provider
             if provider.tier is not tier or not provider.enabled:
+                continue
+            if self._persisted_retry_blocked(provider.name):
                 continue
             if model is not None and provider.model == model:
                 model_declared = True
@@ -3421,6 +3427,8 @@ class Diffundo:
         provider = runtime.provider
         now = time.monotonic()
         if not provider.enabled:
+            return False
+        if self._persisted_retry_blocked(name):
             return False
         if runtime.health is HealthState.DISABLED:
             self._release_auth_quarantine(runtime)

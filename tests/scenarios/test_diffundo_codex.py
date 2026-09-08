@@ -41,6 +41,7 @@ from cambium.diffundo import (
     _codex_input_item,
     _codex_request_body,
 )
+from cambium.worker import _PROVIDER_TOOLS_CONFIG, _exposed_tool_schemas
 
 # --------------------------------------------------------------------------- #
 # Fake codex server (http.server in a thread — no network)
@@ -298,19 +299,16 @@ TOOL_PROMPT = {
     ],
     "tools": [
         {
-            "type": "function",
-            "function": {
-                "name": "read_file",
-                "description": "Read a file from the repository",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"path": {"type": "string"}},
-                    "required": ["path"],
-                },
+            "name": "read_file",
+            "description": "Read a file from the repository",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
             },
         }
     ],
-    "tool_choice": {"type": "function", "function": {"name": "read_file"}},
+    "tool_choice": "auto",
     # chat-only extras must never leak into the codex body
     "max_tokens": 100,
     "max_completion_tokens": 100,
@@ -344,6 +342,27 @@ def test_codex_body_serialization_is_byte_identical_across_calls() -> None:
     first = _codex_request_body(config, TOOL_PROMPT)
     second = _codex_request_body(config, TOOL_PROMPT)
     assert json.dumps(first) == json.dumps(second)
+
+
+def test_codex_native_mode_converts_the_worker_tool_schema() -> None:
+    config = _codex_config(None, supports_native_tools=True)
+    tools = _exposed_tool_schemas(_PROVIDER_TOOLS_CONFIG)
+
+    body = _codex_request_body(
+        config,
+        {"messages": [{"role": "user", "content": "inspect the repo"}], "tools": tools},
+    )
+
+    assert len(body["tools"]) == len(tools)
+    assert body["tools"] == [
+        {
+            "type": "function",
+            "name": tool["name"],
+            "description": tool["description"],
+            "parameters": tool["parameters"],
+        }
+        for tool in tools
+    ]
 
 
 def test_codex_non_native_mode_keeps_messages_and_omits_tool_wire_fields() -> None:

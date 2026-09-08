@@ -1163,6 +1163,14 @@ def test_batched_tool_calls_keep_order_and_deny_atomically(tmp_path: Path) -> No
             {"name": "read_batch", "arguments": {"paths": ["b"]}},
         ],
     }
+    with pytest.raises(ValueError, match="missing 'paths'"):
+        worker._native_tool_action(
+            SimpleNamespace(
+                tool_calls=(
+                    {"function": {"name": "read_batch", "arguments": "{}"}},
+                )
+            )
+        )
 
 
 def test_cancellation_mid_batch_persists_remaining_calls_as_unexecuted(
