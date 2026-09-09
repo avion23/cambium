@@ -694,6 +694,8 @@ def test_build_agent_prompt_last_message_is_always_user() -> None:
     prompt = worker._build_agent_prompt("edit a.txt", [{"name": "read_batch"}], [])
     messages = prompt["messages"]
     assert messages[0]["role"] == "system"
+    assert "native function tools are present" in messages[0]["content"]
+    assert "never serialize a tool invocation into assistant text" in messages[0]["content"]
     assert messages[-1]["role"] == "user"
     # A plan action leaves the transcript ending with an assistant message;
     # the builder appends a neutral user continuation.
@@ -2020,6 +2022,8 @@ def test_three_invalid_actions_fail_fast_with_no_progress(tmp_path: Path) -> Non
     assert recorded[-2] == {"role": "assistant", "content": "not-json-three"}
     correction = recorded[-1]["content"]
     assert "invalid action: action is not valid JSON" in correction
+    assert "native function tools are present" in correction
+    assert "native tool channel" in correction
     assert '{"calls":[{"name":"TOOL","arguments":{}}]}' in correction
     # exactly one occurrence: nested inside calls, never as a bare top-level shape
     assert correction.count('{"name":"TOOL"') == 1

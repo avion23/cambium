@@ -874,12 +874,16 @@ def _oauth_fingerprint(account_id: str | None) -> str:
 
 
 def _oauth_status_text(store: OAuthStore, provider: str) -> str:
-    """Local-only status: expiry plus an account fingerprint; no secrets."""
-    doc = store.read_document(provider)
-    if doc is None:
+    """Local-only status: usability, expiry and account fingerprint; no secrets."""
+    record = store.read_provider(provider)
+    if record is None:
         return f"provider {provider}: no oauth session stored"
-    remaining = doc.expires_at - time.time()
-    state = "expired" if remaining <= 0 else f"{remaining:.0f}s remaining"
+    doc = record.doc
+    if record.disabled:
+        state = "disabled; re-login required"
+    else:
+        remaining = doc.expires_at - time.time()
+        state = "expired" if remaining <= 0 else f"{remaining:.0f}s remaining"
     return (
         f"provider {provider}: oauth session {state}; "
         f"account fingerprint {_oauth_fingerprint(doc.account_id)}"
@@ -892,7 +896,7 @@ def _run_auth_oauth_status(store: OAuthStore, provider: str) -> int:
     except OAuthError as exc:
         print(f"cambium auth: oauth status unavailable: {exc}", file=sys.stderr)
         return 1
-    if "no oauth session" in text:
+    if "no oauth session" in text or "re-login required" in text:
         print(text, file=sys.stderr)
         return 1
     print(text)

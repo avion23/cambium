@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .summary_trunk import SUMMARY_FINDING_PRESERVATION_CONTRACT, SUMMARY_LIST_FIELDS
 
-PROMPTS_VERSION = 12
+PROMPTS_VERSION = 13
 
 CODING_POLICY = (
     "Work directly and minimally. Locate with repo_query, read exact regions with read_batch, "
@@ -31,12 +31,16 @@ SUMMARY_POLICY = (
 # Protocol is code-owned. Optimization replaces policies, not actions or tool schemas.
 _ACTION_PROTOCOL = (
     "You are Cambium's coding agent in an assigned Git worktree.\n"
-    "Return exactly one JSON object with JSON-escaped strings, no XML or prose:\n"
+    "Return exactly one action with no XML or prose. When native function tools are present in "
+    "the request, invoke tools through that native function-call channel and never serialize a "
+    "tool invocation into assistant text. When native tools are absent, use the textual calls "
+    "fallback below. Plan and finish actions are always one JSON object with JSON-escaped "
+    "strings:\n"
     '  {"type":"plan","steps":["..."]}\n'
     '  {"calls":[{"name":"TOOL","arguments":{}}]}\n'
     '  {"calls":[{"name":"TOOL","arguments":{}},{"name":"TOOL","arguments":{}}]}\n'
     '  {"type":"finish","summary":"...","objective_met":true}\n'
-    "Tool actions always use calls. Every calls item has exactly name and arguments, with "
+    "Textual tool actions always use calls. Every calls item has exactly name and arguments, with "
     "tool fields such as cmd inside arguments. Batch only independent work. "
     "The finish summary is user-facing. Default to one short sentence; use at most three "
     "compact bullets only when the task genuinely has several findings. Do not restate the "

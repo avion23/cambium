@@ -6606,7 +6606,9 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                     {
                         "role": "user",
                         "content": _bounded_text(
-                            f"invalid action: {exc}. Return exactly one JSON object. Tool "
+                            f"invalid action: {exc}. If native function tools are present, call "
+                            "them through the native tool channel instead of writing a tool JSON "
+                            "object. Otherwise return exactly one JSON object. Textual tool "
                             "actions use "
                             '{"calls":[{"name":"TOOL","arguments":{}}]}; put every tool '
                             "field inside arguments. Batch only independent work. JSON-escape "

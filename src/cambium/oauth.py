@@ -914,7 +914,7 @@ def refresh_access_token(
         )
         if status != 200:
             error = _error_code(body)
-            if status in (400, 401) and error == "invalid_grant":
+            if status in (400, 401) and error in {"invalid_grant", "refresh_token_reused"}:
                 raise InvalidGrantError("refresh token was rejected; re-login is required")
             raise RefreshUnavailableError(f"refresh unavailable: HTTP {status}")
         payload = _parse_json_object(body)
@@ -947,7 +947,12 @@ def _error_code(body: bytes) -> str | None:
     if not isinstance(value, Mapping):
         return None
     error = value.get("error")
-    return error if isinstance(error, str) and error else None
+    if isinstance(error, str) and error:
+        return error
+    if isinstance(error, Mapping):
+        code = error.get("code")
+        return code if isinstance(code, str) and code else None
+    return None
 
 
 # --------------------------------------------------------------------------- #

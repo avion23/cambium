@@ -52,7 +52,7 @@ from .oauth import (
     OAuthMissingError,
     OAuthStore,
     RefreshUnavailableError,
-    refresh_access_token,
+    TokenManager,
     resolve_codex_client_id,
 )
 from .provider_config import (
@@ -968,11 +968,12 @@ def check_oauth_live(
     """OPT-IN live oauth probe for codex_chatgpt providers.
 
     Runs only with ``cambium doctor --oauth-live``. It probes issuer
-    reachability and performs one real refresh-token exchange per configured
-    codex provider (consuming quota); it never makes a model call. ``issuer``,
-    ``oauth_store``, ``provider_config``, and ``client_id`` are injectable so
-    tests can probe a loopback fake issuer without the network or a store at
-    the real path.
+    reachability and performs one real refresh transaction per configured
+    codex provider; any rotated tokens are saved through the same locked
+    ``TokenManager`` path production uses. It never makes a model call.
+    ``issuer``, ``oauth_store``, ``provider_config``, and ``client_id`` are
+    injectable so tests can probe a loopback fake issuer without the network
+    or a store at the real path.
     """
     if provider_config is None:
         provider_config = _provider_config_path(cwd)[0]
@@ -1005,9 +1006,13 @@ def check_oauth_live(
             failed = True
             continue
         try:
-            refresh_access_token(
-                effective_issuer, effective_client_id, doc.refresh_token, timeout_s
-            )
+            TokenManager(
+                name,
+                store,
+                client_id=effective_client_id,
+                issuer=effective_issuer,
+                refresh_timeout_s=timeout_s,
+            ).ensure_fresh(rejected=doc.access_token)
             details.append(f"{name}=refreshable")
         except InvalidGrantError:
             details.append(f"{name}=refresh-rejected")

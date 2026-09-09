@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from cambium import oneshot
+from cambium import oneshot, supervisor
 from cambium.supervisor import PlanResult, TaskResult
 
 
@@ -109,6 +109,59 @@ def test_successful_run_deletes_its_generated_branch(monkeypatch, tmp_path: Path
         ).stdout.strip()
         == "* main"
     )
+
+
+def test_oneshot_does_not_second_guess_supervisor_stale_resync(
+    monkeypatch, tmp_path: Path
+) -> None:
+    repo = _repo(tmp_path / "repo")
+    session_dir = tmp_path / "session-stale"
+    original_git = supervisor._Runtime._git
+    read_tree_attempts = 0
+
+    async def fail_read_tree(runtime, target, *args, check=True):
+        nonlocal read_tree_attempts
+        if args and args[0] == "read-tree":
+            read_tree_attempts += 1
+            return subprocess.CompletedProcess(
+                ["git", "-C", str(target), *args],
+                1,
+                "",
+                "simulated read-tree failure",
+            )
+        return await original_git(runtime, target, *args, check=check)
+
+    monkeypatch.setattr(supervisor._Runtime, "_git", fail_read_tree)
+
+    result = asyncio.run(
+        oneshot.run_oneshot(
+            oneshot.OneShotConfig(
+                prompt="append marker",
+                repo=repo,
+                session_root=session_dir,
+                target_file="file.txt",
+                marker="// published",
+            )
+        )
+    )
+
+    assert result.exit_code == 0
+    assert read_tree_attempts == 1
+    assert (repo / "file.txt").read_text(encoding="utf-8") == "file\n"
+    published = subprocess.run(
+        ["git", "-C", str(repo), "show", "refs/heads/main:file.txt"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert "// published" in published
+    stale = [
+        event
+        for event in supervisor.read_events(session_dir)
+        if event["kind"] == "main_worktree_stale"
+    ]
+    assert len(stale) == 1
+    assert stale[0]["payload"]["reason"] == "read_tree_failed"
 
 
 def test_successful_run_preserves_another_user_branch(monkeypatch, tmp_path: Path) -> None:

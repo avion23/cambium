@@ -23,10 +23,12 @@ from typing import Any
 
 import pytest
 
-from cambium import cli, doctor, supervisor
+from cambium import cli, doctor, oneshot, supervisor
+from cambium import oauth as oauth_module
 from cambium.oauth import (
     OAuthDoc,
     OAuthStore,
+    TokenManager,
 )
 from cambium.redact import Redactor
 
@@ -133,6 +135,7 @@ class _FakeIssuerState:
         self.refresh_count = 0
         self.poll_approve_immediately = True
         self.refresh_status = 200
+        self.refresh_error_body: dict[str, Any] | None = None
 
 
 class _FakeIssuerHandler(BaseHTTPRequestHandler):
@@ -187,6 +190,8 @@ class _FakeIssuerHandler(BaseHTTPRequestHandler):
                         "expires_in": 3600,
                         "id_token": ID_TOKEN,
                     }
+                elif state.refresh_error_body is not None:
+                    body = state.refresh_error_body
                 elif status == 400:
                     body = {"error": "invalid_grant"}
                 else:
@@ -390,6 +395,17 @@ def test_worker_environment_injects_for_empty_authorized_set(tmp_path: Path) -> 
     assert env["CAMBIUM_OAUTH_ACCOUNT_CODEX"] == ACCOUNT
 
 
+def test_oneshot_readiness_excludes_disabled_oauth_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = OAuthStore(_store_path(tmp_path))
+    store.save_provider(_doc())
+    TokenManager("codex", store).mark_invalid_grant()
+    monkeypatch.setattr(oauth_module, "OAuthStore", lambda: store)
+
+    assert oneshot._oauth_doc_present("codex") is False
+
+
 # --------------------------------------------------------------------------- #
 # CLI: status / logout / import / device flow
 # --------------------------------------------------------------------------- #
@@ -417,6 +433,21 @@ def test_cli_status_has_fingerprint_and_no_secrets(tmp_path: Path) -> None:
 def test_cli_status_missing_session_fails_without_secrets(tmp_path: Path) -> None:
     store = OAuthStore(_store_path(tmp_path))
     assert cli._run_auth_oauth_status(store, "codex") == 1
+
+
+def test_cli_status_disabled_session_requires_relogin(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store = OAuthStore(_store_path(tmp_path))
+    store.save_provider(_doc())
+    TokenManager("codex", store).mark_invalid_grant()
+
+    assert cli._run_auth_oauth_status(store, "codex") == 1
+    text = capsys.readouterr().err
+    assert "disabled; re-login required" in text
+    assert ACCESS not in text
+    assert REFRESH not in text
+    assert ACCOUNT not in text
 
 
 def test_cli_logout_removes_locally_without_revoke_claim(tmp_path: Path) -> None:
@@ -546,6 +577,10 @@ def test_doctor_oauth_live_refreshable_and_reachable(
     assert status is doctor.Status.PASS
     assert "codex=refreshable" in detail
     assert fake_issuer.fake.refresh_count == 1
+    record = store.read_provider("codex")
+    assert record is not None and not record.disabled
+    assert record.doc.access_token == "refreshed-access"
+    assert record.doc.refresh_token == "refreshed-refresh"
     assert "issuer HTTP 200" in detail
 
 
@@ -566,6 +601,37 @@ def test_doctor_oauth_live_rejected_grant_fails(tmp_path: Path, fake_issuer: _Fa
 
     assert status is doctor.Status.FAIL
     assert "codex=refresh-rejected" in detail
+    record = store.read_provider("codex")
+    assert record is not None and record.disabled
+
+
+def test_doctor_oauth_live_reused_refresh_token_fails(
+    tmp_path: Path, fake_issuer: _FakeIssuer
+) -> None:
+    config = _codex_config(tmp_path / "providers.json")
+    store = OAuthStore(_store_path(tmp_path))
+    store.save_provider(_doc(expires_at=time.time() - 100))
+    fake_issuer.fake.refresh_status = 401
+    fake_issuer.fake.refresh_error_body = {
+        "error": {
+            "code": "refresh_token_reused",
+            "message": "refresh token was already used",
+        }
+    }
+
+    status, detail = doctor.check_oauth_live(
+        tmp_path,
+        provider_config=config,
+        oauth_store=store,
+        client_id=CLIENT_ID,
+        issuer=fake_issuer.issuer,
+        timeout_s=5.0,
+    )
+
+    assert status is doctor.Status.FAIL
+    assert "codex=refresh-rejected" in detail
+    record = store.read_provider("codex")
+    assert record is not None and record.disabled
 
 
 def test_doctor_oauth_live_missing_session_warns(tmp_path: Path, fake_issuer: _FakeIssuer) -> None:

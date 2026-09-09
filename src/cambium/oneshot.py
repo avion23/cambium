@@ -228,90 +228,6 @@ def _git_stdout(repo: Path, *args: str) -> str | None:
     return result.stdout.strip() or None
 
 
-def _primary_checkout_is_pristine(repo: Path) -> bool:
-    """Check that tracked primary-checkout files are unchanged before a run."""
-    return all(
-        _git(repo, *args).returncode == 0
-        for args in (
-            ("diff", "--no-ext-diff", "--quiet", "HEAD", "--"),
-            ("diff", "--cached", "--no-ext-diff", "--quiet", "HEAD", "--"),
-        )
-    )
-
-
-def _primary_checkout_matches_base(repo: Path, base_commit: str) -> bool:
-    """Check that the caller did not change tracked files during the run."""
-    return all(
-        _git(repo, *args).returncode == 0
-        for args in (
-            ("diff", "--no-ext-diff", "--quiet", base_commit, "--"),
-            ("diff", "--cached", "--no-ext-diff", "--quiet", base_commit, "--"),
-        )
-    )
-
-
-def _primary_checkout_has_untracked_conflict(repo: Path, target: str) -> bool:
-    """Refuse refresh when the target tree would overwrite an untracked path."""
-    status = _git(
-        repo,
-        "status",
-        "--porcelain=v1",
-        "--untracked-files=all",
-        "--ignored=matching",
-        "-z",
-    )
-    tree = _git(repo, "ls-tree", "-r", "--name-only", "-z", target)
-    if status.returncode != 0 or tree.returncode != 0:
-        return True
-    target_paths = tuple(path for path in tree.stdout.split("\0") if path)
-    for record in status.stdout.split("\0"):
-        if len(record) < 3 or record[:2] not in {"??", "!!"}:
-            continue
-        path = record[3:].rstrip("/")
-        if any(
-            path == target_path
-            or path.startswith(f"{target_path}/")
-            or target_path.startswith(f"{path}/")
-            for target_path in target_paths
-        ):
-            return True
-    return False
-
-
-def _refresh_primary_checkout(
-    repo: Path,
-    initial_branch: str | None,
-    initial_head: str | None,
-    initially_pristine: bool,
-    result: PlanResult,
-) -> None:
-    """Refresh a pristine checked-out ``main`` after a successful one-shot.
-
-    ``MergeSequencer.publish_merge`` remains ref-only.  The one-shot CLI also
-    owns the ordinary clean primary checkout, so it may refresh that checkout
-    after publication.  Any caller-owned change or branch switch suppresses
-    the refresh instead of overwriting it.
-    """
-    if (
-        not initially_pristine
-        or initial_branch != "main"
-        or initial_head is None
-        or result.exit_code != 0
-        or _git_stdout(repo, "symbolic-ref", "--quiet", "--short", "HEAD") != "main"
-    ):
-        return
-    published_head = _git_stdout(repo, "rev-parse", "--verify", "refs/heads/main^{commit}")
-    if published_head is None or published_head == initial_head:
-        return
-    if not _primary_checkout_matches_base(repo, initial_head):
-        return
-    if _primary_checkout_has_untracked_conflict(repo, "main"):
-        return
-    refreshed = _git(repo, "read-tree", "-m", "-u", "main")
-    if refreshed.returncode != 0:
-        detail = (refreshed.stderr + refreshed.stdout).strip()[:512]
-        raise ValueError(f"one-shot primary checkout refresh failed: {detail}")
-
 
 def preflight(
     config: OneShotConfig,
@@ -638,20 +554,11 @@ def _is_codex_oauth_provider(provider: Any) -> bool:
 
 
 def _oauth_doc_present(provider_name: str) -> bool:
-    """Local-only check that the OAuth store holds a document for the provider.
+    """Local-only check that the OAuth store holds an enabled session."""
+    from cambium.oauth import OAuthStore
 
-    Only an explicit missing document yields ``False``; a corrupt, unreadable,
-    or wrong-permission store propagates as an error so eligibility never
-    hides store corruption behind a silent ``False``.
-    """
-    from cambium.oauth import OAuthMissingError, OAuthStore
-
-    store = OAuthStore()
-    try:
-        document = store.read_document(provider_name)
-    except OAuthMissingError:
-        return False
-    return document is not None
+    record = OAuthStore().read_provider(provider_name)
+    return record is not None and not record.disabled
 
 
 def _provider_credential_ready(provider: Any, auth_store: AuthStore) -> bool:
@@ -660,7 +567,7 @@ def _provider_credential_ready(provider: Any, auth_store: AuthStore) -> bool:
     API-key providers are ready when their inline key is non-empty or the
     auth store holds an entry for them (matching doctor's coverage rule);
     ``none`` providers need no credential; OAuth providers are ready when the
-    local OAuth store holds a document for them. The function never returns a
+    local OAuth store holds an enabled session. The function never returns a
     credential value and never changes process-global state. A store without
     a ``has_provider`` probe (e.g. a minimal test double) contributes no
     coverage; a corrupt store propagates instead of reading as uncovered.
@@ -1080,9 +987,6 @@ async def run_oneshot(config: OneShotConfig, on_event: EventSink | None = None) 
     preflight(resolved, repo, session_dir)
     plan = build_plan(resolved, repo, session_dir)
     oneshot_branch = _oneshot_branch_for_cleanup(resolved, plan, session_dir)
-    initial_branch = _git_stdout(repo, "symbolic-ref", "--quiet", "--short", "HEAD")
-    initial_head = _git_stdout(repo, "rev-parse", "--verify", "HEAD^{commit}")
-    initially_pristine = _primary_checkout_is_pristine(repo)
     # The usage-debt ledger is repo-scoped by default so real runs keep
     # cross-session burn per repository without touching a user-global file;
     # tests against temporary repos are isolated automatically.
@@ -1124,11 +1028,4 @@ async def run_oneshot(config: OneShotConfig, on_event: EventSink | None = None) 
             _delete_routing_state_lock(routing_state_lock_path)
         except Exception as exc:  # noqa: BLE001 - cleanup must not fail publication
             _warn_oneshot_cleanup(f"routing-state lock {routing_state_lock_path!s}", exc)
-    _refresh_primary_checkout(
-        repo,
-        initial_branch,
-        initial_head,
-        initially_pristine,
-        result,
-    )
     return result
