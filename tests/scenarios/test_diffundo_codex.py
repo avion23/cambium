@@ -196,6 +196,35 @@ def _completed(model: str = "gpt-5.6-luna", text: str = "Hello, world") -> dict[
     }
 
 
+def _completed_call(
+    name: str, arguments: dict[str, Any], model: str = "gpt-5.6-luna"
+) -> dict[str, Any]:
+    return {
+        "type": "response.completed",
+        "response": {
+            "id": "resp_tool",
+            "object": "response",
+            "model": model,
+            "output": [
+                {
+                    "id": "fc_1",
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": name,
+                    "arguments": json.dumps(arguments),
+                }
+            ],
+            "usage": {
+                "input_tokens": 12,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens": 5,
+                "output_tokens_details": {"reasoning_tokens": 0},
+                "total_tokens": 17,
+            },
+        },
+    }
+
+
 def _ok_stream(model: str = "gpt-5.6-luna", text: str = "Hello, world") -> str:
     return _stream(
         {"type": "response.created", "response": {"id": "resp_1"}},
@@ -344,7 +373,7 @@ def test_codex_body_serialization_is_byte_identical_across_calls() -> None:
     assert json.dumps(first) == json.dumps(second)
 
 
-def test_codex_native_mode_converts_the_worker_tool_schema() -> None:
+def test_codex_native_mode_converts_tools_and_requires_native_controls() -> None:
     config = _codex_config(None, supports_native_tools=True)
     tools = _exposed_tool_schemas(_PROVIDER_TOOLS_CONFIG)
 
@@ -353,8 +382,8 @@ def test_codex_native_mode_converts_the_worker_tool_schema() -> None:
         {"messages": [{"role": "user", "content": "inspect the repo"}], "tools": tools},
     )
 
-    assert len(body["tools"]) == len(tools)
-    assert body["tools"] == [
+    operational = body["tools"][: len(tools)]
+    assert operational == [
         {
             "type": "function",
             "name": tool["name"],
@@ -363,6 +392,104 @@ def test_codex_native_mode_converts_the_worker_tool_schema() -> None:
         }
         for tool in tools
     ]
+    controls = body["tools"][len(tools) :]
+    assert [control["name"] for control in controls] == ["plan", "finish"]
+    assert all(control["strict"] is True for control in controls)
+    assert all(
+        set(control["parameters"]["required"]) == set(control["parameters"]["properties"])
+        and control["parameters"]["additionalProperties"] is False
+        for control in controls
+    )
+    assert body["tool_choice"] == "required"
+
+
+def test_codex_native_mode_without_agent_tools_does_not_force_controls() -> None:
+    config = _codex_config(None, supports_native_tools=True)
+
+    body = _codex_request_body(config, PROMPT)
+
+    assert "tools" not in body
+    assert "tool_choice" not in body
+
+
+def test_codex_generic_native_tools_do_not_gain_cambium_controls() -> None:
+    config = _codex_config(None, supports_native_tools=True)
+
+    body = _codex_request_body(config, TOOL_PROMPT)
+
+    assert body["tool_choice"] == "auto"
+    assert [tool["name"] for tool in body["tools"]] == ["read_file"]
+
+
+def test_codex_required_native_action_never_downgrades_to_text() -> None:
+    server = CodexServer(
+        [
+            (
+                200,
+                _ok_stream(text='{"type":"finish","summary":"text","objective_met":true}'),
+                0.0,
+            )
+        ]
+    )
+    config = _codex_config(server, supports_native_tools=True)
+    router = Diffundo(
+        (config,),
+        credential_source=CREDENTIAL,
+        codex_profile={"api_origin": server.base_url, "api_path": CODEX_PATH},
+        pause_timeout_s=0.01,
+    )
+    prompt = {
+        "messages": [{"role": "user", "content": "finish"}],
+        "tools": _exposed_tool_schemas(_PROVIDER_TOOLS_CONFIG),
+    }
+    try:
+        with pytest.raises(AllProvidersFailed) as raised:
+            asyncio.run(router.call(ProviderTier.FAST, prompt))
+        error = _provider_error(raised.value)
+        assert error.outcome is ProviderOutcome.CONFIG_ERROR
+        assert "required native action" in error.message
+        assert router.health(config.name) is HealthState.DISABLED
+    finally:
+        server.close()
+
+
+def test_codex_required_native_mismatch_falls_through_with_serving_provenance() -> None:
+    server = CodexServer(
+        [
+            (200, _ok_stream(text="text instead of required call"), 0.0),
+            (
+                200,
+                _stream(
+                    _completed_call(
+                        "finish", {"summary": "fallback served", "objective_met": True}
+                    )
+                ),
+                0.0,
+            ),
+        ]
+    )
+    bad = _codex_config(server, name="p_bad", supports_native_tools=True)
+    good = _codex_config(server, name="p_good", supports_native_tools=True)
+    router = Diffundo(
+        (bad, good),
+        credential_source=CREDENTIAL,
+        codex_profile={"api_origin": server.base_url, "api_path": CODEX_PATH},
+        pause_timeout_s=0.01,
+    )
+    prompt = {
+        "messages": [{"role": "user", "content": "finish"}],
+        "tools": _exposed_tool_schemas(_PROVIDER_TOOLS_CONFIG),
+    }
+    try:
+        result = asyncio.run(router.call(ProviderTier.FAST, prompt))
+        assert result.provider == "p_good"
+        assert result.model == good.model
+        assert result.tool_calls is not None
+        assert result.tool_calls[0]["function"]["name"] == "finish"
+        assert router.health("p_bad") is HealthState.DISABLED
+        assert router.health("p_good") is HealthState.HEALTHY
+    finally:
+        server.close()
 
 
 def test_codex_non_native_mode_keeps_messages_and_omits_tool_wire_fields() -> None:

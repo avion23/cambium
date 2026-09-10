@@ -155,7 +155,13 @@ from cambium.prompts import SUMMARY_PROTOCOL_LINES as _SUMMARY_PROTOCOL_LINES
 from cambium.prompts import coding_prompt, validate_policy
 from cambium.provider_config import AuthMode, load_providers
 from cambium.redact import Redactor, build_session_redactor
-from cambium.schemas import FINISH_ACTION_SCHEMA, TOOL_SCHEMAS, validate_tool_call
+from cambium.schemas import (
+    FINISH_ACTION_SCHEMA,
+    NATIVE_CONTROL_TOOL_SCHEMAS,
+    PLAN_ACTION_SCHEMA,
+    TOOL_SCHEMAS,
+    validate_tool_call,
+)
 from cambium.situation import (
     SECTION_ORDER,
     SITUATION_PROJECTION_VERSION,
@@ -1950,6 +1956,7 @@ def _usage_counts(usage: dict[str, Any] | None) -> dict[str, int | float]:
 
 
 _ALL_TOOL_NAMES = frozenset(schema["name"] for schema in TOOL_SCHEMAS)
+_NATIVE_CONTROL_SCHEMAS = {schema["name"]: schema for schema in NATIVE_CONTROL_TOOL_SCHEMAS}
 
 
 def _exposed_tool_schemas(config: AgentConfig) -> list[dict[str, Any]]:
@@ -2175,14 +2182,10 @@ def _parse_agent_action(content: str) -> dict[str, Any]:
     if action_type == "plan":
         if not _action_keys(parsed, frozenset({"type", "steps"})):
             raise ValueError("plan must carry exactly type/steps (plus optional thought)")
-        steps = parsed.get("steps")
-        if (
-            not isinstance(steps, list)
-            or not steps
-            or not all(isinstance(step, str) and step.strip() for step in steps)
-        ):
-            raise ValueError("plan steps must be a non-empty array of non-empty strings")
-        return {"type": "plan", "steps": list(steps)}
+        schema_errors = validate_tool_call(PLAN_ACTION_SCHEMA, parsed)
+        if schema_errors:
+            raise ValueError(schema_errors[0])
+        return {"type": "plan", "steps": list(parsed["steps"])}
     if action_type == "tool_call":
         if "calls" in parsed:
             required = frozenset({"type", "calls"})
@@ -3133,7 +3136,7 @@ def _parse_provider_action(result: CallResult) -> tuple[CallResult, dict[str, An
 
 
 def _native_tool_action(result: CallResult) -> dict[str, Any] | None:
-    """Translate provider-native function calls to one Cambium batch action."""
+    """Translate provider-native function calls to one canonical Cambium action."""
 
     calls = getattr(result, "tool_calls", None)
     if not calls:
@@ -3147,8 +3150,6 @@ def _native_tool_action(result: CallResult) -> dict[str, Any] | None:
         arguments = function.get("arguments", {})
         if not isinstance(name, str) or not name:
             raise ValueError(f"provider native tool call {index} has no function name")
-        if name not in _ALL_TOOL_NAMES:
-            raise ValueError(f"unknown tool: {name!r}")
         if isinstance(arguments, str):
             try:
                 arguments = json.loads(arguments)
@@ -3158,13 +3159,33 @@ def _native_tool_action(result: CallResult) -> dict[str, Any] | None:
                 ) from exc
         if not isinstance(arguments, dict):
             raise ValueError(f"provider native tool call {index} arguments must be an object")
-        schema = next(schema for schema in TOOL_SCHEMAS if schema["name"] == name)
-        validation_errors = validate_tool_call(schema, arguments)
-        if validation_errors:
-            raise ValueError(
-                f"provider native tool call {index} {validation_errors[0]}"
-            )
         normalized.append({"name": name, "arguments": arguments})
+
+    control_calls = [call for call in normalized if call["name"] in _NATIVE_CONTROL_SCHEMAS]
+    if control_calls:
+        if len(normalized) != 1:
+            raise ValueError("provider native control action cannot be mixed with other calls")
+        control = control_calls[0]
+        schema = _NATIVE_CONTROL_SCHEMAS[control["name"]]
+        validation_errors = validate_tool_call(schema, control["arguments"])
+        if validation_errors:
+            raise ValueError(f"provider native control action {validation_errors[0]}")
+        if control["name"] == "plan":
+            return {"type": "plan", "steps": list(control["arguments"]["steps"])}
+        return {
+            "type": "finish",
+            "summary": _user_summary(control["arguments"]["summary"]),
+            "objective_met": control["arguments"]["objective_met"],
+        }
+
+    for index, call in enumerate(normalized):
+        name = call["name"]
+        if name not in _ALL_TOOL_NAMES:
+            raise ValueError(f"unknown tool: {name!r}")
+        schema = next(schema for schema in TOOL_SCHEMAS if schema["name"] == name)
+        validation_errors = validate_tool_call(schema, call["arguments"])
+        if validation_errors:
+            raise ValueError(f"provider native tool call {index} {validation_errors[0]}")
     return {"type": "tool_call", "calls": _normalize_tool_calls({"calls": normalized})}
 
 

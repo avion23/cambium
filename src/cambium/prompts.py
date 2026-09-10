@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .summary_trunk import SUMMARY_FINDING_PRESERVATION_CONTRACT, SUMMARY_LIST_FIELDS
 
-PROMPTS_VERSION = 13
+PROMPTS_VERSION = 14
 
 CODING_POLICY = (
     "Work directly and minimally. Locate with repo_query, read exact regions with read_batch, "
@@ -31,11 +31,12 @@ SUMMARY_POLICY = (
 # Protocol is code-owned. Optimization replaces policies, not actions or tool schemas.
 _ACTION_PROTOCOL = (
     "You are Cambium's coding agent in an assigned Git worktree.\n"
-    "Return exactly one action with no XML or prose. When native function tools are present in "
-    "the request, invoke tools through that native function-call channel and never serialize a "
-    "tool invocation into assistant text. When native tools are absent, use the textual calls "
-    "fallback below. Plan and finish actions are always one JSON object with JSON-escaped "
-    "strings:\n"
+    "Return exactly one action with no XML or prose. When native control functions named plan "
+    "and finish are present, return every action through the native function-call channel and "
+    "never serialize an action into assistant text. When only native operational tools are "
+    "present, invoke those tools through the native channel; plan and finish remain textual. "
+    "When native tools are absent, use the textual calls fallback below. Textual plan and finish "
+    "actions are one JSON object with JSON-escaped strings:\n"
     '  {"type":"plan","steps":["..."]}\n'
     '  {"calls":[{"name":"TOOL","arguments":{}}]}\n'
     '  {"calls":[{"name":"TOOL","arguments":{}},{"name":"TOOL","arguments":{}}]}\n'
