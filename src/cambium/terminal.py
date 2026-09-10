@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import os
 import re
-import unicodedata
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
 from threading import RLock
 from typing import Any
+
+from rich.cells import cell_len, split_graphemes
 
 SYNCHRONIZED_UPDATE_BEGIN = "\x1b[?2026h"
 SYNCHRONIZED_UPDATE_END = "\x1b[?2026l"
@@ -43,6 +44,11 @@ _OSC = re.compile(r"(?:\x1b\]|\x9d)(?s:.*?)(?:\x07|\x1b\\|\x9c|\Z)")
 # labels.  ASCII escapes are visible, searchable, and stable in logs.
 _BIDI_CONTROL = re.compile("[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
 
+# Python strings may contain UTF-16 surrogate code points even though they are
+# not valid Unicode scalar values. Keep them visible as ASCII escapes so a
+# strict UTF-8 terminal stream cannot fail while rendering provider text.
+_SURROGATE = re.compile("[\ud800-\udfff]")
+
 # Unicode NEL, LINE SEPARATOR, and PARAGRAPH SEPARATOR are line boundaries even
 # though ``str.splitlines`` and terminal renderers do not all treat them alike.
 # Normalize them before removing C1 controls so every output path agrees.
@@ -57,6 +63,10 @@ _LINE_WHITESPACE = re.compile(r"[\t\n\r]+")
 
 def _escape_bidi_control(match: re.Match[str]) -> str:
     return f"\\u{ord(match.group(0)):04X}"
+
+
+def _escape_surrogate(match: re.Match[str]) -> str:
+    return f"\\u{ord(match.group(0)):04x}"
 
 
 def sanitize_terminal_text(value: Any, *, single_line: bool = False) -> str:
@@ -74,6 +84,7 @@ def sanitize_terminal_text(value: Any, *, single_line: bool = False) -> str:
     text = _OSC.sub("", text)
     text = _CSI.sub("", text)
     text = _BIDI_CONTROL.sub(_escape_bidi_control, text)
+    text = _SURROGATE.sub(_escape_surrogate, text)
     text = _CONTROLS.sub("", text).replace("\r", "")
     if single_line:
         text = _LINE_WHITESPACE.sub(" ", text)
@@ -94,10 +105,11 @@ def supports_cursor_controls(stream: Any) -> bool:
 
     ``NO_COLOR`` intentionally has no effect: it is a color preference, not a
     request to disable interactive cursor movement.  An explicit ``TERM=dumb``
-    does disable screen-oriented rendering.
+    or an unset ``TERM`` disables screen-oriented rendering.
     """
 
-    return is_tty(stream) and os.environ.get("TERM", "").strip().casefold() != "dumb"
+    term = os.environ.get("TERM", "").strip().casefold()
+    return is_tty(stream) and bool(term) and term != "dumb"
 
 
 _COLOR_TERMINALS = frozenset(
@@ -176,7 +188,7 @@ def _synchronized_output_supported(
     term_program: str,
     override: str,
 ) -> bool:
-    if not tty or term == "dumb":
+    if not tty or not term or term == "dumb":
         return False
     if override in _SYNC_OVERRIDE_FALSE:
         return False
@@ -199,7 +211,7 @@ def _probe_terminal_capabilities(
     """Probe environment-derived terminal capabilities once per environment."""
     return TerminalCapabilities(
         color_depth=_terminal_color_depth(tty, term, colorterm, no_color),
-        cursor_controls=tty and term != "dumb",
+        cursor_controls=tty and bool(term) and term != "dumb",
         synchronized_output=_synchronized_output_supported(
             tty,
             term,
@@ -215,7 +227,7 @@ def terminal_capabilities(stream: Any) -> TerminalCapabilities:
         is_tty(stream),
         os.environ.get("TERM", "").strip().casefold(),
         os.environ.get("COLORTERM", "").strip().casefold(),
-        bool(os.environ.get("NO_COLOR")),
+        "NO_COLOR" in os.environ,
         os.environ.get("TERM_PROGRAM", "").strip().casefold(),
         os.environ.get("CAMBIUM_SYNCHRONIZED_OUTPUT", "").strip().casefold(),
     )
@@ -297,40 +309,38 @@ class SynchronizedOutput:
 
 
 def _cell_width(char: str) -> int:
-    if unicodedata.combining(char) or unicodedata.category(char) == "Cf":
-        return 0
-    return 2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
+    return cell_len(char)
 
 
 def terminal_display_width(value: Any) -> int:
     """Return the terminal-cell width of sanitized single-line plain text."""
 
     text = sanitize_terminal_text(value, single_line=True)
-    return sum(_cell_width(char) for char in text)
+    return cell_len(text)
 
 
 def clip_terminal_text(value: Any, width: int) -> str:
-    """Clip plain text to ``width`` terminal cells without splitting code points."""
+    """Clip plain text to ``width`` cells without splitting grapheme clusters."""
 
     if width <= 0:
         return ""
     text = sanitize_terminal_text(value, single_line=True)
-    if terminal_display_width(text) <= width:
+    if cell_len(text) <= width:
         return text
 
     ellipsis = "…"
-    if width == 1:
+    ellipsis_width = _cell_width(ellipsis)
+    if width <= ellipsis_width:
         return ellipsis
-    limit = width - terminal_display_width(ellipsis)
+    limit = width - ellipsis_width
     used = 0
-    clipped: list[str] = []
-    for char in text:
-        char_width = _cell_width(char)
-        if used + char_width > limit:
+    clipped_end = 0
+    for _start, end, span_width in split_graphemes(text)[0]:
+        if used + span_width > limit:
             break
-        clipped.append(char)
-        used += char_width
-    return "".join(clipped) + ellipsis
+        clipped_end = end
+        used += span_width
+    return text[:clipped_end] + ellipsis
 
 
 def pad_terminal_text(value: Any, width: int) -> str:
