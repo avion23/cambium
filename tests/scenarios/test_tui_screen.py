@@ -441,6 +441,68 @@ def test_private_heartbeat_tail_is_not_status_text() -> None:
     assert "SECRET" not in activity.render(now=3.0)
 
 
+def test_status_and_tool_identity_redact_private_values_before_bounding() -> None:
+    action = '{"type":"action","cmd":"SECRET_OWNER"}'
+    long_action = (
+        '{"secret":"SECRET_PREFIX","pad":"'
+        + ("x" * 120)
+        + '","type":"action"}'
+    )
+    lane = SimpleNamespace(
+        task_id=action,
+        role="main",
+        state="active",
+        provider=action,
+        model="safe-model",
+        tool="read_batch",
+        turn=1,
+        total_tokens=12,
+        calls=1,
+        output_tokens_per_s=2.0,
+    )
+    snapshot = SimpleNamespace(
+        session_status="running",
+        agents=(lane,),
+        selected_task_id=None,
+        active_agents=1,
+        failed_agents=0,
+        succeeded_agents=0,
+        total_tokens=12,
+        output_tokens_per_s=2.0,
+        context=None,
+    )
+    transcript = Transcript()
+    transcript.observe_event(
+        {
+            "kind": "tool_event",
+            "task_id": action,
+            "payload": {
+                "tool": "read_batch",
+                "cmd": long_action,
+                "paths": [long_action],
+                "ok": True,
+            },
+        }
+    )
+
+    rendered = "\n".join(
+        render_primary(
+            snapshot,
+            transcript,
+            session_description=f"provider={action}",
+            branch_line="",
+            cumulative_line="",
+            width=160,
+            color=False,
+        )
+    )
+    assert transcript.status_metadata.get("cmd") is None
+    assert transcript.status_metadata.get("path") is None
+    assert "SECRET_OWNER" not in rendered
+    assert "SECRET_PREFIX" not in rendered
+    assert '"type":"action"' not in rendered
+
+
 def test_activity_names_provider_and_cache_state_before_turn_finishes() -> None:
     activity = ActivityState()
     activity.start(now=10.0)

@@ -699,7 +699,7 @@ def _tool_entry_text(
     ok: bool | None,
     duration_ms: int | float | None,
 ) -> str:
-    tool = _clip(_single_line(tool), 72)
+    tool = _safe_bounded_text(tool, 72) or "tool"
     state = "ok" if ok else "failed" if ok is not None else "done"
     duration = f" · {_format_duration(duration_ms)}" if duration_ms is not None else ""
     lines = [f"{tool}: {state}{duration}"]
@@ -708,6 +708,16 @@ def _tool_entry_text(
         if detail:
             lines.append(f"{key}: {_clip(_single_line(detail), 512)}")
     return "\n".join(lines)
+
+
+def _safe_bounded_text(value: Any, limit: int) -> str | None:
+    """Classify the complete value before clipping it for a terminal field."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    clean = _single_line(value)
+    if not clean or _is_private_runtime_text(clean):
+        return None
+    return _clip(clean, limit)
 
 
 def _format_duration(duration_ms: int | float | None) -> str:
@@ -731,9 +741,10 @@ def _tool_line(
     last_duration_ms: int | float | None = None,
 ) -> str:
     glyph = "✓" if entry.tool_ok else "✗" if entry.tool_ok is not None else "•"
-    name = entry.tool_name or "?"
-    if entry.owner_task_id:
-        name = f"{entry.owner_task_id}/{name}"
+    name = _safe_bounded_text(entry.tool_name, 72) or "?"
+    owner = _safe_bounded_text(entry.owner_task_id, 72)
+    if owner:
+        name = f"{owner}/{name}"
     if count > 1:
         duration = _format_duration(last_duration_ms) if _usage_float(last_duration_ms) > 0 else ""
         prefix = f"{duration:>7} " if duration else ""
@@ -772,8 +783,9 @@ class _FailureBlock:
 
 def _task_id(record: Mapping[str, Any], data: Mapping[str, Any]) -> str | None:
     for value in (record.get("task_id"), data.get("task_id")):
-        if isinstance(value, str) and value.strip():
-            return _clip(_single_line(value), 72)
+        task_id = _safe_bounded_text(value, 72)
+        if task_id:
+            return task_id
     return None
 
 
@@ -786,10 +798,9 @@ def _event_field(data: Mapping[str, Any], *keys: str, limit: int = 96) -> str | 
     """Return one bounded scalar event field; nested payloads stay private."""
     for key in keys:
         value = data.get(key)
-        if isinstance(value, str) and value.strip():
-            clean = _clip(_single_line(value), limit)
-            if not _is_private_runtime_text(clean):
-                return clean
+        clean = _safe_bounded_text(value, limit)
+        if clean:
+            return clean
         if type(value) in (int, float) and not isinstance(value, bool):
             return _clip(_single_line(value), limit)
     return None
@@ -815,11 +826,10 @@ def _event_metadata(data: Mapping[str, Any]) -> dict[str, str]:
         paths = data.get("paths")
         if isinstance(paths, list | tuple):
             for path in paths:
-                if isinstance(path, str) and path.strip():
-                    clean = _clip(_single_line(path), 96)
-                    if not _is_private_runtime_text(clean):
-                        metadata["path"] = clean
-                        break
+                clean = _safe_bounded_text(path, 96)
+                if clean:
+                    metadata["path"] = clean
+                    break
     duration = _event_field(data, "duration_ms")
     if duration is not None:
         metadata["elapsed"] = _format_duration(_usage_float(duration))
@@ -833,11 +843,13 @@ def _event_metadata(data: Mapping[str, Any]) -> dict[str, str]:
 
 def _child_id(record: Mapping[str, Any], data: Mapping[str, Any]) -> str:
     value = data.get("child_task_id") or data.get("child_id")
-    if isinstance(value, str) and value.strip():
-        return _clip(_single_line(value), 72)
+    child_id = _safe_bounded_text(value, 72)
+    if child_id:
+        return child_id
     value = record.get("task_id") or data.get("task_id")
-    if isinstance(value, str) and value.strip():
-        return _clip(_single_line(value), 72)
+    child_id = _safe_bounded_text(value, 72)
+    if child_id:
+        return child_id
     return "child"
 
 
@@ -859,9 +871,10 @@ def _failure_context_line(kind: str, data: Mapping[str, Any]) -> str | None:
     tool_status = _tool_status(data)
     if kind == "tool_event" and tool_status is not None and not tool_status:
         tool = data.get("tool") or data.get("tool_name")
-        if not isinstance(tool, str) or not tool.strip():
+        clean_tool = _safe_bounded_text(tool, 72)
+        if not clean_tool:
             return "tool failed"
-        line = f"{_clip(_single_line(tool), 72)}: failed"
+        line = f"{clean_tool}: failed"
         for key in _TOOL_DETAIL_KEYS:
             detail = _tool_detail_value(data.get(key))
             if detail:
@@ -941,13 +954,13 @@ def _failure_summary(text: str) -> tuple[str | None, str | None] | None:
     if plan_failures is not None:
         pair = re.search(r"([^,\s:{}]+)\s*:\s*(['\"])(.*?)\2", plan_failures.group(1))
         if pair is not None:
-            task_id = pair.group(1)
+            task_id = _safe_bounded_text(pair.group(1), 72)
             cause = pair.group(3)
 
     if task_id is None:
         task_match = re.search(r"\btask(?:_id)?=([^\s]+)", clean)
         if task_match is not None:
-            task_id = task_match.group(1).strip("'\"")
+            task_id = _safe_bounded_text(task_match.group(1).strip("'\""), 72)
     if cause is None:
         reason = re.search(r"\b(?:failure_reason|reason)=((['\"])(.*?)\2|[^\s]+)", clean)
         if reason is not None:
@@ -956,6 +969,8 @@ def _failure_summary(text: str) -> tuple[str | None, str | None] | None:
                 cause = cause.strip("'\"")
     if cause:
         cause = _sanitize(cause).strip()
+        if _is_private_runtime_text(cause):
+            cause = None
     return task_id, cause or None
 
 
@@ -1121,18 +1136,16 @@ class Transcript:
             value = data.get("tool_name")
         if value is None:
             return ""
-        if not isinstance(value, str) or not value.strip():
-            return ""
-        clean = _clip(_single_line(value), 72)
-        return "" if _is_private_runtime_text(clean) else clean
+        return _safe_bounded_text(value, 72) or ""
 
     @staticmethod
     def _event_tool_id(data: Mapping[str, Any]) -> str | None:
         """Return the wire identity for one tool stream when it is present."""
         for key in ("tool_call_id", "tool_id", "call_id", "request_id", "id"):
             value = data.get(key)
-            if isinstance(value, str) and value:
-                return _clip(_single_line(value), 72)
+            tool_id = _safe_bounded_text(value, 72)
+            if tool_id:
+                return tool_id
         return None
 
     def _clear_stream(self) -> None:
@@ -1313,7 +1326,7 @@ class Transcript:
             self._tool_failure_key = key
             self._tool_failure_count = 0
         self._tool_failure_count += 1
-        name = _clip(_single_line(tool), 72) if isinstance(tool, str) else "tool"
+        name = _safe_bounded_text(tool, 72) or "tool"
         self._entries.append(
             TranscriptEntry(
                 role="tool",
@@ -1328,7 +1341,7 @@ class Transcript:
         self._tool_count += 1
         self._turn_tool_count += 1
         self._last_tool_name = (
-            _clip(_single_line(tool), 72) if isinstance(tool, str) and tool.strip() else "tool"
+            _safe_bounded_text(tool, 72) or "tool"
         )
         self._last_tool_duration_ms = duration
 
@@ -1670,25 +1683,24 @@ class ActivityState:
     def _tool_name(data: Mapping[str, Any]) -> str:
         for key in ("tool", "tool_name", "name"):
             value = data.get(key)
-            if isinstance(value, str) and value.strip():
-                clean = _clip(_single_line(value), 72)
-                if not _is_private_runtime_text(clean):
-                    return clean
+            clean = _safe_bounded_text(value, 72)
+            if clean:
+                return clean
         function = data.get("function")
         if isinstance(function, Mapping):
             value = function.get("name")
-            if isinstance(value, str) and value.strip():
-                clean = _clip(_single_line(value), 72)
-                if not _is_private_runtime_text(clean):
-                    return clean
+            clean = _safe_bounded_text(value, 72)
+            if clean:
+                return clean
         return "tool"
 
     @staticmethod
     def _tool_id(data: Mapping[str, Any]) -> str | None:
         for key in ("tool_call_id", "tool_id", "call_id", "request_id", "id"):
             value = data.get(key)
-            if isinstance(value, str) and value:
-                return value
+            tool_id = _safe_bounded_text(value, 72)
+            if tool_id:
+                return tool_id
         return None
 
     @staticmethod
@@ -1790,14 +1802,12 @@ class ActivityState:
     def _observe_provider(self, data: Mapping[str, Any]) -> None:
         provider = data.get("provider")
         model = data.get("model")
-        if isinstance(provider, str) and provider.strip():
-            clean_provider = _clip(_single_line(provider), 96)
-            if not _is_private_runtime_text(clean_provider):
-                self._provider = clean_provider
-        if isinstance(model, str) and model.strip():
-            clean_model = _clip(_single_line(model), 96)
-            if not _is_private_runtime_text(clean_model):
-                self._model = clean_model
+        clean_provider = _safe_bounded_text(provider, 96)
+        if clean_provider:
+            self._provider = clean_provider
+        clean_model = _safe_bounded_text(model, 96)
+        if clean_model:
+            self._model = clean_model
         cache_hit = data.get("provider_cache_hit")
         if type(cache_hit) is bool:
             self._cache_hit = cache_hit
@@ -1811,7 +1821,7 @@ class ActivityState:
             retry_after = self._number(data, "retry_after_s")
             provider = data.get("provider") or data.get("assigned_provider")
             self._cooldown = (
-                provider if isinstance(provider, str) else None,
+                _safe_bounded_text(provider, 96),
                 retry_after,
             )
         elif normalized not in _COOLDOWN_STATUSES:
@@ -2321,8 +2331,9 @@ def _entry_lines(
     if _is_private_runtime_text(entry.text):
         return []
     label = _ROLE_LABELS[entry.role]
-    if entry.role == "tool" and entry.owner_task_id and entry.tool_name is None:
-        label = f"{label}[{entry.owner_task_id}]"
+    owner = _safe_bounded_text(entry.owner_task_id, 72)
+    if entry.role == "tool" and owner and entry.tool_name is None:
+        label = f"{label}[{owner}]"
     label_prefix = f"{label} ▸ "
     body_width = max(1, width - _display_width(label_prefix))
     if entry.tool_name is not None:
@@ -2459,8 +2470,9 @@ def _stream_lines(
     if len(text) > _STREAM_RENDER_LIMIT:
         text = "…\n" + text[-_STREAM_RENDER_LIMIT:]
     label = _ROLE_LABELS[transcript.streaming_role]
-    if transcript.streaming_role == "tool" and transcript._stream_owner_task_id:
-        label = f"{label}[{transcript._stream_owner_task_id}]"
+    owner = _safe_bounded_text(transcript._stream_owner_task_id, 72)
+    if transcript.streaming_role == "tool" and owner:
+        label = f"{label}[{owner}]"
     label_prefix = f"{label} ▸ "
     if transcript.streaming_role == "tool" and transcript._stream_tool_name:
         text = f"[{transcript._stream_tool_name}] {text}"
@@ -2733,21 +2745,26 @@ def _status_fields(
     fields: dict[str, str] = {}
     for source in (session_description, branch_line, cumulative_line):
         clean = _sanitize(source).replace("\n", " ")
+        if _is_private_runtime_text(clean):
+            continue
         for match in re.finditer(r"(?<![\w/])([\w/]+)=([^\s·]+)", clean):
             key, value = match.groups()
             if key in _STATUS_KEYS:
-                fields.setdefault(key, _clip(value, 96))
+                candidate = _safe_bounded_text(value, 96)
+                if candidate:
+                    fields.setdefault(key, candidate)
 
     task_id = transcript.status_task_id if transcript is not None else None
     lane = _active_agent(snapshot, task_id)
     if lane is not None:
-        task = _clip(_single_line(getattr(lane, "task_id", "")), 72)
+        task = _safe_bounded_text(getattr(lane, "task_id", ""), 72)
         if task:
             fields["owner"] = task
         for name, key in (("provider", "provider"), ("model", "model"), ("tool", "tool")):
             value = getattr(lane, key, None)
-            if isinstance(value, str) and value:
-                fields[name] = _clip(_single_line(value), 96)
+            clean = _safe_bounded_text(value, 96)
+            if clean:
+                fields[name] = clean
         turn = getattr(lane, "turn", None)
         if type(turn) is int and turn >= 0:
             fields["turn"] = str(turn)
@@ -2767,18 +2784,24 @@ def _status_fields(
     if context is not None:
         fields["epoch"] = str(_usage_int(getattr(context, "epoch", 0)))
         checkpoint = getattr(context, "checkpoint_ref", None)
-        if isinstance(checkpoint, str) and checkpoint:
-            fields.setdefault("checkpoint", _clip(_single_line(checkpoint), 96))
+        clean = _safe_bounded_text(checkpoint, 96)
+        if clean:
+            fields.setdefault("checkpoint", clean)
     fields.setdefault("tokens", _human_count(_usage_int(getattr(snapshot, "total_tokens", 0))))
     fields.setdefault("out/s", f"{_usage_float(getattr(snapshot, "output_tokens_per_s", 0.0)):.1f}")
     fields.setdefault("rate", fields.get("out/s", ""))
     if transcript is not None:
-        fields.update({key: value for key, value in transcript.status_metadata.items() if value})
+        for key, value in transcript.status_metadata.items():
+            clean = _safe_bounded_text(value, 96)
+            if clean:
+                fields[key] = clean
     return fields
 
 
 def _activity_status(snapshot: Any, activity_line: str) -> str:
     clean = _single_line(activity_line)
+    if _is_private_runtime_text(clean):
+        clean = ""
     if clean:
         return clean
     status = _side_clean(getattr(snapshot, "session_status", "idle")).casefold()
@@ -2844,8 +2867,8 @@ def _status_line(
     activity_source = _activity_status(snapshot, activity_line)
     activity = _status_activity(activity_source, color)
     parts = [activity]
-    provider = fields.get("provider")
-    model = fields.get("model")
+    provider = _side_clean(fields.get("provider", ""))
+    model = _side_clean(fields.get("model", ""))
     if provider or model:
         parts.append(
             _status_paint(f"{provider or '?'}/{_short_model(model or '?')}", "cyan", color)
@@ -2854,7 +2877,7 @@ def _status_line(
         parts.append(f"err{transcript.current_tool_error_count}")
     if token_count := fields.get("tokens"):
         parts.append(_status_paint(f"{token_count} tok", "dim", color))
-    if owner := fields.get("owner"):
+    if owner := _side_clean(fields.get("owner", "")):
         parts.append(f"owner={owner}")
     if turn := fields.get("turn"):
         parts.append(f"t{_side_clean(turn)}")

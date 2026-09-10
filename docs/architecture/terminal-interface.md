@@ -93,9 +93,9 @@ Rich is a normal Cambium dependency and is the single Markdown parser/theme for
 one-shot/REPL output and the timeline. The shared renderer uses a no-background
 extended palette when the terminal supports 256 colors and degrades to the
 standard palette or plain text. Headings, links, quotes, inline code, code blocks,
-tables, user/model/tool roles, routing, provider waits, reasoning, streaming,
-children, cache hits/misses, cooldowns and failures have distinct semantic
-styles. Code blocks use compact bordered panels and narrow tables retain the
+tables, user/model/tool roles, routing, provider waits, reasoning-phase labels,
+streaming, children, cache hits/misses, cooldowns and failures have distinct
+semantic styles. Code blocks use compact bordered panels and narrow tables retain the
 width-safe fallback so cells are not silently clipped.
 
 The renderer sanitizes model/provider text before Rich sees it. Cambium keeps
