@@ -1434,7 +1434,7 @@ def test_plan_and_thought_round_trip_through_parser() -> None:
         )
     )["summary"]
     assert len(verbose.encode("utf-8")) <= worker.MAX_SUMMARY_CHARS
-    assert verbose.endswith("…")
+    assert verbose == ("Useful result. " + "routine tool narration " * 80).strip()
     for bad, match in (
         ('{"type":"tool_call","calls":[]}', "non-empty array"),
         ('{"type":"tool_call","calls":[null]}', "calls\\[0\\] must be an object"),

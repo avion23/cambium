@@ -194,7 +194,6 @@ TOOL_OUTPUT_DELTA_INTERVAL_S = 0.1
 _HEARTBEAT_DRAIN_TIMEOUT_S = 0.25
 INIT_TIMEOUT_S = 30.0
 IDLE_TIMEOUT_S = 300.0
-MAX_SUMMARY_CHARS = 420
 # Consecutive non-novel actions (valid plans, tool calls, and
 # invalid/unparseable actions) before the agent loop fails fast.
 MAX_NO_PROGRESS_ACTIONS = 2
@@ -224,6 +223,8 @@ MAX_CMD_BYTES = 512
 MAX_TRANSCRIPT_CHARS = 120_000
 TRANSCRIPT_KEEP_TURNS = 6
 MAX_ENVELOPE_FIELD_CHARS = 2_000
+# User-facing completion text can use the full existing result-envelope field.
+MAX_SUMMARY_CHARS = MAX_ENVELOPE_FIELD_CHARS
 MAX_ENVELOPE_ITEMS = 16
 # Supervisor-authored correction appended to a resumed parent's context when
 # every child of one delegate batch was rejected before spawn. Bounded so a

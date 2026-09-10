@@ -570,7 +570,7 @@ def _stream_update(
         if text is None:
             return None
         return "assistant", text, False, None
-    if kind == "tool_event" or kind in _ASSISTANT_STREAM_KINDS or kind in _TOOL_STREAM_KINDS:
+    if kind in _ASSISTANT_STREAM_KINDS or kind in _TOOL_STREAM_KINDS:
         tool_status = _tool_status(data)
         if kind == "tool_event" and tool_status is not None and not tool_status:
             return None
@@ -1490,18 +1490,24 @@ class Transcript:
         turn = _event_turn(data)
         self._remember_turn(task_id, turn)
 
+        if kind == "tool_event" and self._stream_role == "tool":
+            owner = task_id or "?"
+            active_tool_key = f"{owner}:run:{self._event_tool(data) or ''}"
+            if self._stream_tool_key == active_tool_key:
+                self._commit_stream()
+
         update = _stream_update(record)
         if update is not None:
             role, text, append, message_id = update
             tool_key: str | None = None
             if role == "tool":
-                # One stream identity per tool operation: deltas from tool A
-                # never append to tool B's row, and a completion event closes
-                # the running tool's stream before the next tool opens one.
+                # One stream identity per task/tool operation: concurrent
+                # children running the same tool must never share one tail.
+                owner = task_id or "?"
                 if kind == "tool_event":
-                    tool_key = f"end:{data.get('tool')}"
+                    tool_key = f"{owner}:end:{data.get('tool')}"
                 else:
-                    tool_key = f"run:{self._event_tool(data) or ''}"
+                    tool_key = f"{owner}:run:{self._event_tool(data) or ''}"
             self._update_stream(
                 role,
                 text,
@@ -4580,7 +4586,7 @@ class Cockpit:
                     transcript,
                     width,
                     color=self.color,
-                    include_stream=False,
+                    include_stream=True,
                 )[-conversation_capacity:]
             )
             if conversation_capacity
@@ -4771,8 +4777,20 @@ class Cockpit:
         if not self._fixed_frame:
             self._draw_now(request, force=True)
             return
+        if self._small_frame:
+            self._draw_small_now(request)
+            return
         content_width = _frame_content_width(self._last_size.columns)
         conversation_capacity = max(1, self._last_size.lines - _frame_overhead(self._show_detail))
+        conversation_rows = tuple(
+            _primary_rows(
+                transcript,
+                content_width,
+                color=self.color,
+                include_stream=True,
+            )
+        )
+        visible_rows = tuple(conversation_rows[-conversation_capacity:])
         rail_width = _rail_width(self._last_size.columns)
         rail_rows = (
             tuple(
@@ -4809,8 +4827,8 @@ class Cockpit:
             and (index >= len(self._last_status_rows) or row != self._last_status_rows[index])
         )
         self._redraw_status_indices(status_rows, changed)
-        if rail_rows != self._last_rail_rows and self._last_frame_conversation_rows:
-            self._redraw_rail(self._last_frame_conversation_rows, rail_rows)
+        if visible_rows != self._last_frame_conversation_rows or rail_rows != self._last_rail_rows:
+            self._redraw_rail(visible_rows, rail_rows)
         self._last_request = request
         self._activity_line = activity_line
         self._activity_only_update = False
@@ -4822,8 +4840,9 @@ class Cockpit:
             branch_line=branch_line,
             cumulative_line=cumulative_line,
         )
-        if self._last_conversation_rows:
-            self._last_primary_rows = _primary_request_rows(self._last_conversation_rows, rail_rows)
+        self._last_conversation_rows = conversation_rows
+        self._last_frame_conversation_rows = visible_rows
+        self._last_primary_rows = _primary_request_rows(conversation_rows, rail_rows)
         self._last_rail_rows = rail_rows
         self._last_live_revision = transcript.live_revision
         self._hold_final_conversation(request)
@@ -4848,7 +4867,7 @@ class Cockpit:
                         request[1],
                         _frame_content_width(self._last_size.columns),
                         color=self.color,
-                        include_stream=False,
+                        include_stream=True,
                     )
                 )
                 visible = rows[-capacity:]
@@ -4931,7 +4950,7 @@ class Cockpit:
                 transcript,
                 content_width,
                 color=self.color,
-                include_stream=False,
+                include_stream=True,
             )
         )
         conversation_capacity = max(1, self._last_size.lines - _frame_overhead(self._show_detail))

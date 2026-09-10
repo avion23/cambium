@@ -1668,7 +1668,7 @@ def test_run_shell_output_deltas_reach_supervisor_and_tui_rows(tmp_path, monkeyp
         joined_deltas = "".join(event["payload"]["delta"] for event in deltas)
         assert "delta-0" in joined_deltas
         assert "delta-" in joined_deltas
-        assert output.count("┌ Cambium · conversation") == 1
+        assert output.count("┌ Cambium · conversation") >= 2
         assert output.find("delta-") > len(first_frame)
         assert "succeeded" in output
     finally:
