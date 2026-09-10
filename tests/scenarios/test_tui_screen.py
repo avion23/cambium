@@ -1166,10 +1166,21 @@ def test_assistant_deltas_render_in_the_active_tail_before_turn_completion() -> 
     assert transcript.entries[-1].text == "# Findings\nThe stream is live."
 
 
-def test_accepted_response_event_uses_the_assistant_timeline_path() -> None:
+def test_accepted_response_chunks_use_one_assistant_timeline_stream() -> None:
     transcript = Transcript()
     transcript.observe_event(
-        {"kind": "response", "payload": {"text": "# Result\n\nFull operator response."}}
+        {
+            "kind": "response_chunk",
+            "request_id": "run-1",
+            "payload": {"chunk_index": 0, "text": "# Result\n\nFull ", "final": False},
+        }
+    )
+    transcript.observe_event(
+        {
+            "kind": "response_chunk",
+            "request_id": "run-1",
+            "payload": {"chunk_index": 1, "text": "operator response.", "final": True},
+        }
     )
 
     assert transcript.streaming_role == "assistant"

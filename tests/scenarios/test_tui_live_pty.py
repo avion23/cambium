@@ -164,6 +164,7 @@ def _spawn_tui(repo: Path, provider_file: Path, *args: str) -> tuple[subprocess.
         {
             "CAMBIUM_PROVIDERS": str(provider_file),
             "PYTHONFAULTHANDLER": "1",
+            "TERM": "xterm-256color",
             "NO_PROXY": "127.0.0.1,localhost",
             "no_proxy": "127.0.0.1,localhost",
         }

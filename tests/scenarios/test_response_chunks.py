@@ -198,8 +198,7 @@ def test_supervisor_accepts_sequential_chunks_and_exact_duplicate() -> None:
 
     durable = [payload for kind, payload in runtime.records if kind == "response_chunk"]
     assert [item["text"] for item in durable] == ["hello world"]
-    presented = [payload for kind, payload in runtime.records if kind == "response"]
-    assert [item["text"] for item in presented] == ["hello world"]
+    assert not [payload for kind, payload in runtime.records if kind == "response"]
     assert state.response_next_index == 2
     assert state.response_bytes == 11
     assert state.response_final_index == 1
@@ -268,10 +267,9 @@ def test_supervisor_rejects_conflicting_duplicate_and_incomplete_result() -> Non
     assert state.protocol_failure == "INCOMPLETE_RESPONSE"
 
 
-def test_supervisor_chunks_legacy_inline_response_before_accepting_result() -> None:
+def test_supervisor_rejects_inline_response_in_result_control_envelope() -> None:
     runtime = _RuntimeProbe()
     state = _state()
-    response = "legacy-" + ("y" * (12 * 1024 + 1))
 
     asyncio.run(
         runtime._handle_result_message(
@@ -283,19 +281,16 @@ def test_supervisor_chunks_legacy_inline_response_before_accepting_result() -> N
                 "request_id": "run-1",
                 "status": "succeeded",
                 "summary": "compact",
-                "response": response,
+                "response": "must use response_chunk",
             },
         )
     )
 
-    chunks = [payload for kind, payload in runtime.records if kind == "response_chunk"]
-    assert "".join(item["text"] for item in chunks) == response
+    assert state.envelope is None
+    assert state.protocol_failure == "INVALID_RESULT_ENVELOPE"
+    assert not [record for record in runtime.records if record[0] == "response_chunk"]
     result = next(payload for kind, payload in runtime.records if kind == "result")
-    assert result["response_chunk_count"] == len(chunks)
-    assert result["response_bytes"] == len(response.encode())
-    assert state.envelope is not None
-    assert "response" not in state.envelope
-    assert state.protocol_failure is None
+    assert result["response_valid"] is False
 
 
 def test_supervisor_session_response_resource_limit_rejects_before_persist(
@@ -345,10 +340,9 @@ def test_supervisor_redacts_secret_across_raw_chunk_boundary_and_replays_redacte
 
     redacted = runtime._redactor.redact(response)
     durable = [payload for kind, payload in runtime.records if kind == "response_chunk"]
-    presented = [payload for kind, payload in runtime.records if kind == "response"]
     assert secret not in "".join(item["text"] for item in durable)
-    assert secret not in "".join(item["text"] for item in presented)
     assert "".join(item["text"] for item in durable) == redacted
+    assert not [payload for kind, payload in runtime.records if kind == "response"]
     result = next(payload for kind, payload in runtime.records if kind == "result")
     assert result["response_chunk_count"] == len(durable)
     assert result["response_bytes"] == len(redacted.encode())
@@ -407,6 +401,7 @@ def test_cancelled_partial_raw_response_flushes_only_a_redacted_prefix() -> None
 
     durable = [payload for kind, payload in runtime.records if kind == "response_chunk"]
     assert "".join(item["text"] for item in durable) == "safe-***"
+    assert durable[-1]["final"] is False
     assert secret not in "".join(item["text"] for item in durable)
     result = next(payload for kind, payload in runtime.records if kind == "result")
     assert result["status"] == "cancelled"

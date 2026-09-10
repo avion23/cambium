@@ -582,10 +582,8 @@ def _restore_turn_transcript(
                     prompt_task_ids.add(task_id)
                 else:
                     unassigned_prompt_seen = True
-        elif kind == "response":
-            response_seen = response_seen or (
-                _event_text(payload, "text", "content", "summary", "output_text") is not None
-            )
+        elif kind == "response_chunk":
+            response_seen = response_seen or (_event_text(payload, "text") is not None)
         if kind == "result":
             result_summary = _event_text(payload, "summary", "output_text") or result_summary
         transcript.observe_event(event)
@@ -1314,7 +1312,7 @@ async def _run_interactive(
                         _turns_by_task.get(record.get("task_id"), _turns[0]), record
                     )
                     transcript.observe_event(record)
-                    if record.get("kind") == "response":
+                    if record.get("kind") == "response_chunk":
                         response_seen = True
                     _activity.observe_event(record)
                     sequence += 1
@@ -1570,7 +1568,10 @@ async def run_tui(
     source = sys.stdin if input_stream is None else input_stream
     out = sys.stdout if output_stream is None else output_stream
     err = sys.stderr if error_stream is None else error_stream
-    if _is_tty(source) and _is_tty(out) and not quiet:
+    capabilities = terminal_capabilities(out)
+    native_streams = source is sys.stdin and out is sys.stdout
+    cursor_safe = capabilities.cursor_controls or not native_streams
+    if _is_tty(source) and _is_tty(out) and cursor_safe and not quiet:
         return await _run_interactive(
             config,
             source=source,

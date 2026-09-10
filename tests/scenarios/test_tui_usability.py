@@ -106,6 +106,26 @@ def _model_config(tmp_path: Path, provider_config: Path) -> OneShotConfig:
     )
 
 
+def test_term_dumb_native_tty_uses_line_oriented_frontend(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = _Tty("/exit\n")
+    output = _Tty()
+    error = io.StringIO()
+    monkeypatch.setenv("TERM", "dumb")
+    monkeypatch.setattr(tui.sys, "stdin", source)
+    monkeypatch.setattr(tui.sys, "stdout", output)
+    monkeypatch.setattr(tui.sys, "stderr", error)
+
+    code = asyncio.run(
+        tui.run_tui(OneShotConfig(repo=tmp_path, session_root=tmp_path / "interactive"))
+    )
+
+    assert code == 0
+    assert "cambium> " in output.getvalue()
+    assert "\x1b[2K" not in output.getvalue()
+
+
 def test_tui_operator_commands_render_without_provider_calls(tmp_path: Path) -> None:
     source = _Tty("/events\n/branches\n/fork\n/compact\n/model\n/cancel\n/exit\n")
     output = _Tty()

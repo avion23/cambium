@@ -756,13 +756,13 @@ def _invalid_result_envelope_fields(msg: Mapping[str, Any]) -> list[str]:
     invalid: list[str] = []
     if msg.get("status") not in {"succeeded", "failed", "cancelled", "suspended", "unresolvable"}:
         invalid.append("status")
-    for field in ("summary", "response", "diff", "unified_diff"):
+    for field in ("summary", "diff", "unified_diff"):
         if field in msg and not isinstance(msg[field], str):
             invalid.append(field)
-    # ``response`` is accepted only as a legacy inline value. A correlated
-    # result handler immediately converts it to bounded response_chunk events
-    # and removes it from the retained/result payload, so the old 12 KiB
-    # product ceiling is not enforced at this boundary.
+    # Full user-facing text has exactly one transport: correlated bounded
+    # response_chunk frames. Result/control envelopes stay compact.
+    if "response" in msg:
+        invalid.append("response")
     for field in ("response_chunk_count", "response_bytes"):
         value = msg.get(field)
         if field in msg and (
@@ -6875,8 +6875,9 @@ class _Runtime:
                 state, f"response rejected: redaction/chunking failed ({exc})"
             )
         durable_bytes = len(redacted.encode("utf-8"))
+        raw_complete = state.response_final_index == state.response_next_index - 1
         state.response_durable_chunks = {
-            index: (chunk, index == len(durable_chunks) - 1)
+            index: (chunk, raw_complete and index == len(durable_chunks) - 1)
             for index, chunk in enumerate(durable_chunks)
         }
         state.response_durable_bytes = durable_bytes
@@ -6893,56 +6894,8 @@ class _Runtime:
                 text=chunk,
                 final=final,
             )
-            # Keep the existing live/replay presentation seam fed without
-            # making it authoritative: response_chunk is the critical
-            # canonical record, while this bounded append event is a
-            # compatibility view for current terminal consumers.
-            await self.emit(
-                "response",
-                task_id=state.task_id,
-                request_id=state.run_rid,
-                generation=state.generation,
-                message_id=f"{state.task_id}:{state.generation}:{state.run_rid}",
-                chunk_index=index,
-                text=chunk,
-                append=True,
-                final=final,
-            )
             state.response_durable_next_index = index + 1
         state.response_redaction_done = True
-        return False
-
-    async def _emit_inline_response_chunks(
-        self, state: _GenerationState, response: str
-    ) -> bool:
-        """Feed a legacy inline response through the same raw-chunk path."""
-        _ensure_response_state(state)
-        if state.response_next_index != 0 or state.response_chunks:
-            return await self._reject_response_chunk(
-                state, "response rejected: chunks already received"
-            )
-        try:
-            chunks = _split_response_chunks(response)
-        except (TypeError, ValueError, UnicodeError) as exc:
-            return await self._reject_response_chunk(
-                state, f"response rejected: cannot chunk inline response ({exc})"
-            )
-        for index, chunk in enumerate(chunks):
-            if await self._handle_response_chunk_message(
-                state,
-                {
-                    "type": "response_chunk",
-                    "task_id": state.task_id,
-                    "generation": state.generation,
-                    "request_id": state.run_rid,
-                    "chunk_index": index,
-                    "text": chunk,
-                    "final": index == len(chunks) - 1,
-                },
-            ):
-                return True
-        state.response_expected_count = len(chunks)
-        state.response_expected_bytes = len(response.encode("utf-8"))
         return False
 
     @staticmethod
@@ -7009,10 +6962,6 @@ class _Runtime:
             and not invalid_fields
             and state.protocol_failure is None
         )
-        response_text = msg.get("response")
-        if response_accepted and isinstance(response_text, str) and response_text:
-            if await self._emit_inline_response_chunks(state, response_text):
-                response_accepted = False
         if response_accepted:
             for field in ("response_chunk_count", "response_bytes"):
                 if field in msg and field not in invalid_fields:
@@ -7096,12 +7045,7 @@ class _Runtime:
         if accepted:
             if state.sandbox_failure_reason is not None and msg.get("status") != "succeeded":
                 msg = {**msg, "failure_reason": state.sandbox_failure_reason}
-            # Inline responses were converted to durable chunks above. Never
-            # retain the full response in the terminal envelope or reusable
-            # parent context.
-            envelope = dict(msg)
-            envelope.pop("response", None)
-            state.envelope = envelope
+            state.envelope = msg
         # Proposals are retained until this generation returns. In particular,
         # a correlated worker ``succeeded`` envelope is still provisional until
         # _supervise has passed integrity and merge; admitting here would orphan

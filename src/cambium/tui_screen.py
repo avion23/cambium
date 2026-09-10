@@ -125,7 +125,7 @@ _ASSISTANT_STREAM_KINDS = frozenset(
         "message_delta",
         "output_text_delta",
         "partial_output",
-        "response",
+        "response_chunk",
         "response.output_text.delta",
         "stream_chunk",
         "text_delta",
@@ -148,6 +148,7 @@ _STREAM_DELTA_KINDS = frozenset(
         "message_delta",
         "output_text_delta",
         "partial_output",
+        "response_chunk",
         "response.output_text.delta",
         "stream_chunk",
         "text_delta",
@@ -641,7 +642,7 @@ def _stream_update(
             append = False
         if data.get("append"):
             append = True
-        message_id = data.get("message_id") or data.get("id")
+        message_id = data.get("message_id") or data.get("id") or record.get("request_id")
         return role, text, append, message_id if isinstance(message_id, str) else None
     return None
 

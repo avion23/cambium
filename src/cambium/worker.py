@@ -3827,11 +3827,15 @@ def _record_situation_tool(
 
 
 def _safe_cmd(name: str, args: dict[str, Any]) -> str:
-    if name == "run_shell":
-        cmd = args.get("cmd")
-        if isinstance(cmd, list):
-            return _cap_utf8(" ".join(str(token) for token in cmd), MAX_CMD_BYTES)
-    return _cap_utf8(f"{name} {json.dumps(args, sort_keys=True)}", MAX_CMD_BYTES)
+    """Return only public command text already intended for live narration."""
+    if name != "run_shell":
+        return ""
+    cmd = args.get("cmd")
+    if isinstance(cmd, list):
+        return _cap_utf8(" ".join(str(token) for token in cmd), MAX_CMD_BYTES)
+    if isinstance(cmd, str):
+        return _cap_utf8(cmd, MAX_CMD_BYTES)
+    return ""
 
 
 async def _emit_tool_event(
