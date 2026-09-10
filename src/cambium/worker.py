@@ -9,9 +9,11 @@ rebind init on stdin (eval-3 ADOPT warm pool):
     init                        ->  ready (echoes the init request_id and the
                                     generation fencing token)
     run_task                    ->  heartbeat(s) every ~1s while working
-                                ->  result_envelope (echoes the run_task
-                                    request_id) -> exit_message (connection
-                                    level; carries NO request_id)
+                                ->  response_chunk(s) when finish returns a
+                                    user-facing response -> result_envelope
+                                    (echoes the run_task request_id) ->
+                                    exit_message (connection level; carries
+                                    NO request_id)
                                 ->  with ``worker_reuse``: result_envelope
                                     then reuse_ready (keeps the process alive)
     init (rebind, reuse only)   ->  clears ALL per-task state (agent loop,
@@ -133,6 +135,7 @@ from cambium.auth import oauth_env_suffix, scrub_environment
 from cambium.branch_state import BranchState, inspect_state
 from cambium.context_policy import CastPolicy
 from cambium.diffundo import (
+    MAX_PROVIDER_RESPONSE_BYTES,
     AllProvidersFailed,
     CallResult,
     CredentialSource,
@@ -217,9 +220,18 @@ DEFAULT_MAX_TOKENS = 200_000
 DEFAULT_MAX_WALL_S = 3600.0
 CHECKPOINT_SCHEMA = 1
 MAX_ACTION_CONTENT_BYTES = 16 * 1024
-# Keep the operator-facing final response large enough for useful Markdown while
-# leaving headroom for the surrounding finish action in textual fallback mode.
-MAX_RESPONSE_CHARS = 12 * 1024
+# A chunk is deliberately far below the 1 MiB IPC line cap.  The provider's
+# response ingress cap is the resource guard for one finish response; it is
+# not a product answer-size ceiling.
+MAX_RESPONSE_CHUNK_BYTES = 32 * 1024
+MAX_RESPONSE_TOTAL_BYTES = MAX_PROVIDER_RESPONSE_BYTES
+# A UTF-8 boundary can move a nominal chunk edge back by at most three bytes
+# (the longest encoded code point). Size the count guard for that worst case so
+# every response at the provider limit remains representable.
+_RESPONSE_CHUNK_WORST_CASE_BYTES = MAX_RESPONSE_CHUNK_BYTES - 3
+MAX_RESPONSE_CHUNKS = (
+    MAX_RESPONSE_TOTAL_BYTES + _RESPONSE_CHUNK_WORST_CASE_BYTES - 1
+) // _RESPONSE_CHUNK_WORST_CASE_BYTES
 MAX_TOOL_CALLS_PER_BATCH = 16
 MAX_OBSERVATION_BYTES = 64 * 1024
 MAX_CMD_BYTES = 512
@@ -274,8 +286,8 @@ def _join_checkpoint_payload(data: dict[str, Any]) -> dict[str, Any]:
     return joined
 
 
-# Start synthesis before the hard ceiling so a bounded terminal response can
-# still be produced instead of discarding the action that crossed the edge.
+# Start synthesis before the token budget edge so a bounded terminal response
+# can still be produced instead of discarding the action that crossed the edge.
 SOFT_TOKEN_CAP_RATIO = 0.9
 FINAL_SYNTHESIS_HEADROOM_RATIO = 0.1
 FINAL_SYNTHESIS_MIN_HEADROOM_TOKENS = 4_000
@@ -861,6 +873,12 @@ async def send(writer: asyncio.StreamWriter, msg: dict[str, Any]) -> None:
     # transport flushes buffered bytes as the pipe becomes writable, and the
     # heartbeat loop performs the only capped, guarded drain.
     write_message(writer, msg)
+
+
+def _request_stop(stop: threading.Event) -> None:
+    """Record an external cancellation before setting the shared stop flag."""
+    stop._cambium_cancel_requested = True  # type: ignore[attr-defined]
+    stop.set()
 
 
 def git(*args: str, cwd: str | Path | None = None) -> tuple[int, str, str]:
@@ -1820,6 +1838,42 @@ def _bounded_user_text(text: str, limit: int) -> str:
     return clipped + "…"
 
 
+def _split_response_chunks(text: str) -> tuple[str, ...]:
+    """Split one finish response into UTF-8-safe, bounded wire chunks.
+
+    The provider ingress cap is the only response-size guard.  A response at
+    that cap produces at most ``MAX_RESPONSE_CHUNKS`` chunks; no chunk can
+    exceed ``MAX_RESPONSE_CHUNK_BYTES`` when encoded as UTF-8.  The returned
+    chunks concatenate byte-for-byte to the original response.
+    """
+    if not isinstance(text, str):
+        raise TypeError("response must be a string")
+    raw = text.encode("utf-8")
+    if len(raw) > MAX_RESPONSE_TOTAL_BYTES:
+        raise ValueError(
+            f"response exceeds the resource limit ({MAX_RESPONSE_TOTAL_BYTES} bytes)"
+        )
+    if not raw:
+        return ()
+    chunks: list[str] = []
+    offset = 0
+    while offset < len(raw):
+        end = min(offset + MAX_RESPONSE_CHUNK_BYTES, len(raw))
+        # Do not split a multi-byte UTF-8 sequence. Continuation bytes are
+        # 10xxxxxx; moving the boundary left is sufficient because ``offset``
+        # always starts at a code-point boundary.
+        while end > offset and end < len(raw) and (raw[end] & 0xC0) == 0x80:
+            end -= 1
+        if end <= offset:
+            raise ValueError("response chunk boundary is not UTF-8 safe")
+        chunk = raw[offset:end].decode("utf-8")
+        chunks.append(chunk)
+        offset = end
+    if len(chunks) > MAX_RESPONSE_CHUNKS:
+        raise ValueError("response exceeds the chunk-count resource limit")
+    return tuple(chunks)
+
+
 def _user_summary(text: str) -> str:
     """Return the compact result/envelope summary derived from a final response."""
     return _bounded_user_text(text, MAX_SUMMARY_CHARS)
@@ -1827,7 +1881,14 @@ def _user_summary(text: str) -> str:
 
 def _user_response(text: str) -> str:
     """Return the full operator-facing finish response at the action boundary."""
-    return _bounded_user_text(text, MAX_RESPONSE_CHARS)
+    if not isinstance(text, str):
+        raise TypeError("finish summary must be a string")
+    clean = text.strip()
+    if len(clean.encode("utf-8")) > MAX_RESPONSE_TOTAL_BYTES:
+        raise ValueError(
+            f"finish summary exceeds the resource limit ({MAX_RESPONSE_TOTAL_BYTES} bytes)"
+        )
+    return clean
 
 
 def _safe_task_id(task_id: str) -> str:
@@ -2170,8 +2231,12 @@ def _parse_agent_action(content: str) -> dict[str, Any]:
     text = content.strip()
     if not text:
         raise ValueError("empty agent action")
-    if len(text.encode("utf-8")) > MAX_ACTION_CONTENT_BYTES:
-        raise ValueError("agent action exceeds the field cap")
+    encoded_size = len(text.encode("utf-8"))
+    # Finish summaries are the one provider action allowed to carry the full
+    # user-facing response. Other actions retain the small context/repair
+    # bound so malformed tool payloads cannot bloat the reusable transcript.
+    if encoded_size > MAX_RESPONSE_TOTAL_BYTES:
+        raise ValueError("agent action exceeds the response resource limit")
     fence = _FENCED_ACTION_RE.match(text)
     if fence:
         text = fence.group(1)
@@ -2193,6 +2258,8 @@ def _parse_agent_action(content: str) -> dict[str, Any]:
         parsed["type"] = "tool_call"
     action_type = parsed.get("type")
     if action_type == "plan":
+        if encoded_size > MAX_ACTION_CONTENT_BYTES:
+            raise ValueError("agent action exceeds the field cap")
         if not _action_keys(parsed, frozenset({"type", "steps"})):
             raise ValueError("plan must carry exactly type/steps (plus optional thought)")
         schema_errors = validate_tool_call(PLAN_ACTION_SCHEMA, parsed)
@@ -2200,6 +2267,8 @@ def _parse_agent_action(content: str) -> dict[str, Any]:
             raise ValueError(schema_errors[0])
         return {"type": "plan", "steps": list(parsed["steps"])}
     if action_type == "tool_call":
+        if encoded_size > MAX_ACTION_CONTENT_BYTES:
+            raise ValueError("agent action exceeds the field cap")
         if "calls" in parsed:
             required = frozenset({"type", "calls"})
             shape = "type/calls"
@@ -5084,7 +5153,7 @@ def _loop_failure_outcome(loop_outcome: dict[str, Any]) -> dict[str, Any]:
     }
     response = loop_outcome.get("response")
     if isinstance(response, str) and response:
-        outcome["response"] = _cap_utf8(response, MAX_RESPONSE_CHARS)
+        outcome["response"] = response
     if outcome["status"] == TaskStatus.SUSPENDED.value:
         outcome["epoch"] = loop_outcome.get("epoch")
         outcome["checkpoint_ref"] = loop_outcome.get("checkpoint_ref")
@@ -7531,6 +7600,12 @@ async def _do_provider_work(
         stop=stop,
         loop_outcome=loop_outcome,
     )
+    # ``stop`` may be set while the synchronous finalizer is staging or
+    # committing.  Re-check before publishing the outcome so a cancellation
+    # racing finalization can never become a successful terminal result.
+    if stop.is_set() and outcome.get("status") == TaskStatus.SUCCEEDED.value:
+        outcome["status"] = TaskStatus.CANCELLED.value
+        outcome["failure_reason"] = "task cancelled during finalization"
     if loop_status == TaskStatus.SUSPENDED.value and outcome["status"] == "succeeded":
         epoch = loop_outcome.get("epoch")
         checkpoint_ref = loop_outcome.get("checkpoint_ref")
@@ -7550,7 +7625,13 @@ async def _do_provider_work(
         )
         response = loop_outcome.get("response")
         if isinstance(response, str) and response:
-            outcome["response"] = _cap_utf8(response, MAX_RESPONSE_CHARS)
+            outcome["response"] = response
+    if stop.is_set() and outcome.get("status") in {
+        TaskStatus.SUCCEEDED.value,
+        TaskStatus.SUSPENDED.value,
+    }:
+        outcome["status"] = TaskStatus.CANCELLED.value
+        outcome["failure_reason"] = "task cancelled during finalization"
     final_checkpoint = outcome.pop("_checkpoint_path", None)
     terminal_checkpoint = outcome.pop("_context_checkpoint", None)
     if writer is not None and final_checkpoint is not None:
@@ -7565,6 +7646,12 @@ async def _do_provider_work(
         await _emit_context_checkpoint(
             writer, config, terminal_checkpoint, request_id=run.get("request_id")
         )
+    if stop.is_set() and outcome.get("status") in {
+        TaskStatus.SUCCEEDED.value,
+        TaskStatus.SUSPENDED.value,
+    }:
+        outcome["status"] = TaskStatus.CANCELLED.value
+        outcome["failure_reason"] = "task cancelled before terminal result"
     return outcome
 
 
@@ -7601,7 +7688,7 @@ def _finalize_worktree(
     }
     response = loop_outcome.get("response")
     if isinstance(response, str) and response:
-        outcome["response"] = _cap_utf8(response, MAX_RESPONSE_CHARS)
+        outcome["response"] = response
     provider_metadata = _cumulative_provider_metadata(loop_outcome)
     if provider_metadata is not None:
         outcome["provider_metadata"] = provider_metadata
@@ -7989,8 +8076,10 @@ async def _run_task(
     hb = asyncio.create_task(
         _heartbeat_loop(writer, task_id, generation, stop, progress, config.heartbeat_interval_s)
     )
+    cancellation_requested = False
     try:
         outcome = await do_work(run, stop, config=config, writer=writer, progress=progress)
+        cancellation_requested = bool(getattr(stop, "_cambium_cancel_requested", False))
     finally:
         stop.set()
         # Heartbeat stop: the write is enqueued synchronously and atomically,
@@ -8007,6 +8096,9 @@ async def _run_task(
                 await hb
             except asyncio.CancelledError:
                 pass
+    if cancellation_requested and outcome.get("status") == TaskStatus.SUCCEEDED.value:
+        outcome["status"] = TaskStatus.CANCELLED.value
+        outcome["failure_reason"] = "task cancelled before terminal result"
     outcome["request_id"] = run_rid
     outcome["task_id"] = task_id
     outcome["generation"] = generation
@@ -8014,6 +8106,12 @@ async def _run_task(
     outcome["started_at"] = started_at
     outcome["ended_at"] = time.time()
     await _emit_proposed_children(writer, run, task_id)
+    if (
+        bool(getattr(stop, "_cambium_cancel_requested", False))
+        and outcome.get("status") == TaskStatus.SUCCEEDED.value
+    ):
+        outcome["status"] = TaskStatus.CANCELLED.value
+        outcome["failure_reason"] = "task cancelled before terminal result"
     return outcome
 
 
@@ -8044,9 +8142,18 @@ async def _emit_result_envelope(writer: asyncio.StreamWriter, outcome: dict[str,
         "started_at": outcome.get("started_at"),
         "ended_at": outcome.get("ended_at"),
     }
-    response = outcome.get("response")
-    if isinstance(response, str) and response:
-        envelope["response"] = _cap_utf8(response, MAX_RESPONSE_CHARS)
+    response_chunk_count = outcome.get("response_chunk_count")
+    response_bytes = outcome.get("response_bytes")
+    if (
+        isinstance(response_chunk_count, int)
+        and not isinstance(response_chunk_count, bool)
+        and 0 < response_chunk_count <= MAX_RESPONSE_CHUNKS
+        and isinstance(response_bytes, int)
+        and not isinstance(response_bytes, bool)
+        and 0 < response_bytes <= MAX_RESPONSE_TOTAL_BYTES
+    ):
+        envelope["response_chunk_count"] = response_chunk_count
+        envelope["response_bytes"] = response_bytes
     if status == TaskStatus.SUSPENDED.value:
         epoch = outcome.get("epoch")
         checkpoint_ref = outcome.get("checkpoint_ref")
@@ -8066,6 +8173,82 @@ async def _emit_result_envelope(writer: asyncio.StreamWriter, outcome: dict[str,
     if isinstance(terminal_action, Mapping):
         envelope["terminal_action"] = _terminal_action_record(terminal_action)
     await send(writer, envelope)
+
+
+async def _emit_response_chunks(
+    writer: asyncio.StreamWriter, outcome: dict[str, Any]
+) -> None:
+    """Emit a finish response before its bounded terminal result envelope.
+
+    Chunk identity is the run request plus task/generation fence.  Chunks are
+    contiguous and zero-based; only the final chunk carries ``final=true``.
+    The result envelope receives count/byte metadata after all chunks queue so
+    the supervisor can reject gaps, duplicates, and incomplete responses.
+    """
+    response = outcome.get("response")
+    if not isinstance(response, str) or not response:
+        return
+    chunks = _split_response_chunks(response)
+    if not chunks:
+        return
+    request_id = outcome.get("request_id")
+    task_id = outcome.get("task_id")
+    generation = outcome.get("generation")
+    if not isinstance(request_id, str) or not request_id:
+        raise ValueError("response chunk request_id is missing")
+    if not isinstance(task_id, str) or not task_id:
+        raise ValueError("response chunk task_id is missing")
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation <= 0:
+        raise ValueError("response chunk generation is invalid")
+    response_bytes = len(response.encode("utf-8"))
+    for index, text in enumerate(chunks):
+        await send(
+            writer,
+            {
+                "type": "response_chunk",
+                "task_id": task_id,
+                "generation": generation,
+                "request_id": request_id,
+                "chunk_index": index,
+                "text": text,
+                "final": index == len(chunks) - 1,
+            },
+        )
+    outcome["response_chunk_count"] = len(chunks)
+    outcome["response_bytes"] = response_bytes
+
+
+async def _emit_terminal_outcome(
+    writer: asyncio.StreamWriter,
+    outcome: dict[str, Any],
+    *,
+    stop: threading.Event | None = None,
+) -> None:
+    """Chunk a terminal response, then emit its bounded result envelope."""
+
+    def _cancel_success_if_requested() -> None:
+        if (
+            stop is not None
+            and stop.is_set()
+            and outcome.get("status") == TaskStatus.SUCCEEDED.value
+        ):
+            outcome["status"] = TaskStatus.CANCELLED.value
+            outcome["failure_reason"] = "task cancelled before terminal result"
+
+    _cancel_success_if_requested()
+    try:
+        await _emit_response_chunks(writer, outcome)
+    except (TypeError, ValueError) as exc:
+        # A response that cannot be chunked must not cross the wire or
+        # produce a false successful completion. Keep the bounded result
+        # envelope and fail closed.
+        outcome.pop("response", None)
+        outcome.pop("response_chunk_count", None)
+        outcome.pop("response_bytes", None)
+        outcome["status"] = TaskStatus.FAILED.value
+        outcome["failure_reason"] = f"response chunking failed: {exc}"
+    _cancel_success_if_requested()
+    await _emit_result_envelope(writer, outcome)
 
 
 async def _await_on_shutdown(
@@ -8234,7 +8417,11 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
                 outcome = task.result()
             except Exception as exc:
                 return await _fatal(writer, {}, f"task crashed: {exc}")
-            await _emit_result_envelope(writer, outcome)
+            # ``_run_task`` sets this event in its heartbeat cleanup even on a
+            # normal success.  Cancellation races are fenced inside
+            # ``_do_provider_work`` before it returns; do not treat that
+            # ordinary heartbeat shutdown as a task cancellation here.
+            await _emit_terminal_outcome(writer, outcome)
             if not worker_reuse:
                 await send(
                     writer,
@@ -8269,7 +8456,7 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
             # No message from the supervisor within the idle deadline: the
             # supervisor is presumed gone. Abort any current task and exit
             # gracefully (documented in the module docstring).
-            stop.set()
+            _request_stop(stop)
             if current is not None:
                 task = current
                 current = None
@@ -8390,23 +8577,23 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
             # Free text containing the word "cancel" must NOT abort.
             if isinstance(payload, dict) and payload.get("action") == "cancel":
                 logger.info("steer: cancel requested")
-                stop.set()
+                _request_stop(stop)
             else:
                 logger.info("steer (v2.1 hook; continuing): %s", json.dumps(payload)[:200])
         elif mtype == "cancel":
             logger.info("cancel: aborting current task")
             await _send_ok(writer, msg, task_id, generation)
-            stop.set()
+            _request_stop(stop)
         elif mtype == "shutdown":
             await _send_ok(writer, msg, task_id, generation)
             if current is not None:
-                stop.set()
+                _request_stop(stop)
                 task = current
                 current = None
                 request_id = current_request_id
                 current_request_id = None
                 outcome = await _await_on_shutdown(task, task_id, generation, request_id)
-                await _emit_result_envelope(writer, outcome)
+                await _emit_terminal_outcome(writer, outcome, stop=stop)
             await send(
                 writer,
                 {

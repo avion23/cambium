@@ -103,6 +103,10 @@ CRITICAL_KINDS = frozenset(
         "context_epoch_advanced",
         "compaction_failed",
         "child_admitted",
+        # User-facing finish responses travel as bounded, correlated chunks.
+        # Chunks are critical so replay never observes a silently dropped
+        # middle segment while the event queue is under pressure.
+        "response_chunk",
     }
 )
 

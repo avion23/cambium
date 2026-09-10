@@ -61,6 +61,7 @@ vocabulary.
 | `resolver_succeeded` | `supervisor.py` | Records a resolver attempt that produced the accepted integration head. |
 | `resolver_failed` | `supervisor.py` | Records a failed or exhausted conflict-resolver attempt with its status and bounded reason. |
 | `resolver_cleanup_failed` | `supervisor.py` | Records failure to prune the resolver worktree after an attempt. |
+| `response_chunk` | `supervisor.py` (worker `response_chunk` message in `worker.py`) | Critical durable finish-response chunk. Chunks carry exact task/generation/request identity, zero-based contiguous indexes, bounded UTF-8 text (32 KiB per chunk, 4 MiB per generation; 64 MiB cumulative session guard), and one final marker. Exact duplicates are ignored; stale, conflicting, gapped, malformed, or post-terminal chunks cannot extend the response. The bounded `result` metadata (`response_chunk_count`, `response_bytes`) lets replay rebuild the valid durable prefix and mark a complete response only after a successful terminal result; full response text is not copied into the result envelope. |
 | `result` | `supervisor.py` (worker envelope in `worker.py`) | Records the correlated terminal worker verdict, bounded `terminal_action` (`type`, `objective_met`, and summary presence), and redacted provider metadata. |
 | `exit` | `supervisor.py` (worker `exit_message` in `worker.py`) | Records the worker generation's terminal exit reason. |
 | `worker_failed` | `supervisor.py` | Records task/generation failure after protocol, integrity, recovery, or restart exhaustion. |

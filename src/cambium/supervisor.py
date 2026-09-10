@@ -79,8 +79,9 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
+from dataclasses import field as dataclass_field
 from pathlib import Path
 from typing import Any, cast
 
@@ -154,7 +155,9 @@ from .worker import (
     MAX_ENVELOPE_FIELD_CHARS,
     MAX_ENVELOPE_ITEMS,
     MAX_REJECTION_FEEDBACK_CHARS,
-    MAX_RESPONSE_CHARS,
+    MAX_RESPONSE_CHUNK_BYTES,
+    MAX_RESPONSE_CHUNKS,
+    MAX_RESPONSE_TOTAL_BYTES,
     _cap_utf8,
     _safe_task_id,
     _validate_checkpoint_ref_shape,
@@ -174,6 +177,12 @@ OUTBOUND_MESSAGE_TOO_LONG = "outbound_message_too_long"
 STDIN_WRITE_TIMEOUT_S = 5.0
 PONG_DEADLINE_S = 10.0
 DURABLE_EVENT_TIMEOUT_S = 5.0
+
+# Finish responses are transported as bounded ``response_chunk`` frames.  The
+# worker's per-generation ingress cap is also the response cap; this cumulative
+# session guard limits accepted chunk volume without constraining a single
+# answer below that cap. Every chunk is critical in the event store.
+MAX_RESPONSE_SESSION_BYTES = MAX_RESPONSE_TOTAL_BYTES * 16
 
 # Index status pairs that porcelain v1 reports for unmerged (conflicted) paths.
 # Kept local to the supervisor because resolver staging uses a normal merge
@@ -739,19 +748,33 @@ def _result_identity_note(msg: Mapping[str, Any], task_id: str, generation: int)
 def _invalid_result_envelope_fields(msg: Mapping[str, Any]) -> list[str]:
     """Validate only terminal fields consumed after the worker wire boundary.
 
-    Omitted fields remain compatible with older/custom workers. A present field
-    must have the canonical type so malformed worker output cannot survive into
-    merge/result construction and fail later at a less precise boundary.
+    Optional fields may be omitted, but every present field must have the
+    canonical type so malformed worker output cannot survive into merge/result
+    construction and fail later at a less precise boundary.
     """
     invalid: list[str] = []
     if msg.get("status") not in {"succeeded", "failed", "cancelled", "suspended", "unresolvable"}:
         invalid.append("status")
-    for field in ("summary", "response", "diff", "unified_diff"):
+    for field in ("summary", "diff", "unified_diff"):
         if field in msg and not isinstance(msg[field], str):
             invalid.append(field)
-    response = msg.get("response")
-    if isinstance(response, str) and len(response.encode("utf-8")) > MAX_RESPONSE_CHARS:
+    # Full user-facing text has exactly one transport: correlated bounded
+    # response_chunk frames. A result/control envelope must stay compact.
+    if "response" in msg:
         invalid.append("response")
+    for field in ("response_chunk_count", "response_bytes"):
+        value = msg.get(field)
+        if field in msg and (
+            type(value) is not int
+            or value < 0
+            or value
+            > (
+                MAX_RESPONSE_CHUNKS
+                if field == "response_chunk_count"
+                else MAX_RESPONSE_TOTAL_BYTES
+            )
+        ):
+            invalid.append(field)
     if "failure_reason" in msg and not (
         msg["failure_reason"] is None or isinstance(msg["failure_reason"], str)
     ):
@@ -766,6 +789,208 @@ def _invalid_result_envelope_fields(msg: Mapping[str, Any]) -> list[str]:
         ):
             invalid.append(field)
     return sorted(set(invalid))
+
+
+def _response_chunk_identity_matches(
+    msg: Mapping[str, Any], task_id: str, generation: int, request_id: str | None
+) -> bool:
+    """Return whether a response chunk claims this exact run identity."""
+    return (
+        isinstance(request_id, str)
+        and bool(request_id)
+        and msg.get("task_id") == task_id
+        and type(msg.get("generation")) is int
+        and msg.get("generation") == generation
+        and msg.get("request_id") == request_id
+    )
+
+
+def _response_chunk_values(
+    msg: Mapping[str, Any], task_id: str, generation: int, request_id: str | None
+) -> tuple[int, str, bool] | str:
+    """Validate one wire/event response chunk and return its bounded fields.
+
+    Identity is intentionally strict for this protocol. A response chunk
+    without all three identity fields is never admitted to assembly.
+    """
+    if not _response_chunk_identity_matches(msg, task_id, generation, request_id):
+        return "identity mismatch"
+    index = msg.get("chunk_index")
+    if type(index) is not int or index < 0 or index >= MAX_RESPONSE_CHUNKS:
+        return "chunk_index invalid"
+    text = msg.get("text")
+    if not isinstance(text, str) or not text:
+        return "text invalid"
+    try:
+        chunk_bytes = len(text.encode("utf-8"))
+    except UnicodeEncodeError:
+        return "text is not valid UTF-8"
+    if chunk_bytes > MAX_RESPONSE_CHUNK_BYTES:
+        return "text exceeds chunk cap"
+    final = msg.get("final")
+    if type(final) is not bool:
+        return "final invalid"
+    return index, text, final
+
+
+def reconstruct_response(
+    events: Iterable[Mapping[str, Any]],
+    task_id: str,
+    generation: int,
+    request_id: str,
+) -> tuple[str, bool]:
+    """Rebuild the valid durable response prefix for one correlated run.
+
+    Events are accepted only in zero-based contiguous order.  Exact duplicate
+    chunks are harmless; conflicting duplicates, gaps, malformed matching
+    chunks, and chunks after a terminal result stop assembly at the last valid
+    prefix.  ``complete`` is true only when a correlated successful ``result``
+    follows a contiguous final chunk sequence. Result ``response_bytes`` is
+    treated as a bounded
+    resource declaration, not an equality check: redaction can change the
+    persisted text length during replay.
+    """
+    if not isinstance(task_id, str) or not task_id:
+        return "", False
+    if type(generation) is not int or generation <= 0:
+        return "", False
+    if not isinstance(request_id, str) or not request_id:
+        return "", False
+
+    chunks: dict[int, tuple[str, bool]] = {}
+    expected_index = 0
+    total_bytes = 0
+    final_index: int | None = None
+    blocked = False
+    terminal_status: str | None = None
+    expected_count: int | None = None
+    expected_bytes: int | None = None
+
+    for event in events:
+        if not isinstance(event, Mapping):
+            continue
+        kind = event.get("kind")
+        if kind == "response_chunk":
+            payload = event.get("payload")
+            fields: Mapping[str, Any] = payload if isinstance(payload, Mapping) else event
+            candidate = dict(fields)
+            # EventStore keeps identity in the event envelope, separate from
+            # the redacted payload.  Missing envelope identity is malformed;
+            # never let payload-only claims bypass that trust boundary.
+            envelope_identity_present = all(
+                event.get(key) is not None for key in ("task_id", "generation", "request_id")
+            )
+            for key in ("task_id", "generation", "request_id"):
+                if envelope_identity_present:
+                    candidate[key] = event[key]
+            if terminal_status is not None or blocked:
+                if terminal_status is not None and _response_chunk_identity_matches(
+                    candidate, task_id, generation, request_id
+                ):
+                    blocked = True
+                continue
+            if not envelope_identity_present:
+                if _response_chunk_identity_matches(
+                    candidate, task_id, generation, request_id
+                ):
+                    blocked = True
+                continue
+            parsed = _response_chunk_values(candidate, task_id, generation, request_id)
+            if isinstance(parsed, str):
+                # Stale/mismatched records are ignored.  A matching malformed
+                # record blocks completion so it cannot be bypassed by later
+                # text in the durable stream.
+                if _response_chunk_identity_matches(candidate, task_id, generation, request_id):
+                    blocked = True
+                continue
+            index, text, final = parsed
+            if index < expected_index:
+                prior = chunks.get(index)
+                if prior == (text, final):
+                    continue
+                blocked = True
+                continue
+            if index != expected_index or final_index is not None:
+                blocked = True
+                continue
+            chunk_bytes = len(text.encode("utf-8"))
+            if total_bytes + chunk_bytes > MAX_RESPONSE_TOTAL_BYTES:
+                blocked = True
+                continue
+            chunks[index] = (text, final)
+            expected_index += 1
+            total_bytes += chunk_bytes
+            if final:
+                final_index = index
+            continue
+        if kind != "result" or terminal_status is not None:
+            continue
+        if event.get("task_id") != task_id or type(event.get("generation")) is not int:
+            continue
+        if event.get("generation") != generation or event.get("request_id") != request_id:
+            continue
+        payload = event.get("payload")
+        data: Mapping[str, Any] = payload if isinstance(payload, Mapping) else event
+        status = data.get("status")
+        if status not in {
+            "succeeded",
+            "failed",
+            "cancelled",
+            "suspended",
+            "unresolvable",
+        }:
+            blocked = True
+            terminal_status = "invalid"
+            continue
+        terminal_status = status
+        if "response_valid" in data and type(data.get("response_valid")) is not bool:
+            blocked = True
+        if data.get("response_valid") is False:
+            blocked = True
+        raw_count = data.get("response_chunk_count")
+        if "response_chunk_count" in data and not (
+            type(raw_count) is int and 0 <= raw_count <= MAX_RESPONSE_CHUNKS
+        ):
+            blocked = True
+        elif type(raw_count) is int and 0 <= raw_count <= MAX_RESPONSE_CHUNKS:
+            expected_count = raw_count
+        raw_bytes = data.get("response_bytes")
+        if "response_bytes" in data and not (
+            type(raw_bytes) is int and 0 <= raw_bytes <= MAX_RESPONSE_TOTAL_BYTES
+        ):
+            blocked = True
+        elif type(raw_bytes) is int and 0 <= raw_bytes <= MAX_RESPONSE_TOTAL_BYTES:
+            expected_bytes = raw_bytes
+
+    text = "".join(chunks[index][0] for index in range(expected_index))
+    complete = terminal_status == "succeeded" and not blocked
+    if complete and chunks:
+        complete = (
+            final_index == expected_index - 1
+            and expected_count is not None
+            and expected_count == expected_index
+            and expected_bytes is not None
+            and expected_bytes > 0
+        )
+    elif complete and (expected_count is not None or expected_bytes is not None):
+        complete = expected_count == 0 and expected_bytes == 0
+    return text, complete
+
+
+def _ensure_response_state(state: Any) -> None:
+    """Populate response fields for lightweight protocol-test state objects."""
+    if not hasattr(state, "response_chunks"):
+        state.response_chunks = {}
+    if not hasattr(state, "response_next_index"):
+        state.response_next_index = 0
+    if not hasattr(state, "response_bytes"):
+        state.response_bytes = 0
+    if not hasattr(state, "response_final_index"):
+        state.response_final_index = None
+    if not hasattr(state, "response_expected_count"):
+        state.response_expected_count = None
+    if not hasattr(state, "response_expected_bytes"):
+        state.response_expected_bytes = None
 
 
 def _claimed_identity_mismatch(
@@ -2494,6 +2719,23 @@ class _GenerationState:
     sandbox_failure_reason: str | None = None
     reuse_ready: bool = False
     keep_alive: bool = False
+    # Response chunks are retained only for this generation's transport
+    # validation.  They never enter the reusable provider context or the
+    # bounded result envelope.
+    response_chunks: dict[int, tuple[str, bool]] = dataclass_field(default_factory=dict)
+    response_next_index: int = 0
+    response_bytes: int = 0
+    response_final_index: int | None = None
+    response_expected_count: int | None = None
+    response_expected_bytes: int | None = None
+    # Durable chunks are kept separately from the validated raw wire chunks.
+    # The raw buffer is redacted as one response when its final marker arrives;
+    # only the resulting bounded chunks cross the event/observer boundary.
+    response_durable_chunks: dict[int, tuple[str, bool]] = dataclass_field(default_factory=dict)
+    response_durable_next_index: int = 0
+    response_durable_bytes: int = 0
+    response_durable_final_index: int | None = None
+    response_redaction_done: bool = False
 
 
 class _Runtime:
@@ -2621,6 +2863,10 @@ class _Runtime:
         # cleanup would be reported twice.
         self._cleanup_attempted: set[str] = set()
         self._child_result_emitted: set[str] = set()
+        # Aggregate accepted response bytes across this session. This is a
+        # resource/backpressure guard only; one answer may still use the full
+        # provider ingress cap in a single generation.
+        self._response_session_bytes = 0
 
     @staticmethod
     def _make_admission_port(architectus: Any) -> Any:
@@ -6481,6 +6727,142 @@ class _Runtime:
         )
         return False
 
+    async def _reject_response_chunk(
+        self, state: _GenerationState, note: str, *, kill: bool = True, **payload: Any
+    ) -> bool:
+        """Reject a response chunk and fail the generation closed."""
+        state.protocol_failure = (
+            getattr(state, "protocol_failure", None) or "INVALID_RESPONSE_CHUNK"
+        )
+        await self.emit(
+            "protocol",
+            task_id=state.task_id,
+            generation=state.generation,
+            note=note,
+            **payload,
+        )
+        proc = getattr(state, "proc", None)
+        if kill and proc is not None:
+            await _kill_worker(proc)
+        return True
+
+    async def _handle_response_chunk_message(
+        self, state: _GenerationState, msg: dict[str, Any]
+    ) -> bool:
+        """Validate and durably append one contiguous finish-response chunk."""
+        _ensure_response_state(state)
+        if getattr(state, "protocol_failure", None) is not None or getattr(
+            state, "envelope", None
+        ) is not None:
+            return await self._reject_response_chunk(
+                state, "response_chunk rejected: generation is already terminal"
+            )
+        parsed = _response_chunk_values(msg, state.task_id, state.generation, state.run_rid)
+        if isinstance(parsed, str):
+            return await self._reject_response_chunk(
+                state,
+                f"response_chunk rejected: {parsed}",
+                expected_request_id=state.run_rid,
+                got_request_id=msg.get("request_id"),
+            )
+        index, text, final = parsed
+        previous = state.response_chunks.get(index)
+        if index < state.response_next_index:
+            if previous == (text, final):
+                await self.emit(
+                    "protocol",
+                    task_id=state.task_id,
+                    generation=state.generation,
+                    request_id=state.run_rid,
+                    note="duplicate response_chunk ignored",
+                    chunk_index=index,
+                )
+                return False
+            return await self._reject_response_chunk(
+                state,
+                "response_chunk rejected: conflicting duplicate",
+                chunk_index=index,
+            )
+        if index != state.response_next_index:
+            return await self._reject_response_chunk(
+                state,
+                "response_chunk rejected: sequence gap",
+                expected_chunk_index=state.response_next_index,
+                got_chunk_index=index,
+            )
+        if state.response_final_index is not None:
+            return await self._reject_response_chunk(
+                state,
+                "response_chunk rejected: chunk follows final",
+                chunk_index=index,
+            )
+        chunk_bytes = len(text.encode("utf-8"))
+        if state.response_bytes + chunk_bytes > MAX_RESPONSE_TOTAL_BYTES:
+            return await self._reject_response_chunk(
+                state,
+                "response_chunk rejected: generation response resource limit",
+                response_bytes=state.response_bytes + chunk_bytes,
+                limit=MAX_RESPONSE_TOTAL_BYTES,
+            )
+        session_bytes = getattr(self, "_response_session_bytes", 0)
+        if type(session_bytes) is not int or session_bytes < 0:
+            session_bytes = 0
+        if session_bytes + chunk_bytes > MAX_RESPONSE_SESSION_BYTES:
+            return await self._reject_response_chunk(
+                state,
+                "response_chunk rejected: session response resource limit",
+                session_response_bytes=session_bytes + chunk_bytes,
+                limit=MAX_RESPONSE_SESSION_BYTES,
+            )
+        # Persist before mutating assembly state.  A critical-store failure
+        # therefore leaves only a durable prefix and cannot yield success.
+        await self.emit(
+            "response_chunk",
+            task_id=state.task_id,
+            request_id=state.run_rid,
+            generation=state.generation,
+            chunk_index=index,
+            text=text,
+            final=final,
+        )
+        state.response_chunks[index] = (text, final)
+        state.response_next_index += 1
+        state.response_bytes += chunk_bytes
+        if final:
+            state.response_final_index = index
+        self._response_session_bytes = session_bytes + chunk_bytes
+        return False
+
+    @staticmethod
+    def _response_completion_error(state: _GenerationState, status: Any) -> str | None:
+        """Return a terminal response completeness error, if one exists."""
+        _ensure_response_state(state)
+        if status != "succeeded":
+            return None
+        chunk_count = getattr(state, "response_expected_count", None)
+        response_bytes = getattr(state, "response_expected_bytes", None)
+        chunk_total = getattr(state, "response_next_index", 0)
+        if chunk_total == 0 and chunk_count is None and response_bytes is None:
+            # A worker may legitimately finish without a user-facing response
+            # (for example, a bounded custom worker used by a non-TUI caller).
+            return None
+        if type(chunk_count) is not int or type(response_bytes) is not int:
+            return "response metadata missing"
+        if chunk_count < 0 or chunk_count > MAX_RESPONSE_CHUNKS:
+            return "response_chunk_count out of range"
+        if response_bytes < 0 or response_bytes > MAX_RESPONSE_TOTAL_BYTES:
+            return "response_bytes out of range"
+        if chunk_count != chunk_total:
+            return "response chunk count mismatch"
+        if response_bytes != getattr(state, "response_bytes", 0):
+            return "response byte count mismatch"
+        final_index = getattr(state, "response_final_index", None)
+        if chunk_count == 0:
+            return None if final_index is None else "empty response has final chunk"
+        if final_index != chunk_count - 1:
+            return "response chunks are incomplete"
+        return None
+
     async def _handle_result_message(self, state: _GenerationState, msg: dict[str, Any]) -> None:
         result_turn = msg.get("turn")
         if type(result_turn) is int and result_turn >= 0:
@@ -6514,16 +6896,32 @@ class _Runtime:
             and not invalid_fields
             and state.protocol_failure is None
         )
-        response_text = msg.get("response")
-        if response_accepted and isinstance(response_text, str) and response_text:
-            await self.emit(
-                "response",
-                task_id=state.task_id,
-                request_id=msg.get("request_id"),
-                generation=state.generation,
-                text=response_text,
-            )
+        if response_accepted:
+            for field in ("response_chunk_count", "response_bytes"):
+                if field in msg and field not in invalid_fields:
+                    setattr(
+                        state,
+                        (
+                            "response_expected_count"
+                            if field == "response_chunk_count"
+                            else "response_expected_bytes"
+                        ),
+                        msg[field],
+                    )
         result_payload: dict[str, Any] = {"status": msg.get("status")}
+        for field in ("response_chunk_count", "response_bytes"):
+            if field in msg and field not in invalid_fields:
+                result_payload[field] = msg[field]
+        completion_error = (
+            self._response_completion_error(state, msg.get("status"))
+            if response_accepted and not invalid_fields and state.protocol_failure is None
+            else None
+        )
+        if invalid_fields or state.protocol_failure is not None or completion_error is not None:
+            # Keep replay aware that a terminal-looking worker envelope was
+            # rejected locally.  The marker is bounded metadata; response text
+            # remains exclusively in accepted response_chunk events.
+            result_payload["response_valid"] = False
         provider_metadata = _redacted_provider_metadata(msg.get("provider_metadata"))
         if provider_metadata is not None:
             result_payload["provider_metadata"] = provider_metadata
@@ -6546,7 +6944,20 @@ class _Runtime:
                 note="result rejected: invalid field(s)",
                 fields=invalid_fields,
             )
-            await _kill_worker(state.proc)
+            proc = getattr(state, "proc", None)
+            if proc is not None:
+                await _kill_worker(proc)
+        if completion_error is not None:
+            state.protocol_failure = "INCOMPLETE_RESPONSE"
+            await self.emit(
+                "protocol",
+                task_id=state.task_id,
+                generation=state.generation,
+                note=f"result rejected: {completion_error}",
+            )
+            proc = getattr(state, "proc", None)
+            if proc is not None:
+                await _kill_worker(proc)
         accepted = (
             state.correlated
             and identity_note is None
@@ -7000,6 +7411,8 @@ class _Runtime:
         if mtype in ("result", "result_envelope"):
             await self._handle_result_message(state, msg)
             return state.protocol_failure is not None
+        if mtype == "response_chunk":
+            return await self._handle_response_chunk_message(state, msg)
         if mtype == "fatal_error":
             error_type = msg.get("error_type")
             state.protocol_failure = (
@@ -7191,6 +7604,10 @@ class _Runtime:
             and state.correlated
             and state.envelope.get("status")
             in ("succeeded", "failed", "cancelled", "suspended", "unresolvable")
+            and self._response_completion_error(
+                state, state.envelope.get("status")
+            )
+            is None
         )
         protocol_failed = state.protocol_failure is not None or state.protocol_reason is not None
         if state.reuse_ready and not state.message_too_long and not protocol_failed:
