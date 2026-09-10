@@ -8040,11 +8040,13 @@ async def _emit_result_envelope(writer: asyncio.StreamWriter, outcome: dict[str,
         "diff": outcome.get("diff", ""),
         "diff_truncated": bool(outcome.get("diff_truncated", False)),
         "summary": (outcome.get("summary") or "")[:MAX_SUMMARY_CHARS],
-        "response": _cap_utf8(outcome.get("response") or "", MAX_RESPONSE_CHARS),
         "failure_reason": outcome.get("failure_reason"),
         "started_at": outcome.get("started_at"),
         "ended_at": outcome.get("ended_at"),
     }
+    response = outcome.get("response")
+    if isinstance(response, str) and response:
+        envelope["response"] = _cap_utf8(response, MAX_RESPONSE_CHARS)
     if status == TaskStatus.SUSPENDED.value:
         epoch = outcome.get("epoch")
         checkpoint_ref = outcome.get("checkpoint_ref")

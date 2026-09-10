@@ -821,6 +821,18 @@ def test_assistant_deltas_render_in_the_active_tail_before_turn_completion() -> 
     assert transcript.entries[-1].text == "# Findings\nThe stream is live."
 
 
+def test_accepted_response_event_uses_the_assistant_timeline_path() -> None:
+    transcript = Transcript()
+    transcript.observe_event(
+        {"kind": "response", "payload": {"text": "# Result\n\nFull operator response."}}
+    )
+
+    assert transcript.streaming_role == "assistant"
+    assert transcript.streaming_text == "# Result\n\nFull operator response."
+    transcript.finish_stream()
+    assert transcript.entries[-1].text == "# Result\n\nFull operator response."
+
+
 def test_message_events_switch_roles_and_keep_streaming_text_bounded() -> None:
     transcript = Transcript()
     transcript.observe_event(

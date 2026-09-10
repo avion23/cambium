@@ -18,34 +18,24 @@ not repeated in every status row.
 
 ## Layout
 
-The conversation and input remain primary. At 100 columns or more the cockpit
-uses a full 32-column operator rail. At 80–99 columns it uses a compact lineage
-rail; below that it omits the rail. Terminal height also limits visible rows.
+The interactive TUI is one chronological timeline in the terminal's normal
+buffer. User messages, Cambium responses, child-agent activity, useful tool
+output, failures, and inspection-command results all append to that timeline.
+The terminal owns scrollback; Cambium does not maintain a second scrollable
+conversation viewport or switch to an alternate screen.
 
-The full rail shows agent/context state and a compact **RESOURCES** block:
-output tokens and end-to-end output rate, cached/input share, the latest
-provider-reported cache `HIT`/`MISS`, calls, and estimated cost. Known provider
-windows appear under **QUOTA** when space allows.
-Resource rows retain space in a short full-width terminal; omitted detail points
-to `/agents`, `/context`, or `/quota`.
+Only two rows are transient: one compact status row and the input row. The
+status row names the current owner/resource first (provider wait, thinking,
+streaming, tool, children, cooldown), then provider/model and compact usage when
+space permits. `/detail` adds more metadata to this same row; it does not open a
+pane. `/agents`, `/context`, `/quota`, `/status`, and `/inspect` append explicit
+snapshots to the timeline on demand instead of permanently consuming columns or
+rows.
 
-When space permits, each full-width lane shows provider/model and one compact
-activity/status row. Crowded rails keep the selected parent and live children
-before older terminal rows, collapse detail before hiding lanes, and show an
-explicit omitted count with `/agents`. The duplicate footer usage row is hidden
-by default; `/detail` reveals it without changing the agent state.
-A suspended parent says `waiting for children` and becomes active on resume.
-The rail does not repeat streamed response text or reserve empty phase/tail/tool/
-duration rows. CAST includes a proportional block strip:
-
-```text
-H██ S▓▓▓▓▓ R░░
-```
-
-`H` is the stable head, `S` the semantic-only trunk, and `R` the raw tail. The
-bar is a size visualization, not a cache-hit claim. Exact byte counts,
-checkpoint paths, and segment details remain available through `/context`.
-Conversation history and narrow layouts remain usable without color or the rail.
+A resize reflows only future/tail rendering and the transient rows; it does not
+replay old history into scrollback. While the operator has scrolled upward, the
+terminal remains authoritative for viewport behavior. New output continues to
+append normally without Cambium forcing a private scroll position.
 
 The output rate is generated output divided by call wall time, not total
 prompt-plus-output tokens. Missing output counts are unknown. `cache HIT` and
@@ -91,8 +81,9 @@ styles. Code blocks use compact bordered panels and narrow tables retain the
 width-safe fallback so cells are not silently clipped.
 
 The renderer sanitizes model/provider text before Rich sees it. Cambium keeps
-Markdown in process rather than invoking a pager subprocess: the cockpit must
-retain its own width, scrollback, input draft, focus and live-event ownership.
+Markdown in process rather than invoking a pager subprocess. The terminal owns
+scrollback; the TUI owns only width-aware rendering, the input draft, focus, and
+live-event synchronization.
 
 ## Input and controls
 
@@ -155,13 +146,13 @@ readable without cockpit escape sequences.
 | `/model [provider:model]` | List eligible choices or set a subsequent preference |
 | `/branches`, `/fork`, `/compact` | Inspect or change conversation continuation |
 | `/events` or `/tail` | Recent bounded events |
-| `/detail` | Toggle additional cockpit detail |
+| `/detail` | Toggle additional metadata on the single status row |
 | `/cancel` | Cancel the active turn |
 | `/exit` | Leave the frontend |
 
 CLI `--help` and the controller's command handling remain authoritative for
-arguments. `/dashboard` is a compatibility response: the persistent cockpit is
-already the live dashboard, not a second UI mode.
+arguments. `/dashboard` is a compatibility response: the live timeline and
+status row are already the dashboard, not a second UI mode.
 
 ## Read-only resource projection
 

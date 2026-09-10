@@ -126,6 +126,7 @@ _ASSISTANT_STREAM_KINDS = frozenset(
         "message_delta",
         "output_text_delta",
         "partial_output",
+        "response",
         "response.output_text.delta",
         "stream_chunk",
         "text_delta",
@@ -3905,6 +3906,11 @@ def _live_status_line(
             "error": "error",
             "cancelled": "cancelled",
         }.get(terminal, terminal)
+        activity = {
+            "succeeded": "✓ done",
+            "error": "✗ error",
+            "cancelled": "• cancelled",
+        }.get(terminal, activity)
     tool = transcript._live_tool if transcript is not None else None
     if terminal is not None:
         tool = None
@@ -3923,7 +3929,7 @@ def _live_status_line(
     )
     calls = _usage_int(fields.get("calls"), _usage_int(getattr(snapshot, "calls", 0)))
 
-    required = [activity]
+    required = [activity, _status_paint(f"{tokens} tok", "dim", color)]
     # Keep phase explicit even when ActivityState is unavailable (for example
     # during a resize or a queued inspection command).
     if phase and phase not in upper_activity.casefold():
@@ -3935,7 +3941,7 @@ def _live_status_line(
     if tool:
         required.append(f"tool={_side_clean(tool)}")
 
-    optional = [_status_paint(f"{tokens} tok", "dim", color)]
+    optional: list[str] = []
     if calls:
         optional.append(f"{calls} calls")
     if transcript is not None and transcript.current_tool_error_count > 0:

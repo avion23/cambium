@@ -130,7 +130,8 @@ def test_tui_operator_commands_render_without_provider_calls(tmp_path: Path) -> 
     assert "compact: no successful checkpoint" in text
     assert "auto/auto" in text
     assert "press Ctrl-C while a turn is running" in text
-    assert "┌ Cambium" in text
+    assert "live timeline plus status row" in text
+    assert "┌ Cambium" not in text
 
 
 def test_status_command_keeps_dropped_context_fields_available(tmp_path: Path) -> None:

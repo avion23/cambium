@@ -217,8 +217,8 @@ _HELP = """Commands:
   /fork       fork a new branch from the current checkpoint
   /quota      show provider quota-window state
   /compact    materialize semantic entries into K0; retain recent raw evidence
-  /dashboard  explain the visible live cockpit
-  /detail     toggle the compact agents/usage/context detail row
+  /dashboard  explain the live timeline and status row
+  /detail     toggle extra metadata on the status row
   /events     recent durable event summaries
   /cancel     cancel the active turn and return to the prompt
   /new        start a fresh semantic branch; old turn artifacts remain
@@ -585,10 +585,9 @@ def _restore_turn_transcript(
                 else:
                     unassigned_prompt_seen = True
         elif kind == "response":
-            response = _event_text(payload, "text", "content", "summary", "output_text")
-            if response is not None:
-                transcript.assistant(response)
-                response_seen = True
+            response_seen = response_seen or (
+                _event_text(payload, "text", "content", "summary", "output_text") is not None
+            )
         if kind == "result":
             result_summary = _event_text(payload, "summary", "output_text") or result_summary
         transcript.observe_event(event)
@@ -892,7 +891,7 @@ def _command_output(
     if name == "/compact" and not argument:
         return session.compact()
     if name == "/dashboard" and not argument:
-        return "The persistent cockpit is already the live dashboard."
+        return "The live timeline plus status row is already the dashboard."
     if name == "/detail" and not argument:
         if cockpit is None:
             return "detail: unavailable"
