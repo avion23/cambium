@@ -217,6 +217,9 @@ DEFAULT_MAX_TOKENS = 200_000
 DEFAULT_MAX_WALL_S = 3600.0
 CHECKPOINT_SCHEMA = 1
 MAX_ACTION_CONTENT_BYTES = 16 * 1024
+# Keep the operator-facing final response large enough for useful Markdown while
+# leaving headroom for the surrounding finish action in textual fallback mode.
+MAX_RESPONSE_CHARS = 12 * 1024
 MAX_TOOL_CALLS_PER_BATCH = 16
 MAX_OBSERVATION_BYTES = 64 * 1024
 MAX_CMD_BYTES = 512
@@ -1805,17 +1808,26 @@ def _bounded_text(text: str, limit: int) -> str:
     return raw[:limit].decode("utf-8", errors="ignore") + "\n... [truncated]"
 
 
-def _user_summary(text: str) -> str:
-    """Keep the operator-facing finish field concise; exact evidence stays in history."""
+def _bounded_user_text(text: str, limit: int) -> str:
     clean = text.strip()
     raw = clean.encode("utf-8")
-    if len(raw) <= MAX_SUMMARY_CHARS:
+    if len(raw) <= limit:
         return clean
-    clipped = raw[: MAX_SUMMARY_CHARS - 3].decode("utf-8", errors="ignore").rstrip()
+    clipped = raw[: limit - 3].decode("utf-8", errors="ignore").rstrip()
     boundary = max(clipped.rfind("\n"), clipped.rfind(". "))
     if boundary >= max(80, len(clipped) // 2):
         clipped = clipped[: boundary + 1].rstrip()
     return clipped + "…"
+
+
+def _user_summary(text: str) -> str:
+    """Return the compact result/envelope summary derived from a final response."""
+    return _bounded_user_text(text, MAX_SUMMARY_CHARS)
+
+
+def _user_response(text: str) -> str:
+    """Return the full operator-facing finish response at the action boundary."""
+    return _bounded_user_text(text, MAX_RESPONSE_CHARS)
 
 
 def _safe_task_id(task_id: str) -> str:
@@ -2211,7 +2223,7 @@ def _parse_agent_action(content: str) -> dict[str, Any]:
             raise ValueError("finish summary must be a non-empty string")
         return {
             "type": "finish",
-            "summary": _user_summary(summary),
+            "summary": _user_response(summary),
             "objective_met": parsed["objective_met"],
         }
     raise ValueError(f"unknown agent action type: {action_type!r}")
@@ -3175,7 +3187,7 @@ def _native_tool_action(result: CallResult) -> dict[str, Any] | None:
             return {"type": "plan", "steps": list(control["arguments"]["steps"])}
         return {
             "type": "finish",
-            "summary": _user_summary(control["arguments"]["summary"]),
+            "summary": _user_response(control["arguments"]["summary"]),
             "objective_met": control["arguments"]["objective_met"],
         }
 
@@ -3199,10 +3211,13 @@ def _bind_router_provider(router: Any, result: CallResult, task_id: str) -> None
 
 
 def _canonical_action_message(action: dict[str, Any]) -> dict[str, str]:
-    """Persist only the parsed action, never an optional scratchpad/thought."""
+    """Persist the canonical action without copying a long final response into context."""
+    persisted = dict(action)
+    if persisted.get("type") == "finish" and isinstance(persisted.get("summary"), str):
+        persisted["summary"] = _user_summary(persisted["summary"])
     return {
         "role": "assistant",
-        "content": json.dumps(action, separators=(",", ":")),
+        "content": json.dumps(persisted, separators=(",", ":")),
     }
 
 
@@ -5067,6 +5082,9 @@ def _loop_failure_outcome(loop_outcome: dict[str, Any]) -> dict[str, Any]:
         "diff_truncated": False,
         "summary": loop_outcome.get("summary", "")[:MAX_SUMMARY_CHARS],
     }
+    response = loop_outcome.get("response")
+    if isinstance(response, str) and response:
+        outcome["response"] = _cap_utf8(response, MAX_RESPONSE_CHARS)
     if outcome["status"] == TaskStatus.SUSPENDED.value:
         outcome["epoch"] = loop_outcome.get("epoch")
         outcome["checkpoint_ref"] = loop_outcome.get("checkpoint_ref")
@@ -6802,10 +6820,13 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                     tools=tools,
                     model_identity=model_identity,
                 )
+                response_text = action["summary"]
+                summary_text = _user_summary(response_text)
                 if not action["objective_met"]:
                     incomplete = {
                         **outcome,
-                        "summary": action["summary"],
+                        "summary": summary_text,
+                        "response": response_text,
                         "terminal_action": _terminal_action_record(action),
                     }
                     reason = (
@@ -6882,7 +6903,8 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                 return {
                     **outcome,
                     "status": "succeeded",
-                    "summary": action["summary"],
+                    "summary": summary_text,
+                    "response": response_text,
                     "terminal_action": _terminal_action_record(action),
                     "turn": turn,
                     "usage": cumulative_usage,
@@ -7526,6 +7548,9 @@ async def _do_provider_work(
             checkpoint_ref=checkpoint_ref,
             summary=loop_outcome.get("summary", "")[:MAX_SUMMARY_CHARS],
         )
+        response = loop_outcome.get("response")
+        if isinstance(response, str) and response:
+            outcome["response"] = _cap_utf8(response, MAX_RESPONSE_CHARS)
     final_checkpoint = outcome.pop("_checkpoint_path", None)
     terminal_checkpoint = outcome.pop("_context_checkpoint", None)
     if writer is not None and final_checkpoint is not None:
@@ -7574,6 +7599,9 @@ def _finalize_worktree(
         "diff_truncated": False,
         "summary": loop_outcome.get("summary", "")[:MAX_SUMMARY_CHARS],
     }
+    response = loop_outcome.get("response")
+    if isinstance(response, str) and response:
+        outcome["response"] = _cap_utf8(response, MAX_RESPONSE_CHARS)
     provider_metadata = _cumulative_provider_metadata(loop_outcome)
     if provider_metadata is not None:
         outcome["provider_metadata"] = provider_metadata
@@ -8012,6 +8040,7 @@ async def _emit_result_envelope(writer: asyncio.StreamWriter, outcome: dict[str,
         "diff": outcome.get("diff", ""),
         "diff_truncated": bool(outcome.get("diff_truncated", False)),
         "summary": (outcome.get("summary") or "")[:MAX_SUMMARY_CHARS],
+        "response": _cap_utf8(outcome.get("response") or "", MAX_RESPONSE_CHARS),
         "failure_reason": outcome.get("failure_reason"),
         "started_at": outcome.get("started_at"),
         "ended_at": outcome.get("ended_at"),

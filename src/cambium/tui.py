@@ -558,6 +558,7 @@ def _restore_turn_transcript(
     prompt_task_ids: set[str] = set()
     unassigned_prompt_seen = False
     result_summary: str | None = None
+    response_seen = False
     for event in events:
         kind = event.get("kind")
         payload = _event_payload(event)
@@ -587,6 +588,7 @@ def _restore_turn_transcript(
             response = _event_text(payload, "text", "content", "summary", "output_text")
             if response is not None:
                 transcript.assistant(response)
+                response_seen = True
         if kind == "result":
             result_summary = _event_text(payload, "summary", "output_text") or result_summary
         transcript.observe_event(event)
@@ -608,7 +610,9 @@ def _restore_turn_transcript(
                     transcript.user(prompt)
                     prompt_task_ids.add(str(task.get("task_id", "")))
 
-    transcript.finish_stream(result_summary or _restore_result_summary(turn_dir))
+    transcript.finish_stream(
+        None if response_seen else result_summary or _restore_result_summary(turn_dir)
+    )
 
 
 def _restore_history(
@@ -1262,6 +1266,7 @@ async def _run_interactive(
                     )
                 completed = False
                 cancel_requested = False
+                response_seen = False
                 activity = ActivityState()
                 activity.start()
                 active_turn = turn
@@ -1309,11 +1314,13 @@ async def _run_interactive(
                     _turns_by_task=turns_by_task,
                     _turns=turns,
                 ) -> None:
-                    nonlocal live_render_enabled, sequence
+                    nonlocal live_render_enabled, response_seen, sequence
                     session.observe_event(
                         _turns_by_task.get(record.get("task_id"), _turns[0]), record
                     )
                     transcript.observe_event(record)
+                    if record.get("kind") == "response":
+                        response_seen = True
                     _activity.observe_event(record)
                     sequence += 1
                     normalized = dict(record)
@@ -1507,7 +1514,9 @@ async def _run_interactive(
                 snapshot = state.snapshot(session_dir=turn.session_dir)
                 last_snapshot = snapshot
                 cumulative.add(snapshot)
-                transcript.finish_stream(_response_markdown(render, response))
+                transcript.finish_stream(
+                    None if response_seen else _response_markdown(render, response)
+                )
                 _draw_final(snapshot, activity_line=activity.status_line())
     except asyncio.CancelledError:
         if not native_input:

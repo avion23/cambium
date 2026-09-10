@@ -154,6 +154,7 @@ from .worker import (
     MAX_ENVELOPE_FIELD_CHARS,
     MAX_ENVELOPE_ITEMS,
     MAX_REJECTION_FEEDBACK_CHARS,
+    MAX_RESPONSE_CHARS,
     _cap_utf8,
     _safe_task_id,
     _validate_checkpoint_ref_shape,
@@ -745,9 +746,12 @@ def _invalid_result_envelope_fields(msg: Mapping[str, Any]) -> list[str]:
     invalid: list[str] = []
     if msg.get("status") not in {"succeeded", "failed", "cancelled", "suspended", "unresolvable"}:
         invalid.append("status")
-    for field in ("summary", "diff", "unified_diff"):
+    for field in ("summary", "response", "diff", "unified_diff"):
         if field in msg and not isinstance(msg[field], str):
             invalid.append(field)
+    response = msg.get("response")
+    if isinstance(response, str) and len(response.encode("utf-8")) > MAX_RESPONSE_CHARS:
+        invalid.append("response")
     if "failure_reason" in msg and not (
         msg["failure_reason"] is None or isinstance(msg["failure_reason"], str)
     ):
@@ -6502,6 +6506,23 @@ class _Runtime:
                 generation=state.generation,
                 note="duplicate result envelope ignored",
             )
+        invalid_fields = _invalid_result_envelope_fields(msg)
+        response_accepted = (
+            state.correlated
+            and identity_note is None
+            and state.envelope is None
+            and not invalid_fields
+            and state.protocol_failure is None
+        )
+        response_text = msg.get("response")
+        if response_accepted and isinstance(response_text, str) and response_text:
+            await self.emit(
+                "response",
+                task_id=state.task_id,
+                request_id=msg.get("request_id"),
+                generation=state.generation,
+                text=response_text,
+            )
         result_payload: dict[str, Any] = {"status": msg.get("status")}
         provider_metadata = _redacted_provider_metadata(msg.get("provider_metadata"))
         if provider_metadata is not None:
@@ -6516,7 +6537,6 @@ class _Runtime:
             generation=state.generation,
             **result_payload,
         )
-        invalid_fields = _invalid_result_envelope_fields(msg)
         if invalid_fields:
             state.protocol_failure = "INVALID_RESULT_ENVELOPE"
             await self.emit(

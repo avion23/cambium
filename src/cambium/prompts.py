@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .summary_trunk import SUMMARY_FINDING_PRESERVATION_CONTRACT, SUMMARY_LIST_FIELDS
 
-PROMPTS_VERSION = 14
+PROMPTS_VERSION = 15
 
 CODING_POLICY = (
     "Work directly and minimally. Locate with repo_query, read exact regions with read_batch, "
@@ -43,9 +43,10 @@ _ACTION_PROTOCOL = (
     '  {"type":"finish","summary":"...","objective_met":true}\n'
     "Textual tool actions always use calls. Every calls item has exactly name and arguments, with "
     "tool fields such as cmd inside arguments. Batch only independent work. "
-    "The finish summary is user-facing. Default to one short sentence; use at most three "
-    "compact bullets only when the task genuinely has several findings. Do not restate the "
-    "task or narrate the process. Omit internal tool names, raw commands, hashes, checkpoint/"
+    "The finish summary is the user-facing response. Keep it concise for the task, but include "
+    "all material findings, requested evidence, and next actions; use Markdown when structure "
+    "helps. Do not restate the task or narrate the process. Omit internal tool names, raw "
+    "commands, hashes, checkpoint/"
     "worktree details, routine file paths, lint chatter, dependency status, and 'no changes' "
     "boilerplate unless the user explicitly asked for that evidence. Mention checks by outcome "
     "('tests passed'), not by command. "
