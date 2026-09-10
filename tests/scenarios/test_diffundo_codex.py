@@ -344,7 +344,7 @@ def test_codex_body_serialization_is_byte_identical_across_calls() -> None:
     assert json.dumps(first) == json.dumps(second)
 
 
-def test_codex_native_mode_converts_the_worker_tool_schema() -> None:
+def test_codex_native_mode_converts_tools_and_requires_native_controls() -> None:
     config = _codex_config(None, supports_native_tools=True)
     tools = _exposed_tool_schemas(_PROVIDER_TOOLS_CONFIG)
 
@@ -353,8 +353,8 @@ def test_codex_native_mode_converts_the_worker_tool_schema() -> None:
         {"messages": [{"role": "user", "content": "inspect the repo"}], "tools": tools},
     )
 
-    assert len(body["tools"]) == len(tools)
-    assert body["tools"] == [
+    operational = body["tools"][: len(tools)]
+    assert operational == [
         {
             "type": "function",
             "name": tool["name"],
@@ -363,6 +363,32 @@ def test_codex_native_mode_converts_the_worker_tool_schema() -> None:
         }
         for tool in tools
     ]
+    controls = body["tools"][len(tools) :]
+    assert [control["name"] for control in controls] == ["plan", "finish"]
+    assert all(control["strict"] is True for control in controls)
+    assert all(
+        set(control["parameters"]["required"]) == set(control["parameters"]["properties"])
+        and control["parameters"]["additionalProperties"] is False
+        for control in controls
+    )
+    assert body["tool_choice"] == "required"
+
+
+def test_codex_native_mode_without_agent_tools_does_not_force_controls() -> None:
+    config = _codex_config(None, supports_native_tools=True)
+
+    body = _codex_request_body(config, PROMPT)
+
+    assert "tools" not in body
+    assert "tool_choice" not in body
+
+
+def test_codex_explicit_tool_choice_remains_authoritative() -> None:
+    config = _codex_config(None, supports_native_tools=True)
+
+    body = _codex_request_body(config, TOOL_PROMPT)
+
+    assert body["tool_choice"] == "auto"
 
 
 def test_codex_non_native_mode_keeps_messages_and_omits_tool_wire_fields() -> None:

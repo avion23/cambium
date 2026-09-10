@@ -135,6 +135,7 @@ from .provider_scheduler import (
     QuotaWindowSpec,
     quota_snapshot_json,
 )
+from .schemas import NATIVE_CONTROL_TOOL_SCHEMAS
 from .selection import Candidate, order_candidates
 
 _TIMESTAMP_PATTERN = (
@@ -1810,10 +1811,12 @@ def _codex_request_body(provider: ProviderConfig, prompt: dict[str, Any]) -> dic
     if provider.supports_native_tools:
         tools = _codex_tools(prompt.get("tools"))
         if tools:
-            body["tools"] = tools
-        tool_choice = prompt.get("tool_choice")
-        if tool_choice is not None:
-            body["tool_choice"] = tool_choice
+            controls = [
+                {**tool, "strict": True}
+                for tool in _codex_tools(list(NATIVE_CONTROL_TOOL_SCHEMAS))
+            ]
+            body["tools"] = [*tools, *controls]
+            body["tool_choice"] = prompt.get("tool_choice", "required")
     if provider.reasoning_effort:
         body["reasoning"] = {"effort": provider.reasoning_effort}
     return body

@@ -118,6 +118,25 @@ def _parameters(properties: dict[str, dict[str, Any]], required: list[str]) -> d
     }
 
 
+PLAN_ACTION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "description": "Set a non-empty execution plan when planning is useful.",
+    "properties": {
+        "type": {"type": "string", "enum": ["plan"]},
+        "steps": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "string", "minLength": 1, "pattern": "\\S"},
+            "description": "Ordered non-empty plan steps.",
+        },
+        # The worker strips this optional reasoning field before persistence.
+        "thought": {},
+    },
+    "required": ["type", "steps"],
+    "additionalProperties": False,
+}
+
+
 FINISH_ACTION_SCHEMA: dict[str, Any] = {
     "type": "object",
     "description": (
@@ -143,6 +162,35 @@ FINISH_ACTION_SCHEMA: dict[str, Any] = {
     "required": ["type", "summary", "objective_met"],
     "additionalProperties": False,
 }
+
+
+def _native_control_tool_schema(action_schema: dict[str, Any]) -> dict[str, Any]:
+    """Derive one native control function from its canonical action schema."""
+    properties = action_schema["properties"]
+    action_type = properties["type"]["enum"][0]
+    return {
+        "name": action_type,
+        "description": action_schema["description"],
+        "parameters": {
+            "type": "object",
+            "properties": {
+                name: schema
+                for name, schema in properties.items()
+                if name not in {"type", "thought"}
+            },
+            "required": [
+                name
+                for name in action_schema["required"]
+                if name not in {"type", "thought"}
+            ],
+            "additionalProperties": False,
+        },
+    }
+
+
+NATIVE_CONTROL_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = tuple(
+    _native_control_tool_schema(schema) for schema in (PLAN_ACTION_SCHEMA, FINISH_ACTION_SCHEMA)
+)
 
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [

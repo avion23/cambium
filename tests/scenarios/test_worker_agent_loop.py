@@ -694,8 +694,8 @@ def test_build_agent_prompt_last_message_is_always_user() -> None:
     prompt = worker._build_agent_prompt("edit a.txt", [{"name": "read_batch"}], [])
     messages = prompt["messages"]
     assert messages[0]["role"] == "system"
-    assert "native function tools are present" in messages[0]["content"]
-    assert "never serialize a tool invocation into assistant text" in messages[0]["content"]
+    assert "native control functions named plan and finish are present" in messages[0]["content"]
+    assert "never serialize an action into assistant text" in messages[0]["content"]
     assert messages[-1]["role"] == "user"
     # A plan action leaves the transcript ending with an assistant message;
     # the builder appends a neutral user continuation.
@@ -1170,6 +1170,59 @@ def test_batched_tool_calls_keep_order_and_deny_atomically(tmp_path: Path) -> No
             SimpleNamespace(
                 tool_calls=(
                     {"function": {"name": "read_batch", "arguments": "{}"}},
+                )
+            )
+        )
+
+
+def test_native_plan_and_finish_controls_use_canonical_validation() -> None:
+    assert worker._native_tool_action(
+        SimpleNamespace(
+            tool_calls=(
+                {"function": {"name": "plan", "arguments": '{"steps":["inspect","edit"]}'}},
+            )
+        )
+    ) == {"type": "plan", "steps": ["inspect", "edit"]}
+    assert worker._native_tool_action(
+        SimpleNamespace(
+            tool_calls=(
+                {
+                    "function": {
+                        "name": "finish",
+                        "arguments": '{"summary":"done","objective_met":true}',
+                    }
+                },
+            )
+        )
+    ) == {"type": "finish", "summary": "done", "objective_met": True}
+
+    with pytest.raises(ValueError, match="provider native control action cannot be mixed"):
+        worker._native_tool_action(
+            SimpleNamespace(
+                tool_calls=(
+                    {"function": {"name": "plan", "arguments": '{"steps":["inspect"]}'}},
+                    {"function": {"name": "read_batch", "arguments": '{"paths":["a.py"]}'}},
+                )
+            )
+        )
+    with pytest.raises(ValueError, match="at least 1 item"):
+        worker._native_tool_action(
+            SimpleNamespace(
+                tool_calls=(
+                    {"function": {"name": "plan", "arguments": '{"steps":[]}'}},
+                )
+            )
+        )
+    with pytest.raises(ValueError, match="unknown argument 'extra'"):
+        worker._native_tool_action(
+            SimpleNamespace(
+                tool_calls=(
+                    {
+                        "function": {
+                            "name": "finish",
+                            "arguments": '{"summary":"done","objective_met":true,"extra":1}',
+                        }
+                    },
                 )
             )
         )
