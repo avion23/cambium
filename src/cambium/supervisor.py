@@ -160,6 +160,7 @@ from .worker import (
     MAX_RESPONSE_TOTAL_BYTES,
     _cap_utf8,
     _safe_task_id,
+    _split_response_chunks,
     _validate_checkpoint_ref_shape,
     _validate_epoch_checkpoint_data,
     _validate_provider_boundary,
@@ -755,13 +756,13 @@ def _invalid_result_envelope_fields(msg: Mapping[str, Any]) -> list[str]:
     invalid: list[str] = []
     if msg.get("status") not in {"succeeded", "failed", "cancelled", "suspended", "unresolvable"}:
         invalid.append("status")
-    for field in ("summary", "diff", "unified_diff"):
+    for field in ("summary", "response", "diff", "unified_diff"):
         if field in msg and not isinstance(msg[field], str):
             invalid.append(field)
-    # Full user-facing text has exactly one transport: correlated bounded
-    # response_chunk frames. A result/control envelope must stay compact.
-    if "response" in msg:
-        invalid.append("response")
+    # ``response`` is accepted only as a legacy inline value. A correlated
+    # result handler immediately converts it to bounded response_chunk events
+    # and removes it from the retained/result payload, so the old 12 KiB
+    # product ceiling is not enforced at this boundary.
     for field in ("response_chunk_count", "response_bytes"):
         value = msg.get(field)
         if field in msg and (
@@ -991,6 +992,16 @@ def _ensure_response_state(state: Any) -> None:
         state.response_expected_count = None
     if not hasattr(state, "response_expected_bytes"):
         state.response_expected_bytes = None
+    if not hasattr(state, "response_durable_chunks"):
+        state.response_durable_chunks = {}
+    if not hasattr(state, "response_durable_next_index"):
+        state.response_durable_next_index = 0
+    if not hasattr(state, "response_durable_bytes"):
+        state.response_durable_bytes = 0
+    if not hasattr(state, "response_durable_final_index"):
+        state.response_durable_final_index = None
+    if not hasattr(state, "response_redaction_done"):
+        state.response_redaction_done = False
 
 
 def _claimed_identity_mismatch(
@@ -6571,6 +6582,14 @@ class _Runtime:
         return False
 
     async def _handle_generation_eof(self, state: _GenerationState) -> None:
+        # A worker can crash or be cancelled after sending a valid prefix but
+        # before its final marker/result. Flush that prefix only after applying
+        # whole-response redaction; replay then exposes safe text with
+        # ``complete=False`` rather than leaking raw buffered content.
+        if getattr(state, "response_next_index", 0) > 0 and not getattr(
+            state, "response_redaction_done", False
+        ):
+            await self._flush_response_chunks(state)
         # Stream EOF can race the child watcher. Give an actually exited child
         # one short scheduling window to publish its return code; reserve the
         # expensive EOF grace/probe for the exceptional case where stdout
@@ -6749,7 +6768,14 @@ class _Runtime:
     async def _handle_response_chunk_message(
         self, state: _GenerationState, msg: dict[str, Any]
     ) -> bool:
-        """Validate and durably append one contiguous finish-response chunk."""
+        """Validate and buffer one contiguous finish-response chunk.
+
+        Raw chunks stay inside the supervisor until the final marker arrives.
+        Redacting the assembled response once is required because a registered
+        secret or a contextual credential can cross any individual chunk
+        boundary. Only the redacted, rechunked response is persisted or sent
+        to observers.
+        """
         _ensure_response_state(state)
         if getattr(state, "protocol_failure", None) is not None or getattr(
             state, "envelope", None
@@ -6814,23 +6840,109 @@ class _Runtime:
                 session_response_bytes=session_bytes + chunk_bytes,
                 limit=MAX_RESPONSE_SESSION_BYTES,
             )
-        # Persist before mutating assembly state.  A critical-store failure
-        # therefore leaves only a durable prefix and cannot yield success.
-        await self.emit(
-            "response_chunk",
-            task_id=state.task_id,
-            request_id=state.run_rid,
-            generation=state.generation,
-            chunk_index=index,
-            text=text,
-            final=final,
-        )
         state.response_chunks[index] = (text, final)
         state.response_next_index += 1
         state.response_bytes += chunk_bytes
         if final:
             state.response_final_index = index
         self._response_session_bytes = session_bytes + chunk_bytes
+        if final and await self._flush_response_chunks(state):
+            return True
+        return False
+
+    async def _flush_response_chunks(self, state: _GenerationState) -> bool:
+        """Redact and durably publish the validated raw response prefix.
+
+        The raw buffer is bounded by ``MAX_RESPONSE_TOTAL_BYTES`` before this
+        helper runs. A complete response is redacted as one string, then split
+        again so no durable or observer frame can contain a secret that was
+        divided across worker chunks. If a critical append fails, the helper
+        stops before a terminal envelope can be accepted; any already durable
+        chunks form a safe replay prefix.
+        """
+        _ensure_response_state(state)
+        if state.response_redaction_done:
+            return False
+        if state.response_next_index <= 0:
+            return False
+        raw = "".join(state.response_chunks[index][0] for index in range(state.response_next_index))
+        redactor = getattr(self, "_redactor", None)
+        try:
+            redacted = redactor.redact(raw) if redactor is not None else raw
+            durable_chunks = _split_response_chunks(redacted)
+        except (TypeError, ValueError, UnicodeError) as exc:
+            return await self._reject_response_chunk(
+                state, f"response rejected: redaction/chunking failed ({exc})"
+            )
+        durable_bytes = len(redacted.encode("utf-8"))
+        state.response_durable_chunks = {
+            index: (chunk, index == len(durable_chunks) - 1)
+            for index, chunk in enumerate(durable_chunks)
+        }
+        state.response_durable_bytes = durable_bytes
+        state.response_durable_final_index = len(durable_chunks) - 1 if durable_chunks else None
+        start = state.response_durable_next_index
+        for index in range(start, len(durable_chunks)):
+            chunk, final = state.response_durable_chunks[index]
+            await self.emit(
+                "response_chunk",
+                task_id=state.task_id,
+                request_id=state.run_rid,
+                generation=state.generation,
+                chunk_index=index,
+                text=chunk,
+                final=final,
+            )
+            # Keep the existing live/replay presentation seam fed without
+            # making it authoritative: response_chunk is the critical
+            # canonical record, while this bounded append event is a
+            # compatibility view for current terminal consumers.
+            await self.emit(
+                "response",
+                task_id=state.task_id,
+                request_id=state.run_rid,
+                generation=state.generation,
+                message_id=f"{state.task_id}:{state.generation}:{state.run_rid}",
+                chunk_index=index,
+                text=chunk,
+                append=True,
+                final=final,
+            )
+            state.response_durable_next_index = index + 1
+        state.response_redaction_done = True
+        return False
+
+    async def _emit_inline_response_chunks(
+        self, state: _GenerationState, response: str
+    ) -> bool:
+        """Feed a legacy inline response through the same raw-chunk path."""
+        _ensure_response_state(state)
+        if state.response_next_index != 0 or state.response_chunks:
+            return await self._reject_response_chunk(
+                state, "response rejected: chunks already received"
+            )
+        try:
+            chunks = _split_response_chunks(response)
+        except (TypeError, ValueError, UnicodeError) as exc:
+            return await self._reject_response_chunk(
+                state, f"response rejected: cannot chunk inline response ({exc})"
+            )
+        for index, chunk in enumerate(chunks):
+            if await self._handle_response_chunk_message(
+                state,
+                {
+                    "type": "response_chunk",
+                    "task_id": state.task_id,
+                    "generation": state.generation,
+                    "request_id": state.run_rid,
+                    "chunk_index": index,
+                    "text": chunk,
+                    "final": index == len(chunks) - 1,
+                },
+            ):
+                return True
+        state.response_expected_count = len(chunks)
+        state.response_expected_bytes = len(response.encode("utf-8"))
         return False
 
     @staticmethod
@@ -6864,6 +6976,7 @@ class _Runtime:
         return None
 
     async def _handle_result_message(self, state: _GenerationState, msg: dict[str, Any]) -> None:
+        _ensure_response_state(state)
         result_turn = msg.get("turn")
         if type(result_turn) is int and result_turn >= 0:
             state.turn = max(state.turn, result_turn)
@@ -6896,6 +7009,10 @@ class _Runtime:
             and not invalid_fields
             and state.protocol_failure is None
         )
+        response_text = msg.get("response")
+        if response_accepted and isinstance(response_text, str) and response_text:
+            if await self._emit_inline_response_chunks(state, response_text):
+                response_accepted = False
         if response_accepted:
             for field in ("response_chunk_count", "response_bytes"):
                 if field in msg and field not in invalid_fields:
@@ -6908,10 +7025,21 @@ class _Runtime:
                         ),
                         msg[field],
                     )
+            # Failed/cancelled results can arrive with only a durable prefix;
+            # flush that prefix through the same whole-response redaction path.
+            # A succeeded result with a missing final marker is also flushed so
+            # replay can recover a safe prefix before the result is rejected.
+            if state.response_next_index > 0 and not state.response_redaction_done:
+                if await self._flush_response_chunks(state):
+                    response_accepted = False
         result_payload: dict[str, Any] = {"status": msg.get("status")}
-        for field in ("response_chunk_count", "response_bytes"):
-            if field in msg and field not in invalid_fields:
-                result_payload[field] = msg[field]
+        if state.response_redaction_done:
+            result_payload["response_chunk_count"] = state.response_durable_next_index
+            result_payload["response_bytes"] = state.response_durable_bytes
+        else:
+            for field in ("response_chunk_count", "response_bytes"):
+                if field in msg and field not in invalid_fields:
+                    result_payload[field] = msg[field]
         completion_error = (
             self._response_completion_error(state, msg.get("status"))
             if response_accepted and not invalid_fields and state.protocol_failure is None
@@ -6968,7 +7096,12 @@ class _Runtime:
         if accepted:
             if state.sandbox_failure_reason is not None and msg.get("status") != "succeeded":
                 msg = {**msg, "failure_reason": state.sandbox_failure_reason}
-            state.envelope = msg
+            # Inline responses were converted to durable chunks above. Never
+            # retain the full response in the terminal envelope or reusable
+            # parent context.
+            envelope = dict(msg)
+            envelope.pop("response", None)
+            state.envelope = envelope
         # Proposals are retained until this generation returns. In particular,
         # a correlated worker ``succeeded`` envelope is still provisional until
         # _supervise has passed integrity and merge; admitting here would orphan

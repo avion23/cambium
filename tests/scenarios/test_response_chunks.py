@@ -12,12 +12,14 @@ import pytest
 
 from cambium import supervisor, worker
 from cambium.ipc import encode_message
+from cambium.redact import Redactor
 
 
 class _RuntimeProbe(supervisor._Runtime):
-    def __init__(self) -> None:
+    def __init__(self, *, redactor: Redactor | None = None) -> None:
         self.records: list[tuple[str, dict[str, Any]]] = []
         self._response_session_bytes = 0
+        self._redactor = redactor
 
     async def emit(self, kind: str, **payload: Any) -> None:
         self.records.append((kind, payload))
@@ -40,6 +42,11 @@ def _state() -> SimpleNamespace:
         response_final_index=None,
         response_expected_count=None,
         response_expected_bytes=None,
+        response_durable_chunks={},
+        response_durable_next_index=0,
+        response_durable_bytes=0,
+        response_durable_final_index=None,
+        response_redaction_done=False,
     )
 
 
@@ -190,8 +197,9 @@ def test_supervisor_accepts_sequential_chunks_and_exact_duplicate() -> None:
     asyncio.run(scenario())
 
     durable = [payload for kind, payload in runtime.records if kind == "response_chunk"]
-    assert [item["text"] for item in durable] == ["hello ", "world"]
-    assert not [record for record in runtime.records if record[0] == "response"]
+    assert [item["text"] for item in durable] == ["hello world"]
+    presented = [payload for kind, payload in runtime.records if kind == "response"]
+    assert [item["text"] for item in presented] == ["hello world"]
     assert state.response_next_index == 2
     assert state.response_bytes == 11
     assert state.response_final_index == 1
@@ -260,9 +268,10 @@ def test_supervisor_rejects_conflicting_duplicate_and_incomplete_result() -> Non
     assert state.protocol_failure == "INCOMPLETE_RESPONSE"
 
 
-def test_supervisor_rejects_inline_response_in_result_control_envelope() -> None:
+def test_supervisor_chunks_legacy_inline_response_before_accepting_result() -> None:
     runtime = _RuntimeProbe()
     state = _state()
+    response = "legacy-" + ("y" * (12 * 1024 + 1))
 
     asyncio.run(
         runtime._handle_result_message(
@@ -274,16 +283,19 @@ def test_supervisor_rejects_inline_response_in_result_control_envelope() -> None
                 "request_id": "run-1",
                 "status": "succeeded",
                 "summary": "compact",
-                "response": "must use response_chunk",
+                "response": response,
             },
         )
     )
 
-    assert state.envelope is None
-    assert state.protocol_failure == "INVALID_RESULT_ENVELOPE"
-    assert not [record for record in runtime.records if record[0] == "response_chunk"]
+    chunks = [payload for kind, payload in runtime.records if kind == "response_chunk"]
+    assert "".join(item["text"] for item in chunks) == response
     result = next(payload for kind, payload in runtime.records if kind == "result")
-    assert result["response_valid"] is False
+    assert result["response_chunk_count"] == len(chunks)
+    assert result["response_bytes"] == len(response.encode())
+    assert state.envelope is not None
+    assert "response" not in state.envelope
+    assert state.protocol_failure is None
 
 
 def test_supervisor_session_response_resource_limit_rejects_before_persist(
@@ -297,9 +309,107 @@ def test_supervisor_session_response_resource_limit_rejects_before_persist(
     assert asyncio.run(runtime._handle_response_chunk_message(state, _chunk(1, "12")))
 
     durable = [payload for kind, payload in runtime.records if kind == "response_chunk"]
-    assert [item["text"] for item in durable] == ["1234"]
+    assert durable == []
     assert state.response_bytes == 4
     assert state.protocol_failure == "INVALID_RESPONSE_CHUNK"
+
+
+def test_supervisor_redacts_secret_across_raw_chunk_boundary_and_replays_redacted_text() -> None:
+    secret = "registered-secret-" + ("s" * 64)
+    response = ("p" * (worker.MAX_RESPONSE_CHUNK_BYTES - 5)) + secret + "-tail"
+    first = response[: worker.MAX_RESPONSE_CHUNK_BYTES]
+    second = response[worker.MAX_RESPONSE_CHUNK_BYTES :]
+    runtime = _RuntimeProbe(redactor=Redactor(secret_values=[secret]))
+    state = _state()
+
+    async def scenario() -> None:
+        assert not await runtime._handle_response_chunk_message(state, _chunk(0, first))
+        assert not await runtime._handle_response_chunk_message(
+            state, _chunk(1, second, final=True)
+        )
+        await runtime._handle_result_message(
+            state,
+            {
+                "type": "result_envelope",
+                "task_id": "task",
+                "generation": 3,
+                "request_id": "run-1",
+                "status": "succeeded",
+                "summary": "compact",
+                "response_chunk_count": 2,
+                "response_bytes": len(response.encode()),
+            },
+        )
+
+    asyncio.run(scenario())
+
+    redacted = runtime._redactor.redact(response)
+    durable = [payload for kind, payload in runtime.records if kind == "response_chunk"]
+    presented = [payload for kind, payload in runtime.records if kind == "response"]
+    assert secret not in "".join(item["text"] for item in durable)
+    assert secret not in "".join(item["text"] for item in presented)
+    assert "".join(item["text"] for item in durable) == redacted
+    result = next(payload for kind, payload in runtime.records if kind == "result")
+    assert result["response_chunk_count"] == len(durable)
+    assert result["response_bytes"] == len(redacted.encode())
+    events = [
+        {
+            "kind": "response_chunk",
+            "task_id": item["task_id"],
+            "generation": item["generation"],
+            "request_id": item["request_id"],
+            "payload": {
+                "chunk_index": item["chunk_index"],
+                "text": item["text"],
+                "final": item["final"],
+            },
+        }
+        for item in durable
+    ]
+    events.append(
+        {
+            "kind": "result",
+            "task_id": result["task_id"],
+            "generation": result["generation"],
+            "request_id": result["request_id"],
+            "payload": {
+                "status": result["status"],
+                "response_chunk_count": result["response_chunk_count"],
+                "response_bytes": result["response_bytes"],
+            },
+        }
+    )
+    assert supervisor.reconstruct_response(events, "task", 3, "run-1") == (redacted, True)
+
+
+def test_cancelled_partial_raw_response_flushes_only_a_redacted_prefix() -> None:
+    secret = "cancel-secret-" + ("c" * 64)
+    runtime = _RuntimeProbe(redactor=Redactor(secret_values=[secret]))
+    state = _state()
+    prefix = "safe-" + secret
+
+    async def scenario() -> None:
+        assert not await runtime._handle_response_chunk_message(state, _chunk(0, prefix))
+        assert not [record for record in runtime.records if record[0] == "response_chunk"]
+        await runtime._handle_result_message(
+            state,
+            {
+                "type": "result_envelope",
+                "task_id": "task",
+                "generation": 3,
+                "request_id": "run-1",
+                "status": "cancelled",
+                "summary": "compact",
+            },
+        )
+
+    asyncio.run(scenario())
+
+    durable = [payload for kind, payload in runtime.records if kind == "response_chunk"]
+    assert "".join(item["text"] for item in durable) == "safe-***"
+    assert secret not in "".join(item["text"] for item in durable)
+    result = next(payload for kind, payload in runtime.records if kind == "result")
+    assert result["status"] == "cancelled"
 
 
 def test_reconstruct_response_returns_valid_prefix_and_full_completion() -> None:
