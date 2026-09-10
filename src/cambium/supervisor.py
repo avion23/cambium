@@ -135,6 +135,7 @@ from .situation import SECTION_ORDER
 from .store import (
     CRITICAL_KINDS,
     EventStore,
+    _PreRedactedEvent,
     StoreError,
     count_events_file,
     read_events_file,
@@ -157,6 +158,8 @@ from .worker import (
     MAX_REJECTION_FEEDBACK_CHARS,
     MAX_RESPONSE_CHUNK_BYTES,
     MAX_RESPONSE_CHUNKS,
+    MAX_RESPONSE_DURABLE_CHUNKS,
+    MAX_RESPONSE_DURABLE_TOTAL_BYTES,
     MAX_RESPONSE_TOTAL_BYTES,
     _cap_utf8,
     _safe_task_id,
@@ -184,6 +187,9 @@ DURABLE_EVENT_TIMEOUT_S = 5.0
 # session guard limits accepted chunk volume without constraining a single
 # answer below that cap. Every chunk is critical in the event store.
 MAX_RESPONSE_SESSION_BYTES = MAX_RESPONSE_TOTAL_BYTES * 16
+# Redaction can expand text, so the durable session guard uses the same
+# expansion allowance as the per-generation durable-output budget.
+MAX_RESPONSE_DURABLE_SESSION_BYTES = MAX_RESPONSE_SESSION_BYTES * 4
 
 # Index status pairs that porcelain v1 reports for unmerged (conflicted) paths.
 # Kept local to the supervisor because resolver staging uses a normal merge
@@ -763,6 +769,10 @@ def _invalid_result_envelope_fields(msg: Mapping[str, Any]) -> list[str]:
     # response_chunk frames. Result/control envelopes stay compact.
     if "response" in msg:
         invalid.append("response")
+    # ``response_valid`` is supervisor-owned replay metadata. A worker cannot
+    # assert it in a terminal envelope and thereby override local validation.
+    if "response_valid" in msg:
+        invalid.append("response_valid")
     for field in ("response_chunk_count", "response_bytes"):
         value = msg.get(field)
         if field in msg and (
@@ -807,7 +817,12 @@ def _response_chunk_identity_matches(
 
 
 def _response_chunk_values(
-    msg: Mapping[str, Any], task_id: str, generation: int, request_id: str | None
+    msg: Mapping[str, Any],
+    task_id: str,
+    generation: int,
+    request_id: str | None,
+    *,
+    max_chunks: int | None = None,
 ) -> tuple[int, str, bool] | str:
     """Validate one wire/event response chunk and return its bounded fields.
 
@@ -816,8 +831,10 @@ def _response_chunk_values(
     """
     if not _response_chunk_identity_matches(msg, task_id, generation, request_id):
         return "identity mismatch"
+    if max_chunks is None:
+        max_chunks = MAX_RESPONSE_CHUNKS
     index = msg.get("chunk_index")
-    if type(index) is not int or index < 0 or index >= MAX_RESPONSE_CHUNKS:
+    if type(index) is not int or index < 0 or index >= max_chunks:
         return "chunk_index invalid"
     text = msg.get("text")
     if not isinstance(text, str) or not text:
@@ -846,10 +863,9 @@ def reconstruct_response(
     chunks are harmless; conflicting duplicates, gaps, malformed matching
     chunks, and chunks after a terminal result stop assembly at the last valid
     prefix.  ``complete`` is true only when a correlated successful ``result``
-    follows a contiguous final chunk sequence. Result ``response_bytes`` is
-    treated as a bounded
-    resource declaration, not an equality check: redaction can change the
-    persisted text length during replay.
+    follows a contiguous final chunk sequence that was not later rejected by
+    supervisor lifecycle events. Result metadata must match the durable
+    sequence exactly, including its UTF-8 byte count.
     """
     if not isinstance(task_id, str) or not task_id:
         return "", False
@@ -866,6 +882,65 @@ def reconstruct_response(
     terminal_status: str | None = None
     expected_count: int | None = None
     expected_bytes: int | None = None
+    identity_fields = ("task_id", "generation", "request_id")
+    lifecycle_blocked = False
+    terminal_signature: tuple[Any, ...] | None = None
+    terminal_statuses = (
+        "succeeded",
+        "failed",
+        "cancelled",
+        "suspended",
+        "unresolvable",
+    )
+
+    def _result_signature(data: Mapping[str, Any]) -> tuple[tuple[Any, ...], bool]:
+        """Return terminal fields and whether any replay field is malformed."""
+        status = data.get("status")
+        response_valid_present = "response_valid" in data
+        response_valid = data.get("response_valid")
+        count_present = "response_chunk_count" in data
+        raw_count = data.get("response_chunk_count")
+        bytes_present = "response_bytes" in data
+        raw_bytes = data.get("response_bytes")
+        malformed = status not in terminal_statuses
+        malformed |= response_valid_present and type(response_valid) is not bool
+        malformed |= count_present and not (
+            type(raw_count) is int
+            and 0 <= raw_count <= MAX_RESPONSE_DURABLE_CHUNKS
+        )
+        malformed |= bytes_present and not (
+            type(raw_bytes) is int
+            and 0 <= raw_bytes <= MAX_RESPONSE_DURABLE_TOTAL_BYTES
+        )
+        return (
+            (
+                status,
+                response_valid_present,
+                response_valid,
+                count_present,
+                raw_count,
+                bytes_present,
+                raw_bytes,
+            ),
+            malformed,
+        )
+
+    def _lifecycle_targets(event: Mapping[str, Any]) -> bool:
+        if event.get("task_id") != task_id:
+            return False
+        event_generation = event.get("generation")
+        if event_generation is not None and (
+            type(event_generation) is not int or event_generation != generation
+        ):
+            return False
+        event_request_id = event.get("request_id")
+        return event_request_id is None or event_request_id == request_id
+
+    def _lifecycle_clear_targets(event: Mapping[str, Any]) -> bool:
+        # Acceptance markers must carry the exact generation. Failure markers
+        # may be task-level and are safe to apply broadly; a marker that lacks
+        # generation identity must never revive an older rejected generation.
+        return _lifecycle_targets(event) and type(event.get("generation")) is int
 
     for event in events:
         if not isinstance(event, Mapping):
@@ -879,15 +954,38 @@ def reconstruct_response(
             # the redacted payload.  Missing envelope identity is malformed;
             # never let payload-only claims bypass that trust boundary.
             envelope_identity_present = all(
-                event.get(key) is not None for key in ("task_id", "generation", "request_id")
+                event.get(key) is not None for key in identity_fields
             )
-            for key in ("task_id", "generation", "request_id"):
+            envelope_identity_matches = envelope_identity_present and (
+                _response_chunk_identity_matches(event, task_id, generation, request_id)
+            )
+            payload_identity_conflict = envelope_identity_present and any(
+                key in fields and fields[key] != event.get(key) for key in identity_fields
+            )
+            if payload_identity_conflict:
+                # The envelope is the trusted EventStore correlation. A
+                # target envelope with contradictory payload claims is
+                # tampered/malformed and blocks completion; a stale envelope
+                # remains ignorable and cannot inject text into this replay.
+                if envelope_identity_matches:
+                    blocked = True
+                continue
+            for key in identity_fields:
                 if envelope_identity_present:
                     candidate[key] = event[key]
             if terminal_status is not None or blocked:
-                if terminal_status is not None and _response_chunk_identity_matches(
-                    candidate, task_id, generation, request_id
-                ):
+                if terminal_status is not None and envelope_identity_matches:
+                    parsed = _response_chunk_values(
+                        candidate,
+                        task_id,
+                        generation,
+                        request_id,
+                        max_chunks=MAX_RESPONSE_DURABLE_CHUNKS,
+                    )
+                    if not isinstance(parsed, str):
+                        index, text, final = parsed
+                        if index < expected_index and chunks.get(index) == (text, final):
+                            continue
                     blocked = True
                 continue
             if not envelope_identity_present:
@@ -896,7 +994,13 @@ def reconstruct_response(
                 ):
                     blocked = True
                 continue
-            parsed = _response_chunk_values(candidate, task_id, generation, request_id)
+            parsed = _response_chunk_values(
+                candidate,
+                task_id,
+                generation,
+                request_id,
+                max_chunks=MAX_RESPONSE_DURABLE_CHUNKS,
+            )
             if isinstance(parsed, str):
                 # Stale/mismatched records are ignored.  A matching malformed
                 # record blocks completion so it cannot be bypassed by later
@@ -915,7 +1019,7 @@ def reconstruct_response(
                 blocked = True
                 continue
             chunk_bytes = len(text.encode("utf-8"))
-            if total_bytes + chunk_bytes > MAX_RESPONSE_TOTAL_BYTES:
+            if total_bytes + chunk_bytes > MAX_RESPONSE_DURABLE_TOTAL_BYTES:
                 blocked = True
                 continue
             chunks[index] = (text, final)
@@ -924,7 +1028,47 @@ def reconstruct_response(
             if final:
                 final_index = index
             continue
-        if kind != "result" or terminal_status is not None:
+        if kind in {
+            "worker_failed",
+            "task_failed",
+            "worker_terminated",
+            "join_invariant_failed",
+            "merge_failed",
+        }:
+            payload = event.get("payload")
+            recoverable_merge_diagnostic = (
+                kind == "merge_failed"
+                and isinstance(payload, Mapping)
+                and payload.get("internal") is True
+                and payload.get("recoverable") is True
+            )
+            if _lifecycle_targets(event) and not recoverable_merge_diagnostic:
+                lifecycle_blocked = True
+            continue
+        if kind in {"merge_committed", "resolver_succeeded"}:
+            if _lifecycle_clear_targets(event):
+                lifecycle_blocked = False
+            continue
+        if kind == "exit":
+            if _lifecycle_targets(event):
+                payload = event.get("payload")
+                reason = payload.get("reason") if isinstance(payload, Mapping) else None
+                if reason not in {"done", "succeeded", "success"}:
+                    lifecycle_blocked = True
+            continue
+        if kind == "session_ended":
+            payload = event.get("payload")
+            if isinstance(payload, Mapping) and payload.get("session_status") == "cancelled":
+                lifecycle_blocked = True
+            statuses = payload.get("results") if isinstance(payload, Mapping) else None
+            if isinstance(statuses, Mapping) and task_id in statuses:
+                # This event has no generation identity. It can confirm a
+                # session-level failure, but a later successful generation
+                # must never revive an earlier rejected generation.
+                if statuses[task_id] != "succeeded":
+                    lifecycle_blocked = True
+            continue
+        if kind != "result":
             continue
         if event.get("task_id") != task_id or type(event.get("generation")) is not int:
             continue
@@ -932,49 +1076,62 @@ def reconstruct_response(
             continue
         payload = event.get("payload")
         data: Mapping[str, Any] = payload if isinstance(payload, Mapping) else event
-        status = data.get("status")
-        if status not in {
-            "succeeded",
-            "failed",
-            "cancelled",
-            "suspended",
-            "unresolvable",
-        }:
+        if any(
+            key in data and data[key] != event.get(key) for key in identity_fields
+        ):
+            # Result payloads are redacted data, not a second correlation
+            # authority. Contradictory claims on an otherwise target result
+            # invalidate completion; stale/mismatched envelopes are ignored
+            # by the identity checks above.
+            blocked = True
+            if terminal_status is None:
+                terminal_status = "invalid"
+            continue
+        signature, malformed = _result_signature(data)
+        if terminal_status is not None:
+            # A byte-for-byte duplicate of an accepted terminal event is
+            # harmless. Any rejected, malformed, or conflicting target result
+            # must remain visible during replay so it cannot be skipped after
+            # an earlier success.
+            if (
+                not blocked
+                and not malformed
+                and terminal_signature is not None
+                and signature == terminal_signature
+            ):
+                continue
+            blocked = True
+            continue
+        if malformed:
             blocked = True
             terminal_status = "invalid"
+            terminal_signature = signature
             continue
+        status = cast(str, signature[0])
         terminal_status = status
-        if "response_valid" in data and type(data.get("response_valid")) is not bool:
+        terminal_signature = signature
+        if signature[1] and signature[2] is False:
             blocked = True
-        if data.get("response_valid") is False:
-            blocked = True
-        raw_count = data.get("response_chunk_count")
-        if "response_chunk_count" in data and not (
-            type(raw_count) is int and 0 <= raw_count <= MAX_RESPONSE_CHUNKS
-        ):
-            blocked = True
-        elif type(raw_count) is int and 0 <= raw_count <= MAX_RESPONSE_CHUNKS:
+        raw_count = signature[4]
+        if signature[3]:
             expected_count = raw_count
-        raw_bytes = data.get("response_bytes")
-        if "response_bytes" in data and not (
-            type(raw_bytes) is int and 0 <= raw_bytes <= MAX_RESPONSE_TOTAL_BYTES
-        ):
-            blocked = True
-        elif type(raw_bytes) is int and 0 <= raw_bytes <= MAX_RESPONSE_TOTAL_BYTES:
+        raw_bytes = signature[6]
+        if signature[5]:
             expected_bytes = raw_bytes
 
     text = "".join(chunks[index][0] for index in range(expected_index))
-    complete = terminal_status == "succeeded" and not blocked
+    complete = terminal_status == "succeeded" and not blocked and not lifecycle_blocked
     if complete and chunks:
         complete = (
             final_index == expected_index - 1
             and expected_count is not None
             and expected_count == expected_index
             and expected_bytes is not None
+            and expected_bytes == total_bytes
             and expected_bytes > 0
         )
     elif complete and (expected_count is not None or expected_bytes is not None):
-        complete = expected_count == 0 and expected_bytes == 0
+        complete = expected_count == 0 and expected_bytes == total_bytes == 0
     return text, complete
 
 
@@ -2878,6 +3035,7 @@ class _Runtime:
         # resource/backpressure guard only; one answer may still use the full
         # provider ingress cap in a single generation.
         self._response_session_bytes = 0
+        self._response_session_durable_bytes = 0
 
     @staticmethod
     def _make_admission_port(architectus: Any) -> Any:
@@ -2926,6 +3084,7 @@ class _Runtime:
         task_id: str | None = None,
         generation: int | None = None,
         request_id: str | None = None,
+        _already_redacted: bool = False,
         _observer_failure_is_fatal: bool | None = None,
         _deferred_observers: list[tuple[dict[str, Any], bool]] | None = None,
         **payload: Any,
@@ -2940,13 +3099,15 @@ class _Runtime:
             "monotonic_ms": time.monotonic_ns() // 1_000_000,
             "payload": dict(payload),
         }
-        if self._redactor is not None:
+        if self._redactor is not None and not _already_redacted:
             redacted_record = self._redactor.redact_protocol_record(
                 record, structural_fields=EVENT_RECORD_STRUCTURAL_FIELDS
             )
             record = cast(dict[str, Any], redacted_record)
             kind = cast(str, record["kind"])
         durable_record = self._copy_event(record)
+        if _already_redacted:
+            durable_record = _PreRedactedEvent(durable_record)
         if self._store is not None:
             try:
                 async with self._event_append_lock:
@@ -6869,13 +7030,28 @@ class _Runtime:
         redactor = getattr(self, "_redactor", None)
         try:
             redacted = redactor.redact(raw) if redactor is not None else raw
-            durable_chunks = _split_response_chunks(redacted)
+            durable_chunks = _split_response_chunks(
+                redacted,
+                total_limit=MAX_RESPONSE_DURABLE_TOTAL_BYTES,
+                max_chunks=MAX_RESPONSE_DURABLE_CHUNKS,
+            )
         except (TypeError, ValueError, UnicodeError) as exc:
             return await self._reject_response_chunk(
                 state, f"response rejected: redaction/chunking failed ({exc})"
             )
         durable_bytes = len(redacted.encode("utf-8"))
         raw_complete = state.response_final_index == state.response_next_index - 1
+        durable_session_bytes = getattr(self, "_response_session_durable_bytes", 0)
+        if type(durable_session_bytes) is not int or durable_session_bytes < 0:
+            durable_session_bytes = 0
+        if durable_session_bytes + durable_bytes > MAX_RESPONSE_DURABLE_SESSION_BYTES:
+            return await self._reject_response_chunk(
+                state,
+                "response rejected: durable session response resource limit",
+                session_response_bytes=durable_session_bytes + durable_bytes,
+                limit=MAX_RESPONSE_DURABLE_SESSION_BYTES,
+            )
+        self._response_session_durable_bytes = durable_session_bytes + durable_bytes
         state.response_durable_chunks = {
             index: (chunk, raw_complete and index == len(durable_chunks) - 1)
             for index, chunk in enumerate(durable_chunks)
@@ -6890,10 +7066,12 @@ class _Runtime:
                 task_id=state.task_id,
                 request_id=state.run_rid,
                 generation=state.generation,
+                _already_redacted=True,
                 chunk_index=index,
                 text=chunk,
                 final=final,
             )
+
             state.response_durable_next_index = index + 1
         state.response_redaction_done = True
         return False
@@ -6994,7 +7172,14 @@ class _Runtime:
             if response_accepted and not invalid_fields and state.protocol_failure is None
             else None
         )
-        if invalid_fields or state.protocol_failure is not None or completion_error is not None:
+        if (
+            invalid_fields
+            or state.protocol_failure is not None
+            or completion_error is not None
+            or identity_note is not None
+            or not state.correlated
+            or state.envelope is not None
+        ):
             # Keep replay aware that a terminal-looking worker envelope was
             # rejected locally.  The marker is bounded metadata; response text
             # remains exclusively in accepted response_chunk events.
@@ -7681,6 +7866,10 @@ class _Runtime:
             and state.correlated
             and state.envelope.get("status")
             in ("succeeded", "failed", "cancelled", "suspended", "unresolvable")
+            and (
+                "response_valid" not in state.envelope
+                or state.envelope.get("response_valid") is True
+            )
             and self._response_completion_error(
                 state, state.envelope.get("status")
             )
@@ -8550,6 +8739,7 @@ class _Runtime:
                         max_attempts=max_attempts,
                         status="succeeded",
                         merge_sha=merged,
+                        generation=handle.generation,
                     )
                     if sanitized_envelope is not None:
                         self._last_envelope = sanitized_envelope
@@ -8792,14 +8982,18 @@ class _Runtime:
             ValueError,
             subprocess.SubprocessError,
         ) as exc:
-            await self.emit(
-                "merge_failed",
-                task_id=task_id,
-                merge_error=exc.__class__.__name__,
-                message=str(exc)[:512],
-                generation=handle.generation,
-                internal=True,
-            )
+            merge_failure_payload: dict[str, Any] = {
+                "merge_error": exc.__class__.__name__,
+                "message": str(exc)[:512],
+                "generation": handle.generation,
+                "internal": True,
+            }
+            if integrated_persisted:
+                # The private integration already advanced the parent's
+                # durable head. A deferred observer failure is diagnostic,
+                # not a rejection of the successful task result.
+                merge_failure_payload["recoverable"] = True
+            await self.emit("merge_failed", task_id=task_id, **merge_failure_payload)
             if not integrated_persisted:
                 return None
         if merge_failed or (cleanup_failed and not integrated_persisted):

@@ -232,6 +232,13 @@ _RESPONSE_CHUNK_WORST_CASE_BYTES = MAX_RESPONSE_CHUNK_BYTES - 3
 MAX_RESPONSE_CHUNKS = (
     MAX_RESPONSE_TOTAL_BYTES + _RESPONSE_CHUNK_WORST_CASE_BYTES - 1
 ) // _RESPONSE_CHUNK_WORST_CASE_BYTES
+# Redaction replaces matched text with a configurable replacement. Keep a
+# separate durable-output budget so safe redaction may expand an in-cap raw
+# response without reapplying the raw provider ingress cap.
+MAX_RESPONSE_DURABLE_TOTAL_BYTES = MAX_RESPONSE_TOTAL_BYTES * 4
+MAX_RESPONSE_DURABLE_CHUNKS = (
+    MAX_RESPONSE_DURABLE_TOTAL_BYTES + _RESPONSE_CHUNK_WORST_CASE_BYTES - 1
+) // _RESPONSE_CHUNK_WORST_CASE_BYTES
 MAX_TOOL_CALLS_PER_BATCH = 16
 MAX_OBSERVATION_BYTES = 64 * 1024
 MAX_CMD_BYTES = 512
@@ -879,6 +886,22 @@ def _request_stop(stop: threading.Event) -> None:
     """Record an external cancellation before setting the shared stop flag."""
     stop._cambium_cancel_requested = True  # type: ignore[attr-defined]
     stop.set()
+
+
+def _external_stop_requested(stop: threading.Event) -> bool:
+    """Return whether a stop flag came from an external control message."""
+    return bool(getattr(stop, "_cambium_cancel_requested", False))
+
+
+def _cancel_control_message(msg: Any) -> bool:
+    """Return whether a ready wire message requests task cancellation."""
+    if not isinstance(msg, dict):
+        return False
+    mtype = msg.get("type")
+    if mtype in {"cancel", "shutdown"}:
+        return True
+    payload = msg.get("payload")
+    return mtype == "steer" and isinstance(payload, dict) and payload.get("action") == "cancel"
 
 
 def git(*args: str, cwd: str | Path | None = None) -> tuple[int, str, str]:
@@ -1838,20 +1861,35 @@ def _bounded_user_text(text: str, limit: int) -> str:
     return clipped + "…"
 
 
-def _split_response_chunks(text: str) -> tuple[str, ...]:
+def _split_response_chunks(
+    text: str,
+    *,
+    total_limit: int | None = None,
+    max_chunks: int | None = None,
+) -> tuple[str, ...]:
     """Split one finish response into UTF-8-safe, bounded wire chunks.
 
-    The provider ingress cap is the only response-size guard.  A response at
-    that cap produces at most ``MAX_RESPONSE_CHUNKS`` chunks; no chunk can
-    exceed ``MAX_RESPONSE_CHUNK_BYTES`` when encoded as UTF-8.  The returned
-    chunks concatenate byte-for-byte to the original response.
+    ``total_limit`` defaults to the provider ingress cap. Callers that process
+    redacted output may provide a larger explicit durable-output budget. No
+    chunk can exceed ``MAX_RESPONSE_CHUNK_BYTES`` when encoded as UTF-8. The
+    returned chunks concatenate byte-for-byte to the original response.
     """
     if not isinstance(text, str):
         raise TypeError("response must be a string")
+    if total_limit is None:
+        total_limit = MAX_RESPONSE_TOTAL_BYTES
+    if type(total_limit) is not int or total_limit <= 0:
+        raise ValueError("response total limit must be a positive integer")
+    if max_chunks is None:
+        max_chunks = (
+            total_limit + _RESPONSE_CHUNK_WORST_CASE_BYTES - 1
+        ) // _RESPONSE_CHUNK_WORST_CASE_BYTES
+    if type(max_chunks) is not int or max_chunks <= 0:
+        raise ValueError("response chunk limit must be a positive integer")
     raw = text.encode("utf-8")
-    if len(raw) > MAX_RESPONSE_TOTAL_BYTES:
+    if len(raw) > total_limit:
         raise ValueError(
-            f"response exceeds the resource limit ({MAX_RESPONSE_TOTAL_BYTES} bytes)"
+            f"response exceeds the resource limit ({total_limit} bytes)"
         )
     if not raw:
         return ()
@@ -1869,7 +1907,7 @@ def _split_response_chunks(text: str) -> tuple[str, ...]:
         chunk = raw[offset:end].decode("utf-8")
         chunks.append(chunk)
         offset = end
-    if len(chunks) > MAX_RESPONSE_CHUNKS:
+    if len(chunks) > max_chunks:
         raise ValueError("response exceeds the chunk-count resource limit")
     return tuple(chunks)
 
@@ -8100,7 +8138,10 @@ async def _run_task(
                 await hb
             except asyncio.CancelledError:
                 pass
-    if cancellation_requested and outcome.get("status") == TaskStatus.SUCCEEDED.value:
+    if cancellation_requested and outcome.get("status") in {
+        TaskStatus.SUCCEEDED.value,
+        TaskStatus.SUSPENDED.value,
+    }:
         outcome["status"] = TaskStatus.CANCELLED.value
         outcome["failure_reason"] = "task cancelled before terminal result"
     outcome["request_id"] = run_rid
@@ -8111,8 +8152,9 @@ async def _run_task(
     outcome["ended_at"] = time.time()
     await _emit_proposed_children(writer, run, task_id)
     if (
-        bool(getattr(stop, "_cambium_cancel_requested", False))
-        and outcome.get("status") == TaskStatus.SUCCEEDED.value
+        _external_stop_requested(stop)
+        and outcome.get("status")
+        in {TaskStatus.SUCCEEDED.value, TaskStatus.SUSPENDED.value}
     ):
         outcome["status"] = TaskStatus.CANCELLED.value
         outcome["failure_reason"] = "task cancelled before terminal result"
@@ -8128,8 +8170,60 @@ def _exit_reason(status: str) -> str:
     }.get(status, "failed")
 
 
+def _bounded_result_strings(value: Any) -> list[str]:
+    """Bound result list items before they cross the worker wire boundary."""
+    if not isinstance(value, list | tuple):
+        return []
+    return [
+        _cap_utf8(item, MAX_ENVELOPE_FIELD_CHARS)
+        for item in value[:MAX_ENVELOPE_ITEMS]
+        if isinstance(item, str)
+    ]
+
+
+def _bounded_result_provider_metadata(value: Any) -> dict[str, Any] | None:
+    """Keep provider metadata to its known scalar/count fields and caps."""
+    if not isinstance(value, Mapping):
+        return None
+    metadata: dict[str, Any] = {}
+    for field in ("provider", "model", "fell_back_from"):
+        item = value.get(field)
+        if isinstance(item, str) and item:
+            metadata[field] = _cap_utf8(item, MAX_ENVELOPE_FIELD_CHARS)
+    usage = value.get("usage")
+    if isinstance(usage, Mapping):
+        bounded_usage: dict[str, int | float] = {}
+        for key in sorted(_USAGE_COUNT_FIELDS):
+            item = usage.get(key)
+            if _valid_usage_count(item) and (
+                not isinstance(item, int) or item <= MAX_RESPONSE_TOTAL_BYTES
+            ):
+                bounded_usage[key] = item
+        metadata["usage"] = bounded_usage
+    latency = value.get("latency_s")
+    if (
+        type(latency) in (int, float)
+        and not isinstance(latency, bool)
+        and math.isfinite(float(latency))
+    ):
+        metadata["latency_s"] = max(0.0, float(latency))
+    return metadata or None
+
+
 async def _emit_result_envelope(writer: asyncio.StreamWriter, outcome: dict[str, Any]) -> None:
     status = outcome["status"]
+    raw_diff = outcome.get("diff", "")
+    diff, diff_truncated = cap_diff(raw_diff) if isinstance(raw_diff, str) else ("", False)
+    raw_summary = outcome.get("summary", "")
+    summary = (
+        _cap_utf8(raw_summary, MAX_SUMMARY_CHARS) if isinstance(raw_summary, str) else ""
+    )
+    raw_failure_reason = outcome.get("failure_reason")
+    failure_reason = (
+        _cap_utf8(raw_failure_reason, MAX_ENVELOPE_FIELD_CHARS)
+        if isinstance(raw_failure_reason, str)
+        else None
+    )
     envelope = {
         "type": "result_envelope",
         "request_id": outcome["request_id"],
@@ -8137,12 +8231,12 @@ async def _emit_result_envelope(writer: asyncio.StreamWriter, outcome: dict[str,
         "generation": outcome["generation"],
         "status": status,
         "exit_code": _exit_code_for(status),
-        "commits": outcome.get("commits", []),
-        "files_changed": outcome.get("files_changed", []),
-        "diff": outcome.get("diff", ""),
-        "diff_truncated": bool(outcome.get("diff_truncated", False)),
-        "summary": (outcome.get("summary") or "")[:MAX_SUMMARY_CHARS],
-        "failure_reason": outcome.get("failure_reason"),
+        "commits": _bounded_result_strings(outcome.get("commits", [])),
+        "files_changed": _bounded_result_strings(outcome.get("files_changed", [])),
+        "diff": diff,
+        "diff_truncated": bool(outcome.get("diff_truncated", False)) or diff_truncated,
+        "summary": summary,
+        "failure_reason": failure_reason,
         "started_at": outcome.get("started_at"),
         "ended_at": outcome.get("ended_at"),
     }
@@ -8167,11 +8261,11 @@ async def _emit_result_envelope(writer: asyncio.StreamWriter, outcome: dict[str,
             envelope["checkpoint_ref"] = checkpoint_ref
     salvage_ref = outcome.get("salvage_ref")
     if isinstance(salvage_ref, str) and salvage_ref:
-        envelope["salvage_ref"] = salvage_ref
+        envelope["salvage_ref"] = _cap_utf8(salvage_ref, MAX_ENVELOPE_FIELD_CHARS)
     if status == TaskStatus.SUCCEEDED.value or "requires_commit" in outcome:
         envelope["requires_commit"] = bool(outcome.get("requires_commit", False))
-    provider_metadata = outcome.get("provider_metadata")
-    if isinstance(provider_metadata, dict):
+    provider_metadata = _bounded_result_provider_metadata(outcome.get("provider_metadata"))
+    if provider_metadata is not None:
         envelope["provider_metadata"] = provider_metadata
     terminal_action = outcome.get("terminal_action")
     if isinstance(terminal_action, Mapping):
@@ -8230,16 +8324,17 @@ async def _emit_terminal_outcome(
 ) -> None:
     """Chunk a terminal response, then emit its bounded result envelope."""
 
-    def _cancel_success_if_requested() -> None:
+    def _cancel_terminal_if_requested() -> None:
         if (
             stop is not None
-            and stop.is_set()
-            and outcome.get("status") == TaskStatus.SUCCEEDED.value
+            and _external_stop_requested(stop)
+            and outcome.get("status")
+            in {TaskStatus.SUCCEEDED.value, TaskStatus.SUSPENDED.value}
         ):
             outcome["status"] = TaskStatus.CANCELLED.value
             outcome["failure_reason"] = "task cancelled before terminal result"
 
-    _cancel_success_if_requested()
+    _cancel_terminal_if_requested()
     try:
         await _emit_response_chunks(writer, outcome)
     except (TypeError, ValueError) as exc:
@@ -8251,7 +8346,7 @@ async def _emit_terminal_outcome(
         outcome.pop("response_bytes", None)
         outcome["status"] = TaskStatus.FAILED.value
         outcome["failure_reason"] = f"response chunking failed: {exc}"
-    _cancel_success_if_requested()
+    _cancel_terminal_if_requested()
     await _emit_result_envelope(writer, outcome)
 
 
@@ -8412,6 +8507,20 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
             task = current
             current = None
             current_request_id = None
+            ready_control: dict[str, Any] | None = None
+            if read_task in done:
+                try:
+                    candidate = read_task.result()
+                except BaseException:
+                    candidate = None
+                if isinstance(candidate, dict):
+                    ready_control = candidate
+                    if _cancel_control_message(candidate):
+                        # A control message and the task can complete in the
+                        # same event-loop turn. Record cancellation before
+                        # terminal serialization so success cannot win the
+                        # race merely because ``current`` was checked first.
+                        _request_stop(stop)
             read_task.cancel()
             try:
                 await read_task
@@ -8421,11 +8530,25 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
                 outcome = task.result()
             except Exception as exc:
                 return await _fatal(writer, {}, f"task crashed: {exc}")
+            if ready_control is not None and ready_control.get("type") in {"cancel", "shutdown"}:
+                await _send_ok(writer, ready_control, task_id, generation)
             # ``_run_task`` sets this event in its heartbeat cleanup even on a
-            # normal success.  Cancellation races are fenced inside
-            # ``_do_provider_work`` before it returns; do not treat that
-            # ordinary heartbeat shutdown as a task cancellation here.
-            await _emit_terminal_outcome(writer, outcome)
+            # normal success. ``_emit_terminal_outcome`` checks only the
+            # explicit external-cancellation marker, so ordinary heartbeat
+            # shutdown does not turn a successful task into a cancellation.
+            await _emit_terminal_outcome(writer, outcome, stop=stop)
+            if ready_control is not None and ready_control.get("type") == "shutdown":
+                await send(
+                    writer,
+                    {
+                        "type": "exit_message",
+                        "task_id": outcome["task_id"],
+                        "generation": outcome["generation"],
+                        "reason": "shutdown",
+                        "monotonic_ms": _monotonic_ms(),
+                    },
+                )
+                return 0
             if not worker_reuse:
                 await send(
                     writer,

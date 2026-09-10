@@ -13,6 +13,7 @@ import pytest
 from cambium import supervisor, worker
 from cambium.ipc import encode_message
 from cambium.redact import Redactor
+from cambium.store import EventStore
 
 
 class _RuntimeProbe(supervisor._Runtime):
@@ -21,7 +22,9 @@ class _RuntimeProbe(supervisor._Runtime):
         self._response_session_bytes = 0
         self._redactor = redactor
 
-    async def emit(self, kind: str, **payload: Any) -> None:
+    async def emit(
+        self, kind: str, *, _already_redacted: bool = False, **payload: Any
+    ) -> None:
         self.records.append((kind, payload))
 
 
@@ -153,6 +156,48 @@ def test_worker_emits_chunks_then_bounded_result_without_response(
     assert len(json.dumps(result).encode()) < worker.MAX_RESPONSE_CHUNK_BYTES
 
 
+def test_worker_result_envelope_bounds_non_response_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sent: list[dict[str, Any]] = []
+
+    async def capture(_writer: Any, message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    monkeypatch.setattr(worker, "send", capture)
+    long_item = "p" * (worker.MAX_ENVELOPE_FIELD_CHARS * 2)
+    outcome = {
+        "request_id": "run-1",
+        "task_id": "task",
+        "generation": 3,
+        "status": "failed",
+        "commits": [long_item] * (worker.MAX_ENVELOPE_ITEMS * 2),
+        "files_changed": [long_item] * (worker.MAX_ENVELOPE_ITEMS * 2),
+        "diff": "d" * (worker.MAX_DIFF_BYTES * 4),
+        "summary": "s" * (worker.MAX_SUMMARY_CHARS * 2),
+        "failure_reason": "r" * (worker.MAX_ENVELOPE_FIELD_CHARS * 2),
+        "provider_metadata": {
+            "provider": "provider-" + long_item,
+            "model": "model-" + long_item,
+            "usage": {"total_tokens": worker.MAX_RESPONSE_TOTAL_BYTES + 1},
+        },
+    }
+
+    asyncio.run(worker._emit_result_envelope(None, outcome))
+
+    result = sent[0]
+    assert encode_message(result) is not None
+    assert len(result["commits"]) == worker.MAX_ENVELOPE_ITEMS
+    assert len(result["files_changed"]) == worker.MAX_ENVELOPE_ITEMS
+    assert all(
+        len(item.encode()) <= worker.MAX_ENVELOPE_FIELD_CHARS for item in result["commits"]
+    )
+    assert len(result["diff"].encode()) <= worker.MAX_DIFF_BYTES + 32
+    assert len(result["summary"].encode()) <= worker.MAX_SUMMARY_CHARS
+    assert len(result["failure_reason"].encode()) <= worker.MAX_ENVELOPE_FIELD_CHARS
+    assert result["provider_metadata"]["usage"] == {}
+
+
 def test_terminal_outcome_cancellation_keeps_prefix_and_never_inlines_response(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -172,7 +217,7 @@ def test_terminal_outcome_cancellation_keeps_prefix_and_never_inlines_response(
         "summary": "compact",
     }
     stop = threading.Event()
-    stop.set()
+    worker._request_stop(stop)
 
     asyncio.run(worker._emit_terminal_outcome(None, outcome, stop=stop))
 
@@ -291,6 +336,150 @@ def test_supervisor_rejects_inline_response_in_result_control_envelope() -> None
     assert not [record for record in runtime.records if record[0] == "response_chunk"]
     result = next(payload for kind, payload in runtime.records if kind == "result")
     assert result["response_valid"] is False
+
+
+def test_supervisor_rejects_worker_owned_response_valid_marker() -> None:
+    runtime = _RuntimeProbe()
+    state = _state()
+
+    asyncio.run(
+        runtime._handle_result_message(
+            state,
+            {
+                "type": "result_envelope",
+                "task_id": "task",
+                "generation": 3,
+                "request_id": "run-1",
+                "status": "succeeded",
+                "summary": "compact",
+                "response_valid": True,
+            },
+        )
+    )
+
+    assert state.envelope is None
+    assert state.protocol_failure == "INVALID_RESULT_ENVELOPE"
+    rejection = next(
+        payload
+        for kind, payload in runtime.records
+        if kind == "protocol" and payload.get("note") == "result rejected: invalid field(s)"
+    )
+    assert rejection["fields"] == ["response_valid"]
+
+
+def test_supervisor_allows_redaction_expansion_with_durable_budget() -> None:
+    response = "x" * worker.MAX_RESPONSE_CHUNK_BYTES
+    runtime = _RuntimeProbe(redactor=Redactor(secret_values=["x"]))
+    state = _state()
+
+    async def scenario() -> None:
+        assert not await runtime._handle_response_chunk_message(
+            state, _chunk(0, response, final=True)
+        )
+        await runtime._handle_result_message(
+            state,
+            {
+                "type": "result_envelope",
+                "task_id": "task",
+                "generation": 3,
+                "request_id": "run-1",
+                "status": "succeeded",
+                "summary": "compact",
+                "response_chunk_count": 1,
+                "response_bytes": len(response.encode()),
+            },
+        )
+
+    asyncio.run(scenario())
+
+    durable = [payload for kind, payload in runtime.records if kind == "response_chunk"]
+    result = next(payload for kind, payload in runtime.records if kind == "result")
+    assert "".join(item["text"] for item in durable) == "***" * len(response)
+    assert len(durable) == 3
+    assert result["response_chunk_count"] == len(durable)
+    assert result["response_bytes"] == len(("***" * len(response)).encode())
+    assert state.protocol_failure is None
+    assert state.envelope is not None
+
+
+def test_pre_redacted_chunks_are_not_redacted_again_in_runtime_or_store(
+    tmp_path: Any,
+) -> None:
+    response = "x" * 100
+    redactor = Redactor(patterns=(), secret_values=["x", "*"])
+    store = EventStore(tmp_path / "events.db", redactor=redactor)
+    runtime = supervisor._Runtime(tmp_path, store, redactor=redactor)
+    state = _state()
+
+    async def scenario() -> None:
+        assert not await runtime._handle_response_chunk_message(
+            state, _chunk(0, response, final=True)
+        )
+        await runtime._handle_result_message(
+            state,
+            {
+                "type": "result_envelope",
+                "task_id": "task",
+                "generation": 3,
+                "request_id": "run-1",
+                "status": "succeeded",
+                "summary": "compact",
+                "response_chunk_count": 1,
+                "response_bytes": len(response.encode()),
+            },
+        )
+        return await asyncio.to_thread(store.events_after, 0)
+
+    try:
+        events = asyncio.run(scenario())
+    finally:
+        asyncio.run(asyncio.to_thread(store.close))
+
+    expected = "***" * len(response)
+    chunks = [event["payload"] for event in events if event["kind"] == "response_chunk"]
+    assert [item["text"] for item in chunks] == [expected]
+    result = next(event["payload"] for event in events if event["kind"] == "result")
+    assert result["response_bytes"] == len(expected.encode())
+
+
+def test_supervisor_marks_identity_mismatched_result_invalid_for_replay() -> None:
+    runtime = _RuntimeProbe()
+    state = _state()
+    asyncio.run(
+        runtime._handle_response_chunk_message(state, _chunk(0, "safe", final=True))
+    )
+
+    asyncio.run(
+        runtime._handle_result_message(
+            state,
+            {
+                "type": "result_envelope",
+                "task_id": "other",
+                "generation": 3,
+                "request_id": "run-1",
+                "status": "succeeded",
+                "summary": "compact",
+                "response_chunk_count": 1,
+                "response_bytes": 4,
+            },
+        )
+    )
+
+    result = next(payload for kind, payload in runtime.records if kind == "result")
+    assert result["response_valid"] is False
+    assert state.envelope is None
+
+
+def test_replay_rejects_supervisor_rejected_duplicate_result() -> None:
+    duplicate = _result(count=2, response_bytes=11)
+    duplicate["payload"]["response_valid"] = False
+
+    assert supervisor.reconstruct_response(
+        [_event(0, "hello "), _event(1, "world", final=True), _result(), duplicate],
+        "task",
+        3,
+        "run-1",
+    ) == ("hello world", False)
 
 
 def test_supervisor_session_response_resource_limit_rejects_before_persist(
@@ -417,6 +606,18 @@ def test_reconstruct_response_returns_valid_prefix_and_full_completion() -> None
     assert supervisor.reconstruct_response(
         [chunks[0], chunks[0], chunks[1], _result()], "task", 3, "run-1"
     ) == ("hello world", True)
+    assert supervisor.reconstruct_response(
+        [chunks[0], chunks[1], _result(), chunks[1]], "task", 3, "run-1"
+    ) == ("hello world", True)
+
+
+def test_replay_requires_exact_durable_byte_metadata() -> None:
+    events = [_event(0, "answer", final=True), _result(count=1, response_bytes=999)]
+
+    assert supervisor.reconstruct_response(events, "task", 3, "run-1") == (
+        "answer",
+        False,
+    )
 
 
 def test_replay_ignores_stale_but_blocks_matching_gap_or_malformed_chunk() -> None:
@@ -452,6 +653,83 @@ def test_replay_blocks_matching_malformed_result_before_later_success() -> None:
 
     assert supervisor.reconstruct_response(events, "task", 3, "run-1") == (
         "prefix",
+        False,
+    )
+
+
+def test_replay_rejects_payload_identity_conflicts() -> None:
+    tampered_chunk = _event(1, "inject", final=True)
+    tampered_chunk["payload"]["task_id"] = "other"
+    tampered_result = _result(count=2, response_bytes=11)
+    tampered_result["payload"]["request_id"] = "other"
+
+    assert supervisor.reconstruct_response(
+        [_event(0, "safe"), tampered_chunk, tampered_result],
+        "task",
+        3,
+        "run-1",
+    ) == ("safe", False)
+
+
+def test_replay_rejects_later_supervisor_generation_failure() -> None:
+    events = [
+        _event(0, "answer", final=True),
+        _result(count=1, response_bytes=len("answer")),
+        {
+            "kind": "worker_failed",
+            "task_id": "task",
+            "generation": 3,
+            "payload": {"reason": "merge rejected"},
+        },
+    ]
+
+    assert supervisor.reconstruct_response(events, "task", 3, "run-1") == (
+        "answer",
+        False,
+    )
+
+
+def test_replay_ignores_recoverable_private_merge_diagnostic() -> None:
+    events = [
+        _event(0, "answer", final=True),
+        _result(count=1, response_bytes=len("answer")),
+        {
+            "kind": "merge_failed",
+            "task_id": "task",
+            "generation": 3,
+            "payload": {
+                "internal": True,
+                "recoverable": True,
+                "message": "observer failed after private integration",
+            },
+        },
+    ]
+
+    assert supervisor.reconstruct_response(events, "task", 3, "run-1") == (
+        "answer",
+        True,
+    )
+
+
+def test_replay_does_not_clear_generation_failure_from_session_success() -> None:
+    events = [
+        _event(0, "rejected", final=True),
+        _result(count=1, response_bytes=len("rejected")),
+        {
+            "kind": "worker_failed",
+            "task_id": "task",
+            "generation": 3,
+            "payload": {"reason": "merge rejected"},
+        },
+        {
+            "kind": "session_ended",
+            "task_id": None,
+            "payload": {"session_status": "ended", "results": {"task": "succeeded"}},
+        },
+    ]
+
+    assert supervisor.reconstruct_response(events, "task", 3, "run-1") == (
+        "rejected",
         False,
     )
 

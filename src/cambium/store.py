@@ -47,7 +47,10 @@ Redaction is optional for backward compatibility: when an event store is
 constructed with a ``cambium.redact.Redactor``, the event envelope uses its
 explicit protocol redaction API before it enters the bounded queue and again
 immediately before the INSERT in the writer; nested payloads use generic
-recursive redaction. Without one, the event is persisted unchanged.
+recursive redaction. The supervisor may pass an internal pre-redacted event
+for response chunks; that marker skips both additional passes only after the
+supervisor has already assembled and redacted the complete response. Without
+one, the event is persisted unchanged.
 ``build_session_redactor`` is the single place a session constructs the shared
 redactor.
 """
@@ -103,6 +106,14 @@ CRITICAL_KINDS = frozenset(
         "context_epoch_advanced",
         "compaction_failed",
         "child_admitted",
+        # These lifecycle verdicts can invalidate a provisional successful
+        # result during replay, so dropping one must not revive response text.
+        "worker_failed",
+        "task_failed",
+        "merge_failed",
+        "resolver_succeeded",
+        "exit",
+        "session_ended",
         # User-facing finish responses travel as bounded, correlated chunks.
         # Chunks are critical so replay never observes a silently dropped
         # middle segment while the event queue is under pressure.
@@ -491,14 +502,19 @@ def _release_writer_lock(fd: int) -> None:
 class _Pending:
     """One in-flight append: the writer signals completion and any failure."""
 
-    __slots__ = ("event", "exc")
+    __slots__ = ("event", "exc", "already_redacted")
 
-    def __init__(self) -> None:
+    def __init__(self, *, already_redacted: bool = False) -> None:
         self.event = threading.Event()
         self.exc: BaseException | None = None
+        self.already_redacted = already_redacted
 
 
 _QueueItem = tuple[int, str, tuple[Any, ...], _Pending]
+
+
+class _PreRedactedEvent(dict[str, Any]):
+    """Internal event envelope whose payload was redacted before persistence."""
 
 
 class _BoundedEventQueue:
@@ -726,8 +742,9 @@ class EventStore:
             return self._dropped
 
     def append(self, event: dict[str, Any]) -> int | None:
+        already_redacted = isinstance(event, _PreRedactedEvent)
         event = _validate_append_record(event)
-        if self._redactor is not None:
+        if self._redactor is not None and not already_redacted:
             event = cast(
                 dict[str, Any],
                 self._redactor.redact_protocol_record(
@@ -749,7 +766,7 @@ class EventStore:
             event.get("generation"),
             event.get("request_id"),
         )
-        pending = _Pending()
+        pending = _Pending(already_redacted=already_redacted)
         critical = kind in CRITICAL_KINDS
         deadline = time.monotonic() + self._critical_timeout_s
         seq_holder: list[int] = []
@@ -839,8 +856,8 @@ class EventStore:
     def events_after(self, seq: int) -> list[dict[str, Any]]:
         return _read_sqlite_events(self._path, _READER_BUSY_TIMEOUT_MS, seq)
 
-    def _redact_row(self, row: tuple) -> tuple:
-        if self._redactor is None:
+    def _redact_row(self, row: tuple, *, already_redacted: bool = False) -> tuple:
+        if self._redactor is None or already_redacted:
             return row
         try:
             payload = json.loads(row[0])
@@ -1193,7 +1210,7 @@ class EventStore:
                     cur_item = None
                     cur_pending = None
                     break
-                row = self._redact_row(row)
+                row = self._redact_row(row, already_redacted=pending.already_redacted)
                 conn.execute(_INSERT, (seq, kind, *row))
                 cur_inserted = True
                 dirty = True
