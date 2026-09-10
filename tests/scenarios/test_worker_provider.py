@@ -1626,6 +1626,7 @@ def test_run_shell_output_deltas_reach_supervisor_and_tui_rows(tmp_path, monkeyp
             )
             first_frame = stream.getvalue()
             cockpit.move_to_input()
+            cockpit.set_input("", 0)
 
             def observe(event: dict[str, Any]) -> None:
                 transcript.observe_event(event)
@@ -1668,7 +1669,10 @@ def test_run_shell_output_deltas_reach_supervisor_and_tui_rows(tmp_path, monkeyp
         joined_deltas = "".join(event["payload"]["delta"] for event in deltas)
         assert "delta-0" in joined_deltas
         assert "delta-" in joined_deltas
-        assert output.count("┌ Cambium · conversation") >= 2
+        # Live output stays in normal scrollback; no fixed frame or operator
+        # rail is painted around the timeline.
+        assert "┌ Cambium · conversation" not in output
+        assert "OPERATOR RAIL" not in output
         assert output.find("delta-") > len(first_frame)
         assert "succeeded" in output
     finally:

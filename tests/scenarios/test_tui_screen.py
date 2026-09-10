@@ -8,8 +8,10 @@ streaming, and terminal-safety invariants.
 import io
 from types import SimpleNamespace
 
+import pytest
 from _helpers_g2 import _Tty  # type: ignore[reportMissingImports]
 
+from cambium import tui_screen
 from cambium.tui import _safe_live_draw
 from cambium.tui_screen import (
     ActivityState,
@@ -330,6 +332,418 @@ def test_tool_output_stream_rotates_per_tool_without_committing_a_mixture() -> N
     assert any("OLD-A" in text for text in texts)
     assert any("NEW-B" in text for text in texts)
     assert all(not ("OLD-A" in text and "NEW-B" in text) for text in texts)
+
+
+def test_live_cockpit_keeps_timeline_and_one_transient_status_input_pair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        tui_screen.shutil,
+        "get_terminal_size",
+        lambda _default: tui_screen.os.terminal_size((80, 24)),
+    )
+    stream = _Tty()
+    transcript = Transcript()
+    transcript.system("ready")
+    cockpit = Cockpit(stream)
+    with cockpit:
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=1 tokens=12",
+            activity_line="◌ THINKING · 1s",
+            turn_active=True,
+        )
+        first = stream.getvalue()
+        assert "SYSTEM ▸ ready" in first
+        assert "OPERATOR RAIL" not in first
+        assert "┌ Cambium · conversation" not in first
+        assert all(marker not in first for marker in ("\x1b[?1049h", "\x1b[2J", "\x1b[H"))
+
+        cockpit.move_to_input()
+        cockpit.set_input("draft", 5)
+        transcript.assistant("completed output")
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=2 tokens=20",
+            activity_line="▸ STREAMING · 2s",
+            turn_active=True,
+        )
+        updated = stream.getvalue()
+        assert "CAMBIUM ▸ completed output" in updated
+        assert "\x1b[1A" in updated[len(first) :]
+        assert updated.count("OPERATOR RAIL") == 0
+
+        unchanged = stream.getvalue()
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=2 tokens=20",
+            activity_line="▸ STREAMING · 2s",
+            turn_active=True,
+        )
+        assert stream.getvalue() == unchanged
+
+
+def test_live_status_prioritizes_owner_phase_provider_tool_and_detail_stays_one_row() -> None:
+    agent = SimpleNamespace(
+        task_id="child-a",
+        role="subagent",
+        state="active",
+        provider="zai",
+        model="glm-5",
+        tool="run_shell",
+        total_tokens=1234,
+    )
+    snapshot = SimpleNamespace(
+        session_status="running",
+        agents=(agent,),
+        active_agents=1,
+        queued_agents=0,
+        total_tokens=1234,
+        calls=2,
+        context=SimpleNamespace(epoch=3),
+    )
+    transcript = Transcript()
+    transcript.observe_event(
+        {
+            "kind": "heartbeat",
+            "task_id": "child-a",
+            "payload": {
+                "phase": "thinking",
+                "provider": "zai",
+                "model": "glm-5",
+                "tool": "run_shell",
+            },
+        }
+    )
+    status = tui_screen._live_status_line(
+        snapshot,
+        transcript,
+        session_description="",
+        branch_line="",
+        cumulative_line="usage: calls=2 tokens=1234",
+        width=120,
+        activity_line="◌ THINKING · 2s",
+    )
+    assert all(value in status for value in ("owner=child-a", "zai/glm-5", "tool=run_shell"))
+    detailed = tui_screen._live_status_line(
+        snapshot,
+        transcript,
+        session_description="",
+        branch_line="",
+        cumulative_line="usage: calls=2 tokens=1234",
+        width=120,
+        activity_line="◌ THINKING · 2s",
+        show_detail=True,
+    )
+    assert len(detailed.splitlines()) == 1
+    assert "agents=" in detailed and "ctx=e3" in detailed
+
+
+def test_live_resize_does_not_replay_timeline_history(monkeypatch: pytest.MonkeyPatch) -> None:
+    sizes = iter(
+        (
+            tui_screen.os.terminal_size((80, 24)),
+            tui_screen.os.terminal_size((80, 24)),
+            tui_screen.os.terminal_size((40, 24)),
+            tui_screen.os.terminal_size((40, 24)),
+        )
+    )
+    monkeypatch.setattr(tui_screen.shutil, "get_terminal_size", lambda _default: next(sizes))
+    stream = _Tty()
+    transcript = Transcript()
+    transcript.assistant("history row")
+    cockpit = Cockpit(stream)
+    with cockpit:
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+        )
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+            force=True,
+        )
+        transcript.assistant("new row")
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+        )
+    rendered = stream.getvalue()
+    assert rendered.count("CAMBIUM ▸ history row") == 1
+    assert rendered.count("CAMBIUM ▸ new row") == 1
+
+
+def test_concurrent_child_tool_streams_keep_distinct_history() -> None:
+    transcript = Transcript()
+    for task, call_id, delta in (
+        ("child-a", "a-1", "A-1"),
+        ("child-b", "b-1", "B-1"),
+        ("child-a", "a-1", "A-2"),
+        ("child-b", "b-1", "B-2"),
+    ):
+        transcript.observe_event(
+            {
+                "kind": "tool_output_delta",
+                "task_id": task,
+                "payload": {
+                    "tool": "run_shell",
+                    "tool_call_id": call_id,
+                    "delta": delta,
+                },
+            }
+        )
+    transcript.observe_event(
+        {
+            "kind": "tool_event",
+            "task_id": "child-a",
+            "payload": {"tool": "run_shell", "tool_call_id": "a-1", "ok": True},
+        }
+    )
+    transcript.observe_event(
+        {
+            "kind": "tool_event",
+            "task_id": "child-b",
+            "payload": {"tool": "run_shell", "tool_call_id": "b-1", "ok": True},
+        }
+    )
+    texts = [entry.text for entry in transcript.entries]
+    assert all(not ("A-" in text and "B-" in text) for text in texts)
+    assert all(any(fragment in text for text in texts) for fragment in ("A-1", "A-2", "B-1", "B-2"))
+
+
+def test_live_stream_switch_does_not_repeat_committed_tool_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        tui_screen.shutil,
+        "get_terminal_size",
+        lambda _default: tui_screen.os.terminal_size((80, 24)),
+    )
+    stream = _Tty()
+    transcript = Transcript()
+    cockpit = Cockpit(stream)
+    with cockpit:
+        transcript.observe_event(
+            {
+                "kind": "tool_output_delta",
+                "task_id": "child-a",
+                "payload": {"tool": "run_shell", "tool_call_id": "a", "delta": "A1\n"},
+            }
+        )
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="",
+            branch_line="",
+            cumulative_line="",
+        )
+        transcript.observe_event(
+            {
+                "kind": "tool_output_delta",
+                "task_id": "child-b",
+                "payload": {"tool": "run_shell", "tool_call_id": "b", "delta": "B1\n"},
+            }
+        )
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="",
+            branch_line="",
+            cumulative_line="",
+        )
+
+    rendered = stream.getvalue()
+    assert rendered.count("TOOL ▸ A1") == 1
+    assert rendered.count("TOOL ▸ B1") == 1
+
+
+def test_managed_native_input_uses_draft_and_keeps_status_row_position(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        tui_screen.shutil,
+        "get_terminal_size",
+        lambda _default: tui_screen.os.terminal_size((80, 24)),
+    )
+    stream = _Tty()
+    transcript = Transcript()
+    transcript.system("ready")
+    cockpit = Cockpit(stream)
+    with cockpit:
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="",
+            branch_line="",
+            cumulative_line="",
+        )
+        cockpit.move_to_input(native=True)
+        cockpit.set_input("draft", 5)
+        assert cockpit._input_line_text() == "draft"
+        cockpit.hide_cursor(commit=True)
+        transcript.assistant("after input")
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="",
+            branch_line="",
+            cumulative_line="",
+            force=True,
+        )
+
+    rendered = stream.getvalue()
+    assert rendered.count("SYSTEM ▸ ready") == 1
+    assert "CAMBIUM ▸ after input" in rendered
+
+
+def test_live_resize_keeps_stream_suffix_arriving_with_new_width(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sizes = iter(
+        (
+            tui_screen.os.terminal_size((80, 24)),
+            tui_screen.os.terminal_size((80, 24)),
+            tui_screen.os.terminal_size((40, 24)),
+            tui_screen.os.terminal_size((40, 24)),
+        )
+    )
+    monkeypatch.setattr(tui_screen.shutil, "get_terminal_size", lambda _default: next(sizes))
+    stream = _Tty()
+    transcript = Transcript()
+    cockpit = Cockpit(stream)
+    with cockpit:
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="",
+            branch_line="",
+            cumulative_line="",
+        )
+        transcript.observe_event({"kind": "assistant_delta", "payload": {"delta": "first\n"}})
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="",
+            branch_line="",
+            cumulative_line="",
+        )
+        transcript.observe_event({"kind": "assistant_delta", "payload": {"delta": "second\n"}})
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="",
+            branch_line="",
+            cumulative_line="",
+        )
+        transcript.observe_event({"kind": "assistant_delta", "payload": {"delta": "third\n"}})
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="",
+            branch_line="",
+            cumulative_line="",
+        )
+
+    rendered = stream.getvalue()
+    assert rendered.count("CAMBIUM ▸ first") == 1
+    assert rendered.count("CAMBIUM ▸ second") == 1
+    assert rendered.count("CAMBIUM ▸ third") == 1
+
+
+def test_live_completion_keeps_unbroken_stream_content_together(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        tui_screen.shutil,
+        "get_terminal_size",
+        lambda _default: tui_screen.os.terminal_size((80, 24)),
+    )
+    stream = _Tty()
+    transcript = Transcript()
+    cockpit = Cockpit(stream)
+    with cockpit:
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="",
+            branch_line="",
+            cumulative_line="",
+        )
+        transcript.observe_event({"kind": "assistant_delta", "payload": {"delta": "one"}})
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="",
+            branch_line="",
+            cumulative_line="",
+        )
+        transcript.observe_event({"kind": "assistant_delta", "payload": {"delta": " two"}})
+        transcript.finish_stream("one two")
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="",
+            branch_line="",
+            cumulative_line="",
+            force=True,
+        )
+
+    rendered = stream.getvalue()
+    assert rendered.count("CAMBIUM ▸ one two") == 1
+
+
+def test_live_bounded_stream_rollover_does_not_replay_retained_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        tui_screen.shutil,
+        "get_terminal_size",
+        lambda _default: tui_screen.os.terminal_size((80, 24)),
+    )
+    stream = _Tty()
+    transcript = Transcript()
+    cockpit = Cockpit(stream)
+    with cockpit:
+        transcript.observe_event({"kind": "assistant_delta", "payload": {"delta": "x\n" * 5000}})
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="",
+            branch_line="",
+            cumulative_line="",
+        )
+        first = stream.getvalue()
+        transcript.observe_event({"kind": "assistant_delta", "payload": {"delta": "y\n" * 4000}})
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="",
+            branch_line="",
+            cumulative_line="",
+        )
+
+    delta = stream.getvalue()[len(first) :]
+    assert "CAMBIUM ▸ x" not in delta
+    assert "    x" not in delta
+    assert "CAMBIUM ▸ y" in delta
 
 
 def test_short_terminal_falls_back_to_stream_rows() -> None:

@@ -9,7 +9,7 @@ scrollback.
 
 ``render_cockpit`` remains available as a deterministic framed renderer for
 presentation tests and callers that need a bounded snapshot.  ``Cockpit``
-uses ``render_primary`` for the live interactive path.
+uses the same primary-row helpers for the live interactive path.
 """
 
 from __future__ import annotations
@@ -190,8 +190,6 @@ _FAILURE_EVENT_KINDS = frozenset(
 )
 _FAILURE_STATUSES = frozenset({"error", "failed", "timeout"})
 _TOOL_ERROR_PREFIX = "tool errors:"
-_LIVE_DRAW_INTERVAL = 0.1
-
 _SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 _ACTIVITY_PHASE_GLYPHS = {"thinking": "◌", "streaming": "▸", "waiting": "◒"}
 _STALL_AFTER_S = 12.0
@@ -944,6 +942,11 @@ class Transcript:
         return self._stream_role
 
     @property
+    def streaming_key(self) -> str | None:
+        """Return the identity of the in-flight stream, when one is known."""
+        return self._stream_tool_key or self._stream_message_id
+
+    @property
     def tool_error_count(self) -> int:
         """Return routine tool failures observed during this session."""
         return self._tool_error_total
@@ -1084,6 +1087,15 @@ class Transcript:
         if value is None:
             return ""
         return _single_line(value) if isinstance(value, str) and value.strip() else ""
+
+    @staticmethod
+    def _event_tool_id(data: Mapping[str, Any]) -> str | None:
+        """Return the wire identity for one tool stream when it is present."""
+        for key in ("tool_call_id", "tool_id", "call_id", "request_id", "id"):
+            value = data.get(key)
+            if isinstance(value, str) and value:
+                return _single_line(value)
+        return None
 
     def _observe_live_event(
         self,
@@ -1492,7 +1504,9 @@ class Transcript:
 
         if kind == "tool_event" and self._stream_role == "tool":
             owner = task_id or "?"
-            active_tool_key = f"{owner}:run:{self._event_tool(data) or ''}"
+            tool_name = self._event_tool(data) or ""
+            tool_id = self._event_tool_id(data) or ""
+            active_tool_key = f"{owner}:run:{tool_name}:{tool_id}"
             if self._stream_tool_key == active_tool_key:
                 self._commit_stream()
 
@@ -1504,10 +1518,12 @@ class Transcript:
                 # One stream identity per task/tool operation: concurrent
                 # children running the same tool must never share one tail.
                 owner = task_id or "?"
+                tool_name = self._event_tool(data) or ""
+                tool_id = self._event_tool_id(data) or ""
                 if kind == "tool_event":
-                    tool_key = f"{owner}:end:{data.get('tool')}"
+                    tool_key = f"{owner}:end:{tool_name}:{tool_id}"
                 else:
-                    tool_key = f"{owner}:run:{self._event_tool(data) or ''}"
+                    tool_key = f"{owner}:run:{tool_name}:{tool_id}"
             self._update_stream(
                 role,
                 text,
@@ -3555,16 +3571,6 @@ def _primary_rows(
     return rendered
 
 
-def _primary_request_rows(
-    conversation_rows: tuple[tuple[str, str], ...],
-    rail_rows: tuple[tuple[str, str], ...],
-) -> tuple[tuple[str, str], ...]:
-    if not rail_rows:
-        return conversation_rows
-    rail_identity = "\x1f".join(f"{kind}\x1e{text}" for kind, text in rail_rows)
-    return (*conversation_rows, ("__rail__", rail_identity))
-
-
 _STATUS_KEYS = frozenset(
     {
         "session",
@@ -3739,7 +3745,7 @@ def _primary_status_line(
     activity_line: str = "",
     color: bool = False,
 ) -> str:
-    """Build the one-line status strip used by both cockpit renderers."""
+    """Build the one-line status strip used by the framed renderer."""
     fields = _status_fields(
         snapshot,
         session_description=session_description,
@@ -3811,6 +3817,171 @@ def _running_tool(activity_line: str) -> tuple[str, str] | None:
         _format_duration(_usage_float(match.group(2)) * 1000) if match.group(2) is not None else ""
     )
     return _sanitize(match.group(1)), duration
+
+
+def _live_status_line(
+    snapshot: Any,
+    transcript: Transcript | None,
+    *,
+    session_description: str,
+    branch_line: str,
+    cumulative_line: str,
+    width: int,
+    activity_line: str = "",
+    show_detail: bool = False,
+    color: bool = False,
+    prefix: bool = False,
+) -> str:
+    """Build one transient status row for the primary-buffer cockpit.
+
+    The row carries the current resource first.  Agent/context metadata is an
+    optional suffix and is clipped as one row; it never reserves a permanent
+    pane or width in the live terminal.
+    """
+    width = max(1, width)
+    fields = _status_fields(
+        snapshot,
+        session_description=session_description,
+        branch_line=branch_line,
+        cumulative_line=cumulative_line,
+    )
+    activity_source = activity_line
+    if not activity_source and transcript is not None and transcript.live_final:
+        activity_source = "✗ error" if transcript._live_status in {"error", "failed"} else "✓ done"
+    activity = _status_activity(_activity_status(snapshot, activity_source), color)
+    lane = _current_lane(snapshot)
+    owner = transcript._live_task_id if transcript is not None else None
+    if not owner and lane is not None:
+        candidate = getattr(lane, "task_id", None)
+        owner = _side_clean(candidate).strip() if candidate is not None else ""
+    owner = owner or ""
+
+    # A child event names its owner explicitly. Prefer that lane over the
+    # main lane selected by the general snapshot helper so provider/model/tool
+    # facts describe the resource that is actually producing the event.
+    if owner:
+        for candidate in getattr(snapshot, "agents", ()):
+            task = _side_clean(getattr(candidate, "task_id", "")).strip()
+            if task == owner:
+                lane = candidate
+                break
+
+    upper_activity = _side_clean(activity).upper()
+    if "TOOL" in upper_activity:
+        phase = "tool"
+    elif "STREAMING" in upper_activity or "RESPONDING" in upper_activity:
+        phase = "streaming"
+    elif "THINKING" in upper_activity:
+        phase = "thinking"
+    elif "WAITING" in upper_activity or "PROVIDER" in upper_activity:
+        phase = "waiting"
+    else:
+        activity_name = _side_clean(activity).casefold()
+        if "orchestrating" in activity_name:
+            phase = "orchestrating"
+        elif "cooldown" in activity_name:
+            phase = "cooldown"
+        elif "suspended" in activity_name or "children" in activity_name:
+            phase = "children"
+        else:
+            phase = (
+                _side_clean(
+                    getattr(lane, "phase", None)
+                    or getattr(lane, "state", None)
+                    or getattr(snapshot, "session_status", "idle")
+                )
+                .strip()
+                .casefold()
+                .replace("_", "-")
+                or "idle"
+            )
+
+    terminal = _terminal_activity_status(activity_line)
+    if terminal is None and transcript is not None and transcript.live_final:
+        terminal = "error" if transcript._live_status in {"error", "failed"} else "succeeded"
+    if terminal is not None:
+        phase = {
+            "succeeded": "done",
+            "error": "error",
+            "cancelled": "cancelled",
+        }.get(terminal, terminal)
+    tool = transcript._live_tool if transcript is not None else None
+    if terminal is not None:
+        tool = None
+    elif not tool and lane is not None:
+        candidate = getattr(lane, "tool", None)
+        tool = _side_clean(candidate).strip() if candidate else ""
+    if terminal is None and not tool:
+        running = _running_tool(activity_line)
+        tool = running[0] if running is not None else ""
+
+    provider = getattr(lane, "provider", None) or fields.get("provider")
+    model = getattr(lane, "model", None) or fields.get("model")
+    provider_model = "/".join(_side_clean(value).strip() for value in (provider, model) if value)
+    tokens = _human_count(
+        _usage_int(fields.get("tokens"), _usage_int(getattr(snapshot, "total_tokens", 0)))
+    )
+    calls = _usage_int(fields.get("calls"), _usage_int(getattr(snapshot, "calls", 0)))
+
+    required = [activity]
+    # Keep phase explicit even when ActivityState is unavailable (for example
+    # during a resize or a queued inspection command).
+    if phase and phase not in upper_activity.casefold():
+        required.append(f"phase={phase}")
+    if owner:
+        required.append(f"owner={_side_clean(owner)}")
+    if provider_model:
+        required.append(_status_paint(provider_model, "cyan", color))
+    if tool:
+        required.append(f"tool={_side_clean(tool)}")
+
+    optional = [_status_paint(f"{tokens} tok", "dim", color)]
+    if calls:
+        optional.append(f"{calls} calls")
+    if transcript is not None and transcript.current_tool_error_count > 0:
+        optional.append(f"err{transcript.current_tool_error_count}")
+    if show_detail:
+        optional.append(
+            "agents="
+            f"{_usage_int(getattr(snapshot, 'active_agents', 0))}/"
+            f"{_usage_int(getattr(snapshot, 'queued_agents', 0))}"
+        )
+        context = getattr(snapshot, "context", None)
+        if context is not None:
+            optional.append(f"ctx=e{_usage_int(getattr(context, 'epoch', 0))}")
+        input_tokens = _usage_int(
+            getattr(lane, "input_tokens", getattr(snapshot, "input_tokens", 0))
+        )
+        output_tokens = _usage_int(
+            getattr(lane, "output_tokens", getattr(snapshot, "output_tokens", 0))
+        )
+        if input_tokens or output_tokens:
+            optional.append(f"in/out={_human_count(input_tokens)}/{_human_count(output_tokens)}")
+
+    def join(parts: list[str]) -> str:
+        return " · ".join(part for part in parts if part)
+
+    parts = [*required]
+    for item in optional:
+        candidate = join([*parts, item])
+        if _display_width(candidate) <= width:
+            parts.append(item)
+        else:
+            break
+
+    text = join(parts)
+    if _display_width(text) > width and len(required) > 1:
+        # Preserve the owner/provider/tool tail when the terminal is narrow;
+        # optional usage is already omitted above.
+        tail = required[1:]
+        tail_text = join(tail)
+        separator_width = _display_width(" · ") if tail_text else 0
+        activity_width = max(1, width - _display_width(tail_text) - separator_width)
+        required[0] = _clip(required[0], activity_width)
+        text = join(required)
+    if prefix:
+        text = f"Cambium · {text}"
+    return _clip(text, width)
 
 
 def _tool_activity_row(transcript: Transcript, activity_line: str, width: int) -> str:
@@ -4179,7 +4350,7 @@ def render_primary(
     activity_line: str = "",
     show_detail: bool = True,
 ) -> list[str]:
-    """Render conversation rows followed by the rolling tool/status rows."""
+    """Render an append-only transcript followed by one compact status row."""
     width = max(8, width)
     lines = [
         _paint(text, _role_color(role, color), color)
@@ -4187,10 +4358,10 @@ def render_primary(
             transcript,
             width,
             color=color,
-            include_stream=False,
+            include_stream=True,
         )
     ]
-    status_rows = _status_rows(
+    status = _live_status_line(
         snapshot,
         transcript,
         session_description=session_description,
@@ -4199,19 +4370,11 @@ def render_primary(
         width=width,
         activity_line=activity_line,
         show_detail=show_detail,
-        include_live=True,
         color=color,
+        prefix=True,
     )
-    # Keep the legacy stream renderer's tool/status suffix intact; the two
-    # live rows still stay in the same bottom block, ahead of that suffix.
-    status_rows = [*status_rows[1:3], status_rows[0], *status_rows[3:]]
-    lines.extend(_paint(text, _DIM_CYAN, color) for text in status_rows)
+    lines.append(_paint(status, _DIM_CYAN, color))
     return lines
-
-
-def _activity_row(activity_line: str, inner: int, color: bool) -> str:
-    content = _pad(_clip(f" {activity_line}" if activity_line else "", inner), inner)
-    return "│" + _paint(content, _DIM, color) + "│"
 
 
 def render_cockpit(
@@ -4257,16 +4420,39 @@ def render_cockpit(
     )
 
 
-class Cockpit:
-    """Persistent primary-buffer writer for one interactive frontend.
+def _suffix_prefix_overlap(previous: str, current: str) -> int:
+    """Return the longest prefix of ``current`` matching ``previous``'s suffix."""
+    if not previous or not current:
+        return 0
+    pattern = current
+    prefix = [0] * len(pattern)
+    for index in range(1, len(pattern)):
+        length = prefix[index - 1]
+        while length and pattern[index] != pattern[length]:
+            length = prefix[length - 1]
+        if pattern[index] == pattern[length]:
+            length += 1
+        prefix[index] = length
 
-    Unlike a conventional full-screen dashboard, a draw never homes the
-    cursor or clears the terminal.  New transcript rows and changed status
-    rows are appended to the terminal's normal buffer, which gives the
-    operator native terminal scrollback for free.  Idle redraws coalesce while
-    readline owns the input line; active-turn redraws preserve that line and
-    stream event output at a bounded rate.
+    length = 0
+    for char in previous[-len(pattern) :]:
+        while length and (length == len(pattern) or char != pattern[length]):
+            length = prefix[length - 1]
+        if char == pattern[length]:
+            length += 1
+    return length
+
+
+class Cockpit:
+    """Append-only primary-buffer terminal presentation.
+
+    The terminal owns the timeline and its scrollback.  Only the final two
+    rows are transient: one status row and one input row.  A redraw replaces
+    those rows in place, then leaves the cursor on the input row so new output
+    follows the terminal's normal bottom-scroll behaviour.
     """
+
+    _Request = tuple[Any, Transcript, str, str, str, str, str]
 
     def __init__(self, stream: TextIO, *, enabled: bool = True) -> None:
         self.stream = stream
@@ -4277,34 +4463,24 @@ class Cockpit:
         self._last_size = os.terminal_size((120, 40))
         self._input_active = False
         self._native_input = False
+        self._input_owner: int | None = None
         self._input_prompt_label = "›"
+        self._managed_input: tuple[str, int] = ("", 0)
+        self._managed_input_active = False
         self._last_restored_input_text: str | None = None
         self._last_restored_input_label = "›"
-        self._pending_draw: tuple[Any, Transcript, str, str, str, str, str] | None = None
-        self._turn_active = False
-        self._last_live_draw_at = 0.0
-        self._draw_in_flight = False
-        self._last_rendered_width: int | None = None
-        self._last_primary_rows: tuple[tuple[str, str], ...] = ()
-        self._last_conversation_rows: tuple[tuple[str, str], ...] = ()
-        self._last_frame_conversation_rows: tuple[tuple[str, str], ...] = ()
+        self._pending_draw: Cockpit._Request | None = None
+        self._last_request: Cockpit._Request | None = None
+        self._timeline_initialized = False
+        self._last_history_rows: tuple[tuple[str, str], ...] = ()
+        self._last_history_entries: tuple[TranscriptEntry, ...] = ()
+        self._last_stream_text = ""
+        self._last_stream_role: str | None = None
+        self._last_stream_key: str | None = None
+        self._stream_emitted_text = ""
         self._last_status_line = ""
-        self._last_detail_line = ""
-        self._last_status_fields: dict[str, str] | None = None
-        self._last_status_rows: tuple[str, ...] = ()
-        self._last_live_status_rows: tuple[str, str] = ("", "")
-        self._last_live_revision = -1
-        self._last_rail_rows: tuple[tuple[str, str], ...] = ()
-        self._last_request: tuple[Any, Transcript, str, str, str, str, str] | None = None
-        self._fixed_frame = False
-        self._small_frame = False
-        self._small_conversation_capacity = 0
-        self._small_total_rows = 0
-        self._frame_size: os.terminal_size | None = None
-        self._frame_show_detail: bool | None = None
-        self._final_hold_conversation_rows: tuple[tuple[str, str], ...] | None = None
-        self._activity_line = ""
-        self._activity_only_update = False
+        self._last_rendered_width: int | None = None
+        self._draw_in_flight = False
         self._show_detail = False
 
     @property
@@ -4316,7 +4492,7 @@ class Cockpit:
         return self._show_detail
 
     def toggle_detail(self) -> bool:
-        """Toggle the compact ambient detail row."""
+        """Toggle the denser single-row status suffix."""
         self._show_detail = not self._show_detail
         return self._show_detail
 
@@ -4340,18 +4516,22 @@ class Cockpit:
         raise SystemExit(128 + signum)
 
     def close(self) -> None:
-        self.flush()
-        if self.enabled and self._fixed_frame:
+        if self.enabled and self._timeline_initialized:
             if self._input_active:
                 self.hide_cursor(commit=True)
-            else:
-                if self._small_frame:
-                    self.stream.write("\r\n")
-                else:
-                    self.stream.write("\x1b[1B\r\n")
-                self._fixed_frame = False
-                self._small_frame = False
+                # Hiding the managed draft releases the deferred-draw gate;
+                # flush the latest timeline before leaving the terminal row.
+                self.flush()
+                self.stream.write("\r\n")
                 self.stream.flush()
+            else:
+                self.flush()
+                # Commit the blank input row and return to the next prompt or
+                # shell line.  No alternate screen or full-frame cleanup is
+                # needed because all history already belongs to scrollback.
+                self.stream.write("\r\n")
+                self.stream.flush()
+            self._timeline_initialized = False
         if self._entered:
             self._entered = False
         if self._previous_sigterm_handler is not None:
@@ -4361,164 +4541,134 @@ class Cockpit:
                 pass
             self._previous_sigterm_handler = None
 
-    def draw(
-        self,
-        snapshot: Any,
-        transcript: Transcript,
-        *,
-        session_description: str,
-        branch_line: str,
-        cumulative_line: str,
-        input_label: str = "›",
-        activity_line: str = "",
-        turn_active: bool = False,
-        force: bool = False,
-    ) -> None:
-        """Draw a frame, streaming active-turn events around pending input."""
-        if not self.enabled:
-            return
-        self._last_size = shutil.get_terminal_size((120, 40))
-        request = (
-            snapshot,
-            transcript,
-            session_description,
-            branch_line,
-            cumulative_line,
-            _clip(_sanitize(input_label).replace(chr(10), " "), 8),
-            _sanitize(activity_line).replace(chr(10), " "),
-        )
-        live_turn = turn_active or bool(activity_line)
-        self._turn_active = live_turn and not force
-        if self._final_hold_conversation_rows is not None:
-            if not request[1].live_final or force:
-                # A force draw after finish_stream must repaint the
-                # conversation: the hold snapshot was captured while the
-                # assistant text was still un-committed stream state, so a
-                # stale hold would keep the committed response out of the
-                # transcript rows.
-                self._final_hold_conversation_rows = None
-            elif (
-                not force
-                and self._frame_size == self._last_size
-                and self._frame_show_detail == self._show_detail
-            ):
-                width = (
-                    self._last_size.columns
-                    if self._small_frame
-                    else _frame_content_width(self._last_size.columns)
-                )
-                current_rows = tuple(
-                    _primary_rows(
-                        request[1],
-                        width,
-                        color=self.color,
-                        include_stream=False,
-                    )
-                )
-                if current_rows == self._final_hold_conversation_rows:
-                    self._draw_live_now(request, live_only=True)
-                    return
-                self._final_hold_conversation_rows = None
-        if self._draw_in_flight:
-            self._pending_draw = request
-            return
-        if self._fixed_frame and live_turn and not force and not self._input_active:
-            live_event_changed = request[1].live_revision != self._last_live_revision
-            activity_changed = request[-1] != self._activity_line
-            if live_event_changed or activity_changed:
-                now = time.monotonic()
-                immediate_event = request[1]._live_kind in (
-                    _ASSISTANT_STREAM_KINDS | _TOOL_STREAM_KINDS | {"heartbeat"}
-                )
-                if (
-                    live_event_changed
-                    and not immediate_event
-                    and now - self._last_live_draw_at < _LIVE_DRAW_INTERVAL
-                ):
-                    self._pending_draw = request
-                    return
-                self._pending_draw = None
-                self._draw_live_now(request, live_only=True)
-                self._last_live_draw_at = now
-                return
-        if self._input_active and not force:
-            pending_before = self._pending_draw
-            self._pending_draw = request
-            if not live_turn:
-                return
-            live_event_changed = (
-                getattr(request[1], "live_revision", -1) != self._last_live_revision
+    @staticmethod
+    def _history_rows(
+        transcript: Transcript, width: int, color: bool | int
+    ) -> tuple[tuple[str, str], ...]:
+        if not transcript.entries:
+            return ()
+        return tuple(
+            _primary_rows(
+                transcript,
+                width,
+                color=color,
+                include_stream=False,
             )
-            if live_event_changed and self._fixed_frame:
-                now = time.monotonic()
-                immediate_event = request[1]._live_kind in (
-                    _ASSISTANT_STREAM_KINDS | _TOOL_STREAM_KINDS | {"heartbeat"}
-                )
-                if immediate_event or now - self._last_live_draw_at >= _LIVE_DRAW_INTERVAL:
-                    self._pending_draw = None
-                    self._draw_live_now(request, live_only=True)
-                    if pending_before is None:
-                        self._last_live_draw_at = now
-                return
-            if not live_event_changed and not request[1]._live_kind:
-                self._pending_draw = None
-                return
-            now = time.monotonic()
-            if now - self._last_live_draw_at < _LIVE_DRAW_INTERVAL:
-                return
-            self._pending_draw = None
-            self._draw_live_now(request)
-            self._last_live_draw_at = now
-            return
-        if force:
-            self._pending_draw = None
-        if self._input_active and force:
-            self._draw_live_now(request, force=True)
-        else:
-            self._paint_now(request, force=force)
-        if live_turn and not force:
-            self._last_live_draw_at = time.monotonic()
-        if force:
-            self.stream.flush()
+        )
 
-    def _paint_now(
+    def _stream_delta_rows(
         self,
-        request: tuple[Any, Transcript, str, str, str, str, str],
-        *,
-        force: bool = False,
-    ) -> None:
-        if self._draw_in_flight:
-            self._pending_draw = request
-            return
-        self._draw_in_flight = True
-        try:
-            self._draw_now(request, force=force)
-        finally:
-            self._draw_in_flight = False
+        transcript: Transcript,
+        width: int,
+        previous_text: str,
+        previous_role: str | None,
+        previous_key: str | None,
+        color: bool | int,
+    ) -> tuple[tuple[tuple[str, str], ...], str]:
+        text = transcript.streaming_text
+        role = transcript.streaming_role
+        key = transcript.streaming_key
+        if not text or role is None:
+            return (), ""
 
-    def set_input(self, text: str, cursor: int, *, paint: bool = True) -> None:
-        """Update the event-loop-owned draft; resize never consults native memory."""
-        self._managed_input = (text, cursor)
-        if paint:
-            self._restore_input_line(text, force=True)
-            self.stream.flush()
+        same_stream = key == previous_key and role == previous_role
+        emitted = self._stream_emitted_text if same_stream else ""
+        if emitted and not text.startswith(emitted):
+            # A bounded snapshot starts with an ellipsis and retains only the
+            # stream tail.  Keep the already-emitted overlap out of scrollback
+            # instead of replaying that retained tail after rollover.
+            candidate = text[2:] if text.startswith("…\n") else text
+            overlap = _suffix_prefix_overlap(emitted, candidate)
+            if overlap:
+                pending = candidate[overlap:]
+            else:
+                # An unrelated replacement is a new baseline.  Wait for a
+                # complete line before appending it to normal scrollback.
+                emitted = ""
+                pending = text
+        else:
+            pending = text[len(emitted) :] if emitted else text
+        newline = pending.rfind("\n")
+        if newline < 0:
+            # Keep partial words/lines out of scrollback. They are rendered
+            # once the provider supplies a newline or commits the result.
+            return (), emitted
+        complete = pending[: newline + 1]
+        rows = tuple(
+            _entry_lines(
+                TranscriptEntry(role=role, text=complete),
+                width,
+                color=bool(color),
+            )
+        )
+        return rows, emitted + complete
+
+    @staticmethod
+    def _history_delta(
+        current: tuple[tuple[str, str], ...],
+        previous: tuple[tuple[str, str], ...],
+    ) -> tuple[tuple[str, str], ...]:
+        if current[: len(previous)] == previous:
+            return current[len(previous) :]
+        if not current:
+            return ()
+        # A bounded transcript can evict its oldest rows between draws.  Keep
+        # only the suffix after the largest shared overlap instead of replaying
+        # the whole retained view into native scrollback.
+        maximum = min(len(previous), len(current))
+        for size in range(maximum, 0, -1):
+            if previous[-size:] == current[:size]:
+                return current[size:]
+        return (("dim", "··· transcript view refreshed ···"), *current)
+
+    @staticmethod
+    def _entry_rows(
+        entries: tuple[TranscriptEntry, ...], width: int, color: bool | int
+    ) -> tuple[tuple[str, str], ...]:
+        rows: list[tuple[str, str]] = []
+        previous_kind = ""
+        for block in _transcript_blocks(entries, width, expanded=False, color=bool(color)):
+            kind = _transcript_block_kind(block)
+            if rows and kind == "tool" and previous_kind != "tool":
+                rows.append(("system", ""))
+            rows.extend(block)
+            previous_kind = kind
+        return tuple(rows)
+
+    @classmethod
+    def _entry_delta_rows(
+        cls,
+        current: tuple[TranscriptEntry, ...],
+        previous: tuple[TranscriptEntry, ...],
+        width: int,
+        color: bool | int,
+    ) -> tuple[tuple[str, str], ...]:
+        if current[: len(previous)] == previous:
+            return cls._entry_rows(current[len(previous) :], width, color)
+        maximum = min(len(previous), len(current))
+        for size in range(maximum, 0, -1):
+            if previous[-size:] == current[:size]:
+                return cls._entry_rows(current[size:], width, color)
+        return cls._entry_rows(current, width, color)
 
     def _input_line_text(self) -> str | None:
-        if self._input_active and hasattr(self, "_managed_input"):
-            return self._managed_input[0]
-        if not self._native_input or _readline is None or not self._input_active:
+        if not self._input_active:
             return ""
-        if getattr(self, "_input_owner", None) != threading.get_ident():
-            # libedit converts mutable editor storage here. Even a read from
-            # another thread can corrupt it while native input inserts text.
+        # The POSIX TerminalInput editor is event-loop managed even though its
+        # caller marks the row ``native``.  Only the legacy readline path must
+        # read editor-owned storage here.
+        if self._managed_input_active:
+            return _sanitize(self._managed_input[0])
+        if not self._native_input or _readline is None:
+            return ""
+        if self._input_owner != threading.get_ident():
+            # Never inspect native editor storage from the event-loop thread.
             return None
         try:
             value = _readline.get_line_buffer()
         except (AttributeError, OSError, RuntimeError):
             return ""
         value = _sanitize(value)
-        # Native readline retains the completed line plus its newline until
-        # the next prompt is edited; do not repaint that stale buffer.
         if value.endswith("\n"):
             return ""
         return value.replace("\r", " ").replace("\n", " ").replace("\t", " ")
@@ -4527,7 +4677,7 @@ class Cockpit:
         if not self._input_active:
             return
         managed = getattr(self, "_managed_input", None)
-        cursor = managed[1] if managed is not None else len(text)
+        cursor = managed[1] if managed is not None and self._managed_input_active else len(text)
         label = _sanitize(self._input_prompt_label)
         if "\n" in text:
             label += f" {text.count(chr(10), 0, cursor) + 1}/{text.count(chr(10)) + 1}"
@@ -4562,370 +4712,85 @@ class Cockpit:
         self._last_restored_input_text = text
         self._last_restored_input_label = label
 
-    def _small_live_rows(
+    def _write_input_blank(self) -> None:
+        self.stream.write(f"\r{_CLEAR_LINE}")
+
+    def _move_to_status(self) -> None:
+        if self._timeline_initialized:
+            self.stream.write("\r\x1b[1A")
+
+    def _write_status_and_input(self, status: str, input_text: str = "") -> None:
+        rendered = _paint(status, _DIM_CYAN, self.color)
+        self.stream.write(f"\r{_CLEAR_LINE}{rendered}\n")
+        self._write_input_blank()
+        if self._input_active:
+            self._restore_input_line(input_text, force=True)
+
+    def _redraw_status_only(self, status: str) -> None:
+        if not self._timeline_initialized:
+            return
+        # Preserve a native editor's exact cursor column while replacing the
+        # row above it.  This is needed for wrapped/mid-line readline drafts.
+        self.stream.write("\x1b[s")
+        self._move_to_status()
+        self.stream.write(f"\r{_CLEAR_LINE}{_paint(status, _DIM_CYAN, self.color)}")
+        self.stream.write("\x1b[1B\r\x1b[u")
+
+    def _append_timeline(self, rows: tuple[tuple[str, str], ...]) -> None:
+        for role, text in rows:
+            clean = _clip(_safe_rendered(text), max(1, self._last_size.columns))
+            rendered = _paint(clean, _role_color(role, self.color), self.color)
+            self.stream.write(f"\r{_CLEAR_LINE}{rendered}\n")
+
+    def draw(
         self,
+        snapshot: Any,
         transcript: Transcript,
-        width: int,
-        activity_line: str,
-    ) -> tuple[str, str]:
-        rows = _live_window_lines(transcript, width, activity_line=activity_line)
-        return rows[0], rows[1]
-
-    def _small_frame_lines(
-        self,
-        transcript: Transcript,
-        width: int,
-        activity_line: str,
-        input_label: str,
-    ) -> tuple[tuple[tuple[str, str], ...], tuple[str, ...]]:
-        has_input = self._last_size.lines >= 3
-        conversation_capacity = max(0, self._last_size.lines - 2 - int(has_input))
-        conversation_rows = (
-            tuple(
-                _primary_rows(
-                    transcript,
-                    width,
-                    color=self.color,
-                    include_stream=True,
-                )[-conversation_capacity:]
-            )
-            if conversation_capacity
-            else ()
-        )
-        live_rows = self._small_live_rows(transcript, width, activity_line)
-        lines_list = [
-            *(
-                _paint(text, _role_color(role, self.color), self.color)
-                for role, text in conversation_rows
-            ),
-            *(_paint(text, _DIM_CYAN, self.color) for text in live_rows),
-        ]
-        if has_input:
-            lines_list.append(_paint(_clip(f"{input_label} ", width), _BLUE, self.color))
-        lines = tuple(lines_list)
-        return conversation_rows, lines
-
-    def _redraw_small_lines(self, lines: tuple[str, ...]) -> None:
-        if not self._small_frame or len(lines) != self._small_total_rows:
-            return
-        self.stream.write("\x1b[s")
-        for index, line in enumerate(lines):
-            distance = self._small_total_rows - 1 - index
-            move = f"\x1b[{distance}A" if distance else ""
-            self.stream.write(f"{move}\r{_CLEAR_LINE}{line}\x1b[u")
-        self.stream.flush()
-
-    def _redraw_small_live(self, live_rows: tuple[str, str]) -> None:
-        if not self._small_frame:
-            return
-        conversation_capacity = self._small_conversation_capacity
-        self.stream.write("\x1b[s")
-        for offset, row in enumerate(live_rows):
-            index = conversation_capacity + offset
-            distance = self._small_total_rows - 1 - index
-            move = f"\x1b[{distance}A" if distance else ""
-            rendered = _paint(row, _DIM_CYAN, self.color)
-            self.stream.write(f"{move}\r{_CLEAR_LINE}{rendered}\x1b[u")
-        self.stream.flush()
-
-    def _draw_small_now(
-        self,
-        request: tuple[Any, Transcript, str, str, str, str, str],
         *,
-        preserve_input: bool = False,
-    ) -> None:
-        del preserve_input
-        (
-            snapshot,
-            transcript,
-            session_description,
-            branch_line,
-            cumulative_line,
-            input_label,
-            activity_line,
-        ) = request
-        width = max(1, self._last_size.columns)
-        conversation_rows, lines = self._small_frame_lines(
-            transcript,
-            width,
-            activity_line,
-            input_label,
-        )
-        if self._small_frame and self._small_total_rows == len(lines):
-            self._redraw_small_lines(lines)
-        else:
-            if self._fixed_frame and not self._small_frame:
-                self.stream.write(f"\r{_CLEAR_LINE}")
-            self.stream.write("\r\n".join(lines))
-            self.stream.flush()
-        status_rows = tuple(
-            _status_rows(
-                snapshot,
-                transcript,
-                session_description=session_description,
-                branch_line=branch_line,
-                cumulative_line=cumulative_line,
-                width=width,
-                activity_line=activity_line,
-                show_detail=self._show_detail,
-                include_live=True,
-                color=self.color,
-            )
-        )
-        self._fixed_frame = True
-        self._small_frame = True
-        self._frame_size = self._last_size
-        self._frame_show_detail = self._show_detail
-        self._small_conversation_capacity = len(conversation_rows)
-        self._small_total_rows = len(lines)
-        self._last_request = request
-        self._activity_line = activity_line
-        self._last_rendered_width = self._last_size.columns
-        self._last_primary_rows = conversation_rows
-        self._last_conversation_rows = conversation_rows
-        self._last_frame_conversation_rows = conversation_rows
-        self._last_status_rows = status_rows
-        self._last_live_status_rows = (status_rows[1], status_rows[2])
-        self._last_live_revision = transcript.live_revision
-        self._last_rail_rows = ()
-
-    def _redraw_live_status(
-        self,
-        request: tuple[Any, Transcript, str, str, str, str, str],
-        status_rows: tuple[str, ...],
-    ) -> None:
-        """Rewrite exactly the two fixed live rows without touching history."""
-        del request
-        if not self._fixed_frame:
-            return
-        live_rows = tuple(status_rows[1:3])
-        if len(live_rows) != _LIVE_WINDOW_ROWS:
-            return
-        if self._small_frame:
-            self._redraw_small_live((live_rows[0], live_rows[1]))
-            return
-        height = self._last_size.lines
-        conversation_capacity = max(1, height - _frame_overhead(self._show_detail))
-        rail_width = _rail_width(self._last_size.columns)
-        changed = tuple(
-            offset
-            for offset, row in enumerate(live_rows)
-            if row != self._last_live_status_rows[offset]
-        )
-        if not changed:
-            return
-        rendered = tuple(
-            _split_frame_row(
-                row,
-                self._last_size.columns,
-                rail_width,
-                left_color=_DIM_CYAN,
-                color=self.color,
-            )
-            for row in live_rows
-        )
-        self.stream.write("\x1b[s")
-        for offset in changed:
-            line = rendered[offset]
-            distance = height - 3 - (conversation_capacity + 2 + offset)
-            self.stream.write(f"\x1b[{distance}A\r{_CLEAR_LINE}{line}\x1b[u")
-        self.stream.flush()
-
-    def _redraw_status_indices(
-        self,
-        status_rows: tuple[str, ...],
-        indices: tuple[int, ...],
-    ) -> None:
-        """Rewrite changed non-live status rows in place."""
-        if not self._fixed_frame or self._small_frame or not indices:
-            return
-        height = self._last_size.lines
-        conversation_capacity = max(1, height - _frame_overhead(self._show_detail))
-        rail_width = _rail_width(self._last_size.columns)
-        self.stream.write("\x1b[s")
-        for index in indices:
-            if index >= len(status_rows):
-                continue
-            distance = height - 2 - (conversation_capacity + 2 + index)
-            line = _split_frame_row(
-                status_rows[index],
-                self._last_size.columns,
-                rail_width,
-                left_color=_DIM_CYAN,
-                color=self.color,
-            )
-            self.stream.write(f"\x1b[{distance}A\r{_CLEAR_LINE}{line}\x1b[u")
-        self.stream.flush()
-
-    def _draw_live_event_now(
-        self,
-        request: tuple[Any, Transcript, str, str, str, str, str],
-    ) -> None:
-        """Paint a real event into the fixed status window, never history."""
-        (
-            snapshot,
-            transcript,
-            session_description,
-            branch_line,
-            cumulative_line,
-            _,
-            activity_line,
-        ) = request
-        terminal_status = _terminal_activity_status(activity_line)
-        if terminal_status is not None:
-            transcript._set_live_status(terminal_status)
-        if not self._fixed_frame:
-            self._draw_now(request, force=True)
-            return
-        if self._small_frame:
-            self._draw_small_now(request)
-            return
-        content_width = _frame_content_width(self._last_size.columns)
-        conversation_capacity = max(1, self._last_size.lines - _frame_overhead(self._show_detail))
-        conversation_rows = tuple(
-            _primary_rows(
-                transcript,
-                content_width,
-                color=self.color,
-                include_stream=True,
-            )
-        )
-        visible_rows = tuple(conversation_rows[-conversation_capacity:])
-        rail_width = _rail_width(self._last_size.columns)
-        rail_rows = (
-            tuple(
-                _rail_rows(
-                    snapshot,
-                    rail_width,
-                    conversation_capacity,
-                    activity_line=activity_line,
-                    cumulative_line=cumulative_line,
-                )
-            )
-            if rail_width
-            else ()
-        )
-        status_rows = tuple(
-            _status_rows(
-                snapshot,
-                transcript,
-                session_description=session_description,
-                branch_line=branch_line,
-                cumulative_line=cumulative_line,
-                width=content_width,
-                activity_line=activity_line,
-                show_detail=self._show_detail,
-                include_live=True,
-                color=self.color,
-            )
-        )
-        self._redraw_live_status(request, status_rows)
-        changed = tuple(
-            index
-            for index, row in enumerate(status_rows)
-            if index not in {1, 2}
-            and (index >= len(self._last_status_rows) or row != self._last_status_rows[index])
-        )
-        self._redraw_status_indices(status_rows, changed)
-        if visible_rows != self._last_frame_conversation_rows or rail_rows != self._last_rail_rows:
-            self._redraw_rail(visible_rows, rail_rows)
-        self._last_request = request
-        self._activity_line = activity_line
-        self._activity_only_update = False
-        self._last_status_rows = status_rows
-        self._last_live_status_rows = (status_rows[1], status_rows[2])
-        self._last_status_fields = _status_fields(
-            snapshot,
-            session_description=session_description,
-            branch_line=branch_line,
-            cumulative_line=cumulative_line,
-        )
-        self._last_conversation_rows = conversation_rows
-        self._last_frame_conversation_rows = visible_rows
-        self._last_primary_rows = _primary_request_rows(conversation_rows, rail_rows)
-        self._last_rail_rows = rail_rows
-        self._last_live_revision = transcript.live_revision
-        self._hold_final_conversation(request)
-
-    def _draw_live_now(
-        self,
-        request: tuple[Any, Transcript, str, str, str, str, str],
-        *,
+        session_description: str,
+        branch_line: str,
+        cumulative_line: str,
+        input_label: str = "›",
+        activity_line: str = "",
+        turn_active: bool = False,
         force: bool = False,
-        live_only: bool = False,
     ) -> None:
-        input_text = self._input_line_text()
-        if input_text is None:
-            # Native editing owns the input row. Keep live cells moving, but
-            # defer destructive frame/input repaint until the line completes.
-            self._pending_draw = request
-            if self._fixed_frame:
-                self._draw_live_event_now(request)
-                capacity = max(1, self._last_size.lines - _frame_overhead(self._show_detail))
-                rows = tuple(
-                    _primary_rows(
-                        request[1],
-                        _frame_content_width(self._last_size.columns),
-                        color=self.color,
-                        include_stream=True,
-                    )
-                )
-                visible = rows[-capacity:]
-                self._redraw_rail(visible, self._last_rail_rows)
-                self._last_frame_conversation_rows = visible
-                self._last_conversation_rows = rows
-                self._last_primary_rows = _primary_request_rows(rows, self._last_rail_rows)
+        """Append new timeline rows and refresh only status/input rows."""
+        if not self.enabled:
             return
-        geometry_changed = self._frame_size != self._last_size or (
-            self._last_rendered_width is not None
-            and self._last_rendered_width != self._last_size.columns
+        self._last_size = shutil.get_terminal_size((120, 40))
+        label = _clip(_sanitize(input_label).replace(chr(10), " "), 8)
+        request: Cockpit._Request = (
+            snapshot,
+            transcript,
+            _sanitize(session_description).replace(chr(10), " "),
+            _sanitize(branch_line).replace(chr(10), " "),
+            _sanitize(cumulative_line).replace(chr(10), " "),
+            label,
+            _sanitize(activity_line).replace(chr(10), " "),
         )
-        # A result event can be live-only before finish_stream commits it.
-        # Promote only the post-commit revision into the conversation frame.
-        final_response_pending = (
-            request[1].live_final
-            and bool(request[1]._live_text)
-            and not request[1].streaming_text
-            and request[1].live_revision != self._last_live_revision
-        )
-        live_only_render = (
-            not geometry_changed
-            and not final_response_pending
+        if self._draw_in_flight:
+            self._pending_draw = request
+            return
+        if (
+            self._input_active
+            and not force
             and (
-                live_only
-                or (
-                    force
-                    and self._fixed_frame
-                    and (
-                        request[1].live_final
-                        or request[1].live_revision != self._last_live_revision
-                        or _terminal_activity_status(request[-1]) is not None
-                    )
-                )
+                self._input_line_text() is None
+                or (not self._native_input and not self._managed_input_active)
             )
-        )
+        ):
+            # Native readline owns its mutable line.  Keep the newest event
+            # until Enter/Ctrl-C releases that storage.
+            self._pending_draw = request
+            return
         self._draw_in_flight = True
         try:
-            if live_only_render:
-                self._draw_live_event_now(request)
-            else:
-                self._draw_now(
-                    request,
-                    force=force,
-                    preserve_input=self._input_active and not self._fixed_frame,
-                )
+            self._draw_now(request, force=force)
         finally:
             self._draw_in_flight = False
-        self._restore_input_line(input_text, force=not live_only_render)
-        self.stream.flush()
 
-    def _draw_now(
-        self,
-        request: tuple[Any, Transcript, str, str, str, str, str],
-        *,
-        force: bool = False,
-        preserve_input: bool = False,
-    ) -> None:
+    def _draw_now(self, request: Cockpit._Request, *, force: bool = False) -> None:
         (
             snapshot,
             transcript,
@@ -4933,304 +4798,162 @@ class Cockpit:
             branch_line,
             cumulative_line,
             input_label,
-            activity_line,
+            activity,
         ) = request
-        previous_request = self._last_request
-        activity_only_update = self._activity_only_update
-        self._activity_only_update = False
-        self._last_request = request
-        self._activity_line = activity_line
-        if self._last_size.lines < _FIXED_MIN_HEIGHT:
-            self._draw_small_now(request, preserve_input=preserve_input)
-            return
+        width = max(8, self._last_size.columns)
+        history = self._history_rows(transcript, width, self.color)
+        history_new = self._history_delta(history, self._last_history_rows)
 
-        content_width = _frame_content_width(self._last_size.columns)
-        conversation_rows = tuple(
-            _primary_rows(
-                transcript,
-                content_width,
-                color=self.color,
-                include_stream=True,
-            )
+        stream_new, stream_emitted = self._stream_delta_rows(
+            transcript,
+            width,
+            self._last_stream_text,
+            self._last_stream_role,
+            self._last_stream_key,
+            self.color,
         )
-        conversation_capacity = max(1, self._last_size.lines - _frame_overhead(self._show_detail))
-        rail_width = _rail_width(self._last_size.columns)
-        rail_rows = (
-            tuple(
-                _rail_rows(
-                    snapshot,
-                    rail_width,
-                    conversation_capacity,
-                    activity_line=activity_line,
-                    cumulative_line=cumulative_line,
-                )
-            )
-            if rail_width
-            else ()
-        )
-        rows = _primary_request_rows(conversation_rows, rail_rows)
-        status_rows = tuple(
-            _status_rows(
-                snapshot,
-                transcript,
-                session_description=session_description,
-                branch_line=branch_line,
-                cumulative_line=cumulative_line,
-                width=content_width,
-                activity_line=activity_line,
-                show_detail=self._show_detail,
-                include_live=True,
-                color=self.color,
-            )
-        )
-        if self._fixed_frame and (
-            self._frame_size != self._last_size
-            or (
-                self._last_rendered_width is not None
-                and self._last_rendered_width != self._last_size.columns
-            )
-            or self._frame_show_detail != self._show_detail
-            or (force and rows != self._last_primary_rows)
-        ):
-            # Leave the current input/status row before appending a fresh frame.
-            if (
-                self._last_rendered_width is not None
-                and self._last_rendered_width != self._last_size.columns
-            ):
-                self._clear_previous_rendered_width()
-            self.stream.write("\x1b[1B\r\n")
-            self._fixed_frame = False
-        if not self._fixed_frame:
-            if preserve_input:
-                self.stream.write("\r\n")
-            hidden_rows = conversation_rows[:-conversation_capacity]
-            if self._last_conversation_rows:
-                if (
-                    conversation_rows[: len(self._last_conversation_rows)]
-                    != self._last_conversation_rows
-                ):
-                    hidden_rows = ()
-                else:
-                    hidden_rows = hidden_rows[len(self._last_conversation_rows) :]
-            if hidden_rows:
-                # The fixed frame keeps only the tail; flush newly hidden rows
-                # so restored history and large live entries reach scrollback.
-                for role, text in hidden_rows:
-                    self.stream.write(_paint(text, _role_color(role, self.color), self.color))
-                    self.stream.write("\n")
-            lines = _cockpit_frame_lines(
-                snapshot,
-                transcript,
-                session_description=session_description,
-                branch_line=branch_line,
-                cumulative_line=cumulative_line,
-                width=self._last_size.columns,
-                height=self._last_size.lines,
-                color=self.color,
-                input_label=input_label,
-                activity_line=activity_line,
-                show_detail=self._show_detail,
-                primary_rows=conversation_rows,
-            )
-            self.stream.write("\r\n".join(lines))
-            self.stream.write("\x1b[1A\r")
-            self.stream.flush()
-            self._fixed_frame = True
-            self._last_rendered_width = self._last_size.columns
-            self._frame_size = self._last_size
-            self._frame_show_detail = self._show_detail
-            self._last_primary_rows = rows
-            self._last_conversation_rows = conversation_rows
-            self._last_frame_conversation_rows = tuple(conversation_rows[-conversation_capacity:])
-            self._last_status_rows = status_rows
-            self._last_live_status_rows = (status_rows[1], status_rows[2])
-            self._last_live_revision = transcript.live_revision
-            self._last_rail_rows = rail_rows
-            return
+        current_stream_text = transcript.streaming_text
+        current_stream_role = transcript.streaming_role
+        current_stream_key = transcript.streaming_key
+        current_history_entries = transcript.entries
+        if current_history_entries == self._last_history_entries:
+            # Presentation-only detail toggles must not replay immutable
+            # transcript rows into normal-buffer scrollback.
+            history_new = ()
 
-        if rows != self._last_primary_rows:
-            # Conversation changes are committed as a fresh normal-buffer
-            # frame. Heartbeat activity only changes the fixed rail cells;
-            # repaint those in place so elapsed seconds cannot move the frame.
-            activity_changed = activity_only_update or (
-                previous_request is not None and activity_line != previous_request[-1]
-            )
-            if conversation_rows == self._last_conversation_rows and activity_changed:
-                self._redraw_rail(self._last_frame_conversation_rows, rail_rows)
-            else:
-                self.stream.write("\x1b[1B\r\n")
-                self._fixed_frame = False
-                self._draw_now(request)
-                return
-        if status_rows != self._last_status_rows:
-            self._redraw_bottom(request, status_rows)
-        self._last_primary_rows = rows
-        self._last_conversation_rows = conversation_rows
-        self._last_frame_conversation_rows = tuple(conversation_rows[-conversation_capacity:])
-        self._last_status_rows = status_rows
-        self._last_live_status_rows = (status_rows[1], status_rows[2])
-        self._last_live_revision = transcript.live_revision
-        self._last_rail_rows = rail_rows
+        previous_stream_emitted = self._stream_emitted_text
 
-    def _hold_final_conversation(
-        self, request: tuple[Any, Transcript, str, str, str, str, str]
-    ) -> None:
-        if not request[1].live_final:
-            return
-        width = (
-            self._last_size.columns
-            if self._small_frame
-            else _frame_content_width(self._last_size.columns)
-        )
-        self._final_hold_conversation_rows = tuple(
-            _primary_rows(
-                request[1],
-                width,
-                color=self.color,
-                include_stream=False,
-            )
+        stream_ended_or_switched = (
+            not current_stream_text
+            or current_stream_role != self._last_stream_role
+            or current_stream_key != self._last_stream_key
         )
 
-    def _clear_previous_rendered_width(self) -> None:
-        """Clear the prior frame's full cell width before changing geometry."""
-        if self._last_rendered_width is None:
-            return
-        self.stream.write(f"\r{_CLEAR_LINE}{pad_terminal_text('', self._last_rendered_width)}\r")
-
-    def _draw_stream_now(
-        self,
-        request: tuple[Any, Transcript, str, str, str, str, str],
-        *,
-        preserve_input: bool = False,
-    ) -> None:
-        snapshot, transcript, session_description, branch_line, cumulative_line, _, _ = request
-        rows = tuple(_primary_rows(transcript, self._last_size.columns, color=self.color))
-        current_status_fields = _status_fields(
-            snapshot,
-            session_description=session_description,
-            branch_line=branch_line,
-            cumulative_line=cumulative_line,
-        )
-        status_rows = _status_rows(
+        status = _live_status_line(
             snapshot,
             transcript,
             session_description=session_description,
             branch_line=branch_line,
             cumulative_line=cumulative_line,
-            width=self._last_size.columns,
-            activity_line=request[-1],
+            width=width,
+            activity_line=activity,
             show_detail=self._show_detail,
-            include_live=True,
             color=self.color,
+            prefix=False,
         )
-        status_line = status_rows[3]
-        detail_line = status_rows[4] if self._show_detail else ""
+        input_text = self._input_line_text()
+        if input_text is None:
+            # Keep native input untouched.  Status still follows activity and
+            # resize changes because it occupies a separate row.
+            if self._timeline_initialized and (status != self._last_status_line or force):
+                self._redraw_status_only(status)
+            self._last_request = request
+            self._last_status_line = status
+            return
 
-        if rows[: len(self._last_conversation_rows)] == self._last_conversation_rows:
-            new_rows = rows[len(self._last_conversation_rows) :]
-        else:
-            # A bounded transcript can evict old rows, and a failure block can
-            # replace a previously emitted row.  Keep the append-only contract
-            # by marking the refreshed view instead of repainting history.
-            new_rows = (("dim", "··· transcript view refreshed ···"), *rows)
+        width_changed = self._last_rendered_width not in {None, width}
+        if width_changed:
+            # Reflowing a bounded transcript is a viewport change, not new
+            # output. Render only entries added since the previous draw; old
+            # rows become the new-width baseline without replaying history.
+            history_new = self._entry_delta_rows(
+                current_history_entries,
+                self._last_history_entries,
+                width,
+                self.color,
+            )
+            # The stream tracker still describes the previous draw.  Render
+            # its pending suffix at the new width instead of dropping it.
 
-        if (
-            new_rows
-            or tuple(status_rows[1:3]) != self._last_live_status_rows
-            or status_line != self._last_status_line
-            or detail_line != self._last_detail_line
-        ):
-            if preserve_input:
-                self.stream.write("\r\n")
-            for role, text in new_rows:
-                self.stream.write(_paint(text, _role_color(role, self.color), self.color))
-                self.stream.write("\n")
-            for status_row in status_rows:
-                self.stream.write(_paint(status_row, _DIM_CYAN, self.color))
-                self.stream.write("\n")
+        # finish_stream() promotes the stream into one history entry.  The
+        # entry has already been emitted chunk-by-chunk, so do not duplicate it
+        # when the committed text matches the last streamed value.
+        if history_new and previous_stream_emitted and stream_ended_or_switched:
+            role = self._last_stream_role
+            if role is not None and transcript.entries:
+                # ``finish_stream`` may commit a tool tail and then append the
+                # assistant's final result.  Locate the matching tail block,
+                # not only the last entry, before deciding whether it was
+                # already emitted above.
+                streamed_entry = next(
+                    (
+                        entry
+                        for entry in reversed(transcript.entries)
+                        if entry.role == role
+                        and (
+                            entry.text.startswith(self._last_stream_text)
+                            or self._last_stream_text.startswith(entry.text)
+                        )
+                    ),
+                    None,
+                )
+                if streamed_entry is not None:
+                    rendered_stream = tuple(
+                        _entry_lines(streamed_entry, width, color=bool(self.color))
+                    )
+                    block_size = len(rendered_stream)
+                    for index in range(len(history_new) - block_size + 1):
+                        if history_new[index : index + block_size] == rendered_stream:
+                            if streamed_entry.text.startswith(previous_stream_emitted):
+                                suffix = streamed_entry.text[len(previous_stream_emitted) :]
+                                replacement = (
+                                    tuple(
+                                        _entry_lines(
+                                            TranscriptEntry(role=role, text=suffix),
+                                            width,
+                                            color=bool(self.color),
+                                        )
+                                    )
+                                    if suffix
+                                    else ()
+                                )
+                            elif previous_stream_emitted.startswith(streamed_entry.text):
+                                replacement = ()
+                            else:
+                                continue
+                            history_new = (
+                                *history_new[:index],
+                                *replacement,
+                                *history_new[index + block_size :],
+                            )
+                            break
+        timeline_new = (*history_new, *stream_new)
+        if not self._timeline_initialized:
+            self._append_timeline(timeline_new)
+            self.stream.write(f"{_paint(status, _DIM_CYAN, self.color)}\n")
+            self._write_input_blank()
+            self._timeline_initialized = True
+        elif timeline_new:
+            self._move_to_status()
+            self._append_timeline(timeline_new)
+            self._write_status_and_input(status, input_text)
+        elif status != self._last_status_line or width_changed or force:
+            self._move_to_status()
+            self._write_status_and_input(status, input_text)
+
+        if self._input_active:
+            self._restore_input_line(input_text, force=False)
+        self.stream.flush()
+        self._last_request = request
+        self._last_status_line = status
+        self._last_history_rows = history
+        self._last_history_entries = current_history_entries
+        self._last_stream_text = current_stream_text
+        self._last_stream_role = current_stream_role
+        self._last_stream_key = current_stream_key
+        self._stream_emitted_text = stream_emitted
+        self._last_rendered_width = width
+
+    def set_input(self, text: str, cursor: int, *, paint: bool = True) -> None:
+        """Update the event-loop-owned draft; native memory is never read."""
+        self._managed_input = (text, cursor)
+        self._managed_input_active = True
+        if paint:
+            self._restore_input_line(text, force=True)
             self.stream.flush()
 
-        self._last_primary_rows = rows
-        self._last_conversation_rows = rows
-        self._last_status_line = status_line
-        self._last_detail_line = detail_line
-        self._last_live_status_rows = (status_rows[1], status_rows[2])
-        self._last_live_revision = transcript.live_revision
-        self._last_status_fields = current_status_fields
-        self._last_rail_rows = ()
-
-    def _redraw_rail(
-        self,
-        conversation_rows: tuple[tuple[str, str], ...],
-        rail_rows: tuple[tuple[str, str], ...],
-    ) -> None:
-        """Rewrite changed conversation/rail cells without touching native input."""
-        rail_width = _rail_width(self._last_size.columns)
-        capacity = max(1, self._last_size.lines - _frame_overhead(self._show_detail))
-        changed = [
-            index
-            for index in range(capacity)
-            if (self._last_rail_rows[index] if index < len(self._last_rail_rows) else ("", ""))
-            != (rail_rows[index] if index < len(rail_rows) else ("", ""))
-            or (
-                self._last_frame_conversation_rows[index]
-                if index < len(self._last_frame_conversation_rows)
-                else ("", "")
-            )
-            != (conversation_rows[index] if index < len(conversation_rows) else ("", ""))
-        ]
-        if not changed:
-            return
-        self.stream.write("\x1b[s")
-        for index in changed:
-            role, text = conversation_rows[index] if index < len(conversation_rows) else ("", "")
-            kind, rail_text = rail_rows[index] if index < len(rail_rows) else ("", "")
-            line = _split_frame_row(
-                text,
-                self._last_size.columns,
-                rail_width,
-                rail_text=rail_text,
-                left_color=_role_color(role, self.color),
-                rail_kind=kind,
-                color=self.color,
-            )
-            distance = self._last_size.lines - 3 - index
-            self.stream.write(f"\x1b[{distance}A\r{_CLEAR_LINE}{line}\x1b[u")
-        self.stream.flush()
-
-    def _redraw_bottom(
-        self,
-        request: tuple[Any, Transcript, str, str, str, str, str],
-        status_rows: tuple[str, ...],
-    ) -> None:
-        snapshot, transcript, session_description, branch_line, cumulative_line, _, _ = request
-        rail_width = _rail_width(self._last_size.columns)
-        rendered_rows = tuple(
-            _split_frame_row(
-                row,
-                self._last_size.columns,
-                rail_width,
-                left_color=_DIM_CYAN,
-                color=self.color,
-            )
-            for row in status_rows
-        )
-        del snapshot, transcript, session_description, branch_line, cumulative_line
-        # The cursor is on the input row; rewrite the fixed status rows in place.
-        self.stream.write(f"\x1b[s\x1b[{len(rendered_rows)}A\r")
-        for index, line in enumerate(rendered_rows):
-            changed = index >= len(self._last_status_rows) or (
-                status_rows[index] != self._last_status_rows[index]
-            )
-            if changed:
-                self.stream.write(f"\r{_CLEAR_LINE}{line}")
-            if index < len(rendered_rows) - 1:
-                self.stream.write("\x1b[1B\r")
-        self.stream.write("\x1b[u")
-        self.stream.flush()
-
     def flush(self) -> None:
-        """Flush the newest draw once the input line is no longer active."""
+        """Flush a deferred draw after input ownership ends."""
         if (
             not self.enabled
             or self._input_active
@@ -5240,50 +4963,31 @@ class Cockpit:
             return
         request = self._pending_draw
         self._pending_draw = None
-        if self._fixed_frame and (request[-1] or request[1].live_final):
-            self._draw_live_now(request, live_only=True)
-        else:
-            self._paint_now(request)
+        self._draw_in_flight = True
+        try:
+            self._draw_now(request, force=True)
+        finally:
+            self._draw_in_flight = False
 
     def draw_activity(self, activity_line: str) -> None:
-        """Update only the fixed status pane while readline owns the input."""
+        """Refresh the transient status row without touching timeline history."""
         if not self.enabled or self._last_request is None or self._draw_in_flight:
             return
         previous_size = self._last_size
         self._last_size = shutil.get_terminal_size((120, 40))
-        if not self._fixed_frame:
+        activity = _sanitize(activity_line).replace(chr(10), " ")
+        request = (*self._last_request[:6], activity)
+        if self._input_active and (
+            self._input_line_text() is None
+            or (not self._native_input and not self._managed_input_active)
+        ):
+            self._pending_draw = request
             return
-        self._activity_line = _sanitize(activity_line).replace(chr(10), " ")
-        request = (*self._last_request[:6], self._activity_line)
-        if previous_size != self._last_size:
-            self._draw_live_now(request, force=True)
-            return
-        if self._frame_show_detail != self._show_detail:
-            self._draw_live_now(request, force=True)
-            return
-        snapshot, transcript, session_description, branch_line, cumulative_line, _, _ = request
-        conversation_width = _frame_content_width(self._last_size.columns)
-        status_rows = tuple(
-            _status_rows(
-                snapshot,
-                transcript,
-                session_description=session_description,
-                branch_line=branch_line,
-                cumulative_line=cumulative_line,
-                width=conversation_width,
-                activity_line=self._activity_line,
-                show_detail=self._show_detail,
-                include_live=True,
-                color=self.color,
-            )
-        )
-        self._redraw_live_status(request, status_rows)
-        if not self._last_status_rows or status_rows[0] != self._last_status_rows[0]:
-            self._redraw_status_indices(status_rows, (0,))
-        self._last_request = request
-        self._last_status_rows = status_rows
-        self._last_live_status_rows = (status_rows[1], status_rows[2])
-        self._activity_only_update = True
+        self._draw_in_flight = True
+        try:
+            self._draw_now(request, force=previous_size != self._last_size)
+        finally:
+            self._draw_in_flight = False
 
     def move_to_input(self, *, label: str = "›", native: bool = False) -> None:
         if not self.enabled:
@@ -5295,32 +4999,33 @@ class Cockpit:
         self._input_prompt_label = label_text
         self._last_restored_input_text = None
         self._last_restored_input_label = label_text
-        if self._small_frame and self._small_total_rows < 3:
-            return
-        if self._fixed_frame:
-            self.stream.write(f"\r{_CLEAR_LINE}{label_text} ")
+        if self._timeline_initialized:
+            self._write_input_blank()
+            self._restore_input_line("", force=True)
         else:
             self.stream.write(f"{label_text} ")
         self.stream.flush()
 
     def hide_cursor(self, *, commit: bool = False) -> None:
+        del commit
+        # POSIX ``TerminalInput`` uses a managed draft while the legacy
+        # readline path owns an echoed native line.  Only the latter leaves
+        # the cursor one row below the prompt after Enter.
+        readline_echoed = self._native_input and not self._managed_input_active
         self._input_active = False
+        self._managed_input_active = False
         self._last_restored_input_text = None
-        if self.enabled:
-            if self._fixed_frame:
-                if self._native_input:
-                    # Native readline echoed the submitted line AND a trailing
-                    # newline, so the cursor is one row below the echoed text.
-                    # Move up before clearing, otherwise the submitted prompt
-                    # stays visible above the fresh input line.
-                    self.stream.write(f"\x1b[1A\r{_CLEAR_LINE}")
-                else:
-                    self.stream.write(f"\r{_CLEAR_LINE}")
-                if commit and not self._small_frame and self._last_request is not None:
-                    self._redraw_bottom(self._last_request, self._last_status_rows)
-            elif commit:
-                self.stream.write("\n")
-            self.stream.flush()
+        if not self.enabled:
+            return
+        if readline_echoed:
+            # readline echoes Enter and leaves the cursor one row below the
+            # input.  Return to that row before clearing the stale prompt.
+            self.stream.write(f"\x1b[1A\r{_CLEAR_LINE}")
+        elif self._timeline_initialized:
+            self._write_input_blank()
+        else:
+            self.stream.write("\r\x1b[2K")
+        self.stream.flush()
 
 
 __all__ = [
