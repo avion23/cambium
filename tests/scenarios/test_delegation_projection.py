@@ -110,9 +110,14 @@ def test_suspended_parent_stays_live_and_resumes_after_child() -> None:
     snapshot = state.snapshot()
     assert snapshot.agents[0].state == "suspended"
     assert snapshot.agents[1].lineage == "fresh"
-    assert not transcript.live_final
     state.apply({"seq": 5, "task_id": "root", "kind": "context_resume", "payload": {}})
+    transcript.observe_event(
+        {"seq": 5, "task_id": "root", "kind": "context_resume", "payload": {}}
+    )
     assert state.snapshot().agents[0].state == "active"
+    timeline = "\n".join(entry.text for entry in transcript.entries)
+    assert "parent waiting" in timeline
+    assert "parent resumed" in timeline
 
 
 def test_render_none_matches_other_empty_event_inputs() -> None:

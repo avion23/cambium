@@ -8,8 +8,9 @@ continuation are documented in [interactive lifecycle](interactive-tui.md).
 The frontend displays evidence and accepts operator input. It does not own worker
 state, provider scheduling, quota reservations, or artifact publication.
 `observability.py` reduces events; `tui.py` controls the interactive session;
-`tui_screen.py` renders bounded terminal rows. Keep terminal escape handling at
-that boundary rather than embedding it in the worker protocol.
+`tui_screen.py` renders the linear timeline and transient rows. Keep terminal
+escape handling at that boundary rather than embedding it in the worker
+protocol.
 
 The important information is the current task, useful output, current activity,
 provider/model, resource consumption, and whether the result was accepted.
@@ -31,6 +32,23 @@ space permits. `/detail` adds more metadata to this same row; it does not open a
 pane. `/agents`, `/context`, `/quota`, `/status`, and `/inspect` append explicit
 snapshots to the timeline on demand instead of permanently consuming columns or
 rows.
+
+### Timeline event policy
+
+The timeline is the durable child-progress view. It keeps bounded, sanitized
+identity for these lifecycle edges when the corresponding events exist:
+
+- child admission (accepted or rejected), followed by child start with the
+  bounded task text and resolved provider/model;
+- child tool start/completion and output, labeled with the child, tool, and
+  bounded command/path identity;
+- child terminal success or failure with its bounded result or cause; and
+- the parent waiting for child results and resuming after the join.
+
+These entries are ordinary timeline rows, not a second live window. Heartbeats
+only refresh the transient status row and never enter scrollback. Private
+reasoning, raw action JSON, credentials, and unbounded tool payloads are never
+rendered. Inspection commands remain the place for deeper recorded evidence.
 
 A resize reflows only future/tail rendering and the transient rows; it does not
 replay old history into scrollback. While the operator has scrolled upward, the
@@ -67,12 +85,12 @@ happens. Cache `HIT`/`MISS` appears only after provider usage establishes it; an
 unknown cache result stays unknown. The worker heartbeat carries a monotonic
 phase revision so active reasoning or response streaming does not look stalled.
 Private reasoning and the model's internal JSON action fragments are not copied
-into the cockpit. Tool output and stream-phase changes reset the progress clock.
+into the timeline. Tool output and stream-phase changes reset the progress clock.
 
 ## Markdown and color
 
 Rich is a normal Cambium dependency and is the single Markdown parser/theme for
-one-shot/REPL output and the cockpit. The shared renderer uses a no-background
+one-shot/REPL output and the timeline. The shared renderer uses a no-background
 extended palette when the terminal supports 256 colors and degrades to the
 standard palette or plain text. Headings, links, quotes, inline code, code blocks,
 tables, user/model/tool roles, routing, provider waits, reasoning, streaming,
@@ -96,7 +114,7 @@ Ctrl-C cancels a running turn and exits when idle. `/cancel` also works while a
 turn is active. Operator commands must not be deferred behind a queued model
 prompt when they are intended to interrupt or inspect running work.
 
-On POSIX, `terminal_input.py` owns input on the same asyncio loop as the cockpit.
+On POSIX, `terminal_input.py` owns input on the same asyncio loop as the timeline.
 It keeps the draft and cursor in Python data, reads terminal keys with
 `add_reader`, and restores the saved terminal mode on exit. No libedit buffer or
 resize signal is shared with a background input thread. A resize can redraw
@@ -128,7 +146,7 @@ other harness policy.
 `NO_COLOR` disables styling; it does **not** by itself make a capable terminal
 non-interactive or disable cursor motion. Terminal capabilities and whether the
 stream is a TTY determine the appropriate display path. Piped output must remain
-readable without cockpit escape sequences.
+readable without timeline escape sequences.
 
 ## Commands
 
@@ -151,8 +169,8 @@ readable without cockpit escape sequences.
 | `/exit` | Leave the frontend |
 
 CLI `--help` and the controller's command handling remain authoritative for
-arguments. `/dashboard` is a compatibility response: the live timeline and
-status row are already the dashboard, not a second UI mode.
+arguments. The live timeline and status row are the dashboard; there is no
+second dashboard mode.
 
 ## Read-only resource projection
 

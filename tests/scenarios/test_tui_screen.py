@@ -17,10 +17,9 @@ from cambium.tui_screen import (
     ActivityState,
     Cockpit,
     Transcript,
-    _transcript_lines,
     _visible,
-    render_cockpit,
     render_markdown_lines,
+    render_primary,
 )
 
 
@@ -155,7 +154,7 @@ def test_activity_heartbeat_phase_tail_is_latest_sanitized_and_not_transcript() 
     assert transcript.entries == ()
 
 
-def test_usage_event_updates_live_cache_without_duplicate_transcript_text() -> None:
+def test_usage_event_updates_status_metadata_without_duplicate_transcript_text() -> None:
     transcript = Transcript()
     transcript.observe_event(
         {
@@ -169,8 +168,9 @@ def test_usage_event_updates_live_cache_without_duplicate_transcript_text() -> N
             },
         }
     )
-    assert transcript._live_cache_hit is False
-    assert transcript._live_text == ""
+    assert transcript.status_metadata["provider"] == "zai"
+    assert transcript.status_metadata["model"] == "glm-5.3"
+    assert transcript.entries == ()
 
 
 def test_child_rejected_lane_row_shows_reason_and_human_message() -> None:
@@ -208,7 +208,7 @@ def test_child_rejected_lane_row_truncates_message_and_falls_back_to_reason() ->
     clipped = transcript.entries[-1].text
     assert clipped.startswith("child rejected: child-9 · ValidationError · ")
     assert clipped.endswith("…")
-    assert "x" * 121 not in clipped
+    assert len(clipped) <= 320
 
     transcript.observe_event(
         {
@@ -220,6 +220,225 @@ def test_child_rejected_lane_row_truncates_message_and_falls_back_to_reason() ->
     assert "child rejected: child-8 · BudgetExceeded" in [
         entry.text for entry in transcript.entries
     ]
+
+
+def test_child_lifecycle_events_form_bounded_linear_timeline() -> None:
+    transcript = Transcript()
+    task = (
+        "inspect README and report the provider routing path "
+        + ("detail " * 80)
+        + "private-tail"
+    )
+    events = [
+        {
+            "kind": "child_admitted",
+            "task_id": "parent",
+            "payload": {
+                "parent_task_id": "parent",
+                "child_task_id": "child-7",
+                "child_kind": "analysis",
+            },
+        },
+        {
+            "kind": "task_assigned",
+            "task_id": "child-7",
+            "payload": {
+                "parent_task_id": "parent",
+                "task": task,
+                "assigned_provider": "zai",
+                "provider": "zai",
+                "model": "glm-5.3",
+            },
+        },
+        {
+            "kind": "tool_output_delta",
+            "task_id": "child-7",
+            "payload": {
+                "tool": "read_batch",
+                "tool_call_id": "read-7",
+                "stream": "stdout",
+                "delta": "child output\n",
+            },
+        },
+        {
+            "kind": "tool_event",
+            "task_id": "child-7",
+            "payload": {
+                "tool": "read_batch",
+                "tool_call_id": "read-7",
+                "cmd": "read README.md",
+                "ok": True,
+                "duration_ms": 12,
+                "output": "child output",
+            },
+        },
+        {
+            "kind": "child_result",
+            "task_id": "child-7",
+            "payload": {
+                "parent_task_id": "parent",
+                "status": "succeeded",
+                "summary": "analysis complete",
+            },
+        },
+        {
+            "kind": "result",
+            "task_id": "parent",
+            "payload": {"status": "suspended"},
+        },
+        {
+            "kind": "context_resume",
+            "task_id": "parent",
+            "payload": {
+                "epoch": 2,
+                "checkpoint_ref": "parent/epoch-0002.json",
+                "child_count": 1,
+                "workspace_changed": True,
+            },
+        },
+        {
+            "kind": "child_failed",
+            "task_id": "child-8",
+            "payload": {
+                "parent_task_id": "parent",
+                "reason": "provider timeout",
+            },
+        },
+        {
+            "kind": "child_result",
+            "task_id": "child-8",
+            "payload": {
+                "parent_task_id": "parent",
+                "status": "failed",
+                "summary": "provider timeout",
+            },
+        },
+    ]
+    for event in events:
+        transcript.observe_event(event)
+
+    text = "\n".join(entry.text for entry in transcript.entries)
+    assert "child-7" in text and "child-8" in text
+    assert "zai" in text and "glm-5.3" in text
+    assert "read_batch" in text and "child-7" in text
+    assert "child output" in text
+    assert "succeeded" in text and "failed" in text
+    assert "waiting" in text and "resume" in text
+    assert "inspect README" in text
+    assert "private-tail" not in text
+    assert len(text) < 4_000
+
+
+def test_heartbeats_and_private_provider_action_content_stay_out_of_timeline() -> None:
+    transcript = Transcript()
+    transcript.observe_event(
+        {
+            "kind": "heartbeat",
+            "task_id": "parent",
+            "payload": {
+                "phase": "thinking",
+                "tail": "SECRET_REASONING should never enter scrollback",
+            },
+        }
+    )
+    transcript.observe_event(
+        {
+            "kind": "response",
+            "task_id": "parent",
+            "payload": {
+                "text": (
+                    '{"type":"tool_call","calls":[{"name":"run_shell",'
+                    '"arguments":{"cmd":"cat SECRET_ACTION"}}]}'
+                )
+            },
+        }
+    )
+    transcript.observe_event(
+        {
+            "kind": "result",
+            "task_id": "parent",
+            "payload": {
+                "status": "succeeded",
+                "terminal_action": {
+                    "type": "tool_call",
+                    "calls": [{"name": "run_shell", "arguments": {"cmd": "cat SECRET_ACTION"}}],
+                },
+            },
+        }
+    )
+    transcript.observe_event(
+        {
+            "kind": "checkpoint",
+            "payload": {
+                "paths": ['{"type":"tool_call","arguments":{"cmd":"cat SECRET_PATH"}}']
+            },
+        }
+    )
+    transcript.finish_stream()
+
+    rendered = "\n".join(
+        render_primary(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+            width=100,
+            color=False,
+        )
+    )
+    assert "SECRET_REASONING" not in rendered
+    assert "SECRET_ACTION" not in rendered
+    assert "SECRET_PATH" not in rendered
+    assert '"tool_call"' not in rendered
+
+
+def test_nested_reasoning_content_stays_out_of_timeline() -> None:
+    transcript = Transcript()
+    transcript.observe_event(
+        {
+            "kind": "response",
+            "task_id": "parent",
+            "payload": {
+                "content": [
+                    {"type": "reasoning", "text": "SECRET_REASONING"},
+                    {"type": "text", "text": "visible answer"},
+                ]
+            },
+        }
+    )
+    transcript.finish_stream()
+
+    rendered = "\n".join(
+        render_primary(
+            _snapshot(),
+            transcript,
+            session_description="",
+            branch_line="",
+            cumulative_line="",
+            width=80,
+            color=False,
+        )
+    )
+    assert "SECRET_REASONING" not in rendered
+    assert "visible answer" not in rendered
+
+
+def test_private_heartbeat_tail_is_not_status_text() -> None:
+    activity = ActivityState()
+    activity.start(now=1.0)
+    activity.observe_event(
+        {
+            "kind": "heartbeat",
+            "payload": {
+                "phase": "streaming",
+                "tail": '{"type":"tool_call","arguments":{"cmd":"SECRET"}}',
+            },
+        },
+        now=2.0,
+    )
+    assert "tool_call" not in activity.render(now=3.0)
+    assert "SECRET" not in activity.render(now=3.0)
 
 
 def test_activity_names_provider_and_cache_state_before_turn_finishes() -> None:
@@ -392,6 +611,135 @@ def test_live_cockpit_keeps_timeline_and_one_transient_status_input_pair(
         assert stream.getvalue() == unchanged
 
 
+def test_live_status_update_does_not_replay_retained_timeline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        tui_screen.shutil,
+        "get_terminal_size",
+        lambda _default: tui_screen.os.terminal_size((80, 24)),
+    )
+    stream = _Tty()
+    transcript = Transcript()
+    transcript.assistant("retained history")
+    cockpit = Cockpit(stream)
+    with cockpit:
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=1",
+            activity_line="◌ THINKING · 1s",
+        )
+        first = stream.getvalue()
+        transcript.observe_event(
+            {
+                "kind": "heartbeat",
+                "task_id": "interactive-main",
+                "payload": {"phase": "thinking", "phase_revision": 2},
+            }
+        )
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=1",
+            activity_line="◌ THINKING · 2s",
+        )
+
+    delta = stream.getvalue()[len(first) :]
+    assert "retained history" not in delta
+    assert "THINKING" in delta
+
+
+def test_repeated_tool_failure_status_does_not_replay_retained_timeline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        tui_screen.shutil,
+        "get_terminal_size",
+        lambda _default: tui_screen.os.terminal_size((80, 24)),
+    )
+    stream = _Tty()
+    transcript = Transcript()
+    for index in range(159):
+        transcript.system(f"history-{index}")
+    cockpit = Cockpit(stream)
+    failed_tool = {
+        "kind": "tool_event",
+        "task_id": "child-a",
+        "payload": {"tool": "run_shell", "ok": False, "error": "blocked"},
+    }
+    with cockpit:
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="",
+            branch_line="",
+            cumulative_line="",
+        )
+        transcript.observe_event(failed_tool)
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="",
+            branch_line="",
+            cumulative_line="",
+        )
+        first = stream.getvalue()
+        transcript.observe_event(failed_tool)
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="",
+            branch_line="",
+            cumulative_line="",
+        )
+
+    delta = stream.getvalue()[len(first) :]
+    assert "history-0" not in delta
+    assert "err2" in delta
+
+
+def test_live_resize_replaces_transient_rows_without_replaying_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sizes = iter(
+        (
+            tui_screen.os.terminal_size((80, 24)),
+            tui_screen.os.terminal_size((40, 24)),
+        )
+    )
+    monkeypatch.setattr(tui_screen.shutil, "get_terminal_size", lambda _default: next(sizes))
+    stream = _Tty()
+    transcript = Transcript()
+    transcript.assistant("resize history")
+    cockpit = Cockpit(stream)
+    with cockpit:
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+        )
+        first = stream.getvalue()
+        cockpit.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+            force=True,
+        )
+
+    delta = stream.getvalue()[len(first) :]
+    assert "resize history" not in delta
+    assert stream.getvalue().count("CAMBIUM ▸ resize history") == 1
+
+
 def test_live_status_prioritizes_owner_phase_provider_tool_and_detail_stays_one_row() -> None:
     agent = SimpleNamespace(
         task_id="child-a",
@@ -424,7 +772,7 @@ def test_live_status_prioritizes_owner_phase_provider_tool_and_detail_stays_one_
             },
         }
     )
-    status = tui_screen._live_status_line(
+    status = tui_screen._status_line(
         snapshot,
         transcript,
         session_description="",
@@ -434,7 +782,7 @@ def test_live_status_prioritizes_owner_phase_provider_tool_and_detail_stays_one_
         activity_line="◌ THINKING · 2s",
     )
     assert all(value in status for value in ("owner=child-a", "zai/glm-5", "tool=run_shell"))
-    detailed = tui_screen._live_status_line(
+    detailed = tui_screen._status_line(
         snapshot,
         transcript,
         session_description="",
@@ -571,8 +919,8 @@ def test_live_stream_switch_does_not_repeat_committed_tool_tail(
         )
 
     rendered = stream.getvalue()
-    assert rendered.count("TOOL ▸ A1") == 1
-    assert rendered.count("TOOL ▸ B1") == 1
+    assert rendered.count("TOOL[child-a] ▸ [run_shell] A1") == 1
+    assert rendered.count("TOOL[child-b] ▸ [run_shell] B1") == 1
 
 
 def test_managed_native_input_uses_draft_and_keeps_status_row_position(
@@ -746,33 +1094,32 @@ def test_live_bounded_stream_rollover_does_not_replay_retained_tail(
     assert "CAMBIUM ▸ y" in delta
 
 
-def test_short_terminal_falls_back_to_stream_rows() -> None:
-    lines = render_cockpit(
+def test_primary_renderer_has_one_status_row() -> None:
+    lines = render_primary(
         _snapshot(),
         Transcript(),
         session_description="session",
         branch_line="branch",
         cumulative_line="usage: calls=0",
         width=80,
-        height=11,
     )
 
     assert lines
     assert not any(line.startswith("┌") for line in lines)
     assert any("codex/gpt-5.6" in line for line in lines)
+    assert sum(line.startswith("Cambium · ") for line in lines) == 1
 
 
 def test_control_sequences_are_removed_and_color_is_opt_in() -> None:
     transcript = Transcript()
     transcript.error("bad\x1b[31m injected\x00 value")
-    plain = render_cockpit(
+    plain = render_primary(
         _snapshot(),
         transcript,
         session_description="session",
         branch_line="branch",
         cumulative_line="usage: calls=0",
         width=100,
-        height=24,
         color=False,
     )
     assert "\x1b" not in "".join(plain)
@@ -790,26 +1137,24 @@ def test_transcript_is_bounded() -> None:
 def test_assistant_deltas_render_in_the_active_tail_before_turn_completion() -> None:
     transcript = Transcript()
     transcript.observe_event({"kind": "assistant_delta", "payload": {"delta": "# Findings\n"}})
-    first = render_cockpit(
+    first = render_primary(
         _snapshot(),
         transcript,
         session_description="session",
         branch_line="branch",
         cumulative_line="usage: calls=0",
         width=80,
-        height=22,
     )
     transcript.observe_event(
         {"kind": "assistant_delta", "payload": {"delta": "The stream is live."}}
     )
-    second = render_cockpit(
+    second = render_primary(
         _snapshot(),
         transcript,
         session_description="session",
         branch_line="branch",
         cumulative_line="usage: calls=0",
         width=80,
-        height=22,
     )
 
     assert "CAMBIUM ▸ Findings" in "\n".join(first)
@@ -857,14 +1202,13 @@ def test_message_events_switch_roles_and_keep_streaming_text_bounded() -> None:
     assert any(entry.role == "tool" and "old" in entry.text for entry in transcript.entries)
     assert transcript.streaming_role == "assistant"
     assert len(transcript.streaming_text) <= 16_384
-    lines = render_cockpit(
+    lines = render_primary(
         _snapshot(),
         transcript,
         session_description="session",
         branch_line="branch",
         cumulative_line="usage: calls=0",
         width=80,
-        height=22,
     )
     assert "CAMBIUM ▸" in "\n".join(lines)
 
@@ -884,7 +1228,16 @@ def test_failed_tool_event_is_one_compact_notice() -> None:
         }
     )
 
-    text = "\n".join(value for _, value in _transcript_lines(transcript, 80, 20))
+    text = "\n".join(
+        render_primary(
+            _snapshot(),
+            transcript,
+            session_description="",
+            branch_line="",
+            cumulative_line="",
+            width=100,
+        )
+    )
     assert "tool errors:" not in text
     assert "permission denied" not in text
     assert "cat protected.txt" not in text

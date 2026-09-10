@@ -1,4 +1,4 @@
-"""Interactive terminal frontend with a persistent semantic branch and cockpit."""
+"""Interactive terminal frontend with a persistent semantic branch and timeline."""
 
 from __future__ import annotations
 
@@ -63,7 +63,6 @@ _LIVE_COMMANDS = frozenset(
         "/model",
         "/branches",
         "/quota",
-        "/dashboard",
         "/detail",
         "/events",
         "/tail",
@@ -217,12 +216,11 @@ _HELP = """Commands:
   /fork       fork a new branch from the current checkpoint
   /quota      show provider quota-window state
   /compact    materialize semantic entries into K0; retain recent raw evidence
-  /dashboard  explain the live timeline and status row
   /detail     toggle extra metadata on the status row
   /events     recent durable event summaries
   /cancel     cancel the active turn and return to the prompt
   /new        start a fresh semantic branch; old turn artifacts remain
-  /clear      clear the visible cockpit transcript
+  /clear      clear the visible timeline
   /exit       leave Cambium (also /quit or a prompt containing only q)
 
 Transcript view:
@@ -429,7 +427,7 @@ def _read_prompt(source: TextIO, out: TextIO, *, native: bool = False) -> str | 
 
 
 def _read_cockpit_prompt(source: TextIO, cockpit: Cockpit, *, native: bool) -> str | None:
-    """Read input on the primary-buffer prompt line with native editing."""
+    """Read input on the primary-buffer timeline prompt with native editing."""
 
     def read_one(label: str) -> str | None:
         cockpit.move_to_input(label=label, native=native)
@@ -554,7 +552,7 @@ def _restore_turn_transcript(
     events: list[dict[str, Any]],
     transcript: Transcript,
 ) -> None:
-    """Replay durable prompt/output events into the bounded cockpit tail."""
+    """Replay durable prompt/output events into the bounded timeline tail."""
     prompt_task_ids: set[str] = set()
     unassigned_prompt_seen = False
     result_summary: str | None = None
@@ -620,7 +618,7 @@ def _restore_history(
     transcript: Transcript | None = None,
     billing_labels: Mapping[str, str] | None = None,
 ) -> tuple[_Cumulative, SessionSnapshot]:
-    """Rebuild usage, dashboard state, and optionally the durable transcript tail."""
+    """Rebuild usage, status state, and optionally the durable timeline tail."""
     cumulative = _Cumulative(billing_labels=dict(billing_labels or {}))
     latest = ObservabilityState(recent_limit=16).snapshot()
     for turn_dir in session.active_turn_dirs():
@@ -890,8 +888,6 @@ def _command_output(
             return str(exc)
     if name == "/compact" and not argument:
         return session.compact()
-    if name == "/dashboard" and not argument:
-        return "The live timeline plus status row is already the dashboard."
     if name == "/detail" and not argument:
         if cockpit is None:
             return "detail: unavailable"
@@ -930,7 +926,7 @@ async def _run_interactive(
     quiet: bool,
     max_workers: int | None = None,
 ) -> int:
-    """Run one persistent cache-aligned branch in one persistent cockpit."""
+    """Run one persistent cache-aligned branch in one linear timeline."""
     from cambium import render
     from cambium.auth import AuthError
     from cambium.cli import ExitCode
@@ -1201,7 +1197,7 @@ async def _run_interactive(
                 if command == "/clear":
                     transcript.clear()
                     transcript.system(
-                        "Cockpit transcript cleared; durable session history is unchanged."
+                        "Timeline cleared; durable session history is unchanged."
                     )
                     continue
                 if command == "/new":
@@ -1567,7 +1563,7 @@ async def run_tui(
 ) -> int:
     """Run Cambium's terminal frontend.
 
-    Real terminals receive the persistent semantic-branch cockpit. Pipes and
+    Real terminals receive the persistent semantic-branch timeline. Pipes and
     injected streams retain the deterministic line-oriented adapter used by
     scripts and tests.
     """

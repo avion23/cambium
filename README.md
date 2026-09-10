@@ -26,10 +26,13 @@ context forks, child joins, Git publication, cancellation, and recovery.
 - **Worker tools:** the active schema and dispatch expose `write_file`,
   `edit_file`, `git_op`, `run_shell`, `read_batch`, `repo_query`,
   `branch_history`, `inspect_state`, and `delegate` (`schemas.py`, `tools.py`).
-- **Persistent terminal cockpit:** one interactive branch across prompts,
+- **Persistent terminal timeline:** one interactive branch across prompts,
   reconnect, queued follow-up, cancellation, live usage/quota projection, and
-  child-agent lanes, event-loop-owned POSIX input, and F6 focus while editing
-  (`interactive.py`, `tui.py`, `tui_screen.py`, `terminal_input.py`).
+  child-agent activity. The TUI writes one chronological timeline to the
+  terminal's primary buffer and keeps only one status row plus one input row
+  transient. Heartbeats, private reasoning, and raw action JSON stay out of
+  scrollback (`interactive.py`, `tui.py`, `tui_screen.py`,
+  `terminal_input.py`).
 - **Branch state inspection:** model `inspect_state`, TUI `/inspect`, and CLI
   `inspect-state` share the recorded `BranchState` reader (`state_view.py`).
   A bounded local SituationFrame supplies current worker context without an
@@ -67,7 +70,7 @@ uv sync --extra dev
 uv run cambium --help
 ```
 
-Run the persistent terminal cockpit against a repository:
+Run the persistent terminal UI against a repository:
 
 ```bash
 uv run cambium tui --repo .
@@ -132,7 +135,7 @@ Focused documents:
 - [`docs/architecture/provider-routing.md`](docs/architecture/provider-routing.md)
   — admission, routing, quota, and usage semantics.
 - [`docs/architecture/terminal-interface.md`](docs/architecture/terminal-interface.md)
-  — cockpit layout, input handling, and commands.
+  — timeline layout, input handling, and commands.
 - [`docs/architecture/interactive-tui.md`](docs/architecture/interactive-tui.md)
   — durable interactive turns, reconnect, and replay.
 - [`docs/architecture/events.md`](docs/architecture/events.md) — event-kind

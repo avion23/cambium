@@ -132,18 +132,21 @@ they cannot replace observed usage.
 
 ## Inspection must not consume or mutate capacity
 
-The TUI's full rail shows output rate, input/output/cache counts, call counts,
-and known quota windows. Session replay uses the quota snapshots carried by
-`usage_event`, retaining the latest window for each provider. It must not mix
-historical session state with today's global ledger.
+The TUI's single status row shows the current provider/model owner and, when
+known, the active tool or command/path, elapsed time, output rate, and compact
+usage/cache fields. `/detail` expands those fields in the same row; `/usage`,
+`/agents`, and `/quota` append deeper snapshots to the timeline. Session replay
+uses the quota snapshots carried by `usage_event`, retaining the latest window
+for each provider. It must not mix historical session state with today's global
+ledger.
 
 `/quota` and `cambium quota status` explicitly read account-wide observations.
 They open existing SQLite storage read-only and do not initialize a ledger,
 change directory permissions, reserve capacity, or run write retries during
 screen redraws. `cambium quota observe` is the explicit mutation command.
 
-The rail may omit details at small terminal sizes; `/usage`, `/agents`, and
-`/quota` provide deeper inspection. A missing observation stays unavailable.
+At narrow widths the status row clips optional fields rather than creating a
+second pane. A missing observation stays unavailable.
 
 ## Remaining optimization work
 
@@ -166,10 +169,23 @@ on-demand read, not a mandatory policy decision on every turn.
 
 [Resource projection tests](../../tests/scenarios/test_resource_projection.py)
 cover output-only rates, deterministic multi-provider quota replay, read-only
-inspection, and a height-bounded resource rail.
+inspection, and the one-line status projection.
 [Routing throughput tests](../../tests/scenarios/test_routing_throughput.py)
 cover lane capacity and measured provider scoring.
 [Observed-resource scenarios](../../tests/scenarios/test_routing_resources.py)
 check quota expiry, persisted cooldown, fallback reservation ownership, and a
 queued task waking on release. Real coding/TUI tests check accepted artifacts;
 these deterministic scenarios alone do not establish a throughput improvement.
+
+For renderer comparisons, run the same interpreter and sample counts at each
+revision:
+
+```sh
+PYTHONPATH=src python3 scripts/profile_overhead.py \
+  --iterations 12 --warmups 2 --no-cprofile
+```
+
+The profile reports median/p95 wall time for a long-session event draw,
+status-only draw, and resize, plus peak bytes for a retained live render. The
+fixtures use a discard-only TTY and fixed 120/100-column sizes, so the numbers
+measure renderer work rather than provider or terminal I/O.

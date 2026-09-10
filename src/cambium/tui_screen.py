@@ -7,13 +7,14 @@ operator's current terminal view.  Live output is appended to the terminal's
 primary buffer so the terminal, rather than a private alternate screen, owns
 scrollback.
 
-``render_cockpit`` remains available as a deterministic framed renderer for
-presentation tests and callers that need a bounded snapshot.  ``Cockpit``
-uses the same primary-row helpers for the live interactive path.
+``Cockpit`` appends timeline rows to the terminal primary buffer and keeps
+only one transient status row plus one input row.  There is no alternate
+screen, fixed frame, or side rail: terminal scrollback is the timeline.
 """
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
@@ -26,14 +27,12 @@ import unicodedata
 from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
-from decimal import Decimal
 from functools import lru_cache
 from typing import Any, TextIO
 
 from .render_markdown import render_markdown_lines as _shared_markdown_lines
 from .terminal import (
     clip_terminal_text,
-    pad_terminal_text,
     sanitize_terminal_text,
     terminal_color_depth,
     terminal_display_width,
@@ -169,6 +168,9 @@ _TOOL_DETAIL_KEYS = (
     "output",
     "stdout",
     "stderr",
+    "path",
+    "file_path",
+    "paths",
     "detail",
 )
 _FAILURE_CONTEXT_PREFIX = "↳ "
@@ -190,15 +192,10 @@ _FAILURE_EVENT_KINDS = frozenset(
     }
 )
 _FAILURE_STATUSES = frozenset({"error", "failed", "timeout"})
-_TOOL_ERROR_PREFIX = "tool errors:"
 _SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 _ACTIVITY_PHASE_GLYPHS = {"thinking": "◌", "streaming": "▸", "waiting": "◒"}
 _STALL_AFTER_S = 12.0
 _ACTIVITY_TAIL_MAX_CHARS = 120
-_ACTIVITY_PHASE_RE = re.compile(
-    r"^[◌▸…]\s+(thinking|streaming|waiting)\s+(\d+(?:\.\d+)?)s(?:\s+·\s*(.*))?$",
-    re.IGNORECASE,
-)
 _STATUS_PHASE_RE = re.compile(r"^(\S+)(\s+)([a-z][a-z-]*)(.*)$", re.IGNORECASE)
 _STATUS_PHASE_STYLES = {
     "idle": "dim",
@@ -298,33 +295,59 @@ _TOOL_PHASE_ENDS = frozenset(
         "succeeded",
     }
 )
-_LIVE_WINDOW_ROWS = 2
-_LIVE_EVENT_KINDS = frozenset(
+
+# Durable lifecycle events are concise timeline facts.  Heartbeats remain
+# status-only and are intentionally absent from this set.
+_CHILD_START_KINDS = frozenset(
     {
-        "child_admitted",
-        "child_rejected",
-        "checkpoint",
-        "compaction_failed",
-        "context_checkpoint",
-        "context_epoch_advanced",
-        "context_resume_failed",
-        "error",
-        "fatal_error",
-        "heartbeat",
-        "log",
-        "result",
-        "run_task",
+        "child_started",
+        "child_start",
+        "task_started",
+        "task_start",
         "task_assigned",
-        "task_failed",
-        "timeout",
-        "tool_event",
-        "tool_output_delta",
-        "turn_failed",
-        "usage_event",
-        "worker_failed",
+        "spawned",
+        "run_task",
     }
 )
-_LIVE_TEXT_LIMIT = 4_096
+_CHILD_RESULT_KINDS = frozenset({"child_result", "child_succeeded", "child_completed"})
+_PARENT_WAIT_KINDS = frozenset(
+    {"parent_wait", "parent_waiting", "suspended_parent", "context_suspend"}
+)
+_PARENT_RESUME_KINDS = frozenset({"parent_resume", "parent_resumed", "context_resume"})
+_PRIVATE_PAYLOAD_KEYS = frozenset(
+    {
+        "analysis",
+        "analysis_content",
+        "arguments",
+        "chain_of_thought",
+        "function_calls",
+        "function_call",
+        "reasoning",
+        "reasoning_content",
+        "thought",
+        "thoughts",
+        "tool_call",
+        "tool_calls",
+    }
+)
+_PRIVATE_ACTION_TYPES = frozenset(
+    {
+        "action",
+        "apply_patch",
+        "delegate",
+        "finish",
+        "function",
+        "function_call",
+        "plan",
+        "read_file",
+        "run_shell",
+        "shell",
+        "tool_call",
+        "tool_use",
+        "write_file",
+    }
+)
+_PRIVATE_CONTENT_TYPES = _PRIVATE_ACTION_TYPES | frozenset({"analysis", "reasoning", "thinking"})
 
 
 def _is_tty(stream: Any) -> bool:
@@ -343,14 +366,12 @@ def _single_line(value: Any) -> str:
     return sanitize_terminal_text(value, single_line=True).strip()
 
 
-def _utf8_size(value: str) -> int:
-    return len(value.encode("utf-8", errors="replace"))
-
-
 def _activity_tail(value: Any) -> str:
     if not isinstance(value, str):
         return ""
     clean = sanitize_terminal_text(value, single_line=True).strip()
+    if _is_private_runtime_text(clean):
+        return ""
     return _clip(clean, _ACTIVITY_TAIL_MAX_CHARS) if clean else ""
 
 
@@ -441,11 +462,6 @@ def _clip(text: str, width: int) -> str:
     return head + _sanitize("…") + reset
 
 
-def _pad(text: str, width: int) -> str:
-    clean = _clip(text, width)
-    return clean + " " * max(0, width - _display_width(clean))
-
-
 def _fmt_secs(seconds: float) -> str:
     """Whole-second duration label; durations never render decimal delimiters."""
     return f"{int(seconds)}s"
@@ -457,14 +473,6 @@ def _human_count(value: int) -> str:
     if value < 1_000_000:
         return f"{value / 1_000:.1f}".rstrip("0").rstrip(".") + "k"
     return f"{value / 1_000_000:.1f}".rstrip("0").rstrip(".") + "m"
-
-
-def _human_bytes(value: int) -> str:
-    if value < 1_024:
-        return f"{value}B"
-    if value < 1_024 * 1_024:
-        return f"{value / 1_024:.1f}".rstrip("0").rstrip(".") + "KiB"
-    return f"{value / (1_024 * 1_024):.1f}".rstrip("0").rstrip(".") + "MiB"
 
 
 def _paint(text: str, color: str, enabled: bool | int) -> str:
@@ -554,6 +562,51 @@ def _result_text(data: Mapping[str, Any]) -> str | None:
     return "\n\n".join(parts) if parts else None
 
 
+def _is_private_runtime_text(value: str) -> bool:
+    """Reject reasoning and raw action envelopes at the terminal boundary."""
+    clean = value.strip()
+    if not clean:
+        return False
+    if re.search(
+        r'"type"\s*:\s*"(?:action|apply_patch|delegate|finish|function(?:_call)?|'
+        r'plan|read_file|run_shell|shell|tool_(?:call|use)|write_file)"',
+        clean,
+        re.IGNORECASE,
+    ) or re.search(
+        r'"(?:analysis|arguments|calls|chain[_ -]?of[_ -]?thought|reasoning|thought|'
+        r'tool[_ -]?call|function[_ -]?call)"\s*:',
+        clean,
+        re.IGNORECASE,
+    ):
+        return True
+    if not clean.startswith(("{", "[")):
+        return False
+    try:
+        parsed = json.loads(clean)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return _is_private_payload(parsed)
+
+
+def _is_private_payload(value: Any) -> bool:
+    """Return whether a payload contains private reasoning or an action envelope."""
+    if isinstance(value, Mapping):
+        keys = {str(key).casefold().replace("-", "_") for key in value}
+        if keys & _PRIVATE_PAYLOAD_KEYS:
+            return True
+        for key in ("type", "kind", "event"):
+            kind = value.get(key)
+            if (
+                isinstance(kind, str)
+                and kind.casefold().replace("-", "_") in _PRIVATE_CONTENT_TYPES
+            ):
+                return True
+        return any(_is_private_payload(item) for item in value.values())
+    if isinstance(value, list | tuple):
+        return any(_is_private_payload(item) for item in value)
+    return isinstance(value, str) and _is_private_runtime_text(value)
+
+
 def _stream_update(
     record: Mapping[str, Any],
 ) -> tuple[str, str, bool, str | None] | None:
@@ -565,8 +618,10 @@ def _stream_update(
     if kind == "result":
         if data.get("status") in _FAILURE_STATUSES or data.get("status") == "suspended":
             return None
+        if _is_private_payload(data):
+            return None
         text = _result_text(data)
-        if text is None:
+        if text is None or _is_private_runtime_text(text):
             return None
         return "assistant", text, False, None
     if kind in _ASSISTANT_STREAM_KINDS or kind in _TOOL_STREAM_KINDS:
@@ -576,8 +631,10 @@ def _stream_update(
         role = _message_role(kind, data)
         if role is None:
             return None
+        if _is_private_payload(data):
+            return None
         text = _text_value(data)
-        if not text:
+        if not text or _is_private_runtime_text(text):
             return None
         append = kind in _STREAM_DELTA_KINDS
         if data.get("cumulative") or data.get("replace"):
@@ -617,15 +674,21 @@ def _tool_detail_value(value: Any) -> str | None:
     if value is None:
         return None
     if isinstance(value, str):
+        if _is_private_runtime_text(value):
+            return None
         return value
+    if _is_private_payload(value):
+        return None
     text = _text_value(value)
     if text is not None:
+        if _is_private_runtime_text(text):
+            return None
         return text
     if isinstance(value, list | tuple):
-        return " ".join(_sanitize(item) for item in value)
+        parts = [part for item in value if (part := _tool_detail_value(item))]
+        return " ".join(parts) if parts else None
     if isinstance(value, Mapping):
-        parts = [f"{key}={_sanitize(item)}" for key, item in value.items()]
-        return ", ".join(parts) if parts else None
+        return None
     return _sanitize(value)
 
 
@@ -635,13 +698,14 @@ def _tool_entry_text(
     ok: bool | None,
     duration_ms: int | float | None,
 ) -> str:
+    tool = _clip(_single_line(tool), 72)
     state = "ok" if ok else "failed" if ok is not None else "done"
     duration = f" · {_format_duration(duration_ms)}" if duration_ms is not None else ""
     lines = [f"{tool}: {state}{duration}"]
     for key in _TOOL_DETAIL_KEYS:
         detail = _tool_detail_value(data.get(key))
         if detail:
-            lines.append(f"{key}: {detail}")
+            lines.append(f"{key}: {_clip(_single_line(detail), 512)}")
     return "\n".join(lines)
 
 
@@ -667,6 +731,8 @@ def _tool_line(
 ) -> str:
     glyph = "✓" if entry.tool_ok else "✗" if entry.tool_ok is not None else "•"
     name = entry.tool_name or "?"
+    if entry.owner_task_id:
+        name = f"{entry.owner_task_id}/{name}"
     if count > 1:
         duration = _format_duration(last_duration_ms) if _usage_float(last_duration_ms) > 0 else ""
         prefix = f"{duration:>7} " if duration else ""
@@ -689,6 +755,7 @@ class TranscriptEntry:
     tool_name: str | None = None
     tool_ok: bool | None = None
     duration_ms: int | float | None = None
+    owner_task_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -704,8 +771,8 @@ class _FailureBlock:
 
 def _task_id(record: Mapping[str, Any], data: Mapping[str, Any]) -> str | None:
     for value in (record.get("task_id"), data.get("task_id")):
-        if isinstance(value, str) and value:
-            return value
+        if isinstance(value, str) and value.strip():
+            return _clip(_single_line(value), 72)
     return None
 
 
@@ -714,14 +781,86 @@ def _event_turn(data: Mapping[str, Any]) -> int | None:
     return value if type(value) is int and value >= 0 else None
 
 
+def _event_field(data: Mapping[str, Any], *keys: str, limit: int = 96) -> str | None:
+    """Return one bounded scalar event field; nested payloads stay private."""
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            clean = _clip(_single_line(value), limit)
+            if not _is_private_runtime_text(clean):
+                return clean
+        if type(value) in (int, float) and not isinstance(value, bool):
+            return _clip(_single_line(value), limit)
+    return None
+
+
+def _event_metadata(data: Mapping[str, Any]) -> dict[str, str]:
+    """Collect safe status metadata without copying reasoning or action JSON."""
+    metadata: dict[str, str] = {}
+    aliases = {
+        "provider": ("assigned_provider", "provider"),
+        "model": ("model",),
+        "tool": ("tool", "tool_name"),
+        "cmd": ("cmd", "command"),
+        "path": ("path", "file_path"),
+        "rate": ("output_tokens_per_s", "tokens_per_s", "out_per_s"),
+        "phase": ("phase",),
+    }
+    for name, keys in aliases.items():
+        value = _event_field(data, *keys)
+        if value is not None:
+            metadata[name] = value
+    if "path" not in metadata:
+        paths = data.get("paths")
+        if isinstance(paths, list | tuple):
+            for path in paths:
+                if isinstance(path, str) and path.strip():
+                    clean = _clip(_single_line(path), 96)
+                    if not _is_private_runtime_text(clean):
+                        metadata["path"] = clean
+                        break
+    duration = _event_field(data, "duration_ms")
+    if duration is not None:
+        metadata["elapsed"] = _format_duration(_usage_float(duration))
+    else:
+        elapsed = _event_field(data, "elapsed_s", "elapsed")
+        if elapsed is not None:
+            number = _usage_float(elapsed, default=-1.0)
+            metadata["elapsed"] = f"{number:g}s" if number >= 0 else elapsed
+    return metadata
+
+
+def _child_id(record: Mapping[str, Any], data: Mapping[str, Any]) -> str:
+    value = data.get("child_task_id") or data.get("child_id")
+    if isinstance(value, str) and value.strip():
+        return _clip(_single_line(value), 72)
+    value = record.get("task_id") or data.get("task_id")
+    if isinstance(value, str) and value.strip():
+        return _clip(_single_line(value), 72)
+    return "child"
+
+
+def _child_descriptor(record: Mapping[str, Any], data: Mapping[str, Any]) -> str:
+    child = _child_id(record, data)
+    parts = [child]
+    task = _event_field(data, "task", "description", "child_task", limit=120)
+    if task:
+        parts.append(f"task={task}")
+    provider = _event_field(data, "assigned_provider", "provider")
+    model = _event_field(data, "model")
+    if provider or model:
+        parts.append(f"provider={provider or '?'}" if not model else f"{provider or '?'}/{model}")
+    return " · ".join(parts)
+
+
 def _failure_context_line(kind: str, data: Mapping[str, Any]) -> str | None:
     """Return a short, safe line for a failure's preceding-event context."""
     tool_status = _tool_status(data)
     if kind == "tool_event" and tool_status is not None and not tool_status:
-        tool = data.get("tool")
-        if not isinstance(tool, str) or not tool:
+        tool = data.get("tool") or data.get("tool_name")
+        if not isinstance(tool, str) or not tool.strip():
             return "tool failed"
-        line = f"{tool}: failed"
+        line = f"{_clip(_single_line(tool), 72)}: failed"
         for key in _TOOL_DETAIL_KEYS:
             detail = _tool_detail_value(data.get(key))
             if detail:
@@ -729,8 +868,8 @@ def _failure_context_line(kind: str, data: Mapping[str, Any]) -> str | None:
         return _sanitize(line)
 
     if kind == "timeout":
-        phase = data.get("phase")
-        return _sanitize(f"timeout: {phase}" if isinstance(phase, str) and phase else "timeout")
+        phase = _event_field(data, "phase")
+        return f"timeout: {phase}" if phase else "timeout"
 
     if kind == "restart_scheduled":
         count = data.get("restart_count")
@@ -740,19 +879,19 @@ def _failure_context_line(kind: str, data: Mapping[str, Any]) -> str | None:
         return "restart scheduled"
 
     if kind == "usage_event":
-        reason = data.get("failure_reason")
-        if isinstance(reason, str) and reason:
-            return _sanitize(f"provider call failed: {reason}")
+        reason = _event_field(data, "failure_reason", limit=160)
+        if reason:
+            return f"provider call failed: {reason}"
 
     if kind == "protocol":
-        detail = data.get("note") or data.get("error_type")
-        if isinstance(detail, str) and detail:
-            return _sanitize(f"protocol: {detail}")
+        detail = _event_field(data, "note", "error_type", limit=160)
+        if detail:
+            return f"protocol: {detail}"
 
     if kind == "log" and data.get("stream") == "worker-error":
-        detail = data.get("message") or data.get("error_type")
-        if isinstance(detail, str) and detail:
-            return _sanitize(f"worker error: {detail}")
+        detail = _event_field(data, "message", "error_type", limit=160)
+        if detail:
+            return f"worker error: {detail}"
     return None
 
 
@@ -761,7 +900,7 @@ def _failure_cause(kind: str, data: Mapping[str, Any]) -> str | None:
     cause: str | None = None
     for key in ("failure_reason", "reason", "message", "error"):
         value = data.get(key)
-        if isinstance(value, str) and value.strip():
+        if isinstance(value, str) and value.strip() and not _is_private_runtime_text(value):
             cause = _sanitize(value).strip()
             break
     maximum = data.get("max_restarts")
@@ -831,6 +970,8 @@ class Transcript:
         self._stream_message_id: str | None = None
         self._stream_truncated = False
         self._stream_tool_key: str | None = None
+        self._stream_owner_task_id: str | None = None
+        self._stream_tool_name: str | None = None
         self._turn_serial = 0
         self._turn_by_task: dict[str, int] = {}
         self._failure_context: dict[tuple[str, int | None, int], list[str]] = {}
@@ -839,30 +980,13 @@ class Transcript:
         self._tool_failure_key: int | None = None
         self._tool_failure_count = 0
         self._tool_error_total = 0
-        self._tool_failure_entry: TranscriptEntry | None = None
         self._tool_count = 0
         self._turn_tool_count = 0
         self._last_tool_name: str | None = None
         self._last_tool_duration_ms: int | float | None = None
         self._tool_details_expanded = False
-        self._live_revision = 0
-        self._live_task_id: str | None = None
-        self._live_kind = ""
-        self._live_role = "live"
-        self._live_text = ""
-        self._live_status = ""
-        self._live_phase = ""
-        self._live_tool: str | None = None
-        self._live_command = ""
-        self._live_duration_ms: int | float | None = None
-        self._live_turn: int | None = None
-        self._live_calls = 0
-        self._live_bytes = 0
-        self._live_age_s = 0.0
-        self._live_started_at: float | None = None
-        self._live_provider_call_open = False
-        self._live_cache_hit: bool | None = None
-        self._live_final = False
+        self._last_event_task_id: str | None = None
+        self._last_event_metadata: dict[str, str] = {}
 
     @property
     def entries(self) -> tuple[TranscriptEntry, ...]:
@@ -879,12 +1003,12 @@ class Transcript:
         self._tool_failure_key = None
         self._tool_failure_count = 0
         self._tool_error_total = 0
-        self._tool_failure_entry = None
         self._tool_count = 0
         self._turn_tool_count = 0
         self._last_tool_name = None
         self._last_tool_duration_ms = None
-        self._clear_live_window()
+        self._last_event_task_id = None
+        self._last_event_metadata.clear()
 
     @property
     def tool_details_expanded(self) -> bool:
@@ -900,7 +1024,7 @@ class Transcript:
         if role not in _ROLE_LABELS:
             raise ValueError(f"unknown transcript role: {role}")
         clean = _sanitize(text).strip("\n")
-        if clean:
+        if clean and not _is_private_runtime_text(clean):
             self._entries.append(TranscriptEntry(role=role, text=clean))
 
     def user(self, text: str) -> None:
@@ -908,12 +1032,12 @@ class Transcript:
         self._turn_by_task.clear()
         self._tool_failure_key = None
         self._tool_failure_count = 0
-        self._tool_failure_entry = None
         self._turn_tool_count = 0
         self._last_tool_name = None
         self._last_tool_duration_ms = None
+        self._last_event_task_id = None
+        self._last_event_metadata.clear()
         self._clear_stream()
-        self._clear_live_window()
         self.add("user", text)
 
     def assistant(self, text: str) -> None:
@@ -976,104 +1100,13 @@ class Transcript:
         return self._last_tool_duration_ms
 
     @property
-    def live_revision(self) -> int:
-        """Return the revision of the latest real progress/result event."""
-        return self._live_revision
+    def status_metadata(self) -> Mapping[str, str]:
+        """Return the latest safe event metadata for the transient status row."""
+        return self._last_event_metadata
 
     @property
-    def live_final(self) -> bool:
-        """Whether the fixed live window currently holds terminal result text."""
-        return self._live_final
-
-    def _clear_live_window(self) -> None:
-        self._live_revision += 1
-        self._live_task_id = None
-        self._live_kind = ""
-        self._live_role = "live"
-        self._live_text = ""
-        self._live_status = ""
-        self._live_phase = ""
-        self._live_tool = None
-        self._live_command = ""
-        self._live_duration_ms = None
-        self._live_turn = None
-        self._live_calls = 0
-        self._live_bytes = 0
-        self._live_age_s = 0.0
-        self._live_started_at = None
-        self._live_provider_call_open = False
-        self._live_cache_hit = None
-        self._live_final = False
-
-    @staticmethod
-    def _event_clock(record: Mapping[str, Any]) -> float | None:
-        monotonic_ms = record.get("monotonic_ms")
-        if isinstance(monotonic_ms, int | float) and math.isfinite(monotonic_ms):
-            return max(0.0, float(monotonic_ms) / 1000.0)
-        timestamp = record.get("ts")
-        if isinstance(timestamp, int | float) and math.isfinite(timestamp):
-            return max(0.0, float(timestamp))
-        return None
-
-    @staticmethod
-    def _live_event_text(kind: str, data: Mapping[str, Any]) -> str:
-        if kind == "heartbeat":
-            return _text_value(data.get("tail")) or ""
-        if kind == "tool_event":
-            for key in ("output", "stdout", "stderr", "message", "error", "cmd", "tool"):
-                value = _text_value(data.get(key))
-                if value:
-                    return value
-            return ""
-        if kind == "usage_event":
-            # Usage/cache values already have dedicated status and rail rows.
-            # Repeating them as LIVE transcript text adds noise without state.
-            return ""
-        if kind == "result":
-            return _result_text(data) or _single_line(data.get("status"))
-        for key in (
-            "message",
-            "reason",
-            "failure_reason",
-            "error",
-            "summary",
-            "output",
-            "cmd",
-            "tool",
-            "phase",
-            "status",
-        ):
-            value = _text_value(data.get(key))
-            if value:
-                return value
-        return ""
-
-    def _start_live_operation(
-        self,
-        task_id: str | None,
-        event_clock: float | None,
-        *,
-        force: bool = False,
-    ) -> None:
-        if not force and task_id == self._live_task_id:
-            return
-        self._live_task_id = task_id
-        self._live_kind = ""
-        self._live_role = "live"
-        self._live_text = ""
-        self._live_status = ""
-        self._live_phase = ""
-        self._live_tool = None
-        self._live_command = ""
-        self._live_duration_ms = None
-        self._live_turn = None
-        self._live_calls = 0
-        self._live_bytes = 0
-        self._live_age_s = 0.0
-        self._live_started_at = event_clock
-        self._live_provider_call_open = False
-        self._live_cache_hit = None
-        self._live_final = False
+    def status_task_id(self) -> str | None:
+        return self._last_event_task_id
 
     @staticmethod
     def _event_tool(data: Mapping[str, Any]) -> str | None:
@@ -1087,7 +1120,10 @@ class Transcript:
             value = data.get("tool_name")
         if value is None:
             return ""
-        return _single_line(value) if isinstance(value, str) and value.strip() else ""
+        if not isinstance(value, str) or not value.strip():
+            return ""
+        clean = _clip(_single_line(value), 72)
+        return "" if _is_private_runtime_text(clean) else clean
 
     @staticmethod
     def _event_tool_id(data: Mapping[str, Any]) -> str | None:
@@ -1095,163 +1131,8 @@ class Transcript:
         for key in ("tool_call_id", "tool_id", "call_id", "request_id", "id"):
             value = data.get(key)
             if isinstance(value, str) and value:
-                return _single_line(value)
+                return _clip(_single_line(value), 72)
         return None
-
-    def _observe_live_event(
-        self,
-        record: Mapping[str, Any],
-        kind: str,
-        data: Mapping[str, Any],
-    ) -> None:
-        if kind not in _LIVE_EVENT_KINDS and _stream_update(record) is None:
-            return
-        event_clock = self._event_clock(record)
-        task_id = _task_id(record, data)
-        turn = _event_turn(data)
-        if task_id is not None or self._live_task_id is None:
-            self._start_live_operation(task_id, event_clock)
-        if self._live_final and kind != "result":
-            return
-        incoming_tool = self._event_tool(data)
-        if (turn is not None and self._live_turn is not None and turn != self._live_turn) or (
-            kind == "tool_output_delta" and self._live_kind == "tool_event"
-        ):
-            self._start_live_operation(task_id, event_clock, force=True)
-        elif (
-            kind in _FAILURE_EVENT_KINDS | {"error", "fatal_error", "timeout"}
-            and self._live_tool is not None
-        ):
-            self._start_live_operation(task_id, event_clock, force=True)
-        elif (
-            kind not in {"heartbeat", "tool_event", "tool_output_delta"}
-            and self._live_tool is not None
-        ):
-            self._start_live_operation(task_id, event_clock, force=True)
-        if incoming_tool and incoming_tool != self._live_tool:
-            self._start_live_operation(task_id, event_clock, force=True)
-        elif (
-            kind == "heartbeat"
-            and not incoming_tool
-            and (
-                self._live_tool is not None
-                or (
-                    self._live_kind == "heartbeat"
-                    and _single_line(data.get("phase")) != self._live_phase
-                )
-                or self._live_kind not in {"", "heartbeat"}
-            )
-        ):
-            # A heartbeat with no tool is the next provider phase. Clear the
-            # completed operation's tail/duration instead of displaying it as live.
-            self._start_live_operation(task_id, event_clock, force=True)
-        if self._live_started_at is None:
-            self._live_started_at = event_clock
-        if event_clock is not None and self._live_started_at is not None:
-            self._live_age_s = max(0.0, event_clock - self._live_started_at)
-
-        if turn is not None:
-            self._live_turn = turn
-        self._live_kind = kind
-        self._live_phase = _single_line(data.get("phase"))
-        status = data.get("status")
-        if isinstance(status, str) and status:
-            self._live_status = _single_line(status)
-        elif kind == "tool_event":
-            tool_status = _tool_status(data)
-            self._live_status = (
-                "ok" if tool_status is True else "failed" if tool_status is False else "done"
-            )
-        elif kind == "heartbeat":
-            heartbeat_status = data.get("status")
-            if isinstance(heartbeat_status, str) and heartbeat_status:
-                self._live_status = _single_line(heartbeat_status)
-
-        if incoming_tool:
-            self._live_tool = incoming_tool
-        elif incoming_tool is not None:
-            # Explicit ``tool: null`` on the wire clears the completed tool
-            # without resetting the rest of the live operation; an event with
-            # no tool key at all carries no tool information and leaves the
-            # current tool display alone.
-            self._live_tool = None
-        command = data.get("cmd") or data.get("command")
-        if isinstance(command, str) and command.strip():
-            self._live_command = _single_line(command)
-        duration = _duration_ms(data.get("duration_ms"))
-        if duration is not None:
-            self._live_duration_ms = duration
-
-        if kind == "heartbeat":
-            phase = _single_line(data.get("phase")).casefold().replace("_", "-")
-            if phase == "waiting" and not incoming_tool and not self._live_provider_call_open:
-                self._live_calls += 1
-                self._live_provider_call_open = True
-        elif kind == "usage_event":
-            if not self._live_provider_call_open:
-                self._live_calls += 1
-            self._live_provider_call_open = False
-            cache_hit = data.get("provider_cache_hit")
-            if type(cache_hit) is bool:
-                self._live_cache_hit = cache_hit
-
-        text = self._live_event_text(kind, data)
-        if kind in _ASSISTANT_STREAM_KINDS or kind in _TOOL_STREAM_KINDS:
-            update = _stream_update(record)
-            if update is not None:
-                self._live_role = update[0]
-                text = self._stream_text or text
-        elif kind == "tool_event":
-            self._live_role = "tool"
-        elif kind in _FAILURE_EVENT_KINDS or kind in {"error", "fatal_error", "timeout"}:
-            self._live_role = "error"
-        elif kind == "result":
-            self._live_role = "assistant"
-
-        clean_text = _single_line(text)
-        if clean_text:
-            self._live_text = clean_text[-_LIVE_TEXT_LIMIT:]
-            self._live_bytes = _utf8_size(self._live_text)
-        if kind == "usage_event":
-            active_bytes = data.get("active_context_bytes")
-            if type(active_bytes) is int and active_bytes >= 0:
-                self._live_bytes = max(self._live_bytes, active_bytes)
-        self._live_final = self._live_final or (
-            kind == "result" and data.get("status") != "suspended"
-        )
-        self._live_revision += 1
-
-    def _set_live_result(self, text: str | None) -> None:
-        clean = _single_line(text) if isinstance(text, str) else ""
-        self._live_tool = None
-        self._live_command = ""
-        self._live_duration_ms = None
-        if clean:
-            self._live_text = clean[-_LIVE_TEXT_LIMIT:]
-            self._live_bytes = _utf8_size(self._live_text)
-        self._live_kind = "result"
-        self._live_role = "assistant"
-        if _failure_summary(clean or "") is not None:
-            self._live_status = "failed"
-        elif self._live_status.casefold() not in {"succeeded", "failed", "cancelled", "error"}:
-            self._live_status = "succeeded"
-        self._live_final = True
-        self._live_revision += 1
-
-    def _set_live_status(self, status: str) -> None:
-        """Close the fixed live window when the activity state is terminal."""
-        if self._live_final and self._live_status == status:
-            return
-        self._live_kind = self._live_kind or "result"
-        self._live_tool = None
-        self._live_command = ""
-        self._live_duration_ms = None
-        self._live_text = ""
-        self._live_bytes = 0
-        self._live_status = status
-        self._live_role = "error" if status == "error" else "assistant"
-        self._live_final = True
-        self._live_revision += 1
 
     def _clear_stream(self) -> None:
         self._stream_role = None
@@ -1259,10 +1140,25 @@ class Transcript:
         self._stream_message_id = None
         self._stream_truncated = False
         self._stream_tool_key = None
+        self._stream_owner_task_id = None
+        self._stream_tool_name = None
 
     def _commit_stream(self) -> None:
-        if self._stream_role is not None and self._stream_text:
-            self.add(self._stream_role, self._stream_text)
+        if (
+            self._stream_role is not None
+            and self._stream_text
+            and not _is_private_runtime_text(self._stream_text)
+        ):
+            text = self._stream_text
+            if self._stream_role == "tool" and self._stream_tool_name:
+                text = f"[{self._stream_tool_name}] {text}"
+            self._entries.append(
+                TranscriptEntry(
+                    role=self._stream_role,
+                    text=_sanitize(text).strip("\n"),
+                    owner_task_id=self._stream_owner_task_id,
+                )
+            )
         self._clear_stream()
 
     def _bounded_stream_text(self, text: str) -> str:
@@ -1280,6 +1176,8 @@ class Transcript:
         append: bool,
         message_id: str | None,
         tool_key: str | None = None,
+        owner_task_id: str | None = None,
+        tool_name: str | None = None,
     ) -> None:
         if self._stream_role != role or (
             message_id is not None
@@ -1295,6 +1193,8 @@ class Transcript:
         self._stream_role = role
         self._stream_message_id = message_id
         self._stream_tool_key = tool_key
+        self._stream_owner_task_id = owner_task_id
+        self._stream_tool_name = tool_name
 
         current = self._stream_text
         if not current:
@@ -1315,11 +1215,13 @@ class Transcript:
         """Commit the active stream and optionally replace it with final text."""
         current = self._stream_text
         role = self._stream_role
+        tool_name = self._stream_tool_name
+        owner_task_id = self._stream_owner_task_id
         truncated = self._stream_truncated
         self._clear_stream()
         final = _sanitize(final_text).strip("\n") if isinstance(final_text, str) else ""
-        if final:
-            self._set_live_result(final)
+        if final and _is_private_runtime_text(final):
+            return
         summary_failure = _failure_summary(final) if final else None
         if summary_failure is not None:
             task_id, cause = summary_failure
@@ -1328,8 +1230,11 @@ class Transcript:
             # block. Never render the worker's failure summary as model text.
             return
         if not final:
-            if current and role is not None:
-                self.add(role, current)
+            if current and role is not None and not _is_private_runtime_text(current):
+                text = f"[{tool_name}] {current}" if role == "tool" and tool_name else current
+                self._entries.append(
+                    TranscriptEntry(role=role, text=text, owner_task_id=owner_task_id)
+                )
             return
         if current and role == "assistant" and not truncated:
             if final.startswith(current) or current.startswith(final):
@@ -1337,7 +1242,11 @@ class Transcript:
             elif current != final:
                 final = f"{current}\n{final}"
         elif current and role is not None:
-            self.add(role, current)
+            if not _is_private_runtime_text(current):
+                text = f"[{tool_name}] {current}" if role == "tool" and tool_name else current
+                self._entries.append(
+                    TranscriptEntry(role=role, text=text, owner_task_id=owner_task_id)
+                )
         self.assistant(final)
 
     def _failure_key(self, task_id: str | None, turn: int | None) -> tuple[str, int | None, int]:
@@ -1396,42 +1305,36 @@ class Transcript:
         turn: int | None,
         tool: Any,
     ) -> None:
-        del task_id, turn
+        del turn
         self._tool_error_total += 1
         key = self._turn_serial
-        if self._tool_failure_key != key or self._tool_failure_entry not in self._entries:
+        if self._tool_failure_key != key:
             self._tool_failure_key = key
             self._tool_failure_count = 0
-            self._tool_failure_entry = TranscriptEntry(role="tool", text="")
-            self._entries.append(self._tool_failure_entry)
-
         self._tool_failure_count += 1
-        name = _sanitize(tool).strip() if isinstance(tool, str) else "tool"
-        previous_entry = self._tool_failure_entry
-        self._tool_failure_entry = TranscriptEntry(
-            role="tool",
-            text=f"{_TOOL_ERROR_PREFIX} {self._tool_failure_count} (last: {name} …)",
+        name = _clip(_single_line(tool), 72) if isinstance(tool, str) else "tool"
+        self._entries.append(
+            TranscriptEntry(
+                role="tool",
+                text=f"{name}: failed",
+                tool_name=name,
+                tool_ok=False,
+                owner_task_id=task_id,
+            )
         )
-        for index, current in enumerate(self._entries):
-            if current is previous_entry:
-                self._entries[index] = self._tool_failure_entry
-                return
 
     def _remember_tool_activity(self, tool: Any, duration: int | float | None) -> None:
         self._tool_count += 1
         self._turn_tool_count += 1
         self._last_tool_name = (
-            _sanitize(tool).strip() if isinstance(tool, str) and tool.strip() else "tool"
+            _clip(_single_line(tool), 72) if isinstance(tool, str) and tool.strip() else "tool"
         )
         self._last_tool_duration_ms = duration
 
     def _clear_tool_failure_notice(self, task_id: str | None, turn: int | None) -> None:
         del task_id, turn
-        if self._tool_failure_entry is None:
-            return
         self._tool_failure_key = None
         self._tool_failure_count = 0
-        self._tool_failure_entry = None
 
     @staticmethod
     def _prefer_failure_cause(current: str | None, candidate: str | None) -> bool:
@@ -1502,6 +1405,27 @@ class Transcript:
         task_id = _task_id(record, data)
         turn = _event_turn(data)
         self._remember_turn(task_id, turn)
+        self._last_event_task_id = task_id
+        metadata = _event_metadata(data)
+        for name, keys in (
+            ("provider", ("provider", "assigned_provider")),
+            ("model", ("model",)),
+            ("tool", ("tool", "tool_name")),
+            ("cmd", ("cmd", "command")),
+            ("path", ("path", "file_path", "paths")),
+            ("elapsed", ("elapsed_s", "elapsed", "duration_ms")),
+            ("rate", ("output_tokens_per_s", "tokens_per_s", "out_per_s")),
+            ("phase", ("phase",)),
+        ):
+            if not any(key in data for key in keys):
+                if name in {"tool", "cmd", "path", "elapsed"}:
+                    self._last_event_metadata.pop(name, None)
+                continue
+            value = metadata.get(name)
+            if value:
+                self._last_event_metadata[name] = value
+            else:
+                self._last_event_metadata.pop(name, None)
 
         if kind == "tool_event" and self._stream_role == "tool":
             owner = task_id or "?"
@@ -1531,11 +1455,12 @@ class Transcript:
                 append=append,
                 message_id=message_id,
                 tool_key=tool_key,
+                owner_task_id=task_id if role == "tool" else None,
+                tool_name=self._event_tool(data) if role == "tool" else None,
             )
-        self._observe_live_event(record, kind, data)
 
         if kind == "tool_event":
-            tool = data.get("tool")
+            tool = self._event_tool(data)
             ok = _tool_status(data)
             duration = _duration_ms(data.get("duration_ms"))
             self._remember_tool_activity(tool, duration)
@@ -1545,7 +1470,7 @@ class Transcript:
                     self._remember_failure_context(task_id, turn, context_line)
                 self._remember_tool_failure(task_id, turn, tool)
                 return
-            if isinstance(tool, str):
+            if tool:
                 text = _sanitize(_tool_entry_text(data, tool, ok, duration)).strip("\n")
                 if text:
                     self._entries.append(
@@ -1555,20 +1480,73 @@ class Transcript:
                             tool_name=tool,
                             tool_ok=ok,
                             duration_ms=duration,
+                            owner_task_id=task_id,
                         )
                     )
             return
 
         if kind in {"child_admitted", "child_rejected"}:
-            child = data.get("child_task_id") or data.get("task_id") or "child"
-            reason = data.get("reason")
-            message = f"{kind.replace('_', ' ')}: {child}"
-            if isinstance(reason, str) and reason:
+            message = f"{kind.replace('_', ' ')}: {_child_descriptor(record, data)}"
+            reason = _event_field(data, "reason", limit=96)
+            if reason:
                 message += f" · {reason}"
-            detail = _activity_tail(data.get("message"))
+            detail = _event_field(data, "message", limit=160)
             if detail:
                 message += f" · {detail}"
-            self.system(message)
+            self.system(_clip(message, 320))
+            return
+
+        if kind in _CHILD_START_KINDS and (
+            data.get("child_task_id") is not None
+            or data.get("parent_task_id") is not None
+            or kind.startswith("child")
+        ):
+            message = f"child task started: {_child_descriptor(record, data)}"
+            self.system(_clip(message, 320))
+            return
+
+        if kind in _CHILD_RESULT_KINDS:
+            status = _event_field(data, "status") or "done"
+            message = f"child {_child_id(record, data)}: {status}"
+            summary = _event_field(data, "summary", "failure_reason", "reason", limit=160)
+            if summary:
+                message += f" · {summary}"
+            self.system(_clip(message, 320))
+            return
+
+        if kind == "child_failed":
+            reason = _event_field(data, "reason", "failure_reason", limit=160)
+            message = f"child {_child_id(record, data)} failed"
+            if reason:
+                message += f" · {reason}"
+            self.system(_clip(message, 320))
+            self._remember_failure_context(task_id, turn, _sanitize(message))
+            return
+
+        if kind in _PARENT_WAIT_KINDS or (
+            kind == "result"
+            and (_event_field(data, "status") or "").casefold() == "suspended"
+        ):
+            child_count = _event_field(data, "child_count")
+            message = "parent waiting for children"
+            if task_id:
+                message += f" · task={task_id}"
+            if child_count:
+                message += f" · children={child_count}"
+            self.system(_clip(message, 240))
+            return
+
+        if kind in _PARENT_RESUME_KINDS:
+            child_count = _event_field(data, "child_count")
+            message = "parent resumed"
+            if task_id:
+                message += f" · task={task_id}"
+            if child_count:
+                message += f" · children={child_count}"
+            epoch = _event_field(data, "epoch")
+            if epoch:
+                message += f" · epoch={epoch}"
+            self.system(_clip(message, 240))
             return
 
         if kind in {"context_epoch_advanced", "context_checkpoint"}:
@@ -1590,8 +1568,8 @@ class Transcript:
             return
 
         if kind in {"merge_committed", "merge_published"}:
-            sha = data.get("merge_sha") or data.get("commit") or data.get("sha")
-            self.system(f"repository integrated{f' · {str(sha)[:12]}' if sha else ''}")
+            sha = _event_field(data, "merge_sha", "commit", "sha", limit=12)
+            self.system(f"repository integrated{f' · {sha}' if sha else ''}")
 
 
 class ActivityState:
@@ -1602,7 +1580,7 @@ class ActivityState:
         self._finished = False
         self._state = "IDLE"
         self._turn_started_at = 0.0
-        self._frame = 0
+        self._spinner_index = 0
         self._responding = False
         self._stream_tokens = 0
         self._stream_rate = 0.0
@@ -1633,7 +1611,7 @@ class ActivityState:
         self._finished = False
         self._state = "WAITING"
         self._turn_started_at = time.monotonic() if now is None else now
-        self._frame = 0
+        self._spinner_index = 0
         self._responding = False
         self._stream_tokens = 0
         self._stream_rate = 0.0
@@ -1660,7 +1638,7 @@ class ActivityState:
         self._heartbeat_tool = None
 
     def complete(self, *, succeeded: bool = True) -> None:
-        """Record a terminal state before the final frame is drawn."""
+        """Record a terminal state before the final status redraw."""
         self._state = "DONE" if succeeded else "ERROR"
         self._active = False
         self._finished = True
@@ -1691,13 +1669,17 @@ class ActivityState:
     def _tool_name(data: Mapping[str, Any]) -> str:
         for key in ("tool", "tool_name", "name"):
             value = data.get(key)
-            if isinstance(value, str) and value:
-                return value
+            if isinstance(value, str) and value.strip():
+                clean = _clip(_single_line(value), 72)
+                if not _is_private_runtime_text(clean):
+                    return clean
         function = data.get("function")
         if isinstance(function, Mapping):
             value = function.get("name")
-            if isinstance(value, str) and value:
-                return value
+            if isinstance(value, str) and value.strip():
+                clean = _clip(_single_line(value), 72)
+                if not _is_private_runtime_text(clean):
+                    return clean
         return "tool"
 
     @staticmethod
@@ -1807,10 +1789,14 @@ class ActivityState:
     def _observe_provider(self, data: Mapping[str, Any]) -> None:
         provider = data.get("provider")
         model = data.get("model")
-        if isinstance(provider, str) and provider:
-            self._provider = provider
-        if isinstance(model, str) and model:
-            self._model = model
+        if isinstance(provider, str) and provider.strip():
+            clean_provider = _clip(_single_line(provider), 96)
+            if not _is_private_runtime_text(clean_provider):
+                self._provider = clean_provider
+        if isinstance(model, str) and model.strip():
+            clean_model = _clip(_single_line(model), 96)
+            if not _is_private_runtime_text(clean_model):
+                self._model = clean_model
         cache_hit = data.get("provider_cache_hit")
         if type(cache_hit) is bool:
             self._cache_hit = cache_hit
@@ -1965,11 +1951,11 @@ class ActivityState:
         if not self._active:
             return ""
         if advance:
-            self._frame = (self._frame + 1) % len(_SPINNER_FRAMES)
+            self._spinner_index = (self._spinner_index + 1) % len(_SPINNER_FRAMES)
         current = time.monotonic() if now is None else now
         turn_elapsed = max(0.0, current - self._turn_started_at)
         quiet_for = max(0.0, current - self._last_progress_at)
-        spinner = _SPINNER_FRAMES[self._frame]
+        spinner = _SPINNER_FRAMES[self._spinner_index]
 
         tool = self._heartbeat_tool or next(
             (self._tools[key] for key in reversed(self._tools)),
@@ -2258,8 +2244,7 @@ def _wrap_markdown(text: str, width: int) -> list[str]:
             while _display_width(chunk) > line_width:
                 head, tail = _take_display_width(chunk, line_width)
                 if not head:
-                    # The framed renderers never pass a one-column body, but
-                    # keep this helper bounded for direct callers too.
+                    # Keep this helper bounded for direct callers too.
                     head, tail = "?", chunk[1:]
                 output_lines.append(head)
                 chunk = tail
@@ -2292,14 +2277,6 @@ def _wrap_markdown(text: str, width: int) -> list[str]:
         output.append(_clip(prefix + wrapped[0], width))
         output.extend(_clip(continuation + line, width) for line in wrapped[1:])
     return output
-
-
-def _bounded_render_lines(lines: list[str], limit: int) -> list[str]:
-    """Bound rendered detail without changing the transcript's source text."""
-    if len(lines) <= limit:
-        return lines
-    hidden = len(lines) - max(1, limit - 1)
-    return [f"… {hidden} lines hidden", *lines[-max(1, limit - 1) :]]
 
 
 def _bounded_markdown_lines(
@@ -2340,9 +2317,12 @@ def _entry_lines(
     color: bool = False,
 ) -> list[tuple[str, str]]:
     width = max(1, width)
-    if entry.role == "tool" and entry.text.startswith(_TOOL_ERROR_PREFIX):
+    if _is_private_runtime_text(entry.text):
         return []
-    label_prefix = f"{_ROLE_LABELS[entry.role]} ▸ "
+    label = _ROLE_LABELS[entry.role]
+    if entry.role == "tool" and entry.owner_task_id and entry.tool_name is None:
+        label = f"{label}[{entry.owner_task_id}]"
+    label_prefix = f"{label} ▸ "
     body_width = max(1, width - _display_width(label_prefix))
     if entry.tool_name is not None:
         summary_lines = _dense_rendered_lines(_wrap_markdown(_tool_line(entry), body_width))
@@ -2412,9 +2392,6 @@ def _transcript_blocks(
     while index < len(entries):
         entry = entries[index]
         if entry.role != "tool" or entry.tool_name is None:
-            if entry.role == "tool" and entry.text.startswith(_TOOL_ERROR_PREFIX):
-                index += 1
-                continue
             detail_limit = _TOOL_DETAIL_RENDER_LIMIT if entry.role == "error" else None
             blocks.append(_entry_lines(entry, width, detail_limit=detail_limit, color=color))
             index += 1
@@ -2462,7 +2439,7 @@ def _transcript_block_kind(block: list[tuple[str, str]]) -> str:
     if not block:
         return ""
     role, text = block[0]
-    if role in {"tool", "dim"} or text.lstrip().startswith(("✓ ", "✗ ", "• ", _TOOL_ERROR_PREFIX)):
+    if role in {"tool", "dim"} or text.lstrip().startswith(("✓ ", "✗ ", "• ")):
         return "tool"
     return role
 
@@ -2480,7 +2457,12 @@ def _stream_lines(
     text = transcript.streaming_text
     if len(text) > _STREAM_RENDER_LIMIT:
         text = "…\n" + text[-_STREAM_RENDER_LIMIT:]
-    label_prefix = f"{_ROLE_LABELS[transcript.streaming_role]} ▸ "
+    label = _ROLE_LABELS[transcript.streaming_role]
+    if transcript.streaming_role == "tool" and transcript._stream_owner_task_id:
+        label = f"{label}[{transcript._stream_owner_task_id}]"
+    label_prefix = f"{label} ▸ "
+    if transcript.streaming_role == "tool" and transcript._stream_tool_name:
+        text = f"[{transcript._stream_tool_name}] {text}"
     body_width = max(1, width - _display_width(label_prefix))
     lines = _dense_rendered_lines(render_markdown_lines(text, body_width, color=color))
     rendered = [
@@ -2491,161 +2473,6 @@ def _stream_lines(
     ]
     rendered.extend((transcript.streaming_role, _clip("    " + line, width)) for line in lines[1:])
     return rendered[-max(1, capacity) :]
-
-
-def _activity_parts(activity_line: str) -> tuple[str, str, str] | None:
-    clean = _single_line(activity_line)
-    if not clean:
-        return None
-    phase_match = _ACTIVITY_PHASE_RE.match(clean)
-    if phase_match is not None:
-        return (
-            clean[0],
-            phase_match.group(1).casefold(),
-            _fmt_secs(_usage_float(phase_match.group(2))),
-        )
-    spinner = next((frame for frame in _SPINNER_FRAMES if clean.startswith(frame)), "⠋")
-    upper = clean.upper()
-    if "RUNNING" in upper:
-        phase = "running"
-    elif "STREAMING" in upper or "RESPONDING" in upper:
-        phase = "streaming"
-    elif "WAITING" in upper:
-        phase = "waiting"
-    elif "THINKING" in upper:
-        phase = "thinking"
-    else:
-        return None
-    match = re.search(
-        r"\b(?:running\s+\S+\s+|(?:thinking|streaming|waiting|turn)\s*…?\s*)"
-        r"(\d+(?:\.\d+)?)s",
-        clean,
-        re.IGNORECASE,
-    )
-    elapsed = _fmt_secs(_usage_float(match.group(1))) if match is not None else "0s"
-    return spinner, phase, elapsed
-
-
-def _terminal_activity_status(activity_line: str) -> str | None:
-    clean = _single_line(activity_line)
-    upper = clean.upper()
-    if "✗" in clean or "ERROR" in upper or "FAILED" in upper:
-        return "error"
-    if "CANCEL" in upper:
-        return "cancelled"
-    if "✓" in clean or any(word in upper for word in ("DONE", "SUCCEEDED", "COMPLETE")):
-        return "succeeded"
-    return None
-
-
-def _latest_live_text(transcript: Transcript) -> str:
-    if transcript._live_text:
-        return transcript._live_text
-    for entry in reversed(transcript.entries):
-        if entry.role in {"assistant", "error", "system"}:
-            text = _single_line(entry.text)
-            if text:
-                return text
-    return "status recorded"
-
-
-def _live_window_lines(
-    transcript: Transcript,
-    width: int,
-    *,
-    activity_line: str = "",
-) -> list[str]:
-    """Render a stable phase row plus the evidence currently backing that phase."""
-    width = max(1, width)
-    activity = _single_line(activity_line)
-    if not transcript._live_kind and not activity:
-        return [_status_row([], width), _status_row([], width)]
-
-    terminal_status = _terminal_activity_status(activity)
-    if terminal_status is not None and (transcript._live_kind or transcript.live_final):
-        glyph = {"error": "✗", "cancelled": "•"}.get(terminal_status, "✓")
-        row_one = activity or f"{glyph} {terminal_status}"
-        label = _ROLE_LABELS.get(transcript._live_role, "RESULT")
-        return [
-            _status_row([row_one], width),
-            _status_row([f"{label} ▸ {_latest_live_text(transcript)}"], width),
-        ]
-
-    if not transcript._live_kind:
-        local = activity
-        if not local or "WAITING" in local.upper() or "PROVIDER" in local.upper():
-            parsed = _activity_parts(activity) if activity else None
-            local = "⠋ STARTING" + (f" · {parsed[2]}" if parsed is not None else "")
-        return [
-            _status_row([local], width),
-            _status_row(["runtime handshake pending"], width),
-        ]
-
-    meta: list[str] = []
-    if transcript._live_turn is not None:
-        meta.append(f"t{transcript._live_turn}")
-    if transcript._live_calls:
-        meta.append(f"call {transcript._live_calls}")
-    if transcript._live_cache_hit is not None:
-        meta.append("cache HIT" if transcript._live_cache_hit else "cache MISS")
-    if transcript._live_bytes:
-        meta.append(f"ctx {_human_bytes(transcript._live_bytes)}")
-
-    if transcript.live_final:
-        row_one = activity or f"✓ result {transcript._live_status or 'done'}"
-        row_two = f"{_ROLE_LABELS.get(transcript._live_role, 'RESULT')} ▸ "
-        row_two += transcript._live_text or "status recorded"
-        if meta:
-            row_two += " · " + " · ".join(meta)
-        return [_status_row([row_one], width), _status_row([row_two], width)]
-
-    phase = transcript._live_phase.casefold().replace("_", "-")
-    if activity:
-        row_one = activity
-    elif transcript._live_tool:
-        row_one = f"⠋ TOOL · {transcript._live_tool}"
-    elif phase == "waiting":
-        row_one = (
-            f"{_ACTIVITY_PHASE_GLYPHS['waiting']} PROVIDER · waiting "
-            f"{_fmt_secs(transcript._live_age_s)}"
-        )
-    elif phase == "thinking":
-        row_one = (
-            f"{_ACTIVITY_PHASE_GLYPHS['thinking']} THINKING · {_fmt_secs(transcript._live_age_s)}"
-        )
-    elif phase == "streaming":
-        row_one = (
-            f"{_ACTIVITY_PHASE_GLYPHS['streaming']} STREAMING · {_fmt_secs(transcript._live_age_s)}"
-        )
-    else:
-        row_one = "⠋ ORCHESTRATING"
-
-    details: list[str] = []
-    if transcript._live_tool:
-        if transcript._live_kind == "tool_event":
-            glyph = {"ok": "✓", "failed": "✗"}.get(transcript._live_status, "•")
-            tool_result = f"{glyph} {transcript._live_tool}"
-            if transcript._live_duration_ms is not None:
-                tool_result += f" {_format_duration(transcript._live_duration_ms)}"
-            details.append(tool_result)
-        else:
-            details.append(f"tool {transcript._live_tool}")
-        if transcript._live_text:
-            label = _ROLE_LABELS.get(transcript._live_role, "TOOL")
-            details.append(f"{label} ▸ {transcript._live_text}")
-    elif transcript._live_text:
-        label = _ROLE_LABELS.get(transcript._live_role, "LIVE")
-        details.append(f"{label} ▸ {transcript._live_text}")
-    elif phase == "waiting" or "PROVIDER" in row_one.upper():
-        details.append("waiting for provider response")
-    elif "CHILDREN" in row_one.upper() or "SUSPENDED" in row_one.upper():
-        details.append("waiting for child results")
-    elif transcript._live_command:
-        details.append(transcript._live_command)
-    else:
-        details.append("processing runtime events")
-    details.extend(meta)
-    return [_status_row([row_one], width), _status_row([" · ".join(details)], width)]
 
 
 def _transcript_lines(
@@ -2686,27 +2513,15 @@ def _transcript_lines(
     return rendered[-capacity:]
 
 
-def _agent_model(agent: Any) -> str:
-    provider = getattr(agent, "provider", None)
-    model = getattr(agent, "model", None)
-    if provider and model:
-        return f"{provider}/{model}"
-    return model or provider or "?"
-
-
 def _side_clean(value: Any) -> str:
-    """Return one terminal-safe, single-line value for the side panel."""
-    return _sanitize(value).replace("\n", " ")
+    """Return one terminal-safe, single-line field value."""
+    clean = _sanitize(value).replace("\n", " ")
+    return "" if _is_private_runtime_text(clean) else clean
 
 
-def _side_row(kind: str, text: Any, width: int) -> tuple[str, str]:
-    """Build a side-panel row that can never wrap at the panel boundary."""
+def _quota_row(kind: str, text: Any, width: int) -> tuple[str, str]:
+    """Build one width-safe quota row."""
     return kind, clip_terminal_text(_side_clean(text), max(1, width))
-
-
-def _usage_field(line: str, key: str) -> str | None:
-    match = re.search(rf"(?<![\w/]){re.escape(key)}=([^\s()]+)", _side_clean(line))
-    return match.group(1) if match is not None else None
 
 
 def _usage_int(value: Any, default: int = 0) -> int:
@@ -2742,656 +2557,6 @@ def _usage_float(value: Any, default: float = 0.0) -> float:
     except (TypeError, ValueError):
         return default
     return number if math.isfinite(number) else default
-
-
-def _format_cost(value: Any) -> str:
-    """Format estimated cash cost, not a claim about free tokens or quota."""
-    cost = _usage_float(value)
-    if cost <= 0:
-        return "$0"
-    rendered = f"{cost:.4g}"
-    if "e" in rendered.lower():
-        rendered = format(Decimal(rendered), "f")
-        if "." in rendered:
-            rendered = rendered.rstrip("0").rstrip(".")
-    return f"${rendered}"
-
-
-def _cache_rate(cached_tokens: int, input_tokens: int) -> float | None:
-    if cached_tokens > 0 and input_tokens > 0:
-        return min(1.0, cached_tokens / input_tokens)
-    return None
-
-
-def _usage_rows(
-    snapshot: Any, cumulative_line: str, width: int, *, compact: bool = False
-) -> list[tuple[str, str]]:
-    """Render cumulative usage as aligned, compact rows."""
-
-    def field(key: str) -> str | None:
-        return _usage_field(cumulative_line, key)
-
-    snapshot_calls = _usage_int(getattr(snapshot, "calls", 0))
-    snapshot_tokens = _usage_int(getattr(snapshot, "total_tokens", 0))
-    snapshot_input = _usage_int(getattr(snapshot, "input_tokens", 0))
-    snapshot_output = _usage_int(getattr(snapshot, "output_tokens", 0))
-    snapshot_cached = _usage_int(getattr(snapshot, "cached_tokens", 0))
-    calls = _usage_int(field("calls"), snapshot_calls)
-    total_tokens = _usage_int(field("tokens"), snapshot_tokens)
-    input_tokens = _usage_int(field("in"), snapshot_input)
-    output_tokens = _usage_int(field("out"), snapshot_output)
-    cached_tokens = _usage_int(field("cached"), snapshot_cached)
-    rate = _usage_float(
-        field("out/s"),
-        _usage_float(getattr(snapshot, "output_tokens_per_s", 0.0)),
-    )
-    cost = _usage_float(
-        field("cost"),
-        _usage_float(getattr(snapshot, "estimated_cost_usd", 0.0)),
-    )
-    lane = _current_lane(snapshot)
-    last_cache_hit = getattr(lane, "last_provider_cache_hit", None) if lane is not None else None
-    cache_rate = _cache_rate(cached_tokens, input_tokens)
-    cache_share = f"{cache_rate:.0%}" if cache_rate is not None else "n/a"
-    if last_cache_hit is True:
-        cache_last, cache_kind = "HIT", "cache-hit"
-    elif last_cache_hit is False:
-        cache_last, cache_kind = "MISS", "cache-miss"
-    else:
-        cache_last, cache_kind = "?", "dim"
-
-    if compact:
-        return [
-            _side_row("normal", f" out {_human_count(output_tokens)} · {rate:.1f} tok/s", width),
-            _side_row(
-                cache_kind,
-                " cache "
-                f"{cache_share} · {_human_count(cached_tokens)}/{_human_count(input_tokens)} "
-                f"· {cache_last}",
-                width,
-            ),
-            _side_row("dim", f" {calls} calls · est {_format_cost(cost)}", width),
-        ]
-
-    label_width = 7
-
-    def row(label: str, value: str) -> tuple[str, str]:
-        label_column = max(label_width, _display_width(label) + 1)
-        return _side_row("normal", f" {label:<{label_column}}{value}", width)
-
-    token_line = f" {'tokens':<{label_width}}{_human_count(total_tokens)}"
-    has_details = any(
-        field(key) is not None or hasattr(snapshot, snapshot_key)
-        for key, snapshot_key in (
-            ("in", "input_tokens"),
-            ("out", "output_tokens"),
-            ("cached", "cached_tokens"),
-        )
-    )
-    detail_rows: list[tuple[str, str]] = []
-    if has_details:
-        input_value = _human_count(input_tokens)
-        output_value = _human_count(output_tokens)
-        cached_value = _human_count(cached_tokens)
-        details = (
-            (f"(in {input_value} · out {output_value} · cached {cached_value})", True),
-            (f"(in {input_value}/out {output_value}/cached {cached_value})", True),
-            (f"(in {input_value} · out {output_value})", False),
-            (f"(in {input_value}/out {output_value})", False),
-        )
-        selected_detail = False
-        for detail, includes_cached in details:
-            candidate = f"{token_line} {detail}"
-            if _display_width(candidate) <= max(1, width):
-                token_line = candidate
-                selected_detail = True
-                if not includes_cached:
-                    detail_rows.append(_side_row("normal", f" cached {cached_value}", width))
-                break
-        if not selected_detail:
-            detail_rows.extend(
-                [
-                    row("in", input_value),
-                    row("out", output_value),
-                    _side_row("normal", f" cached {cached_value}", width),
-                ]
-            )
-
-    rows = [
-        row("calls", str(calls)),
-        _side_row("normal", token_line, width),
-        *detail_rows,
-        row("out/s", f"{rate:.1f}"),
-        row("cost", _format_cost(cost)),
-    ]
-    if cache_rate is not None or last_cache_hit is not None:
-        rows.append(_side_row(cache_kind, f" {'cache':<7}{cache_share} · last {cache_last}", width))
-    return rows
-
-
-def _agent_rows(agents: tuple[Any, ...], width: int) -> list[tuple[str, str]]:
-    """Render agents with stable glyph, task, and provider/model columns."""
-    panel_width = max(1, width)
-    name_start = 3
-    states = [_side_clean(getattr(agent, "state", "?")).strip() or "?" for agent in agents]
-    tasks = [_side_clean(getattr(agent, "task_id", "?")).strip() or "?" for agent in agents]
-    state_width = min(
-        max((terminal_display_width(state) for state in states), default=1),
-        max(1, panel_width - name_start - 1),
-    )
-    task_width = max(
-        1,
-        min(
-            max((terminal_display_width(task) for task in tasks), default=1),
-            panel_width - name_start - 1 - state_width,
-        ),
-    )
-    rows: list[tuple[str, str]] = []
-    for agent, state, task in zip(agents, states, tasks, strict=True):
-        role = "M" if getattr(agent, "role", "") == "main" else "S"
-        rows.append(
-            _side_row(
-                state,
-                f" {role} {pad_terminal_text(task, task_width)} "
-                f"{pad_terminal_text(state, state_width)}",
-                panel_width,
-            )
-        )
-        rows.append(
-            _side_row(
-                "dim",
-                " " * name_start + _agent_model(agent),
-                panel_width,
-            )
-        )
-
-        tokens = _usage_int(getattr(agent, "total_tokens", 0))
-        parts = [f"{_human_count(tokens)} tok"]
-        rate = getattr(agent, "output_tokens_per_s", None)
-        if isinstance(rate, int | float) and math.isfinite(float(rate)):
-            parts.append(f"{rate:.1f} out/s")
-        tool = _side_clean(getattr(agent, "tool", "")).strip()
-        if tool:
-            parts.append(tool)
-        stats = " " * name_start + parts[0]
-        for part in parts[1:]:
-            candidate = f"{stats} · {part}"
-            if terminal_display_width(candidate) <= panel_width:
-                stats = candidate
-        rows.append(_side_row("dim", stats, panel_width))
-    return rows
-
-
-_RAIL_FULL_WIDTH = 32
-_RAIL_COMPACT_WIDTH = 6
-_RAIL_DETAIL_MIN_WIDTH = 24
-_RAIL_STATE_GLYPHS = {
-    "suspended": "Ⅱ",
-    "active": "●",
-    "queued": "○",
-    "admitted": "○",
-    "starting": "◐",
-    "restarting": "↻",
-    "merging": "↻",
-    "succeeded": "✓",
-    "done": "✓",
-    "exited": "✓",
-    "failed": "✗",
-    "cancelled": "✗",
-    "rejected": "✗",
-}
-_RAIL_LINEAGE_GLYPHS = {"exact": "=", "semantic": "~", "fresh": "∅", "": "?"}
-
-
-def _rail_width(columns: int) -> int:
-    if columns >= 100:
-        return _RAIL_FULL_WIDTH
-    if columns >= 80:
-        return _RAIL_COMPACT_WIDTH
-    return 0
-
-
-def _frame_content_width(columns: int) -> int:
-    columns = max(8, columns)
-    rail_width = _rail_width(columns)
-    separator = 1 if rail_width else 0
-    return max(1, columns - 2 - rail_width - separator)
-
-
-def _rail_state_glyph(state: Any) -> str:
-    value = _side_clean(state).strip().casefold()
-    return _RAIL_STATE_GLYPHS.get(value, "○")
-
-
-def _rail_parent_id(agent: Any) -> str | None:
-    value = getattr(agent, "parent_task_id", None)
-    if value is None:
-        return None
-    return _side_clean(value).strip() or None
-
-
-def _rail_lineage_glyph(lineage: Any) -> str:
-    value = _side_clean(lineage).strip().casefold()
-    return _RAIL_LINEAGE_GLYPHS.get(value, "?")
-
-
-def _rail_depth(
-    task_id: str,
-    parents: Mapping[str, str | None],
-    depths: dict[str, int] | None = None,
-) -> int:
-    depths = {} if depths is None else depths
-    if task_id in depths:
-        return depths[task_id]
-
-    path: list[str] = []
-    positions: dict[str, int] = {}
-    current: str | None = task_id
-    while current is not None and current not in depths and current not in positions:
-        positions[current] = len(path)
-        path.append(current)
-        current = parents.get(current)
-
-    if current is None:
-        depth = 0
-        if path:
-            depths[path.pop()] = depth
-    elif current in depths:
-        depth = depths[current]
-    else:
-        cycle_start = positions[current]
-        depth = len(path) - cycle_start
-        for node in path[cycle_start:]:
-            depths[node] = depth
-        del path[cycle_start:]
-
-    for node in reversed(path):
-        depth += 1
-        depths[node] = depth
-    return depths[task_id]
-
-
-def _rail_tree_order(
-    agents: tuple[Any, ...], depths: dict[str, int] | None = None
-) -> tuple[Any, ...]:
-    tasks = [_side_clean(getattr(agent, "task_id", "?")).strip() or "?" for agent in agents]
-    parents = {task: _rail_parent_id(agent) for agent, task in zip(agents, tasks, strict=True)}
-    depths = {} if depths is None else depths
-    order = sorted(
-        range(len(agents)),
-        key=lambda index: (_rail_depth(tasks[index], parents, depths), index),
-    )
-    return tuple(agents[index] for index in order)
-
-
-def _rail_lane_rows(agents: tuple[Any, ...], width: int) -> list[tuple[str, str]]:
-    panel_width = max(1, width)
-    if not agents:
-        return [_side_row("dim", " no agents yet", panel_width)]
-    depths: dict[str, int] = {}
-    agents = _rail_tree_order(agents, depths)
-
-    tasks = [_side_clean(getattr(agent, "task_id", "?")).strip() or "?" for agent in agents]
-    parents: dict[str, str | None] = {}
-    children: dict[str | None, list[str]] = {}
-    for agent, task in zip(agents, tasks, strict=True):
-        parent = _rail_parent_id(agent)
-        parents[task] = parent
-        children.setdefault(parent, []).append(task)
-
-    rows: list[tuple[str, str]] = []
-    for agent, task in zip(agents, tasks, strict=True):
-        parent = parents.get(task)
-        siblings = children.get(parent, ())
-        connector = "└" if not siblings or task == siblings[-1] else "├"
-        indent = "  " * min(_rail_depth(task, parents, depths), panel_width // 2)
-        state = _side_clean(getattr(agent, "state", "queued")).strip().casefold() or "queued"
-        lineage = _rail_lineage_glyph(getattr(agent, "lineage", ""))
-        prefix = f"{indent}{connector}{_rail_state_glyph(state)}{lineage} "
-        suffix = f" E{_usage_int(getattr(agent, 'epoch', 0))}"
-        name_width = max(1, panel_width - _display_width(prefix) - _display_width(suffix))
-        rows.append(_side_row(state, prefix + _clip(task, name_width) + suffix, panel_width))
-    return rows
-
-
-def _context_bar(context: Any, width: int) -> str:
-    """Render head / semantic trunk / raw tail as a compact CAST block strip."""
-    head = _usage_int(getattr(context, "stable_head_bytes", 0))
-    trunk = _usage_int(getattr(context, "summary_trunk_bytes", 0))
-    raw = _usage_int(getattr(context, "raw_tail_bytes", 0))
-    segments = _usage_int(getattr(context, "summary_segments", 0))
-    head_known = head > 0
-    if not head_known and trunk > 0 and segments == 0:
-        # With no semantic segments, the entire trunk is the stable head.
-        head = trunk
-        head_known = True
-    semantic = max(0, trunk - head) if head_known else trunk
-    values = [head, semantic, raw]
-    total = sum(values)
-    if total <= 0:
-        return " H· S· R·"
-    cells = max(3, min(14, max(3, width - 9)))
-    counts = [max(1, round(cells * value / total)) if value else 0 for value in values]
-    while sum(counts) > cells:
-        index = max((i for i, count in enumerate(counts) if count > 1), key=counts.__getitem__)
-        counts[index] -= 1
-    while sum(counts) < cells:
-        index = max(range(3), key=lambda i: values[i] / total - counts[i] / cells)
-        counts[index] += 1
-    head_label = "H" if head_known else "H?"
-    semantic_label = "S" if head_known else "S?"
-    return f" {head_label}{'█' * counts[0]} {semantic_label}{'▓' * counts[1]} R{'░' * counts[2]}"
-
-
-def _context_rows(
-    snapshot: Any,
-    width: int,
-    *,
-    compact_epoch: bool = False,
-) -> list[tuple[str, str]]:
-    panel_width = max(1, width)
-    context = getattr(snapshot, "context", None)
-    if context is None:
-        return [_side_row("dim", " unavailable", panel_width)]
-    approx = "≈" if getattr(context, "approximate", False) else ""
-    epoch = _usage_int(getattr(context, "epoch", 0))
-    epoch_text = f"e{epoch}" if compact_epoch else str(epoch)
-    return [
-        _side_row(
-            "normal",
-            f" CAST {epoch_text} · {getattr(context, 'summary_segments', 0)} seg",
-            panel_width,
-        ),
-        _side_row("cast", _context_bar(context, panel_width), panel_width),
-        _side_row(
-            "normal",
-            f" trunk {approx}{_human_count(getattr(context, 'estimated_trunk_tokens', 0))} tok",
-            panel_width,
-        ),
-        _side_row(
-            "dim",
-            f" {_human_bytes(getattr(context, 'summary_trunk_bytes', 0))} serialized",
-            panel_width,
-        ),
-        _side_row(
-            "normal",
-            f" raw {approx}{_human_count(getattr(context, 'estimated_raw_tail_tokens', 0))} tok",
-            panel_width,
-        ),
-        _side_row(
-            "dim",
-            f" {_human_bytes(getattr(context, 'raw_tail_bytes', 0))} tail bytes",
-            panel_width,
-        ),
-        _side_row(
-            "dim",
-            " checkpoint " + _side_clean(getattr(context, "checkpoint_ref", None) or "none"),
-            panel_width,
-        ),
-    ]
-
-
-def _rail_fold_rows(snapshot: Any, width: int) -> list[tuple[str, str]]:
-    panel_width = max(1, width)
-    context = getattr(snapshot, "context", None)
-    epoch = _usage_int(getattr(context, "epoch", 0)) if context is not None else 0
-    rows: list[tuple[str, str]] = []
-    for event in tuple(getattr(snapshot, "recent_events", ())):
-        kind = _side_clean(getattr(event, "kind", "")).strip()
-        if kind not in {"context_epoch_advanced", "compaction_failed"}:
-            continue
-        detail = _side_clean(getattr(event, "detail", "")).strip()
-        if kind == "context_epoch_advanced":
-            text = f" │ {kind} e{epoch}"
-            row_kind = "active"
-        else:
-            text = f" ! {kind}"
-            row_kind = "failed"
-        if detail:
-            text += f" · {detail}"
-        rows.append(_side_row(row_kind, text, panel_width))
-    return rows[-4:]
-
-
-def _compact_rail_rows(
-    snapshot: Any,
-    width: int = _RAIL_COMPACT_WIDTH,
-    capacity: int = 32,
-) -> list[tuple[str, str]]:
-    panel_width = max(1, width)
-    agents = _rail_tree_order(tuple(getattr(snapshot, "agents", ())))
-    rows: list[tuple[str, str]] = []
-    for agent in agents:
-        parent = _rail_parent_id(agent)
-        connector = "├" if parent is not None else "└"
-        state = _rail_state_glyph(getattr(agent, "state", "queued"))
-        lineage = _side_clean(getattr(agent, "lineage", "")).strip().casefold()
-        lineage_suffix = "" if lineage == "exact" else _rail_lineage_glyph(lineage)
-        text = f"{connector}{state}={lineage_suffix}E{_usage_int(getattr(agent, 'epoch', 0))}"
-        rows.append(_side_row(getattr(agent, "state", "queued"), text, panel_width))
-    if not rows:
-        context = getattr(snapshot, "context", None)
-        epoch = _usage_int(getattr(context, "epoch", 0)) if context is not None else 0
-        rows.append(_side_row("dim", f"└○=?E{epoch}", panel_width))
-    else:
-        context = getattr(snapshot, "context", None)
-        epoch = _usage_int(getattr(context, "epoch", 0)) if context is not None else 0
-    for kind, _ in _rail_fold_rows(snapshot, panel_width):
-        tick = "!" if kind == "failed" else "│"
-        rows.append(_side_row(kind, "├" + tick + "E" + str(epoch), panel_width))
-    return rows[: max(1, capacity)]
-
-
-def _rail_selected_agent(snapshot: Any, agents: tuple[Any, ...]) -> Any | None:
-    """Return the run currently represented by the live activity ticker."""
-    if not agents:
-        return None
-    by_task = {
-        _side_clean(getattr(agent, "task_id", "?")).strip() or "?": agent for agent in agents
-    }
-    for key in ("selected_task_id", "cursor_task_id", "selected_run_id"):
-        value = getattr(snapshot, key, None)
-        if isinstance(value, str) and value in by_task:
-            return by_task[value]
-    for key in ("selected_agent", "selected_run"):
-        value = getattr(snapshot, key, None)
-        task_id = getattr(value, "task_id", None)
-        if isinstance(task_id, str) and task_id in by_task:
-            return by_task[task_id]
-    cursor = getattr(snapshot, "cursor", None)
-    if type(cursor) is int and 0 <= cursor < len(agents):
-        return agents[cursor]
-    for agent in agents:
-        if any(
-            getattr(agent, key, False) is True
-            for key in ("selected", "is_selected", "focused", "cursor")
-        ):
-            return agent
-    return next(
-        (agent for agent in agents if getattr(agent, "role", "") == "main"),
-        agents[0],
-    )
-
-
-def _rail_detail_rows(
-    agent: Any,
-    width: int,
-    *,
-    activity_line: str = "",
-) -> list[tuple[str, str]]:
-    """Two useful rows per lane; streamed text already has a live window."""
-    if width < _RAIL_DETAIL_MIN_WIDTH:
-        return []
-    state = _side_clean(getattr(agent, "state", "unknown"))
-    rows: list[tuple[str, str]] = []
-    if getattr(agent, "provider", None) or getattr(agent, "model", None):
-        identity = "   " + _agent_model(agent)
-        cache_hit = getattr(agent, "last_provider_cache_hit", None)
-        if cache_hit is True:
-            identity += " · cache hit"
-            identity_kind = "cache-hit"
-        elif cache_hit is False:
-            identity += " · cache miss"
-            identity_kind = "cache-miss"
-        else:
-            identity_kind = "dim"
-        rows.append(_side_row(identity_kind, identity, width))
-    if state == "suspended":
-        detail, detail_kind = "waiting for children", "children"
-    elif state in {"succeeded", "failed", "cancelled", "exited", "rejected"}:
-        detail, detail_kind = state, state
-    elif activity_line:
-        detail = _side_clean(activity_line).strip()
-        if " " in detail:
-            detail = detail.split(" ", 1)[1]
-        upper = detail.upper()
-        if "STREAMING" in upper:
-            detail_kind = "streaming"
-        elif "THINKING" in upper:
-            detail_kind = "thinking"
-        elif "ROUTING" in upper:
-            detail_kind = "routing"
-        elif "PROVIDER" in upper:
-            detail_kind = "provider"
-        elif "CHILDREN" in upper:
-            detail_kind = "children"
-        elif "TOOL" in upper:
-            detail_kind = "tool"
-        elif "STALL" in upper or "SILENT" in upper or "NO OUTPUT" in upper:
-            detail_kind = "stalled"
-        else:
-            detail_kind = state
-    else:
-        tool = getattr(agent, "tool", None)
-        phase = _side_clean(getattr(agent, "phase", "")).strip().casefold()
-        if tool:
-            detail, detail_kind = f"tool {_side_clean(tool)}", "tool"
-        elif phase == "waiting":
-            detail, detail_kind = "provider wait", "provider"
-        elif phase in {"thinking", "streaming"}:
-            detail, detail_kind = phase, phase
-        else:
-            detail, detail_kind = state, state
-    rows.append(_side_row(detail_kind, "   " + detail, width))
-    return rows
-
-
-def _rail_rows(
-    snapshot: Any,
-    width: int = _RAIL_FULL_WIDTH,
-    capacity: int = 32,
-    *,
-    activity_line: str = "",
-    cumulative_line: str = "",
-) -> list[tuple[str, str]]:
-    panel_width = max(1, width)
-    if panel_width <= _RAIL_COMPACT_WIDTH:
-        return _compact_rail_rows(snapshot, panel_width, capacity)
-    agents = _rail_tree_order(tuple(getattr(snapshot, "agents", ())))
-    selected = _rail_selected_agent(snapshot, agents)
-    context = [_side_row("heading", " CONTEXT", panel_width)]
-    # Byte counts and checkpoint paths are available through /context.
-    context.extend(
-        row
-        for index, row in enumerate(_context_rows(snapshot, panel_width, compact_epoch=True))
-        if index in {0, 1, 2, 4}
-    )
-    context.extend(_rail_fold_rows(snapshot, panel_width))
-    resources: list[tuple[str, str]] = []
-    if capacity >= 8 and (cumulative_line or hasattr(snapshot, "calls")):
-        resources.append(_side_row("heading", " RESOURCES", panel_width))
-        resources.extend(_usage_rows(snapshot, cumulative_line, panel_width, compact=True))
-        quota = _quota_rows(snapshot, panel_width)
-        if quota and capacity >= 14:
-            resources.append(_side_row("heading", " QUOTA", panel_width))
-            resources.extend(quota[:4])
-            if len(quota) > 4:
-                resources.append(_side_row("dim", " more: /quota", panel_width))
-    body_capacity = max(2, capacity - len(resources))
-    context = context[: max(0, body_capacity - 1 - min(4, len(agents)))]
-    if len(context) < 2:
-        context = []
-    lane_capacity = max(2, body_capacity - len(context))
-    terminal = {"succeeded", "failed", "cancelled", "exited", "rejected"}
-    # Preserve the selected parent and live children before historical rows.
-    slots = lane_capacity - 1
-    if len(agents) > slots:
-        slots = max(0, slots - 1)  # one row explains what is omitted
-    order = sorted(
-        range(len(agents)),
-        key=lambda i: (
-            agents[i] is not selected,
-            getattr(agents[i], "state", "") in terminal,
-            i,
-        ),
-    )
-    visible = set(order[:slots])
-    hidden = len(agents) - len(visible)
-    rows = _rail_lane_rows(agents, panel_width) if agents else []
-    lines = [_side_row("heading", " LANES", panel_width)]
-    remaining = len(visible)
-    crowded = len(agents) * 3 + 1 > lane_capacity
-    for index, (agent, row) in enumerate(zip(agents, rows, strict=True)):
-        if index not in visible:
-            continue
-        lines.append(row)
-        remaining -= 1
-        if crowded and agent is not selected and getattr(agent, "state", "") in terminal:
-            continue
-        room = max(0, lane_capacity - len(lines) - remaining - bool(hidden))
-        lines.extend(
-            _rail_detail_rows(
-                agent,
-                panel_width,
-                activity_line=activity_line if agent is selected else "",
-            )[:room]
-        )
-    if not agents:
-        lines.append(_side_row("dim", " no agents yet", panel_width))
-    if hidden:
-        lines.append(_side_row("dim", f" {hidden} more: /agents", panel_width))
-    return (lines + context + resources)[: max(1, capacity)]
-
-
-def _recent_rows(event: Any, width: int) -> list[tuple[str, str]]:
-    """Keep each recent event attached to its detail or omit that detail."""
-    panel_width = max(1, width)
-    kind = _side_clean(getattr(event, "kind", "event")).strip() or "event"
-    detail = _side_clean(getattr(event, "detail", "")).strip()
-    if not detail:
-        return [_side_row("dim", f" {kind}", panel_width)]
-
-    delimiter = " · "
-    kind_width = (
-        panel_width - 1 - terminal_display_width(delimiter) - terminal_display_width(detail)
-    )
-    if kind_width >= 1:
-        return [
-            _side_row(
-                "dim",
-                f" {_clip(kind, kind_width)}{delimiter}{detail}",
-                panel_width,
-            )
-        ]
-
-    kind_row = _side_row("dim", f" {kind}", panel_width)
-    detail_row = f"   {detail}"
-    if terminal_display_width(detail_row) <= panel_width:
-        return [kind_row, _side_row("dim", detail_row, panel_width)]
-    return [kind_row]
-
-
-def _append_side_rows(
-    lines: list[tuple[str, str]], rows: list[tuple[str, str]], capacity: int
-) -> None:
-    """Append a row block without leaving a trailing detail fragment."""
-    room = max(0, capacity - len(lines))
-    if room <= 0:
-        return
-    if len(rows) <= room:
-        lines.extend(rows)
-    else:
-        lines.append(rows[0])
 
 
 def _quota_field(window: Any, key: str, default: Any = None) -> Any:
@@ -3469,81 +2634,18 @@ def _quota_rows(snapshot: Any, width: int) -> list[tuple[str, str]]:
         ]
         compact = f" {subject}: {', '.join(compact_fields)}"
         if terminal_display_width(full) <= panel_width:
-            rows.append(_side_row("normal", full, panel_width))
+            rows.append(_quota_row("normal", full, panel_width))
         elif terminal_display_width(compact) <= panel_width:
-            rows.append(_side_row("normal", compact, panel_width))
+            rows.append(_quota_row("normal", compact, panel_width))
         else:
-            rows.append(_side_row("normal", f" {subject}", panel_width))
-            rows.extend(_side_row("dim", f"   {field}", panel_width) for field in fields)
+            rows.append(_quota_row("normal", f" {subject}", panel_width))
+            rows.extend(_quota_row("dim", f"   {field}", panel_width) for field in fields)
     return rows
 
 
 def render_quota_rows(snapshot: Any, width: int = 44) -> list[str]:
-    """Return quota rows in the compact format used by the side panel."""
+    """Return width-safe quota rows for explicit timeline inspection."""
     return [text for _, text in _quota_rows(snapshot, width)]
-
-
-def _side_sections(
-    snapshot: Any, cumulative_line: str, width: int, capacity: int
-) -> list[tuple[str, str]]:
-    panel_width = max(1, width)
-    capacity = max(1, capacity)
-    lines: list[tuple[str, str]] = []
-    agents = tuple(getattr(snapshot, "agents", ()))
-    lines.append(_side_row("heading", " AGENTS", panel_width))
-    if not agents:
-        lines.append(_side_row("dim", " no agents yet", panel_width))
-    else:
-        lines.extend(_agent_rows(agents[-6:], panel_width))
-
-    lines.append(_side_row("heading", " CONTEXT", panel_width))
-    lines.extend(_context_rows(snapshot, panel_width))
-
-    lines.append(_side_row("heading", " SESSION USAGE", panel_width))
-    lines.extend(_usage_rows(snapshot, cumulative_line, panel_width))
-
-    lines.append(_side_row("heading", " QUOTA", panel_width))
-    quota_rows = _quota_rows(snapshot, panel_width)
-    lines.extend(quota_rows or [_side_row("dim", " unavailable", panel_width)])
-
-    recent = tuple(
-        event
-        for event in getattr(snapshot, "recent_events", ())
-        if (
-            (kind := _side_clean(getattr(event, "kind", "")).strip()) != "dirty"
-            and not kind.startswith("worktree_cleanup")
-        )
-    )
-    if recent:
-        lines.append(_side_row("heading", " RECENT", panel_width))
-        for event in recent[-4:]:
-            _append_side_rows(lines, _recent_rows(event, panel_width), capacity)
-
-    return [_side_row(kind, text, panel_width) for kind, text in lines[:capacity]]
-
-
-def _style_kind(kind: Any, enabled: bool | int = True) -> str:
-    if not isinstance(kind, str):
-        kind = _side_clean(kind)
-    if kind in {"failed", "cancelled", "rejected", "error"}:
-        style = "red"
-    elif kind in {"streaming", "succeeded", "done", "cache-hit"}:
-        style = "green"
-    elif kind in {"thinking", "cast"}:
-        style = "magenta"
-    elif kind in {"children"}:
-        style = "pink"
-    elif kind in {"provider", "waiting"}:
-        style = "blue"
-    elif kind in {"stalled", "cooldown", "cache-miss"}:
-        style = "yellow"
-    elif kind in {"active", "starting", "merging", "running", "tool", "heading"}:
-        style = "cyan"
-    elif kind == "dim":
-        style = "dim"
-    else:
-        return ""
-    return _status_color(style, enabled)
 
 
 def _primary_rows(
@@ -3556,8 +2658,7 @@ def _primary_rows(
     """Return safe, labelled transcript rows for the append-only view."""
     width = max(8, width)
     # The transcript itself is bounded, but a large Markdown entry may occupy
-    # many wrapped rows.  Leave enough capacity to render the complete local
-    # view so the Cockpit can append only the suffix it has not emitted yet.
+    # many wrapped rows. Leave enough capacity for the complete local view.
     capacity = max(64, len(transcript.entries) * 16 + 64)
     rows = _transcript_lines(
         transcript,
@@ -3593,49 +2694,30 @@ _STATUS_KEYS = frozenset(
 )
 
 
-def _snapshot_is_active(snapshot: Any) -> bool:
-    session_status = _side_clean(getattr(snapshot, "session_status", "")).strip().casefold()
-    if session_status in {
-        "done",
-        "ended",
-        "succeeded",
-        "complete",
-        "completed",
-        "failed",
-        "error",
-        "cancelled",
-    }:
-        return False
-    return bool(
-        getattr(snapshot, "active_agents", 0)
-        or any(
-            _side_clean(getattr(agent, "state", "")).strip().casefold()
-            in {"starting", "active", "merging"}
-            for agent in getattr(snapshot, "agents", ())
-        )
-    )
-
-
-def _current_lane(snapshot: Any) -> Any | None:
+def _active_agent(snapshot: Any, task_id: str | None = None) -> Any | None:
+    """Select the lane that owns the latest event, then the active main lane."""
     agents = tuple(getattr(snapshot, "agents", ()))
+    if task_id:
+        for agent in agents:
+            if _side_clean(getattr(agent, "task_id", "")).strip() == task_id:
+                return agent
+    selected = getattr(snapshot, "selected_task_id", None)
+    if isinstance(selected, str):
+        for agent in agents:
+            if getattr(agent, "task_id", None) == selected:
+                return agent
+    active = {"starting", "active", "merging"}
     main = next((agent for agent in agents if getattr(agent, "role", "") == "main"), None)
-    active_main = (
-        main
-        if main is not None
-        and _side_clean(getattr(main, "state", "")).strip().casefold()
-        in {"starting", "active", "merging"}
-        else None
-    )
-    active = next(
+    if main is not None and _side_clean(getattr(main, "state", "")).casefold() in active:
+        return main
+    return next(
         (
             agent
             for agent in agents
-            if _side_clean(getattr(agent, "state", "")).strip().casefold()
-            in {"starting", "active", "merging"}
+            if _side_clean(getattr(agent, "state", "")).casefold() in active
         ),
-        None,
+        main or (agents[-1] if agents else None),
     )
-    return active_main or active or main or (agents[-1] if agents else None)
 
 
 def _status_fields(
@@ -3644,138 +2726,58 @@ def _status_fields(
     session_description: str,
     branch_line: str,
     cumulative_line: str,
+    transcript: Transcript | None = None,
 ) -> dict[str, str]:
-    """Collect status facts once instead of rendering three verbose source rows."""
+    """Collect bounded status facts from snapshots and safe event metadata."""
     fields: dict[str, str] = {}
     for source in (session_description, branch_line, cumulative_line):
         clean = _sanitize(source).replace("\n", " ")
         for match in re.finditer(r"(?<![\w/])([\w/]+)=([^\s·]+)", clean):
             key, value = match.groups()
             if key in _STATUS_KEYS:
-                fields.setdefault(key, value)
+                fields.setdefault(key, _clip(value, 96))
 
-    agents = tuple(getattr(snapshot, "agents", ()))
-    main = next((agent for agent in agents if getattr(agent, "role", "") == "main"), None)
-    provider = getattr(main, "provider", None) if main is not None else None
-    model = getattr(main, "model", None) if main is not None else None
-    if isinstance(provider, str) and provider:
-        fields["provider"] = _sanitize(provider)
-    if isinstance(model, str) and model:
-        fields["model"] = _sanitize(model)
-    if main is not None:
-        main_turn = getattr(main, "turn", None)
-        if isinstance(main_turn, int) and main_turn >= 0:
-            fields["turn"] = str(main_turn)
-
-    if _snapshot_is_active(snapshot):
-        lane = _current_lane(snapshot)
-        if "tokens" not in fields:
-            fields["tokens"] = _human_count(
+    task_id = transcript.status_task_id if transcript is not None else None
+    lane = _active_agent(snapshot, task_id)
+    if lane is not None:
+        task = _clip(_single_line(getattr(lane, "task_id", "")), 72)
+        if task:
+            fields["owner"] = task
+        for name, key in (("provider", "provider"), ("model", "model"), ("tool", "tool")):
+            value = getattr(lane, key, None)
+            if isinstance(value, str) and value:
+                fields[name] = _clip(_single_line(value), 96)
+        turn = getattr(lane, "turn", None)
+        if type(turn) is int and turn >= 0:
+            fields["turn"] = str(turn)
+        fields.setdefault(
+            "tokens",
+            _human_count(
                 _usage_int(getattr(lane, "total_tokens", getattr(snapshot, "total_tokens", 0)))
-            )
-        if "calls" not in fields:
-            fields["calls"] = str(_usage_int(getattr(lane, "calls", getattr(snapshot, "calls", 0))))
-
+            ),
+        )
+        fields.setdefault(
+            "calls", str(_usage_int(getattr(lane, "calls", getattr(snapshot, "calls", 0))))
+        )
+        rate = getattr(lane, "output_tokens_per_s", None)
+        if isinstance(rate, int | float) and math.isfinite(float(rate)):
+            fields["out/s"] = f"{float(rate):.1f}"
     context = getattr(snapshot, "context", None)
     if context is not None:
-        fields["epoch"] = str(getattr(context, "epoch", 0))
+        fields["epoch"] = str(_usage_int(getattr(context, "epoch", 0)))
         checkpoint = getattr(context, "checkpoint_ref", None)
         if isinstance(checkpoint, str) and checkpoint:
-            fields.setdefault("checkpoint", _sanitize(checkpoint))
+            fields.setdefault("checkpoint", _clip(_single_line(checkpoint), 96))
     fields.setdefault("tokens", _human_count(_usage_int(getattr(snapshot, "total_tokens", 0))))
-    rate = _usage_float(getattr(snapshot, "output_tokens_per_s", 0.0))
-    fields.setdefault("out/s", f"{rate:.1f}")
+    fields.setdefault("out/s", f"{_usage_float(getattr(snapshot, "output_tokens_per_s", 0.0)):.1f}")
+    fields.setdefault("rate", fields.get("out/s", ""))
+    if transcript is not None:
+        fields.update({key: value for key, value in transcript.status_metadata.items() if value})
     return fields
 
 
-def _compact_checkpoint(value: str) -> str:
-    """Show a checkpoint filename and keep each content hash to eight chars."""
-    clean = _side_clean(value).strip().rstrip("/")
-    if not clean or clean == "none":
-        return "none"
-    filename = clean.rsplit("/", 1)[-1]
-    hashes = re.findall(r"(?i)(?<![a-z0-9])[0-9a-f]{9,}(?![a-z0-9])", filename)
-    return hashes[0][:8] if hashes else filename
-
-
-def _status_parts(fields: Mapping[str, str], previous: Mapping[str, str] | None) -> list[str]:
-    status = fields.get("status", "idle")
-    parts = ["┌ Cambium", f"status={status}"]
-    provider = fields.get("provider")
-    model = fields.get("model")
-    if provider or model:
-        parts.append(f"provider={provider or '?'} model={model or '?'}")
-    if session := fields.get("session"):
-        parts.append(f"session={_clip(session, 28)}")
-    if turn := fields.get("turn"):
-        parts.append(f"t={turn}")
-
-    def changed(key: str) -> bool:
-        return previous is None or fields.get(key) != previous.get(key)
-
-    if fields.get("branch") and changed("branch"):
-        parts.append(f"b={fields['branch']}")
-    if fields.get("generation") and changed("generation"):
-        parts.append(f"g={fields['generation']}")
-    if fields.get("epoch") and changed("epoch"):
-        parts.append(f"e={fields['epoch']}")
-    if checkpoint := fields.get("checkpoint"):
-        parts.append(f"ckpt={_compact_checkpoint(checkpoint)}")
-
-    usage = []
-    if calls := fields.get("calls"):
-        usage.append(f"calls={calls}")
-    if tokens := fields.get("tokens"):
-        usage.append(f"{tokens} tok")
-    if rate := fields.get("out/s"):
-        usage.append(f"{rate}/s")
-    if usage:
-        parts.append(" ".join(usage))
-    return parts
-
-
-def _primary_status_line(
-    snapshot: Any,
-    *,
-    session_description: str,
-    branch_line: str,
-    cumulative_line: str,
-    width: int,
-    previous: Mapping[str, str] | None = None,
-    transcript: Transcript | None = None,
-    activity_line: str = "",
-    color: bool = False,
-) -> str:
-    """Build the one-line status strip used by the framed renderer."""
-    fields = _status_fields(
-        snapshot,
-        session_description=session_description,
-        branch_line=branch_line,
-        cumulative_line=cumulative_line,
-    )
-    del previous
-    width = max(8, width)
-    parts = [_status_activity(_activity_status(snapshot, activity_line), color)]
-    provider = fields.get("provider")
-    model = fields.get("model")
-    if provider or model:
-        provider = _side_clean(provider or "?").strip()
-        model = _short_model(model or "?")
-        parts.append(_status_paint(f"{provider}/{model}", "cyan", color))
-    if turn := fields.get("turn"):
-        parts.append(f"t{_side_clean(turn)}")
-    tokens = _human_count(
-        _usage_int(fields.get("tokens"), _usage_int(getattr(snapshot, "total_tokens", 0)))
-    )
-    parts.append(_status_paint(f"{tokens} tok", "dim", color))
-    if transcript is not None and transcript.current_tool_error_count > 0:
-        parts.append(f"err{transcript.current_tool_error_count}")
-    return _clip(" · ".join(parts), width)
-
-
 def _activity_status(snapshot: Any, activity_line: str) -> str:
-    """Keep the concrete ActivityState label; invent only an idle/terminal fallback."""
-    clean = sanitize_terminal_text(activity_line, single_line=True).strip()
+    clean = _single_line(activity_line)
     if clean:
         return clean
     status = _side_clean(getattr(snapshot, "session_status", "idle")).casefold()
@@ -3783,6 +2785,11 @@ def _activity_status(snapshot: Any, activity_line: str) -> str:
         return "✓ done"
     if status in {"error", "failed", "failure"}:
         return "✗ error"
+    if not getattr(snapshot, "active_agents", 0):
+        if getattr(snapshot, "failed_agents", 0):
+            return "✗ error"
+        if getattr(snapshot, "succeeded_agents", 0):
+            return "✓ done"
     return "⠋ orchestrating" if getattr(snapshot, "active_agents", 0) else "⠋ idle"
 
 
@@ -3791,8 +2798,7 @@ def _status_activity(activity_line: str, color: bool) -> str:
     match = _STATUS_PHASE_RE.match(clean)
     if match is None:
         return clean
-    phase = match.group(3).casefold()
-    style = _STATUS_PHASE_STYLES.get(phase)
+    style = _STATUS_PHASE_STYLES.get(match.group(3).casefold())
     if style is None:
         return clean
     return (
@@ -3802,25 +2808,19 @@ def _status_activity(activity_line: str, color: bool) -> str:
 
 
 def _short_model(value: Any) -> str:
-    model = _side_clean(value).strip() or "?"
-    return model.replace("/", "-")
+    return _side_clean(value).strip().replace("/", "-") or "?"
 
 
-def _running_tool(activity_line: str) -> tuple[str, str] | None:
-    match = re.search(
-        r"(?:\brunning\s+|\bTOOL\s+·\s+)(\S+)(?:\s+(\d+(?:\.\d+)?)s)?",
-        _side_clean(activity_line),
-        re.IGNORECASE,
-    )
-    if match is None:
-        return None
-    duration = (
-        _format_duration(_usage_float(match.group(2)) * 1000) if match.group(2) is not None else ""
-    )
-    return _sanitize(match.group(1)), duration
+def _compact_checkpoint(value: str) -> str:
+    clean = _side_clean(value).strip().rstrip("/")
+    if not clean or clean == "none":
+        return "none"
+    filename = clean.rsplit("/", 1)[-1]
+    hashes = re.findall(r"(?i)(?<![a-z0-9])[0-9a-f]{9,}(?![a-z0-9])", filename)
+    return hashes[0][:8] if hashes else filename
 
 
-def _live_status_line(
+def _status_line(
     snapshot: Any,
     transcript: Transcript | None,
     *,
@@ -3833,515 +2833,64 @@ def _live_status_line(
     color: bool = False,
     prefix: bool = False,
 ) -> str:
-    """Build one transient status row for the primary-buffer cockpit.
-
-    The row carries the current resource first.  Agent/context metadata is an
-    optional suffix and is clipped as one row; it never reserves a permanent
-    pane or width in the live terminal.
-    """
-    width = max(1, width)
     fields = _status_fields(
         snapshot,
         session_description=session_description,
         branch_line=branch_line,
         cumulative_line=cumulative_line,
+        transcript=transcript,
     )
-    activity_source = activity_line
-    if not activity_source and transcript is not None and transcript.live_final:
-        activity_source = "✗ error" if transcript._live_status in {"error", "failed"} else "✓ done"
-    activity = _status_activity(_activity_status(snapshot, activity_source), color)
-    lane = _current_lane(snapshot)
-    owner = transcript._live_task_id if transcript is not None else None
-    if not owner and lane is not None:
-        candidate = getattr(lane, "task_id", None)
-        owner = _side_clean(candidate).strip() if candidate is not None else ""
-    owner = owner or ""
-
-    # A child event names its owner explicitly. Prefer that lane over the
-    # main lane selected by the general snapshot helper so provider/model/tool
-    # facts describe the resource that is actually producing the event.
-    if owner:
-        for candidate in getattr(snapshot, "agents", ()):
-            task = _side_clean(getattr(candidate, "task_id", "")).strip()
-            if task == owner:
-                lane = candidate
-                break
-
-    upper_activity = _side_clean(activity).upper()
-    if "TOOL" in upper_activity:
-        phase = "tool"
-    elif "STREAMING" in upper_activity or "RESPONDING" in upper_activity:
-        phase = "streaming"
-    elif "THINKING" in upper_activity:
-        phase = "thinking"
-    elif "WAITING" in upper_activity or "PROVIDER" in upper_activity:
-        phase = "waiting"
-    else:
-        activity_name = _side_clean(activity).casefold()
-        if "orchestrating" in activity_name:
-            phase = "orchestrating"
-        elif "cooldown" in activity_name:
-            phase = "cooldown"
-        elif "suspended" in activity_name or "children" in activity_name:
-            phase = "children"
-        else:
-            phase = (
-                _side_clean(
-                    getattr(lane, "phase", None)
-                    or getattr(lane, "state", None)
-                    or getattr(snapshot, "session_status", "idle")
-                )
-                .strip()
-                .casefold()
-                .replace("_", "-")
-                or "idle"
-            )
-
-    terminal = _terminal_activity_status(activity_line)
-    if terminal is None and transcript is not None and transcript.live_final:
-        terminal = "error" if transcript._live_status in {"error", "failed"} else "succeeded"
-    if terminal is not None:
-        phase = {
-            "succeeded": "done",
-            "error": "error",
-            "cancelled": "cancelled",
-        }.get(terminal, terminal)
-        activity = {
-            "succeeded": "✓ done",
-            "error": "✗ error",
-            "cancelled": "• cancelled",
-        }.get(terminal, activity)
-    tool = transcript._live_tool if transcript is not None else None
-    if terminal is not None:
-        tool = None
-    elif not tool and lane is not None:
-        candidate = getattr(lane, "tool", None)
-        tool = _side_clean(candidate).strip() if candidate else ""
-    if terminal is None and not tool:
-        running = _running_tool(activity_line)
-        tool = running[0] if running is not None else ""
-
-    provider = getattr(lane, "provider", None) or fields.get("provider")
-    model = getattr(lane, "model", None) or fields.get("model")
-    provider_model = "/".join(_side_clean(value).strip() for value in (provider, model) if value)
-    tokens = _human_count(
-        _usage_int(fields.get("tokens"), _usage_int(getattr(snapshot, "total_tokens", 0)))
-    )
-    calls = _usage_int(fields.get("calls"), _usage_int(getattr(snapshot, "calls", 0)))
-
-    required = [activity, _status_paint(f"{tokens} tok", "dim", color)]
-    # Keep phase explicit even when ActivityState is unavailable (for example
-    # during a resize or a queued inspection command).
-    if phase and phase not in upper_activity.casefold():
-        required.append(f"phase={phase}")
-    if owner:
-        required.append(f"owner={_side_clean(owner)}")
-    if provider_model:
-        required.append(_status_paint(provider_model, "cyan", color))
-    if tool:
-        required.append(f"tool={_side_clean(tool)}")
-
-    optional: list[str] = []
+    activity_source = _activity_status(snapshot, activity_line)
+    activity = _status_activity(activity_source, color)
+    parts = [activity]
+    provider = fields.get("provider")
+    model = fields.get("model")
+    if provider or model:
+        parts.append(
+            _status_paint(f"{provider or '?'}/{_short_model(model or '?')}", "cyan", color)
+        )
+    if transcript is not None and transcript.current_tool_error_count:
+        parts.append(f"err{transcript.current_tool_error_count}")
+    if token_count := fields.get("tokens"):
+        parts.append(_status_paint(f"{token_count} tok", "dim", color))
+    if owner := fields.get("owner"):
+        parts.append(f"owner={owner}")
+    if turn := fields.get("turn"):
+        parts.append(f"t{_side_clean(turn)}")
+    if tool := fields.get("tool"):
+        parts.append(f"tool={_side_clean(tool)}")
+    for key, label in (("cmd", "cmd"), ("path", "path"), ("elapsed", "elapsed"), ("rate", "rate")):
+        value = fields.get(key)
+        if value:
+            parts.append(f"{label}={_side_clean(value)}")
+    calls = _usage_int(fields.get("calls"))
     if calls:
-        optional.append(f"{calls} calls")
-    if transcript is not None and transcript.current_tool_error_count > 0:
-        optional.append(f"err{transcript.current_tool_error_count}")
+        parts.append(f"{calls} calls")
     if show_detail:
-        optional.append(
-            "agents="
-            f"{_usage_int(getattr(snapshot, 'active_agents', 0))}/"
-            f"{_usage_int(getattr(snapshot, 'queued_agents', 0))}"
-        )
-        context = getattr(snapshot, "context", None)
-        if context is not None:
-            optional.append(f"ctx=e{_usage_int(getattr(context, 'epoch', 0))}")
-        input_tokens = _usage_int(
-            getattr(lane, "input_tokens", getattr(snapshot, "input_tokens", 0))
-        )
-        output_tokens = _usage_int(
-            getattr(lane, "output_tokens", getattr(snapshot, "output_tokens", 0))
-        )
-        if input_tokens or output_tokens:
-            optional.append(f"in/out={_human_count(input_tokens)}/{_human_count(output_tokens)}")
-
-    def join(parts: list[str]) -> str:
-        return " · ".join(part for part in parts if part)
-
-    parts = [*required]
-    for item in optional:
-        candidate = join([*parts, item])
-        if _display_width(candidate) <= width:
-            parts.append(item)
-        else:
-            break
-
-    text = join(parts)
-    if _display_width(text) > width and len(required) > 1:
-        # Preserve the owner/provider/tool tail when the terminal is narrow;
-        # optional usage is already omitted above.
-        tail = required[1:]
-        tail_text = join(tail)
-        separator_width = _display_width(" · ") if tail_text else 0
-        activity_width = max(1, width - _display_width(tail_text) - separator_width)
-        required[0] = _clip(required[0], activity_width)
-        text = join(required)
-    if prefix:
-        text = f"Cambium · {text}"
-    return _clip(text, width)
-
-
-def _tool_activity_row(transcript: Transcript, activity_line: str, width: int) -> str:
-    count = transcript.current_tool_count
-    name = transcript.last_tool_name
-    duration = _format_duration(transcript.last_tool_duration_ms)
-    running = _running_tool(activity_line)
-    if running is not None:
-        count += 1
-        name, duration = running
-    if count <= 0:
-        return _status_row(["· 0 tools"], width)
-    parts = [f"✓ {count} tools"]
-    if name:
-        last = f"last {name}"
-        if duration:
-            last += f" {duration}"
-        parts.append(last)
-    return _status_row(parts, width)
-
-
-def _detail_status_line(
-    snapshot: Any,
-    cumulative_line: str,
-    width: int,
-    *,
-    color: bool = False,
-) -> str:
-    """Render the one-line ambient agent, usage, and context summary."""
-
-    lane = _current_lane(snapshot)
-
-    def field(key: str, snapshot_key: str) -> int:
-        if _snapshot_is_active(snapshot):
-            return _usage_int(getattr(lane, snapshot_key, getattr(snapshot, snapshot_key, 0)))
-        return _usage_int(
-            _usage_field(cumulative_line, key),
-            _usage_int(getattr(snapshot, snapshot_key, 0)),
-        )
-
-    input_tokens = field("in", "input_tokens")
-    output_tokens = field("out", "output_tokens")
-    cached_tokens = field("cached", "cached_tokens")
-    total_tokens = field("tokens", "total_tokens")
-    calls = field("calls", "calls")
-    summaries = field("summaries", "summary_calls")
-    rate = (
-        _usage_float(
-            getattr(lane, "output_tokens_per_s", getattr(snapshot, "output_tokens_per_s", 0.0))
-        )
-        if _snapshot_is_active(snapshot)
-        else _usage_float(
-            _usage_field(cumulative_line, "out/s"),
-            _usage_float(getattr(snapshot, "output_tokens_per_s", 0.0)),
-        )
-    )
-    cost_field = _usage_field(cumulative_line, "cost")
-    cost = (
-        cost_field
-        if cost_field in {"free", "subscription"} and not _snapshot_is_active(snapshot)
-        else _format_cost(
-            _usage_float(
-                getattr(lane, "estimated_cost_usd", getattr(snapshot, "estimated_cost_usd", 0.0))
-                if _snapshot_is_active(snapshot)
-                else cost_field,
-                _usage_float(getattr(snapshot, "estimated_cost_usd", 0.0)),
-            )
-        )
-    )
-    cache_rate = _cache_rate(cached_tokens, input_tokens)
-    last_cache_hit = getattr(lane, "last_provider_cache_hit", None) if lane is not None else None
-    cache = f"{cache_rate:.0%}" if cache_rate is not None else "n/a"
-    if last_cache_hit is True:
-        cache += "/HIT"
-    elif last_cache_hit is False:
-        cache += "/MISS"
-
-    agents = " ".join(
-        (
-            "agents",
-            _status_paint(
-                f"active={_usage_int(getattr(snapshot, 'active_agents', 0))}",
-                "bold",
-                color,
-            ),
-            _status_paint(
-                f"queued={_usage_int(getattr(snapshot, 'queued_agents', 0))}",
-                "yellow",
-                color,
-            ),
-            _status_paint(
-                f"ok={_usage_int(getattr(snapshot, 'succeeded_agents', 0))}",
-                "green",
-                color,
-            ),
-            _status_paint(
-                f"failed={_usage_int(getattr(snapshot, 'failed_agents', 0))}",
-                "red",
-                color,
-            ),
-        )
-    )
-    cache_style = (
-        "green"
-        if last_cache_hit is True
-        else "yellow"
-        if last_cache_hit is False
-        else "green"
-        if cache_rate is not None and cache_rate >= 0.5
-        else "yellow"
-    )
-    cache_text = _status_paint(cache, cache_style, color) if cache_rate is not None else cache
-    usage = (
-        "usage "
-        f"{_status_paint(f'in={_human_count(input_tokens)}', 'dim', color)} "
-        f"{_status_paint(f'out={_human_count(output_tokens)}', 'dim', color)} "
-        f"{_status_paint(f'cached={_human_count(cached_tokens)}', 'dim', color)} "
-        f"({cache_text}) "
-        f"{_status_paint(f'total={_human_count(total_tokens)}', 'dim', color)} "
-        f"calls={calls} summaries={summaries} "
-        f"out/s={rate:.1f} cost={cost}"
-    )
-    line = f"{agents} · {usage}"
-
-    context = getattr(snapshot, "context", None)
-    if context is not None:
-        trunk_prefix = "≈" if getattr(context, "approximate", False) else "="
-        context_line = (
-            f"context epoch={_usage_int(getattr(context, 'epoch', 0))} "
-            f"trunk{trunk_prefix}{_human_count(getattr(context, 'estimated_trunk_tokens', 0))}tok "
-            f"segments={_usage_int(getattr(context, 'summary_segments', 0))}"
-        )
-        context_line = _status_paint(context_line, "dim", color)
-        candidate = f"{line} · {context_line}"
-        if _display_width(candidate) <= max(1, width):
-            line = candidate
-    return _status_row([line], width)
-
-
-_FIXED_MIN_HEIGHT = 12
-_STATUS_ROW_COUNT = 5
-_BOTTOM_RESERVED_ROWS = 1 + _STATUS_ROW_COUNT + 1
-_FRAME_OVERHEAD = 2 + _BOTTOM_RESERVED_ROWS
-
-
-def _frame_overhead(show_detail: bool) -> int:
-    return _FRAME_OVERHEAD if show_detail else _FRAME_OVERHEAD - 1
-
-
-def _status_row(parts: list[str], width: int) -> str:
-    text = " · ".join(part for part in parts if part)
-    return _clip(f" {text}", max(1, width))
-
-
-def _status_rows(
-    snapshot: Any,
-    transcript: Transcript,
-    *,
-    session_description: str,
-    branch_line: str,
-    cumulative_line: str,
-    width: int,
-    activity_line: str = "",
-    show_detail: bool = True,
-    include_live: bool = False,
-    color: bool = False,
-) -> list[str]:
-    """Render the rolling tool row, fixed live window, and status rows."""
+        agent_count = len(getattr(snapshot, "agents", ()))
+        active_count = _usage_int(getattr(snapshot, "active_agents", 0))
+        if agent_count:
+            parts.append(f"agents={active_count}/{agent_count}")
+        epoch = fields.get("epoch")
+        if epoch:
+            parts.append(f"ctx=e{_side_clean(epoch)}")
+        for key, label in (("checkpoint", "ckpt"), ("cost", "cost")):
+            value = fields.get(key)
+            if value:
+                rendered = _compact_checkpoint(value) if key == "checkpoint" else _side_clean(value)
+                parts.append(f"{label}={rendered}")
     width = max(1, width)
-    rows = [_tool_activity_row(transcript, activity_line, width)]
-    if include_live:
-        rows.extend(_live_window_lines(transcript, width, activity_line=activity_line))
-    rows.append(
-        _status_row(
-            [
-                _primary_status_line(
-                    snapshot,
-                    session_description=session_description,
-                    branch_line=branch_line,
-                    cumulative_line=cumulative_line,
-                    width=width,
-                    transcript=transcript,
-                    activity_line=activity_line if not include_live else "",
-                    color=color,
-                )
-            ],
-            width,
-        ),
-    )
-    if show_detail:
-        rows.append(_detail_status_line(snapshot, cumulative_line, width, color=color))
-    return rows
-
-
-def _frame_inside(text: str, width: int) -> str:
-    inner = max(1, width - 2)
-    clean = _safe_rendered(text).replace("\n", " ").replace("\r", " ").replace("\t", " ")
-    return "│" + _pad(clean, inner) + "│"
-
-
-def _split_frame_row(
-    text: str,
-    width: int,
-    rail_width: int,
-    *,
-    rail_text: str = "",
-    left_color: str = "",
-    rail_kind: str = "dim",
-    color: bool = False,
-) -> str:
-    width = max(8, width)
-    left_width = _frame_content_width(width)
-    left = _paint(_frame_inside(text, left_width + 2), left_color, color)
-    if not rail_width:
-        return left
-    right = _pad(_paint(rail_text, _style_kind(rail_kind, color), color), rail_width)
-    return left + right + _paint("│", _DIM_CYAN, color)
-
-
-def _cockpit_frame_lines(
-    snapshot: Any,
-    transcript: Transcript,
-    *,
-    session_description: str,
-    branch_line: str,
-    cumulative_line: str,
-    width: int,
-    height: int,
-    color: bool,
-    input_label: str,
-    activity_line: str,
-    show_detail: bool = True,
-    primary_rows: tuple[tuple[str, str], ...] | None = None,
-) -> list[str]:
-    width = max(8, width)
-    height = max(_FIXED_MIN_HEIGHT, height)
-    inner = max(1, width - 2)
-    rail_width = _rail_width(width)
-    left_inner = _frame_content_width(width)
-    status_rows = _status_rows(
-        snapshot,
-        transcript,
-        session_description=session_description,
-        branch_line=branch_line,
-        cumulative_line=cumulative_line,
-        width=left_inner,
-        activity_line=activity_line,
-        show_detail=show_detail,
-        include_live=True,
-        color=color,
-    )
-    conversation_capacity = max(1, height - _frame_overhead(show_detail))
-    status = _single_line(getattr(snapshot, "session_status", "idle")) or "idle"
-    conversation = (
-        list(primary_rows[-conversation_capacity:])
-        if primary_rows is not None
-        else _transcript_lines(
-            transcript,
-            left_inner,
-            conversation_capacity,
-            color=color,
-            include_stream=True,
-        )
-    )
-    if not rail_width:
-        lines = [
-            _paint("┌" + _pad(f" Cambium · conversation · {status} ", inner) + "┐", _CYAN, color)
-        ]
-        for role, text in conversation[:conversation_capacity]:
-            lines.append(
-                _paint(
-                    _frame_inside(text, width),
-                    _role_color(role, color),
-                    color,
-                )
-            )
-        while len(lines) < 1 + conversation_capacity:
-            lines.append(_frame_inside("", width))
-
-        lines.append(_paint("├" + "─" * inner + "┤", _DIM_CYAN, color))
-        for text in status_rows:
-            lines.append(_paint(_frame_inside(text, width), _DIM_CYAN, color))
-        label = _clip(_sanitize(input_label).replace(chr(10), " "), max(1, inner - 8))
-        lines.append(_paint(_frame_inside(f" input {label} ", width), _BLUE, color))
-        lines.append(_paint("└" + "─" * inner + "┘", _CYAN, color))
-        return lines[:height]
-
-    rail_rows = _rail_rows(
-        snapshot,
-        rail_width,
-        conversation_capacity,
-        activity_line=activity_line,
-        cumulative_line=cumulative_line,
-    )
-    rail_heading = (
-        _pad("", rail_width)
-        if rail_width == _RAIL_COMPACT_WIDTH
-        else _pad(_paint(" OPERATOR RAIL", _CYAN, color), rail_width)
-    )
-    heading = _paint(
-        "┌" + _pad(f" Cambium · conversation · {status} ", left_inner) + "┬",
-        _CYAN,
-        color,
-    )
-    lines = [heading + rail_heading + _paint("┐", _CYAN, color)]
-    for index in range(conversation_capacity):
-        role, text = conversation[index] if index < len(conversation) else ("", "")
-        rail_kind, rail_text = rail_rows[index] if index < len(rail_rows) else ("", "")
-        lines.append(
-            _split_frame_row(
-                text,
-                width,
-                rail_width,
-                rail_text=rail_text,
-                left_color=_role_color(role, color),
-                rail_kind=rail_kind,
-                color=color,
-            )
-        )
-    lines.append(
-        _paint(
-            "├" + "─" * left_inner + "┼" + "─" * rail_width + "┤",
-            _DIM_CYAN,
-            color,
-        )
-    )
-    for text in status_rows:
-        lines.append(
-            _split_frame_row(
-                text,
-                width,
-                rail_width,
-                left_color=_DIM_CYAN,
-                color=color,
-            )
-        )
-    label = _clip(_sanitize(input_label).replace(chr(10), " "), max(1, left_inner - 8))
-    lines.append(
-        _split_frame_row(
-            f" input {label} ",
-            width,
-            rail_width,
-            left_color=_BLUE,
-            color=color,
-        )
-    )
-    lines.append(
-        _paint(
-            "└" + "─" * left_inner + "┴" + "─" * rail_width + "┘",
-            _CYAN,
-            color,
-        )
-    )
-    return lines[:height]
+    prefix_text = "Cambium · " if prefix else ""
+    visible_parts: list[str] = []
+    for part in parts:
+        candidate = " · ".join((*visible_parts, part))
+        if _display_width(prefix_text + candidate) <= width:
+            visible_parts.append(part)
+            continue
+        if visible_parts:
+            break
+        visible_parts.append(part)
+    return _clip(prefix_text + " · ".join(visible_parts), width)
 
 
 def render_primary(
@@ -4367,7 +2916,7 @@ def render_primary(
             include_stream=True,
         )
     ]
-    status = _live_status_line(
+    status = _status_line(
         snapshot,
         transcript,
         session_description=session_description,
@@ -4381,49 +2930,6 @@ def render_primary(
     )
     lines.append(_paint(status, _DIM_CYAN, color))
     return lines
-
-
-def render_cockpit(
-    snapshot: Any,
-    transcript: Transcript,
-    *,
-    session_description: str,
-    branch_line: str,
-    cumulative_line: str,
-    width: int,
-    height: int,
-    color: bool = False,
-    input_label: str = "›",
-    activity_line: str = "",
-    show_detail: bool = True,
-) -> list[str]:
-    """Render one deterministic conversation/status frame without controls."""
-    width = max(8, width)
-    if height < _FIXED_MIN_HEIGHT:
-        return render_primary(
-            snapshot,
-            transcript,
-            session_description=session_description,
-            branch_line=branch_line,
-            cumulative_line=cumulative_line,
-            width=width,
-            color=color,
-            activity_line=activity_line,
-            show_detail=show_detail,
-        )
-    return _cockpit_frame_lines(
-        snapshot,
-        transcript,
-        session_description=session_description,
-        branch_line=branch_line,
-        cumulative_line=cumulative_line,
-        width=width,
-        height=height,
-        color=color,
-        input_label=input_label,
-        activity_line=activity_line,
-        show_detail=show_detail,
-    )
 
 
 def _suffix_prefix_overlap(previous: str, current: str) -> int:
@@ -4447,6 +2953,16 @@ def _suffix_prefix_overlap(previous: str, current: str) -> int:
         if char == pattern[length]:
             length += 1
     return length
+
+
+def _stream_entry_content(entry: TranscriptEntry) -> str:
+    """Return stream content without the presentation-only tool label."""
+    text = entry.text
+    if entry.role == "tool" and text.startswith("["):
+        separator = text.find("] ")
+        if separator > 0:
+            return text[separator + 2 :]
+    return text
 
 
 class Cockpit:
@@ -4478,7 +2994,6 @@ class Cockpit:
         self._pending_draw: Cockpit._Request | None = None
         self._last_request: Cockpit._Request | None = None
         self._timeline_initialized = False
-        self._last_history_rows: tuple[tuple[str, str], ...] = ()
         self._last_history_entries: tuple[TranscriptEntry, ...] = ()
         self._last_stream_text = ""
         self._last_stream_role: str | None = None
@@ -4547,21 +3062,6 @@ class Cockpit:
                 pass
             self._previous_sigterm_handler = None
 
-    @staticmethod
-    def _history_rows(
-        transcript: Transcript, width: int, color: bool | int
-    ) -> tuple[tuple[str, str], ...]:
-        if not transcript.entries:
-            return ()
-        return tuple(
-            _primary_rows(
-                transcript,
-                width,
-                color=color,
-                include_stream=False,
-            )
-        )
-
     def _stream_delta_rows(
         self,
         transcript: Transcript,
@@ -4600,32 +3100,21 @@ class Cockpit:
             # once the provider supplies a newline or commits the result.
             return (), emitted
         complete = pending[: newline + 1]
+        rendered_complete = complete
+        if role == "tool" and transcript._stream_tool_name:
+            rendered_complete = f"[{transcript._stream_tool_name}] {complete}"
         rows = tuple(
             _entry_lines(
-                TranscriptEntry(role=role, text=complete),
+                TranscriptEntry(
+                    role=role,
+                    text=rendered_complete,
+                    owner_task_id=transcript._stream_owner_task_id,
+                ),
                 width,
                 color=bool(color),
             )
         )
         return rows, emitted + complete
-
-    @staticmethod
-    def _history_delta(
-        current: tuple[tuple[str, str], ...],
-        previous: tuple[tuple[str, str], ...],
-    ) -> tuple[tuple[str, str], ...]:
-        if current[: len(previous)] == previous:
-            return current[len(previous) :]
-        if not current:
-            return ()
-        # A bounded transcript can evict its oldest rows between draws.  Keep
-        # only the suffix after the largest shared overlap instead of replaying
-        # the whole retained view into native scrollback.
-        maximum = min(len(previous), len(current))
-        for size in range(maximum, 0, -1):
-            if previous[-size:] == current[:size]:
-                return current[size:]
-        return (("dim", "··· transcript view refreshed ···"), *current)
 
     @staticmethod
     def _entry_rows(
@@ -4807,8 +3296,24 @@ class Cockpit:
             activity,
         ) = request
         width = max(8, self._last_size.columns)
-        history = self._history_rows(transcript, width, self.color)
-        history_new = self._history_delta(history, self._last_history_rows)
+        current_entries = transcript.entries
+        width_changed = self._last_rendered_width not in {None, width}
+        entries_changed = current_entries != self._last_history_entries
+
+        # Never render retained rows for a status-only update.  New rows are
+        # rendered from only the entries added since the last draw.  A resize
+        # changes the width of future rows, not the already committed timeline.
+        if not self._timeline_initialized:
+            history_new = self._entry_rows(current_entries, width, self.color)
+        elif entries_changed:
+            history_new = self._entry_delta_rows(
+                current_entries,
+                self._last_history_entries,
+                width,
+                self.color,
+            )
+        else:
+            history_new = ()
 
         stream_new, stream_emitted = self._stream_delta_rows(
             transcript,
@@ -4821,21 +3326,75 @@ class Cockpit:
         current_stream_text = transcript.streaming_text
         current_stream_role = transcript.streaming_role
         current_stream_key = transcript.streaming_key
-        current_history_entries = transcript.entries
-        if current_history_entries == self._last_history_entries:
-            # Presentation-only detail toggles must not replay immutable
-            # transcript rows into normal-buffer scrollback.
-            history_new = ()
-
         previous_stream_emitted = self._stream_emitted_text
-
         stream_ended_or_switched = (
             not current_stream_text
             or current_stream_role != self._last_stream_role
             or current_stream_key != self._last_stream_key
         )
 
-        status = _live_status_line(
+        # finish_stream() promotes streamed text into history.  It was already
+        # emitted line-by-line, so append only a genuine suffix of the commit.
+        if history_new and previous_stream_emitted and stream_ended_or_switched:
+            role = self._last_stream_role
+            if role is not None:
+                streamed_entry = next(
+                    (
+                        entry
+                        for entry in reversed(current_entries)
+                        if entry.role == role
+                        and (
+                            entry.text.startswith(self._last_stream_text)
+                            or self._last_stream_text.startswith(entry.text)
+                            or _stream_entry_content(entry).startswith(
+                                self._stream_emitted_text.rstrip("\n")
+                            )
+                            or self._stream_emitted_text.rstrip("\n").startswith(
+                                _stream_entry_content(entry)
+                            )
+                        )
+                    ),
+                    None,
+                )
+                if streamed_entry is not None:
+                    rendered_stream = tuple(
+                        _entry_lines(streamed_entry, width, color=bool(self.color))
+                    )
+                    block_size = len(rendered_stream)
+                    for index in range(len(history_new) - block_size + 1):
+                        if history_new[index : index + block_size] != rendered_stream:
+                            continue
+                        committed_text = _stream_entry_content(streamed_entry)
+                        emitted_text = previous_stream_emitted.rstrip("\n")
+                        if committed_text.startswith(emitted_text):
+                            suffix = committed_text[len(emitted_text) :].lstrip("\n")
+                            replacement_rows = (
+                                tuple(
+                                    _entry_lines(
+                                        TranscriptEntry(
+                                            role=role,
+                                            text=suffix,
+                                            owner_task_id=streamed_entry.owner_task_id,
+                                        ),
+                                        width,
+                                        color=bool(self.color),
+                                    )
+                                )
+                                if suffix
+                                else ()
+                            )
+                        elif emitted_text.startswith(committed_text):
+                            replacement_rows = ()
+                        else:
+                            continue
+                        history_new = (
+                            *history_new[:index],
+                            *replacement_rows,
+                            *history_new[index + block_size :],
+                        )
+                        break
+
+        status = _status_line(
             snapshot,
             transcript,
             session_description=session_description,
@@ -4849,80 +3408,15 @@ class Cockpit:
         )
         input_text = self._input_line_text()
         if input_text is None:
-            # Keep native input untouched.  Status still follows activity and
-            # resize changes because it occupies a separate row.
-            if self._timeline_initialized and (status != self._last_status_line or force):
+            if self._timeline_initialized and (
+                status != self._last_status_line or force or width_changed
+            ):
                 self._redraw_status_only(status)
             self._last_request = request
             self._last_status_line = status
+            self._last_rendered_width = width
             return
 
-        width_changed = self._last_rendered_width not in {None, width}
-        if width_changed:
-            # Reflowing a bounded transcript is a viewport change, not new
-            # output. Render only entries added since the previous draw; old
-            # rows become the new-width baseline without replaying history.
-            history_new = self._entry_delta_rows(
-                current_history_entries,
-                self._last_history_entries,
-                width,
-                self.color,
-            )
-            # The stream tracker still describes the previous draw.  Render
-            # its pending suffix at the new width instead of dropping it.
-
-        # finish_stream() promotes the stream into one history entry.  The
-        # entry has already been emitted chunk-by-chunk, so do not duplicate it
-        # when the committed text matches the last streamed value.
-        if history_new and previous_stream_emitted and stream_ended_or_switched:
-            role = self._last_stream_role
-            if role is not None and transcript.entries:
-                # ``finish_stream`` may commit a tool tail and then append the
-                # assistant's final result.  Locate the matching tail block,
-                # not only the last entry, before deciding whether it was
-                # already emitted above.
-                streamed_entry = next(
-                    (
-                        entry
-                        for entry in reversed(transcript.entries)
-                        if entry.role == role
-                        and (
-                            entry.text.startswith(self._last_stream_text)
-                            or self._last_stream_text.startswith(entry.text)
-                        )
-                    ),
-                    None,
-                )
-                if streamed_entry is not None:
-                    rendered_stream = tuple(
-                        _entry_lines(streamed_entry, width, color=bool(self.color))
-                    )
-                    block_size = len(rendered_stream)
-                    for index in range(len(history_new) - block_size + 1):
-                        if history_new[index : index + block_size] == rendered_stream:
-                            if streamed_entry.text.startswith(previous_stream_emitted):
-                                suffix = streamed_entry.text[len(previous_stream_emitted) :]
-                                replacement = (
-                                    tuple(
-                                        _entry_lines(
-                                            TranscriptEntry(role=role, text=suffix),
-                                            width,
-                                            color=bool(self.color),
-                                        )
-                                    )
-                                    if suffix
-                                    else ()
-                                )
-                            elif previous_stream_emitted.startswith(streamed_entry.text):
-                                replacement = ()
-                            else:
-                                continue
-                            history_new = (
-                                *history_new[:index],
-                                *replacement,
-                                *history_new[index + block_size :],
-                            )
-                            break
         timeline_new = (*history_new, *stream_new)
         if not self._timeline_initialized:
             self._append_timeline(timeline_new)
@@ -4942,8 +3436,7 @@ class Cockpit:
         self.stream.flush()
         self._last_request = request
         self._last_status_line = status
-        self._last_history_rows = history
-        self._last_history_entries = current_history_entries
+        self._last_history_entries = current_entries
         self._last_stream_text = current_stream_text
         self._last_stream_role = current_stream_role
         self._last_stream_key = current_stream_key
@@ -5042,5 +3535,4 @@ __all__ = [
     "render_quota_rows",
     "render_markdown_lines",
     "render_primary",
-    "render_cockpit",
 ]

@@ -107,7 +107,7 @@ def _model_config(tmp_path: Path, provider_config: Path) -> OneShotConfig:
 
 
 def test_tui_operator_commands_render_without_provider_calls(tmp_path: Path) -> None:
-    source = _Tty("/dashboard\n/events\n/branches\n/fork\n/compact\n/model\n/cancel\n/exit\n")
+    source = _Tty("/events\n/branches\n/fork\n/compact\n/model\n/cancel\n/exit\n")
     output = _Tty()
     error = io.StringIO()
 
@@ -130,7 +130,7 @@ def test_tui_operator_commands_render_without_provider_calls(tmp_path: Path) -> 
     assert "compact: no successful checkpoint" in text
     assert "auto/auto" in text
     assert "press Ctrl-C while a turn is running" in text
-    assert "live timeline plus status row" in text
+    assert "Unknown command: /dashboard" not in text
     assert "┌ Cambium" not in text
 
 
