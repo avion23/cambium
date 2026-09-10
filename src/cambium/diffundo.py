@@ -135,7 +135,7 @@ from .provider_scheduler import (
     QuotaWindowSpec,
     quota_snapshot_json,
 )
-from .schemas import NATIVE_CONTROL_TOOL_SCHEMAS
+from .schemas import NATIVE_CONTROL_TOOL_SCHEMAS, TOOL_SCHEMAS
 from .selection import Candidate, order_candidates
 
 _TIMESTAMP_PATTERN = (
@@ -1386,6 +1386,12 @@ class _CodexRawResponse(_RawResponse):
                 if _tool_call_name(call) is None:
                     raise ValueError("function call has no name")
                 _tool_call_arguments(call)
+            if _codex_native_action_required(prompt) and not calls:
+                raise ProviderError(
+                    provider.name,
+                    ProviderOutcome.CONFIG_ERROR,
+                    "codex response omitted the required native action",
+                )
             model = provider.model
             if isinstance(response, dict) and isinstance(response.get("model"), str):
                 model = response["model"]
@@ -1782,6 +1788,33 @@ def _codex_tools(tools: Any) -> list[dict[str, Any]]:
     return converted
 
 
+_CODEX_AGENT_TOOL_NAMES = frozenset(
+    schema["name"] for schema in TOOL_SCHEMAS if schema["name"] != "run_shell"
+)
+
+
+def _codex_agent_tools(tools: list[dict[str, Any]]) -> bool:
+    """Return whether ``tools`` is Cambium's worker action surface.
+
+    ``run_shell`` is the only permission-dependent schema. The remaining
+    canonical tools are always exposed together by the worker, so exact name
+    matching keeps native control actions scoped to Cambium agent turns rather
+    than every generic Codex request that happens to define a function.
+    """
+    names = frozenset(tool.get("name") for tool in tools)
+    return names in {_CODEX_AGENT_TOOL_NAMES, _CODEX_AGENT_TOOL_NAMES | {"run_shell"}}
+
+
+def _codex_native_action_required(prompt: dict[str, Any]) -> bool:
+    """Return whether this Cambium worker request requires one native action."""
+    tools = _codex_tools(prompt.get("tools"))
+    return bool(
+        tools
+        and _codex_agent_tools(tools)
+        and prompt.get("tool_choice", "required") == "required"
+    )
+
+
 def _codex_request_body(provider: ProviderConfig, prompt: dict[str, Any]) -> dict[str, Any]:
     """Convert a chat-completions prompt to the codex Responses-API request body.
 
@@ -1811,12 +1844,16 @@ def _codex_request_body(provider: ProviderConfig, prompt: dict[str, Any]) -> dic
     if provider.supports_native_tools:
         tools = _codex_tools(prompt.get("tools"))
         if tools:
-            controls = [
-                {**tool, "strict": True}
-                for tool in _codex_tools(list(NATIVE_CONTROL_TOOL_SCHEMAS))
-            ]
-            body["tools"] = [*tools, *controls]
-            body["tool_choice"] = prompt.get("tool_choice", "required")
+            body["tools"] = tools
+            if _codex_agent_tools(tools):
+                controls = [
+                    {**tool, "strict": True}
+                    for tool in _codex_tools(list(NATIVE_CONTROL_TOOL_SCHEMAS))
+                ]
+                body["tools"] = [*tools, *controls]
+                body["tool_choice"] = prompt.get("tool_choice", "required")
+            elif prompt.get("tool_choice") is not None:
+                body["tool_choice"] = prompt["tool_choice"]
     if provider.reasoning_effort:
         body["reasoning"] = {"effort": provider.reasoning_effort}
     return body
