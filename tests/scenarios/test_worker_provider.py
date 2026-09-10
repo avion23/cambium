@@ -1674,6 +1674,6 @@ def test_run_shell_output_deltas_reach_supervisor_and_tui_rows(tmp_path, monkeyp
         assert "┌ Cambium · conversation" not in output
         assert "OPERATOR RAIL" not in output
         assert output.find("delta-") > len(first_frame)
-        assert "✓ done" in output
+        assert "✓ DONE" in output
     finally:
         server.close()

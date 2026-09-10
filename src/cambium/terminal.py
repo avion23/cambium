@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import os
 import re
+import unicodedata
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
 from threading import RLock
 from typing import Any
-
-from rich.cells import cell_len, split_graphemes
 
 SYNCHRONIZED_UPDATE_BEGIN = "\x1b[?2026h"
 SYNCHRONIZED_UPDATE_END = "\x1b[?2026l"
@@ -308,15 +307,42 @@ class SynchronizedOutput:
         return getattr(self.stream, name)
 
 
+def _fallback_cell_width(char: str) -> int:
+    if unicodedata.combining(char) or unicodedata.category(char) == "Cf":
+        return 0
+    return 2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
+
+
+def _cell_len(text: str) -> int:
+    """Use Rich cell metrics when installed without making sanitization depend on Rich."""
+    try:
+        from rich.cells import cell_len
+    except ImportError:
+        return sum(_fallback_cell_width(char) for char in text)
+    return cell_len(text)
+
+
+def _grapheme_spans(text: str) -> list[tuple[int, int, int]]:
+    """Return Rich grapheme spans, with a dependency-light code-point fallback."""
+    try:
+        from rich.cells import split_graphemes
+    except ImportError:
+        return [
+            (index, index + 1, _fallback_cell_width(char))
+            for index, char in enumerate(text)
+        ]
+    return split_graphemes(text)[0]
+
+
 def _cell_width(char: str) -> int:
-    return cell_len(char)
+    return _cell_len(char)
 
 
 def terminal_display_width(value: Any) -> int:
     """Return the terminal-cell width of sanitized single-line plain text."""
 
     text = sanitize_terminal_text(value, single_line=True)
-    return cell_len(text)
+    return _cell_len(text)
 
 
 def clip_terminal_text(value: Any, width: int) -> str:
@@ -325,7 +351,7 @@ def clip_terminal_text(value: Any, width: int) -> str:
     if width <= 0:
         return ""
     text = sanitize_terminal_text(value, single_line=True)
-    if cell_len(text) <= width:
+    if _cell_len(text) <= width:
         return text
 
     ellipsis = "…"
@@ -335,7 +361,7 @@ def clip_terminal_text(value: Any, width: int) -> str:
     limit = width - ellipsis_width
     used = 0
     clipped_end = 0
-    for _start, end, span_width in split_graphemes(text)[0]:
+    for _start, end, span_width in _grapheme_spans(text):
         if used + span_width > limit:
             break
         clipped_end = end
