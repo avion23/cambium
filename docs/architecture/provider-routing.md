@@ -77,9 +77,11 @@ inside its executor thread, so the worker subprocess remains the hard kill
 boundary; the logical call and fallback do not wait for that late transport.
 
 Summaries and child calls pass through the same accounting rather than becoming
-invisible side traffic. A successful fallback moves the task's lane reservation
-to the provider that actually served it; repeated calls do not reserve it again.
-Exact and `inherit` children also reserve the selected provider lane before a
+invisible side traffic. A coding/child call that actually falls back moves that
+task's incumbent to the provider that served it. A provider-neutral CAST summary
+may use a sibling without moving the coding branch's provider/model lease; its
+usage still counts against the serving provider. Exact and `inherit` children
+also reserve the selected provider lane before a
 worker starts: context compatibility is not permission to exceed provider
 capacity. A failed attempt does not move that reservation. Persisted Retry-After
 timestamps expire naturally; a past 429 is not a permanent ban.

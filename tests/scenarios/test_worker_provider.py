@@ -980,13 +980,18 @@ def test_worker_context_reuse_fork_resume_is_byte_exact(tmp_path, monkeypatch) -
             authorizations = list(REQUEST_AUTHORIZATION)
 
         checkpoints = [event for event in events if event["kind"] == "context_checkpoint"]
-        assert len(checkpoints) == 2
+        assert len(checkpoints) == 3
         checkpoint_event = checkpoints[0]["payload"]
         assert checkpoint_event["epoch"] == 1
         checkpoint_ref = checkpoint_event["checkpoint_ref"]
         assert isinstance(checkpoint_ref, str) and checkpoint_ref
         assert checkpoint_ref.startswith(f"{task['task_id']}/")
         assert checkpoint_event["cache_key"]["redacted"] is False
+        assert [(event["task_id"], event["payload"]["epoch"]) for event in checkpoints] == [
+            (task["task_id"], 1),
+            (child_task_id, 2),
+            (task["task_id"], 2),
+        ]
 
         assert checkpoint_path is not None
         assert checkpoint_path.is_file()

@@ -69,7 +69,7 @@ from cambium.merge import MergeSequencer  # noqa: E402
 from cambium.prompts import CODING_AGENT  # noqa: E402
 from cambium.schemas import TOOL_SCHEMAS, validate_tool_call  # noqa: E402
 from cambium.store import EventStore  # noqa: E402
-from cambium.tui_screen import Cockpit, Transcript  # noqa: E402
+from cambium.tui_screen import LinearTimeline, Transcript  # noqa: E402
 from cambium.worker import (  # noqa: E402
     CHECKPOINT_EPOCH_SCHEMA,
     AgentConfig,
@@ -163,7 +163,7 @@ def _measure(
 class _ProfileTty:
     """Discarding TTY stream used to exercise the live renderer.
 
-    ``Cockpit`` only enables its primary-buffer path for a TTY.  Keeping the
+    ``LinearTimeline`` only enables its primary-buffer path for a TTY. Keeping the
     stream write-only prevents terminal output from becoming part of the
     retained-memory measurement while still exercising every write and flush.
     """
@@ -186,7 +186,7 @@ class _ProfileTty:
 def _terminal_size_provider(
     provider: Callable[[tuple[int, int]], os.terminal_size],
 ) -> Any:
-    """Temporarily provide deterministic terminal sizes to ``Cockpit.draw``."""
+    """Temporarily provide deterministic terminal sizes to ``LinearTimeline.draw``."""
     previous = tui_screen.shutil.get_terminal_size
     tui_screen.shutil.get_terminal_size = provider  # type: ignore[assignment]
     try:
@@ -203,7 +203,7 @@ def _measure_retained_memory(
     warmups: int,
     load: str,
 ) -> Measurement:
-    """Measure bytes retained by one long-session timeline and live cockpit."""
+    """Measure bytes retained by one long-session transcript and linear renderer."""
     for _ in range(warmups):
         operation()
     samples: list[float] = []
@@ -764,13 +764,13 @@ def _tui_append_event(transcript: Transcript, index: int) -> None:
 
 
 def _tui_draw(
-    cockpit: Cockpit,
+    timeline: LinearTimeline,
     snapshot: Any,
     transcript: Transcript,
     *,
     activity_line: str = "",
 ) -> None:
-    cockpit.draw(
+    timeline.draw(
         snapshot,
         transcript,
         session_description="session=/tmp/cambium-profile/session-0001",
@@ -785,22 +785,22 @@ def _tui_prime_live(
     snapshot: Any,
     *,
     size_provider: Callable[[tuple[int, int]], os.terminal_size],
-) -> tuple[_ProfileTty, Transcript, Cockpit]:
+) -> tuple[_ProfileTty, Transcript, LinearTimeline]:
     """Replay a long durable session through the production live sink seams."""
     stream = _ProfileTty()
     transcript = Transcript(max_entries=_TUI_RETAINED_ENTRIES)
-    cockpit = Cockpit(stream, enabled=True)
+    timeline = LinearTimeline(stream, enabled=True)
     with _terminal_size_provider(size_provider):
         for index in range(_TUI_DURABLE_EVENTS):
             transcript.observe_event(_tui_event(index))
             _tui_draw(
-                cockpit,
+                timeline,
                 snapshot,
                 transcript,
                 activity_line=f"▸ STREAMING · {index + 1}s",
             )
     transcript.finish_stream()
-    return stream, transcript, cockpit
+    return stream, transcript, timeline
 
 
 def _tui_measurements(*, iterations: int, warmups: int) -> list[Measurement]:
@@ -813,7 +813,7 @@ def _tui_measurements(*, iterations: int, warmups: int) -> list[Measurement]:
     # Prime one live session through the same observe/draw sequence used by
     # ``cambium.tui``.  Reusing this initialized timeline keeps the benchmark
     # modest while every measured seam still runs after thousands of events.
-    _stream, transcript, cockpit = _tui_prime_live(snapshot, size_provider=fixed_size)
+    _stream, transcript, timeline = _tui_prime_live(snapshot, size_provider=fixed_size)
     if len(transcript.entries) != _TUI_RETAINED_ENTRIES:
         raise AssertionError(
             "long-session fixture did not reach its bounded transcript cap: "
@@ -836,7 +836,7 @@ def _tui_measurements(*, iterations: int, warmups: int) -> list[Measurement]:
         event_index[0] += 1
         _tui_append_event(transcript, index)
         _tui_draw(
-            cockpit,
+            timeline,
             snapshot,
             transcript,
             activity_line=f"▸ STREAMING · {index + 1}s",
@@ -861,7 +861,7 @@ def _tui_measurements(*, iterations: int, warmups: int) -> list[Measurement]:
     def status_draw() -> None:
         index = status_index[0]
         status_index[0] += 1
-        cockpit.draw_activity(f"◌ THINKING · {index + 1}s")
+        timeline.draw_activity(f"◌ THINKING · {index + 1}s")
 
     with _terminal_size_provider(fixed_size):
         measurements.append(
@@ -892,7 +892,7 @@ def _tui_measurements(*, iterations: int, warmups: int) -> list[Measurement]:
             _measure(
                 "TUI live resize",
                 lambda: _tui_draw(
-                    cockpit,
+                    timeline,
                     snapshot,
                     transcript,
                     activity_line="◌ THINKING · 2s",
@@ -907,16 +907,16 @@ def _tui_measurements(*, iterations: int, warmups: int) -> list[Measurement]:
         )
 
     # Measure the retained bookkeeping owned by the production timeline and
-    # cockpit after a long session.  The operation returns both objects so the
+    # timeline after a long session. The operation returns both objects so the
     # traced current bytes include their live state rather than only temporary
     # allocations made by one draw.  The full per-event replay above is not
     # traced: tracing every allocation in thousands of draws obscures this
     # retained-bookkeeping number and makes the profile needlessly slow.
-    def retained_bookkeeping() -> tuple[Transcript, Cockpit]:
+    def retained_bookkeeping() -> tuple[Transcript, LinearTimeline]:
         retained_transcript = _tui_transcript()
-        retained_cockpit = Cockpit(_ProfileTty(), enabled=True)
-        _tui_draw(retained_cockpit, snapshot, retained_transcript)
-        return retained_transcript, retained_cockpit
+        retained_timeline = LinearTimeline(_ProfileTty(), enabled=True)
+        _tui_draw(retained_timeline, snapshot, retained_transcript)
+        return retained_transcript, retained_timeline
 
     with _terminal_size_provider(fixed_size):
         measurements.append(
@@ -927,7 +927,7 @@ def _tui_measurements(*, iterations: int, warmups: int) -> list[Measurement]:
                 warmups=0,
                 load=(
                     f"{_TUI_DURABLE_EVENTS:,} durable tool/output/child/context events processed; "
-                    f"{_TUI_RETAINED_ENTRIES} retained entries; live Cockpit state; "
+                    f"{_TUI_RETAINED_ENTRIES} retained entries; live timeline state; "
                     "one traced bookkeeping replay; 120x40"
                 ),
             )
@@ -1045,7 +1045,7 @@ def _mailbox_measurement(*, iterations: int, warmups: int) -> Measurement:
 def _cprofile_hot_paths(prompt: dict[str, Any], schema: dict[str, Any], snapshot: Any) -> None:
     """Run CPU-only paths for a compact cProfile view after wall timing."""
     transcript = _tui_transcript()
-    cockpit = Cockpit(_ProfileTty(), enabled=True)
+    timeline = LinearTimeline(_ProfileTty(), enabled=True)
     provider = ProviderConfig(
         name="profile-codex",
         tier=ProviderTier.STRONG,
@@ -1067,7 +1067,7 @@ def _cprofile_hot_paths(prompt: dict[str, Any], schema: dict[str, Any], snapshot
             _codex_request_body(provider, prompt)
             _canonical_json_bytes(_checkpoint_fixture(prompt))
             validate_tool_call(schema, call)
-            _tui_draw(cockpit, snapshot, transcript)
+            _tui_draw(timeline, snapshot, transcript)
         profile.disable()
     output = io.StringIO()
     pstats.Stats(profile, stream=output).strip_dirs().sort_stats("cumulative").print_stats(5)

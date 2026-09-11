@@ -463,6 +463,7 @@ def test_tui_model_preference_refusals_name_provider_config(monkeypatch, tmp_pat
 def test_resume_reselects_healthy_provider_and_reconciles_model(
     monkeypatch, tmp_path: Path
 ) -> None:
+    monkeypatch.setenv("TERM", "xterm-256color")
     provider_config = _two_provider_config(tmp_path / "providers.json")
     config = OneShotConfig(
         repo=tmp_path,
@@ -681,6 +682,7 @@ def test_tui_multiline_input() -> None:
 
 
 def test_tty_tui_reuses_checkpoint_on_second_prompt(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("TERM", "xterm-256color")
     seen_context_forks: list[dict[str, object] | None] = []
 
     async def fake_run(self, turn, *, on_event=None):
@@ -793,6 +795,7 @@ def test_restore_history_folds_completed_current_branch(monkeypatch, tmp_path: P
 def test_tui_reconnects_to_explicit_durable_interactive_session(
     tmp_path: Path, monkeypatch, columns: int
 ) -> None:
+    monkeypatch.setenv("TERM", "xterm-256color")
     monkeypatch.setenv("COLUMNS", str(columns))
     monkeypatch.setenv("LINES", "24")
     root = default_session_root(tmp_path) / "prior"

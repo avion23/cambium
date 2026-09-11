@@ -23,15 +23,18 @@ The interactive TUI is one chronological timeline in the terminal's normal
 buffer. User messages, Cambium responses, child-agent activity, useful tool
 output, failures, and inspection-command results all append to that timeline.
 The terminal owns scrollback; Cambium does not maintain a second scrollable
-conversation viewport or switch to an alternate screen.
+conversation viewport or switch to an alternate screen. Rendered cells,
+viewport positions, and screenshots are never session data and are never
+persisted; replay starts from durable events and response chunks only.
 
 Only two rows are transient: one compact status row and the input row. The
 status row names the current owner/resource first (provider wait, thinking,
 streaming, tool, children, cooldown), then provider/model and compact usage when
 space permits. `/detail` adds more metadata to this same row; it does not open a
 pane. `/agents`, `/context`, `/quota`, `/status`, and `/inspect` append explicit
-snapshots to the timeline on demand instead of permanently consuming columns or
-rows.
+event-derived data projections to the timeline on demand instead of permanently
+consuming columns or rows. `SessionSnapshot` is an immutable observability read
+model, not a saved screen or viewport.
 
 ### Timeline event policy
 
@@ -193,10 +196,10 @@ follow-up tasks and check events plus Git artifacts. A canned provider is useful
 for deterministic rendering, not proof that the agent can code.
 
 The overhead profiler primes a long session through the production event
-projection and `Cockpit`/`Transcript` timeline path. It then measures one
-durable event draw, one status-only draw, resize, and retained timeline
-bookkeeping separately. Those samples measure incremental live work after the
-retained history exists; they are not full-history snapshot-render timings.
+projection and `LinearTimeline`/`Transcript` path. It then measures one durable
+event draw, one status-only draw, resize, and retained timeline bookkeeping
+separately. Those samples measure incremental live work after retained history
+exists; they never persist or replay a rendered screen image.
 
 Run focused checks before broader changes:
 
