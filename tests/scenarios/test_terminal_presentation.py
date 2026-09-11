@@ -34,25 +34,20 @@ def test_cursor_controls_require_a_capable_terminal_but_ignore_no_color(
     assert not supports_cursor_controls(io.StringIO())
 
 
-def test_dashboard_screen_mode_uses_terminal_capability_not_color(monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("TERM", "xterm-256color")
-    monkeypatch.setenv("NO_COLOR", "1")
-    capable_stream = _Tty()
-    capable = AnsiDashboard(tmp_path, stream=capable_stream)
+def test_dashboard_appends_frames_without_terminal_controls(tmp_path) -> None:
+    stream = io.StringIO()
+    dashboard = AnsiDashboard(tmp_path, stream=stream)
+    snapshot = snapshot_from_events([])
 
-    assert capable.enabled
-    with capable:
-        pass
-    assert capable_stream.getvalue() == "\x1b[?1049h\x1b[?25l\x1b[?25h\x1b[?1049l"
+    with dashboard:
+        dashboard.draw(snapshot)
+    first = stream.getvalue()
+    dashboard.draw(snapshot)
 
-    monkeypatch.setenv("TERM", "dumb")
-    dumb_stream = _Tty()
-    dumb = AnsiDashboard(tmp_path, stream=dumb_stream)
-
-    assert not dumb.enabled
-    with dumb:
-        pass
-    assert dumb_stream.getvalue() == ""
+    assert dashboard.enabled
+    assert first.endswith("\n")
+    assert "\x1b" not in first
+    assert stream.getvalue() == first * 2
 
 
 def test_plain_text_clipping_and_padding_use_terminal_cells() -> None:

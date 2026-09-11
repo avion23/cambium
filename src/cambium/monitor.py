@@ -13,12 +13,11 @@ import json
 import math
 import os
 import shutil
-import signal
 import sys
 from collections.abc import Mapping
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, TextIO
+from typing import TextIO
 
 from .doctor import CacheProviderStats, cache_provider_status, record_cache_event
 from .observability import (
@@ -32,13 +31,8 @@ from .terminal import (
     clip_terminal_text,
     pad_terminal_text,
     sanitize_terminal_text,
-    supports_cursor_controls,
     terminal_display_width,
 )
-
-_ALT_ENTER = "\x1b[?1049h\x1b[?25l"
-_ALT_EXIT = "\x1b[?25h\x1b[?1049l"
-_HOME_CLEAR = "\x1b[H\x1b[2J"
 
 
 def _human_count(value: int) -> str:
@@ -182,7 +176,7 @@ def render_dashboard(
     height: int = 40,
     cache_stats: Mapping[str, CacheProviderStats] | None = None,
 ) -> list[str]:
-    """Render one full dashboard frame without terminal control sequences."""
+    """Render one dashboard snapshot as lines without terminal controls."""
 
     width = max(60, width)
     height = max(18, height)
@@ -310,7 +304,7 @@ def snapshot_json(snapshot: SessionSnapshot) -> str:
 
 
 class AnsiDashboard:
-    """Small alternate-screen renderer for an already-owned event stream."""
+    """Append dashboard snapshots to the terminal's normal output buffer."""
 
     def __init__(
         self,
@@ -321,54 +315,9 @@ class AnsiDashboard:
     ) -> None:
         self.session_dir = Path(session_dir)
         self.stream = sys.stdout if stream is None else stream
-        self.enabled = enabled and supports_cursor_controls(self.stream)
-        self._entered = False
-        self._previous_sigterm_handler: Any = None
-        self._sigterm_handler_installed = False
-
-    def _install_sigterm_handler(self) -> None:
-        try:
-            self._previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
-            signal.signal(signal.SIGTERM, self._handle_sigterm)
-        except (OSError, ValueError):
-            self._previous_sigterm_handler = None
-        else:
-            self._sigterm_handler_installed = True
-
-    def _restore_sigterm_handler(self) -> None:
-        if not self._sigterm_handler_installed:
-            return
-        previous = self._previous_sigterm_handler
-        try:
-            signal.signal(signal.SIGTERM, previous)
-        finally:
-            self._sigterm_handler_installed = False
-            self._previous_sigterm_handler = None
-
-    def _leave(self) -> None:
-        if self._entered:
-            try:
-                self.stream.write(_ALT_EXIT)
-                self.stream.flush()
-            finally:
-                self._entered = False
-        self._restore_sigterm_handler()
-
-    def _handle_sigterm(self, signum: int, frame: Any) -> None:
-        del frame
-        self._leave()
-        raise SystemExit(128 + signum)
+        self.enabled = bool(enabled)
 
     def __enter__(self) -> AnsiDashboard:
-        if self.enabled:
-            self._install_sigterm_handler()
-            self._entered = True
-            try:
-                self.stream.write(_ALT_ENTER)
-                self.stream.flush()
-            except BaseException:
-                self._leave()
-                raise
         return self
 
     def draw(
@@ -387,13 +336,11 @@ class AnsiDashboard:
             height=size.lines,
             cache_stats=cache_stats,
         )
-        self.stream.write(_HOME_CLEAR)
-        self.stream.write("\n".join(lines))
+        self.stream.write("\n".join(lines) + "\n")
         self.stream.flush()
 
     def __exit__(self, exc_type, exc, tb) -> None:
         del exc_type, exc, tb
-        self._leave()
 
 
 def _latest_session(repo: Path | None) -> Path | None:
@@ -463,6 +410,9 @@ async def monitor_session_async(
     event_cursor = EventCursor()
     cache_stats: dict[str, CacheProviderStats] = {}
     dashboard = AnsiDashboard(session, stream=out, enabled=not once and not json_output)
+    # Normal-buffer output keeps the initial view and each new event; it does
+    # not append unchanged screen snapshots while waiting for the next event.
+    rendered = False
     try:
         with dashboard:
             while True:
@@ -475,21 +425,19 @@ async def monitor_session_async(
                     out.write(snapshot_json(snapshot) + "\n")
                     out.flush()
                     return 0
-                frame = (
-                    "\n".join(
-                        render_dashboard(snapshot, session_dir=session, cache_stats=cache_stats)
-                    )
-                    + "\n"
-                )
                 if once:
+                    frame = (
+                        "\n".join(
+                            render_dashboard(snapshot, session_dir=session, cache_stats=cache_stats)
+                        )
+                        + "\n"
+                    )
                     out.write(frame)
                     out.flush()
                     return 0
-                if dashboard.enabled:
+                if events or not rendered:
                     dashboard.draw(snapshot, cache_stats=cache_stats)
-                else:
-                    out.write(frame)
-                    out.flush()
+                    rendered = True
                 if (
                     snapshot.session_status in {"ended", "cancelled", "failed"}
                     and snapshot.active_agents == 0
