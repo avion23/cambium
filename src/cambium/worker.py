@@ -6364,6 +6364,8 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
             semantic_trunk, semantic_tail = partition_summary_trunk(semantic_prompt["messages"])
             base_messages = tuple(copy.deepcopy(semantic_trunk))
             context_continuation = copy.deepcopy(semantic_tail)
+            epoch_count = semantic_checkpoint.epoch
+            usage_epoch = semantic_checkpoint.epoch
             usage_fork_of = config.summary_trunk_ref
             transcript = _sync_context_transcript(base_messages, context_continuation, transcript)
         except (ContextForkError, SummaryTrunkError) as exc:
@@ -6998,7 +7000,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                 if base_messages is not None:
                     terminal_messages = copy.deepcopy(list(base_messages))
                     terminal_suffix = copy.deepcopy(context_continuation)
-                if config.context_reuse and usage_fork_of is None:
+                if config.context_reuse:
                     epoch_count += 1
                     terminal_epoch = {
                         "turn": turn,

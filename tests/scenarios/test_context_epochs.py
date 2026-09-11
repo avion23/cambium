@@ -1165,6 +1165,9 @@ def test_fork_reuses_epoch_prefix(tmp_path: Path) -> None:
     assert "context_fork_skipped" not in kinds
     usage = [m for m in writer.messages() if m["type"] == "usage_event"]
     assert usage and usage[0]["fork_of"] == checkpoint.checkpoint_ref
+    terminal = [m for m in writer.messages() if m["type"] == "context_checkpoint"]
+    assert terminal and terminal[-1]["epoch"] == checkpoint.epoch + 1
+    assert terminal[-1]["checkpoint_ref"] != checkpoint.checkpoint_ref
 
 
 def test_fork_fallback_reports_skip(tmp_path: Path) -> None:
@@ -1362,6 +1365,15 @@ def test_redacted_interactive_continuation_reuses_semantic_summary_without_cache
     assert "***" in prompt_text
     usage = [message for message in writer.messages() if message["type"] == "usage_event"]
     assert usage and all(message.get("provider_cache_hit") is not True for message in usage)
+    terminal = [message for message in writer.messages() if message["type"] == "context_checkpoint"]
+    assert terminal and terminal[-1]["epoch"] == persisted.epoch + 1
+    next_checkpoint = worker._load_epoch_checkpoint(
+        continuation_config,
+        terminal[-1]["checkpoint_ref"],
+        expect_task_id=True,
+    )
+    assert next_checkpoint.cache_key.provider == "loopback-provider"
+    assert "continued" in json.dumps(next_checkpoint.full_messages)
 
 
 def test_invalid_context_checkpoint_fields_matrix() -> None:
