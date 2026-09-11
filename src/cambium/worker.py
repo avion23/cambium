@@ -8181,35 +8181,6 @@ def _bounded_result_strings(value: Any) -> list[str]:
     ]
 
 
-def _bounded_result_provider_metadata(value: Any) -> dict[str, Any] | None:
-    """Keep provider metadata to its known scalar/count fields and caps."""
-    if not isinstance(value, Mapping):
-        return None
-    metadata: dict[str, Any] = {}
-    for field in ("provider", "model", "fell_back_from"):
-        item = value.get(field)
-        if isinstance(item, str) and item:
-            metadata[field] = _cap_utf8(item, MAX_ENVELOPE_FIELD_CHARS)
-    usage = value.get("usage")
-    if isinstance(usage, Mapping):
-        bounded_usage: dict[str, int | float] = {}
-        for key in sorted(_USAGE_COUNT_FIELDS):
-            item = usage.get(key)
-            if _valid_usage_count(item) and (
-                not isinstance(item, int) or item <= MAX_RESPONSE_TOTAL_BYTES
-            ):
-                bounded_usage[key] = item
-        metadata["usage"] = bounded_usage
-    latency = value.get("latency_s")
-    if (
-        type(latency) in (int, float)
-        and not isinstance(latency, bool)
-        and math.isfinite(float(latency))
-    ):
-        metadata["latency_s"] = max(0.0, float(latency))
-    return metadata or None
-
-
 async def _emit_result_envelope(writer: asyncio.StreamWriter, outcome: dict[str, Any]) -> None:
     status = outcome["status"]
     raw_diff = outcome.get("diff", "")
@@ -8264,8 +8235,8 @@ async def _emit_result_envelope(writer: asyncio.StreamWriter, outcome: dict[str,
         envelope["salvage_ref"] = _cap_utf8(salvage_ref, MAX_ENVELOPE_FIELD_CHARS)
     if status == TaskStatus.SUCCEEDED.value or "requires_commit" in outcome:
         envelope["requires_commit"] = bool(outcome.get("requires_commit", False))
-    provider_metadata = _bounded_result_provider_metadata(outcome.get("provider_metadata"))
-    if provider_metadata is not None:
+    provider_metadata = outcome.get("provider_metadata")
+    if isinstance(provider_metadata, dict):
         envelope["provider_metadata"] = provider_metadata
     terminal_action = outcome.get("terminal_action")
     if isinstance(terminal_action, Mapping):

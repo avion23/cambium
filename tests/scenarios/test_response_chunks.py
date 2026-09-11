@@ -176,11 +176,6 @@ def test_worker_result_envelope_bounds_non_response_fields(
         "diff": "d" * (worker.MAX_DIFF_BYTES * 4),
         "summary": "s" * (worker.MAX_SUMMARY_CHARS * 2),
         "failure_reason": "r" * (worker.MAX_ENVELOPE_FIELD_CHARS * 2),
-        "provider_metadata": {
-            "provider": "provider-" + long_item,
-            "model": "model-" + long_item,
-            "usage": {"total_tokens": worker.MAX_RESPONSE_TOTAL_BYTES + 1},
-        },
     }
 
     asyncio.run(worker._emit_result_envelope(None, outcome))
@@ -195,7 +190,6 @@ def test_worker_result_envelope_bounds_non_response_fields(
     assert len(result["diff"].encode()) <= worker.MAX_DIFF_BYTES + 32
     assert len(result["summary"].encode()) <= worker.MAX_SUMMARY_CHARS
     assert len(result["failure_reason"].encode()) <= worker.MAX_ENVELOPE_FIELD_CHARS
-    assert result["provider_metadata"]["usage"] == {}
 
 
 def test_terminal_outcome_cancellation_keeps_prefix_and_never_inlines_response(
