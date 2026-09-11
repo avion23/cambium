@@ -24,7 +24,13 @@ from typing import Any, cast
 import pytest
 
 from cambium import tools, worker
-from cambium.diffundo import ProviderTier, prompt_prefix_bytes, validate_prompt_structure
+from cambium.diffundo import (
+    ProviderError,
+    ProviderOutcome,
+    ProviderTier,
+    prompt_prefix_bytes,
+    validate_prompt_structure,
+)
 from cambium.fencing import write_generation
 
 
@@ -581,6 +587,44 @@ def test_summary_fallback_does_not_move_coding_lease_for_later_agent_call(
         ("dead-primary", "dead-model"),
         ("dead-primary", "dead-model"),
     ]
+
+
+def test_attempt_failure_usage_event_preserves_provider_state() -> None:
+    class _Router:
+        def declared_model(self, name: str) -> str:
+            assert name == "dead-provider"
+            return "dead-model"
+
+        def status(self, name: str) -> SimpleNamespace:
+            assert name == "dead-provider"
+            return SimpleNamespace(value="cooldown")
+
+    failures = [
+        ProviderError(
+            "dead-provider",
+            ProviderOutcome.QUOTA,
+            "HTTP 429 rate limit",
+            retry_after_s=60.0,
+            request_rate_status="cooldown",
+        )
+    ]
+
+    events = worker._attempt_failure_usage_events(
+        failures,
+        turn=3,
+        router=cast(Any, _Router()),
+        prompt={"messages": [{"role": "system", "content": "stable"}]},
+        call_kind="summary",
+    )
+
+    assert len(events) == 1
+    event = events[0]
+    assert event["provider"] == "dead-provider"
+    assert event["model"] == "dead-model"
+    assert event["call_kind"] == "summary"
+    assert event["failure_reason"].startswith("quota:")
+    assert event["retry_after_s"] == 60.0
+    assert event["request_rate_status"] == "cooldown"
 
 
 def test_agent_call_receives_remaining_wall_cap(tmp_path: Path) -> None:

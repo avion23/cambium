@@ -1821,6 +1821,7 @@ async def _call_provider(
     progress: AgentProgress,
     *args: Any,
     remaining_wall_s: float | None = None,
+    provider_errors: list[ProviderError] | None = None,
     **kwargs: Any,
 ) -> Any:
     progress.begin_provider_call()
@@ -1830,6 +1831,9 @@ async def _call_provider(
     status_keyword = _callback_keyword(caller, "on_status")
     if status_keyword is not None:
         kwargs[status_keyword] = _progress_status_callback(progress)
+    provider_error_keyword = _callback_keyword(caller, "on_provider_error")
+    if provider_error_keyword is not None and provider_errors is not None:
+        kwargs[provider_error_keyword] = provider_errors.append
     max_budget_keyword = _callback_keyword(caller, "max_call_budget_s")
     if max_budget_keyword is not None and remaining_wall_s is not None:
         kwargs[max_budget_keyword] = remaining_wall_s
@@ -4135,8 +4139,12 @@ def _failure_usage_event(
     retry_after_s: float | None = None
     request_rate_status: str | None = None
     account_quota_owner: str | None = None
-    if isinstance(exc, AllProvidersFailed) and isinstance(exc.last_error, ProviderError):
+    error: ProviderError | None = None
+    if isinstance(exc, ProviderError):
+        error = exc
+    elif isinstance(exc, AllProvidersFailed) and isinstance(exc.last_error, ProviderError):
         error = exc.last_error
+    if error is not None:
         provider = error.provider
         retry_after_s = error.retry_after_s
         request_rate_status = error.request_rate_status
@@ -4145,6 +4153,12 @@ def _failure_usage_event(
             failure_reason = f"{error.outcome.value}: {error.message}"
     if provider is not None:
         event["provider"] = provider
+        try:
+            declared_model = router.declared_model(provider)
+        except Exception:
+            declared_model = ""
+        if declared_model:
+            event["model"] = declared_model
         if request_rate_status is None:
             try:
                 request_rate_status = router.status(provider).value
@@ -4161,6 +4175,31 @@ def _failure_usage_event(
         event["prompt_prefix_bytes"] = prefix_bytes
     event["failure_reason"] = _cap_utf8(failure_reason, 512)
     return event
+
+
+def _attempt_failure_usage_events(
+    failures: Sequence[ProviderError],
+    *,
+    turn: int,
+    router: Diffundo,
+    prompt: dict[str, Any],
+    call_kind: str,
+    situation_provenance: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Durable provider failures observed during one router call."""
+    return [
+        _failure_usage_event(
+            failure,
+            turn=turn,
+            model=None,
+            router=router,
+            prompt=prompt,
+            call_kind=call_kind,
+            situation_provenance=situation_provenance,
+        )
+        for failure in failures
+        if not failure.probe_already_in_flight
+    ]
 
 
 async def _emit_usage_event(
@@ -5798,6 +5837,7 @@ async def _bound_context_continuation(
         summary_entry: SummaryEntry | None = None
         for summary_attempt in range(2):
             sent_summary_prompt = copy.deepcopy(summary_prompt)
+            provider_errors: list[ProviderError] = []
             remaining_wall_s = wall_deadline - time.monotonic()
             if remaining_wall_s <= 0:
                 raise ContextForkError("wall budget exceeded during summary flush")
@@ -5813,6 +5853,7 @@ async def _bound_context_continuation(
                         model=model,
                         budget_usd=budget_usd,
                         remaining_wall_s=remaining_wall_s,
+                        provider_errors=provider_errors,
                         # Summary entries are provider-neutral semantic state;
                         # unlike the agent transcript, they may be generated
                         # by a configured sibling when the pinned endpoint is
@@ -5828,13 +5869,19 @@ async def _bound_context_continuation(
                         model=model,
                         budget_usd=budget_usd,
                         remaining_wall_s=remaining_wall_s,
+                        provider_errors=provider_errors,
                         allow_model_substitution=True,
                     )
             except Exception as exc:
-                if writer is not None:
-                    await _emit_usage_event(
-                        writer,
-                        config,
+                failure_events = _attempt_failure_usage_events(
+                    provider_errors,
+                    turn=turn,
+                    router=router,
+                    prompt=sent_summary_prompt,
+                    call_kind="summary",
+                )
+                if not failure_events:
+                    failure_events = [
                         _failure_usage_event(
                             exc,
                             turn=turn,
@@ -5842,10 +5889,17 @@ async def _bound_context_continuation(
                             router=router,
                             prompt=sent_summary_prompt,
                             call_kind="summary",
-                        ),
-                        epoch=usage_epoch,
-                        fork_of=usage_fork_of,
-                    )
+                        )
+                    ]
+                if writer is not None:
+                    for failure_event in failure_events:
+                        await _emit_usage_event(
+                            writer,
+                            config,
+                            failure_event,
+                            epoch=usage_epoch,
+                            fork_of=usage_fork_of,
+                        )
                 content_flagged = _is_content_flagged(exc)
                 if content_flagged and summary_attempt == 0:
                     summary_prompt = _transform_content_flagged_summary_prompt(
@@ -5865,6 +5919,21 @@ async def _bound_context_continuation(
                         f"{_cap_utf8(inner_message, MAX_ENVELOPE_FIELD_CHARS)}"
                     )
                 raise ContextForkError(f"summary provider call failed: {detail}") from exc
+            if writer is not None:
+                for failure_event in _attempt_failure_usage_events(
+                    provider_errors,
+                    turn=turn,
+                    router=router,
+                    prompt=sent_summary_prompt,
+                    call_kind="summary",
+                ):
+                    await _emit_usage_event(
+                        writer,
+                        config,
+                        failure_event,
+                        epoch=usage_epoch,
+                        fork_of=usage_fork_of,
+                    )
             try:
                 if summary_result is None:  # narrowing aid: captured by closures below
                     raise ContextForkError("summary provider call returned no result")
@@ -6644,6 +6713,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                     cumulative_usage,
                     transcript,
                 )
+            provider_errors: list[ProviderError] = []
             try:
                 result = await _call_provider(
                     router.call,
@@ -6653,17 +6723,29 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                     model=model,
                     budget_usd=budget_usd,
                     remaining_wall_s=remaining_wall_s,
+                    provider_errors=provider_errors,
                 )
             except Exception as exc:
-                failure_event = _failure_usage_event(
-                    exc,
+                failure_events = _attempt_failure_usage_events(
+                    provider_errors,
                     turn=turn,
-                    model=model,
                     router=router,
                     prompt=sent_prompt,
                     call_kind="agent",
                     situation_provenance=situation_provenance,
                 )
+                if not failure_events:
+                    failure_events = [
+                        _failure_usage_event(
+                            exc,
+                            turn=turn,
+                            model=model,
+                            router=router,
+                            prompt=sent_prompt,
+                            call_kind="agent",
+                            situation_provenance=situation_provenance,
+                        )
+                    ]
                 budget_failure = final_synthesis_call and budget_new_tokens >= soft_cap
                 wall_failure = time.monotonic() >= wall_deadline
                 failure_reason = (
@@ -6673,27 +6755,22 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                     if budget_failure
                     else _provider_call_failure_reason(exc)
                 )
-                if final_synthesis_call:
-                    failure_event["failure_reason"] = _phase_failure(
-                        failure_reason
-                        if budget_failure
-                        else str(failure_event.get("failure_reason", "provider call failed")),
-                        final_synthesis=True,
-                    )
                 if writer is not None:
-                    await _emit_usage_event(
-                        writer,
-                        config,
-                        failure_event,
-                        epoch=usage_epoch,
-                        fork_of=usage_fork_of,
+                    for durable_failure in failure_events:
+                        await _emit_usage_event(
+                            writer,
+                            config,
+                            durable_failure,
+                            epoch=usage_epoch,
+                            fork_of=usage_fork_of,
+                        )
+                for durable_failure in failure_events:
+                    _append_situation_event(
+                        situation_events,
+                        "usage_event",
+                        config.task_id,
+                        **durable_failure,
                     )
-                _append_situation_event(
-                    situation_events,
-                    "usage_event",
-                    config.task_id,
-                    **failure_event,
-                )
                 return _loop_result(
                     outcome,
                     "failed",
@@ -6771,7 +6848,23 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                     cumulative_usage,
                     transcript,
                 )
+            attempt_failure_events = _attempt_failure_usage_events(
+                provider_errors,
+                turn=turn,
+                router=router,
+                prompt=sent_prompt,
+                call_kind="agent",
+                situation_provenance=situation_provenance,
+            )
             if writer is not None:
+                for failure_event in attempt_failure_events:
+                    await _emit_usage_event(
+                        writer,
+                        config,
+                        failure_event,
+                        epoch=usage_epoch,
+                        fork_of=usage_fork_of,
+                    )
                 await _emit_usage_event(
                     writer,
                     config,
@@ -6784,6 +6877,13 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                     ),
                     epoch=usage_epoch,
                     fork_of=usage_fork_of,
+                )
+            for failure_event in attempt_failure_events:
+                _append_situation_event(
+                    situation_events,
+                    "usage_event",
+                    config.task_id,
+                    **failure_event,
                 )
             _record_situation_usage(
                 situation_events,

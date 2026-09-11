@@ -248,6 +248,44 @@ def test_summary_serving_provider_does_not_move_coding_reservation(tmp_path):
     asyncio.run(exercise())
 
 
+def test_generation_init_carries_durable_provider_blocks(tmp_path):
+    store = DebtStore(tmp_path / "debt.json")
+    store.record({"provider": "auth-dead", "failure_reason": "auth_error: credential rejected"})
+    store.record(
+        {
+            "provider": "cooling",
+            "failure_reason": "quota: HTTP 429",
+            "request_rate_status": "cooldown",
+            "retry_after_s": 60.0,
+        }
+    )
+    runtime = _Runtime(tmp_path, None, debt_store=store)
+    spec = {
+        "task_id": "task",
+        "task": "test",
+        "repo": str(tmp_path),
+        "worktree_path": str(tmp_path / "wt"),
+        "branch": "task",
+        "base_commit": "a" * 40,
+    }
+
+    _request_id, init = runtime._build_generation_init_message(
+        spec,
+        tmp_path / "wt",
+        "task",
+        1,
+        15.0,
+        90.0,
+        120.0,
+    )
+
+    auth = init["debt"]["auth-dead"]
+    assert auth["disable_reason"] == "auth_error: credential rejected"
+    assert isinstance(auth["disable_at"], float)
+    cooling = init["debt"]["cooling"]
+    assert cooling["retry_at"] > time.time()
+
+
 def test_busy_lane_queues_until_release_without_starting_another_worker(tmp_path):
     config = tmp_path / "providers.json"
     config.write_text(

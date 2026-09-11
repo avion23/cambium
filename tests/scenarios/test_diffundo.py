@@ -407,12 +407,14 @@ def test_cascade_falls_through_500_to_next_provider() -> None:
         )
     )
     statuses: list[dict[str, Any]] = []
+    provider_errors: list[ProviderError] = []
     try:
         result = asyncio.run(
             router.call(
                 ProviderTier.FAST,
                 PROMPT,
                 on_status=lambda event: statuses.append(dict(event)),
+                on_provider_error=provider_errors.append,
             )
         )
         assert result.provider == "p_good"
@@ -424,6 +426,9 @@ def test_cascade_falls_through_500_to_next_provider() -> None:
         assert result.request_rate_status == "available"
         assert result.retry_after_s is None
         assert result.account_quota_owner is None
+        assert len(provider_errors) == 1
+        assert provider_errors[0].provider == "p_bad"
+        assert provider_errors[0].outcome is ProviderOutcome.ERROR
         assert [(event["kind"], event["provider"]) for event in statuses] == [
             ("provider_attempt", "p_bad"),
             ("provider_failed", "p_bad"),

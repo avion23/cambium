@@ -1081,6 +1081,19 @@ def _notify_observer(
         pass
 
 
+def _notify_provider_error(
+    callback: Callable[[ProviderError], None] | None,
+    error: ProviderError,
+) -> None:
+    """Keep provider-error observers outside provider call correctness."""
+    if callback is None:
+        return
+    try:
+        callback(error)
+    except Exception:
+        pass
+
+
 def _read_provider_sse(
     response: Any,
     provider: str,
@@ -2790,6 +2803,7 @@ class Diffundo:
         max_call_budget_s: float | None = None,
         on_delta: Callable[[str, str], None] | None = None,
         on_status: Callable[[Mapping[str, Any]], None] | None = None,
+        on_provider_error: Callable[[ProviderError], None] | None = None,
     ) -> CallResult:
         """Ordered cascade over tier-matching providers (arch §9.2).
 
@@ -2805,6 +2819,8 @@ class Diffundo:
         monitor wakes it (D8f); if nothing recovers within the bounded pause
         window, raises ``AllProvidersFailed``. ``max_call_budget_s`` can impose
         an outer cap without extending the configured logical budget.
+        ``on_provider_error`` observes each real attempted provider failure;
+        probe-admission races are excluded and observer errors never affect routing.
         """
         validate_prompt_structure(prompt)
         self._consume_summary_auth_deaths()
@@ -2901,6 +2917,7 @@ class Diffundo:
                     if exc.probe_already_in_flight:
                         probe_rejected = True
                         continue
+                    _notify_provider_error(on_provider_error, exc)
                     lease = self._provider_lease
                     lease_matches_provider = (
                         lease is not None
@@ -2999,6 +3016,7 @@ class Diffundo:
         max_call_budget_s: float | None = None,
         on_delta: Callable[[str, str], None] | None = None,
         on_status: Callable[[Mapping[str, Any]], None] | None = None,
+        on_provider_error: Callable[[ProviderError], None] | None = None,
     ) -> CallResult:
         """Run a semantic summary with extra provider response headroom.
 
@@ -3011,7 +3029,8 @@ class Diffundo:
         quota accounting and transport seams remain shared. A caller-supplied
         maximum acts as an upper bound so a worker task wall deadline can cap
         the extra summary headroom without removing it when the wall budget is
-        ample.
+        ample. Provider-error observation remains accounting-only and cannot
+        rebind the coding branch.
         """
         summary_router = self._summary_router()
         with self._all_provider_failure_lock:
@@ -3028,6 +3047,7 @@ class Diffundo:
                 max_call_budget_s=max_call_budget_s,
                 on_delta=on_delta,
                 on_status=on_status,
+                on_provider_error=on_provider_error,
             )
         finally:
             # The counter is a cross-call circuit safeguard. Propagate only

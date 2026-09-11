@@ -6407,16 +6407,23 @@ class _Runtime:
         if self._debt_store is not None:
             debt = self._debt_store.as_mapping()
             if debt:
-                init_msg["debt"] = {
-                    name: {
+                worker_debt: dict[str, dict[str, Any]] = {}
+                for name, entry in debt.items():
+                    values: dict[str, Any] = {
                         "requests": entry.requests,
                         "cache_hit_count": entry.cache_hit_count,
                         "latency_total_s": entry.latency_total_s,
                         "latency_count": entry.latency_count,
                         "last_seen": entry.last_seen,
                     }
-                    for name, entry in debt.items()
-                }
+                    if entry.retry_at is not None:
+                        values["retry_at"] = entry.retry_at
+                    if entry.disable_reason is not None:
+                        values["disable_reason"] = entry.disable_reason
+                        if entry.disable_at is not None:
+                            values["disable_at"] = entry.disable_at
+                    worker_debt[name] = values
+                init_msg["debt"] = worker_debt
         if self._warm_pool_size > 0:
             # Eval-3 ADOPT opt-in: the worker stays alive after its task and
             # accepts a rebind init instead of exiting. 0 disables the pool
