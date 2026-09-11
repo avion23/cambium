@@ -140,6 +140,7 @@ from .store import (
     count_events_file,
     read_events_file,
 )
+from .summary_trunk import semantic_summary_messages
 from .tasktree import (
     _ENVELOPE_KEYS,
     MAX_WIDTH,
@@ -4660,17 +4661,49 @@ class _Runtime:
                 return
             checkpoint_ref = epoch.get("checkpoint_ref") if isinstance(epoch, dict) else None
             if context_mode == "semantic":
-                if not (
-                    isinstance(cache_key, dict)
-                    and type(cache_key.get("redacted")) is bool
-                    and isinstance(checkpoint_ref, str)
-                    and bool(checkpoint_ref)
-                ):
-                    raise ChildPolicyError(
-                        "child context_mode=semantic requires a persisted parent "
-                        "checkpoint; the parent epoch or checkpoint reference is "
-                        "missing; declare context_mode=fresh instead"
+                semantic_error: str | None = None
+                if not isinstance(checkpoint_ref, str) or not checkpoint_ref:
+                    semantic_error = "parent checkpoint reference is missing"
+                else:
+                    try:
+                        checkpoint_data = _load_epoch_checkpoint_data(
+                            self._session_dir, parent_task_id, checkpoint_ref
+                        )
+                        checkpoint = _validate_epoch_checkpoint_data(
+                            checkpoint_data,
+                            checkpoint_ref,
+                            expected_task_id=parent_task_id,
+                        )
+                        semantic_summary_messages(checkpoint.full_messages)
+                    except (OSError, TypeError, ValueError) as exc:
+                        semantic_error = str(exc) or exc.__class__.__name__
+                if semantic_error is not None:
+                    child_spec.pop("summary_trunk_ref", None)
+                    child_spec.pop("context_fork", None)
+                    child_spec.pop("parent_envelope", None)
+                    if placement == "spread":
+                        self._apply_spread(child_spec, parent_provider)
+                    else:
+                        self._pin_parent_provider(child_spec, parent_provider, cache_key)
+                    await self._emit_child_fork_event(
+                        parent_task_id,
+                        child_task_id,
+                        kind,
+                        epoch,
+                        compatible=False,
+                        semantic_reuse=False,
+                        context_mode=context_mode,
+                        placement=placement,
+                        resolved_context_mode="fresh",
+                        reason=_cap_utf8(
+                            f"semantic context unavailable: {semantic_error}",
+                            MAX_ENVELOPE_FIELD_CHARS,
+                        ),
+                        spread_from_provider=(
+                            parent_provider if placement == "spread" else None
+                        ),
                     )
+                    return
                 child_spec["summary_trunk_ref"] = checkpoint_ref
                 if placement == "spread":
                     self._apply_spread(child_spec, parent_provider)
@@ -4859,22 +4892,29 @@ class _Runtime:
         context_mode: str,
         placement: str,
         spread_from_provider: str | None,
+        resolved_context_mode: str | None = None,
+        reason: str | None = None,
     ) -> None:
         """Emit one context_fork event with requested and resolved policy."""
+        payload: dict[str, Any] = {
+            "task_id": parent_task_id,
+            "parent_task_id": parent_task_id,
+            "child_task_id": child_task_id,
+            "child_kind": kind,
+            "epoch": epoch.get("epoch") if isinstance(epoch, dict) else None,
+            "compatible": compatible,
+            "semantic_reuse": semantic_reuse,
+            "context_mode": context_mode,
+            "placement": placement,
+            "resolved_context_mode": resolved_context_mode or context_mode,
+            "resolved_placement": placement,
+            "spread_from_provider": spread_from_provider,
+        }
+        if reason is not None:
+            payload["reason"] = reason
         await self.emit(
             "context_fork",
-            task_id=parent_task_id,
-            parent_task_id=parent_task_id,
-            child_task_id=child_task_id,
-            child_kind=kind,
-            epoch=epoch.get("epoch") if isinstance(epoch, dict) else None,
-            compatible=compatible,
-            semantic_reuse=semantic_reuse,
-            context_mode=context_mode,
-            placement=placement,
-            resolved_context_mode=context_mode,
-            resolved_placement=placement,
-            spread_from_provider=spread_from_provider,
+            **payload,
         )
 
     async def _record_revision_conversation(
@@ -7560,11 +7600,16 @@ class _Runtime:
             generation=state.generation,
             **forwarded,
         )
-        # Count the lane that actually served the task, including call-time
-        # fallback. Do not pretend the original assignment is still busy.
+        # Count the lane that actually served a coding/child task, including
+        # call-time fallback; isolated summary calls must not rebind the coding lease.
         spec = getattr(state, "spec", None)
         served = msg.get("provider")
-        if isinstance(spec, dict) and served in self._lanes and not msg.get("failure_reason"):
+        if (
+            isinstance(spec, dict)
+            and served in self._lanes
+            and not msg.get("failure_reason")
+            and msg.get("call_kind") != "summary"
+        ):
             if served != spec.get("assigned_provider") or not spec.get("_lane_reserved"):
                 providers = load_providers(_provider_config_path(os.environ, spec))
                 configured = next((p for p in providers if p.name == served), None)

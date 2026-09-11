@@ -46,7 +46,7 @@ def test_budget_advice_allows_last_check_and_preserves_verdict(
     assert len(router.prompts) == 3
 
 
-def test_progress_detector_compares_contents_not_read_paths() -> None:
+def test_distinct_read_queries_count_as_progress_with_same_evidence() -> None:
     detector = worker._ProgressDetector(max_no_progress_actions=2, progress_window=3)
     outcomes = [
         detector.observe(
@@ -55,7 +55,141 @@ def test_progress_detector_compares_contents_not_read_paths() -> None:
         )
         for path in ("one.txt", "two.txt", "three.txt")
     ]
+    assert outcomes == [False, False, False]
+    assert detector.no_progress_actions == 0
+
+
+@pytest.mark.parametrize(
+    ("name", "first_arguments", "second_arguments"),
+    [
+        (
+            "branch_history",
+            {"action": "tools", "task_id": "child", "offset": 0},
+            {"action": "tools", "task_id": "child", "offset": 1},
+        ),
+        ("inspect_state", {"task_id": "child"}, {"task_id": "other-child"}),
+        (
+            "git_op",
+            {"op": "status", "args": "--short"},
+            {"op": "status", "args": "--porcelain"},
+        ),
+    ],
+)
+def test_observable_read_queries_count_as_progress(
+    name: str,
+    first_arguments: dict[str, object],
+    second_arguments: dict[str, object],
+) -> None:
+    detector = worker._ProgressDetector(max_no_progress_actions=2, progress_window=3)
+
+    def _action(arguments: dict[str, object]) -> dict[str, object]:
+        return {
+            "type": "tool_call",
+            "calls": [{"name": name, "arguments": arguments}],
+        }
+
+    outcomes = [
+        detector.observe(action=_action(first_arguments), result_content="same evidence"),
+        detector.observe(action=_action(second_arguments), result_content="same evidence"),
+    ]
+
+    assert outcomes == [False, False]
+    assert detector.no_progress_actions == 0
+
+
+@pytest.mark.parametrize(
+    ("name", "arguments"),
+    [
+        ("branch_history", {"action": "tools", "task_id": "child"}),
+        ("inspect_state", {"task_id": "child"}),
+        ("git_op", {"op": "status", "args": "--short"}),
+    ],
+)
+def test_observable_read_result_change_counts_as_progress(
+    name: str,
+    arguments: dict[str, object],
+) -> None:
+    detector = worker._ProgressDetector(max_no_progress_actions=2, progress_window=3)
+    action = {
+        "type": "tool_call",
+        "calls": [{"name": name, "arguments": arguments}],
+    }
+
+    outcomes = [
+        detector.observe(action=action, result_content="watermark=1"),
+        detector.observe(action=action, result_content="watermark=2"),
+    ]
+
+    assert outcomes == [False, False]
+    assert detector.no_progress_actions == 0
+
+
+@pytest.mark.parametrize(
+    ("name", "first_arguments", "second_arguments"),
+    [
+        (
+            "branch_history",
+            {"action": "tools", "task_id": "first"},
+            {"action": "tools", "task_id": "second"},
+        ),
+        ("inspect_state", {"task_id": "first"}, {"task_id": "second"}),
+        (
+            "git_op",
+            {"op": "status", "args": "--short"},
+            {"op": "diff", "args": "--stat"},
+        ),
+    ],
+)
+def test_changed_result_is_scoped_to_the_repeated_query(
+    name: str,
+    first_arguments: dict[str, object],
+    second_arguments: dict[str, object],
+) -> None:
+    detector = worker._ProgressDetector(max_no_progress_actions=2, progress_window=3)
+    first_action = {
+        "type": "tool_call",
+        "calls": [{"name": name, "arguments": first_arguments}],
+    }
+    second_action = {
+        "type": "tool_call",
+        "calls": [{"name": name, "arguments": second_arguments}],
+    }
+
+    outcomes = [
+        detector.observe(action=first_action, result_content="evidence=old"),
+        detector.observe(action=second_action, result_content="evidence=new"),
+        detector.observe(action=first_action, result_content="evidence=new"),
+    ]
+
+    assert outcomes == [False, False, False]
+    assert detector.no_progress_actions == 0
+
+
+@pytest.mark.parametrize(
+    ("name", "arguments"),
+    [
+        ("branch_history", {"action": "tools", "task_id": "child"}),
+        ("inspect_state", {"task_id": "child"}),
+        ("git_op", {"op": "status", "args": "--short"}),
+    ],
+)
+def test_exact_observable_read_repeat_still_stalls(
+    name: str,
+    arguments: dict[str, object],
+) -> None:
+    detector = worker._ProgressDetector(max_no_progress_actions=2, progress_window=3)
+    action = {
+        "type": "tool_call",
+        "calls": [{"name": name, "arguments": arguments}],
+    }
+
+    outcomes = [
+        detector.observe(action=action, result_content="same evidence")
+        for _ in range(3)
+    ]
+
     assert outcomes == [False, False, True]
+    assert detector.no_progress_actions == 2
 
 
 def test_progress_hash_retains_only_recent_reads() -> None:

@@ -18,14 +18,18 @@ remains covered.
 from __future__ import annotations
 
 import asyncio
+import http.client
+import io
 import json
 import threading
 import time
+import urllib.error
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, cast
 
 import pytest
 
+from cambium import diffundo as diffundo_module
 from cambium.diffundo import (
     AllProvidersFailed,
     AuthMode,
@@ -40,6 +44,8 @@ from cambium.diffundo import (
     ProviderTier,
     _codex_input_item,
     _codex_request_body,
+    _RawResponse,
+    _read_provider_sse,
 )
 from cambium.worker import _PROVIDER_TOOLS_CONFIG, _exposed_tool_schemas
 
@@ -158,6 +164,38 @@ CODEX_PATH = "/backend-api/codex/responses"
 
 def _stream(*events: dict[str, Any]) -> str:
     return "".join(f"data: {json.dumps(event)}\n\n" for event in events)
+
+
+class _MemorySocket:
+    def __init__(self, data: bytes) -> None:
+        self._file = io.BytesIO(data)
+
+    def makefile(self, *_args: Any, **_kwargs: Any) -> io.BytesIO:
+        return self._file
+
+    def close(self) -> None:
+        self._file.close()
+
+
+def _chunked_response(
+    body: bytes,
+    *,
+    complete: bool,
+    status: int = 200,
+    reason: str = "OK",
+) -> http.client.HTTPResponse:
+    raw = (
+        f"HTTP/1.1 {status} {reason}\r\n".encode("ascii")
+        + b"Content-Type: text/event-stream\r\n"
+        b"Transfer-Encoding: chunked\r\n\r\n"
+        + format(len(body), "x").encode("ascii")
+        + b"\r\n"
+        + body
+        + (b"\r\n0\r\n\r\n" if complete else b"")
+    )
+    response = http.client.HTTPResponse(_MemorySocket(raw))
+    response.begin()
+    return response
 
 
 def _delta(text: str) -> dict[str, Any]:
@@ -563,6 +601,146 @@ def test_codex_stream_without_completed_event_is_malformed() -> None:
         assert router.health("p_codex") is HealthState.COOLDOWN
     finally:
         server.close()
+
+
+def test_codex_incomplete_stream_cascades_after_typed_read_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stream = _stream(_completed(text="partial but complete-looking"))
+    primary = _codex_config(None, name="p_codex_incomplete", max_retries=0, priority=0)
+    sibling = ProviderConfig(
+        name="p_chat_sibling",
+        tier=ProviderTier.FAST,
+        base_url="http://127.0.0.1",
+        api_key_env="",
+        api_key="sk-chat-sibling",
+        model="m-chat-sibling",
+        priority=1,
+    )
+    router = Diffundo(
+        (primary, sibling),
+        credential_source=CREDENTIAL,
+        pause_timeout_s=0.01,
+    )
+    typed_errors: list[ProviderError] = []
+    statuses: list[dict[str, Any]] = []
+
+    async def scripted_post(
+        _self: Diffundo,
+        provider: ProviderConfig,
+        _prompt: dict[str, Any],
+        *,
+        timeout_s: float,
+        deadline: float | None,
+        on_delta: Any = None,
+    ) -> _RawResponse:
+        del timeout_s, deadline, on_delta
+        if provider.protocol is Protocol.CODEX_RESPONSES:
+            with _chunked_response(stream.encode("utf-8"), complete=False) as response:
+                try:
+                    _read_provider_sse(response, provider.name)
+                except ProviderError as exc:
+                    typed_errors.append(exc)
+                    raise
+            raise AssertionError("incomplete stream should raise before parsing")
+        return _RawResponse(
+            {
+                "model": provider.model,
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": "sibling response"},
+                        "finish_reason": "stop",
+                    }
+                ],
+            },
+            0.0,
+        )
+
+    monkeypatch.setattr(Diffundo, "_post_with_deadline", scripted_post)
+    result = asyncio.run(
+        router.call(
+            ProviderTier.FAST,
+            PROMPT,
+            on_status=lambda event: statuses.append(dict(event)),
+        )
+    )
+
+    assert result.provider == sibling.name
+    assert result.content == "sibling response"
+    assert len(typed_errors) == 1
+    assert typed_errors[0].outcome is ProviderOutcome.ERROR
+    assert isinstance(typed_errors[0].cause, http.client.IncompleteRead)
+    assert typed_errors[0].message == "incomplete provider response"
+    assert [event["kind"] for event in statuses] == [
+        "provider_attempt",
+        "provider_failed",
+        "provider_attempt",
+        "provider_succeeded",
+    ]
+    assert statuses[1]["outcome"] == ProviderOutcome.ERROR.value
+    assert router.health(primary.name) is HealthState.COOLDOWN
+
+
+def test_truncated_codex_http_error_preserves_auth_classification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = b'{"error":{"message":"secret codex unauthorized details"}}'
+
+    class ErrorOpener:
+        calls = 0
+
+        def open(self, *_args: Any, **_kwargs: Any) -> Any:
+            self.calls += 1
+            response = _chunked_response(
+                body,
+                complete=False,
+                status=401,
+                reason="Unauthorized",
+            )
+            raise urllib.error.HTTPError(
+                "http://127.0.0.1/backend-api/codex/responses",
+                401,
+                "Unauthorized",
+                {},
+                response,
+            )
+
+    opener = ErrorOpener()
+    monkeypatch.setattr(
+        diffundo_module.urllib.request,
+        "build_opener",
+        lambda *_handlers: opener,
+    )
+    provider = _codex_config(None, name="p_truncated_codex_http_error", max_retries=2)
+    router = Diffundo(
+        (provider,),
+        credential_source=CREDENTIAL,
+        codex_profile={"api_origin": "http://127.0.0.1", "api_path": CODEX_PATH},
+        pause_timeout_s=0.01,
+    )
+
+    async def direct_post(
+        _self: Diffundo,
+        current_provider: ProviderConfig,
+        prompt: dict[str, Any],
+        *,
+        timeout_s: float,
+        deadline: float | None,
+        on_delta: Any = None,
+    ) -> _RawResponse:
+        del deadline, on_delta
+        return _self._post_sync(current_provider, prompt, timeout_s)
+
+    monkeypatch.setattr(Diffundo, "_post_with_deadline", direct_post)
+    with pytest.raises(AllProvidersFailed) as raised:
+        asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+
+    error = _provider_error(raised.value)
+    assert error.outcome is ProviderOutcome.AUTH_ERROR
+    assert error.http_status == 401
+    assert opener.calls == 1
+    assert router.health(provider.name) is HealthState.DISABLED
+    assert "secret codex unauthorized details" not in error.message
 
 
 def test_codex_stream_service_unavailable_is_retryable_error() -> None:

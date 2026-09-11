@@ -1731,9 +1731,17 @@ def _reduce_context_fork(state: BranchState, values: Mapping[str, Any]) -> Branc
     child = next(child for child in state.children if child.branch_id == child_id)
     compatible = values.get("compatible") is True
     semantic = values.get("semantic_reuse") is True
-    lineage = "exact" if compatible else "semantic" if semantic else "unknown"
     context_mode = _optional_string(values.get("resolved_context_mode")) or _optional_string(
         values.get("context_mode")
+    )
+    lineage = (
+        "exact"
+        if compatible
+        else "semantic"
+        if semantic
+        else "fresh"
+        if context_mode == "fresh"
+        else "unknown"
     )
     placement = _optional_string(values.get("resolved_placement")) or _optional_string(
         values.get("placement")

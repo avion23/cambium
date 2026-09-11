@@ -102,6 +102,7 @@ import asyncio
 import copy
 import errno
 import hashlib
+import http.client
 import json
 import math
 import os
@@ -1049,7 +1050,15 @@ def prompt_prefix_estimate_tokens(prompt: dict[str, Any]) -> int | None:
 
 
 def _read_provider_response(response: Any, provider: str) -> bytes:
-    body = response.read(MAX_PROVIDER_RESPONSE_BYTES + 1)
+    try:
+        body = response.read(MAX_PROVIDER_RESPONSE_BYTES + 1)
+    except http.client.IncompleteRead as exc:
+        raise ProviderError(
+            provider,
+            ProviderOutcome.ERROR,
+            "incomplete provider response",
+            exc,
+        ) from exc
     if len(body) > MAX_PROVIDER_RESPONSE_BYTES:
         raise ProviderError(
             provider,
@@ -1101,7 +1110,17 @@ def _read_provider_sse(
         _notify_observer(on_event, value)
 
     while True:
-        chunk = cast(bytes, reader(min(16 * 1024, MAX_PROVIDER_RESPONSE_BYTES + 1 - len(body))))
+        try:
+            chunk = cast(
+                bytes, reader(min(16 * 1024, MAX_PROVIDER_RESPONSE_BYTES + 1 - len(body)))
+            )
+        except http.client.IncompleteRead as exc:
+            raise ProviderError(
+                provider,
+                ProviderOutcome.ERROR,
+                "incomplete provider response",
+                exc,
+            ) from exc
         if not chunk:
             break
         body.extend(chunk)
@@ -2436,8 +2455,12 @@ class _ChatCompletionsTransport:
                 error_body = _read_provider_response(exc, provider.name).decode(
                     "utf-8", errors="replace"
                 )
-            except ProviderError:
-                raise
+            except ProviderError as read_error:
+                if not isinstance(read_error.cause, http.client.IncompleteRead):
+                    raise
+                # A truncated error body cannot provide reliable provider
+                # details; preserve the HTTP status classification instead.
+                error_body = ""
             except Exception:
                 error_body = ""
             safe_body = _redact_error_text(error_body, api_key)[:500]
@@ -2571,8 +2594,12 @@ class _CodexResponsesTransport:
                 error_body = _read_provider_response(exc, provider.name).decode(
                     "utf-8", errors="replace"
                 )
-            except ProviderError:
-                raise
+            except ProviderError as read_error:
+                if not isinstance(read_error.cause, http.client.IncompleteRead):
+                    raise
+                # A truncated error body cannot provide reliable provider
+                # details; preserve the HTTP status classification instead.
+                error_body = ""
             except Exception:
                 error_body = ""
             safe_body = _redact_error_text(error_body, access_token)[:500]

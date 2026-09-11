@@ -108,3 +108,26 @@ def test_unknown_events_increment_explicit_counter() -> None:
     assert state.unknown_event_kinds == ("future_event", "another_future_event")
     assert state.source_watermark == 2
     assert state.lifecycle == Lifecycle.UNKNOWN
+
+
+def test_context_fork_projects_resolved_fresh_lineage() -> None:
+    state = reduce(
+        BranchState(),
+        {
+            "seq": 1,
+            "kind": "context_fork",
+            "task_id": "parent",
+            "payload": {
+                "parent_task_id": "parent",
+                "child_task_id": "child",
+                "context_mode": "semantic",
+                "resolved_context_mode": "fresh",
+                "semantic_reuse": False,
+                "compatible": False,
+            },
+        },
+    )
+
+    child = next(child for child in state.children if child.branch_id == "child")
+    assert child.context_mode == "fresh"
+    assert child.lineage == "fresh"

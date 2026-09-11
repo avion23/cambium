@@ -134,6 +134,7 @@ def test_serving_provider_moves_the_reservation_once(tmp_path):
             "generation": 1,
             "provider": "b",
             "model": "b",
+            "call_kind": "agent",
             "turn": 1,
             "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5},
         }
@@ -154,6 +155,95 @@ def test_serving_provider_moves_the_reservation_once(tmp_path):
         )
         assert spec["assigned_provider"] == "b"
         assert runtime._lanes["a"].in_flight == 0
+
+    asyncio.run(exercise())
+
+
+def test_summary_serving_provider_does_not_move_coding_reservation(tmp_path):
+    config = tmp_path / "providers.json"
+    config.write_text(
+        json.dumps(
+            {
+                "providers": [
+                    {
+                        "name": "coding",
+                        "model": "coding-model",
+                        "tier": "fast",
+                        "auth": "none",
+                        "base_url": "http://127.0.0.1:1",
+                        "max_in_flight": 1,
+                    },
+                    {
+                        "name": "summary",
+                        "model": "summary-model",
+                        "tier": "strong",
+                        "auth": "none",
+                        "base_url": "http://127.0.0.1:1",
+                        "max_in_flight": 1,
+                    },
+                ]
+            }
+        )
+    )
+
+    async def exercise():
+        events = []
+        debt_store = DebtStore(tmp_path / "debt.json")
+        runtime = _Runtime(
+            tmp_path,
+            None,
+            on_event=events.append,
+            debt_store=debt_store,
+        )
+        runtime._lanes = {
+            name: LaneState.from_provider(_provider(name)) for name in ("coding", "summary")
+        }
+        runtime._lanes["coding"].in_flight = 1
+        spec = {
+            "task_id": "task",
+            "assigned_provider": "coding",
+            "_lane_reserved": True,
+            "fanout_config": {"model": "coding-model", "tier": "fast"},
+            "provider_config_path": str(config),
+        }
+        state = SimpleNamespace(task_id="task", generation=1, spec=spec)
+        event = {
+            "type": "usage_event",
+            "task_id": "task",
+            "generation": 1,
+            "provider": "summary",
+            "model": "summary-model",
+            "call_kind": "summary",
+            "turn": 1,
+            "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5},
+            "estimated_cost_usd": 0.004,
+            "account_quota_owner": "acct-summary",
+            "request_rate_status": "ok",
+            "quota_windows": [{"provider": "summary", "name": "week"}],
+        }
+
+        await runtime._handle_usage_event_message(state, event)
+
+        assert spec["assigned_provider"] == "coding"
+        assert spec["fanout_config"] == {"model": "coding-model", "tier": "fast"}
+        assert spec["_lane_reserved"] is True
+        assert runtime._lanes["coding"].in_flight == 1
+        assert runtime._lanes["summary"].in_flight == 0
+        assert [item["kind"] for item in events] == ["usage_event"]
+        payload = events[0]["payload"]
+        assert payload["provider"] == "summary"
+        assert payload["model"] == "summary-model"
+        assert payload["call_kind"] == "summary"
+        assert payload["usage"] == {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}
+        assert payload["estimated_cost_usd"] == 0.004
+        assert payload["account_quota_owner"] == "acct-summary"
+        assert payload["request_rate_status"] == "ok"
+        assert payload["quota_windows"] == [{"provider": "summary", "name": "week"}]
+        summary_debt = debt_store.as_mapping()["summary"]
+        assert summary_debt.requests == 1
+        assert summary_debt.tokens == 5
+        assert summary_debt.cost == 0.004
+        assert "coding" not in debt_store.as_mapping()
 
     asyncio.run(exercise())
 

@@ -1403,6 +1403,94 @@ def test_cancellation_mid_batch_persists_remaining_calls_as_unexecuted(
     assert tool_events[0]["batch_index"] == 0
 
 
+def test_repeated_read_failure_persists_causal_tool_event_and_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def direct_to_thread(function: Any, *args: Any, **kwargs: Any) -> Any:
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(worker.asyncio, "to_thread", direct_to_thread)
+    worktree = _make_worktree(tmp_path / "repo")
+    checkpoint_root = tmp_path / "checkpoints"
+    config = _agent_config(
+        worktree,
+        checkpoint_root=checkpoint_root,
+        max_no_progress_actions=2,
+        progress_window=3,
+    )
+    action = json.dumps(
+        {
+            "type": "tool_call",
+            "calls": [{"name": "read_batch", "arguments": {"paths": ["alpha.txt"]}}],
+        }
+    )
+    router = _ScriptedRouter([action, action, action])
+    writer = _FakeWriter()
+
+    outcome = asyncio.run(_drive_loop(config, worktree, router, writer))
+
+    assert outcome["status"] == "failed"
+    assert "no progress" in outcome["failure_reason"]
+    assert outcome["turn"] == 3
+    assert len(router.prompts) == 3
+    messages = writer.messages()
+    tool_events = [message for message in messages if message["type"] == "tool_event"]
+    assert [message["turn"] for message in tool_events] == [1, 2, 3]
+    checkpoints = [message for message in messages if message["type"] == "checkpoint"]
+    assert [message["turn"] for message in checkpoints] == [1, 2, 3]
+    checkpoint_path = Path(checkpoints[-1]["state_ref"])
+    assert checkpoint_path == checkpoint_root / "loop-agent" / "turn-003.json"
+    persisted = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    assert persisted["transcript"] == outcome["transcript"]
+    assert persisted["transcript"][-1]["content"].startswith("tool read_batch ok=True\n")
+
+
+@pytest.mark.parametrize(
+    ("name", "arguments"),
+    [
+        ("branch_history", {"action": "tools", "task_id": "child"}),
+        ("inspect_state", {"task_id": "child"}),
+        ("git_op", {"op": "status", "args": "--short"}),
+    ],
+)
+def test_changed_observable_read_evidence_prevents_pre_execution_stall(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    arguments: dict[str, Any],
+) -> None:
+    worktree = _make_worktree(tmp_path / "repo")
+    config = _agent_config(
+        worktree,
+        max_no_progress_actions=1,
+        progress_window=1,
+    )
+    action = json.dumps(
+        {
+            "type": "tool_call",
+            "calls": [{"name": name, "arguments": arguments}],
+        }
+    )
+    router = _ScriptedRouter(
+        [action, action, '{"type":"finish","summary":"evidence changed","objective_met":true}']
+    )
+    results = iter(("evidence=1", "evidence=2"))
+
+    async def execute_read(
+        tool_name: str, _arguments: dict[str, Any], _ctx: Any
+    ) -> worker.ToolResult:
+        assert tool_name == name
+        return worker.ToolResult(ok=True, output=next(results), duration_ms=1)
+
+    monkeypatch.setattr(worker, "run_tool", execute_read)
+
+    outcome = asyncio.run(_drive_loop(config, worktree, router))
+
+    assert outcome["status"] == "succeeded"
+    assert outcome["summary"] == "evidence changed"
+    assert len(router.prompts) == 3
+
+
 def test_restore_hashes_a_read_batch_as_one_joined_result() -> None:
     action = {
         "type": "tool_call",
@@ -1431,6 +1519,35 @@ def test_restore_hashes_a_read_batch_as_one_joined_result() -> None:
 
     assert len(live._recent_content_hashes) == 1
     assert list(restored._recent_content_hashes) == list(live._recent_content_hashes)
+
+
+@pytest.mark.parametrize(
+    ("name", "arguments"),
+    [
+        ("branch_history", {"action": "tools", "task_id": "child"}),
+        ("inspect_state", {"task_id": "child"}),
+        ("git_op", {"op": "status", "args": "--short"}),
+    ],
+)
+def test_restore_recognizes_observable_read_evidence(
+    name: str,
+    arguments: dict[str, Any],
+) -> None:
+    action = {
+        "type": "tool_call",
+        "calls": [{"name": name, "arguments": arguments}],
+    }
+    result = "watermark=7\ncheckpoint_ref=turn-007"
+    restored = worker._ProgressDetector(max_no_progress_actions=1, progress_window=1)
+
+    restored.restore(
+        [
+            worker._canonical_action_message(action),
+            {"role": "user", "content": f"tool {name} ok=True\n{result}"},
+        ]
+    )
+
+    assert restored.observe(action=action, result_content=result)
 
 
 def test_tool_call_batch_cap_rejects_text_and_native_actions(tmp_path: Path) -> None:

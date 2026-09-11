@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .summary_trunk import SUMMARY_FINDING_PRESERVATION_CONTRACT, SUMMARY_LIST_FIELDS
 
-PROMPTS_VERSION = 17
+PROMPTS_VERSION = 18
 
 CODING_POLICY = (
     "Work directly and minimally. Locate with repo_query, read exact regions with read_batch, "
@@ -59,7 +59,8 @@ _ACTION_PROTOCOL = (
     "context_mode/placement override these defaults. "
     "Cambium supplies repo, worktree, branch and provider configuration. trunk requires inherit. "
     "A proposal is not a joined result. Set objective_met only when the task is met; "
-    "read-only completion needs no edit. Write inside your worktree, not .git or .cambium."
+    "read-only completion needs no edit. Write inside your worktree, not .git or .cambium. "
+    "Cambium creates the publication commit; do not run git commit, merge or push."
 )
 _SUMMARY_PROTOCOL = (
     "When the final message is <cambium-summary-control>, return only a summary JSON "

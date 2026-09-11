@@ -20,10 +20,13 @@ and cascade-design contracts:
 from __future__ import annotations
 
 import asyncio
+import http.client
+import io
 import json
 import socket
 import threading
 import time
+import urllib.error
 import urllib.request
 from dataclasses import replace
 from typing import Any, cast
@@ -45,6 +48,7 @@ from cambium.diffundo import (
     ProviderTier,
     _codex_usage,
     _RawResponse,
+    _read_provider_response,
     prompt_prefix_bytes,
     prompt_prefix_estimate_tokens,
     validate_prompt_structure,
@@ -57,6 +61,40 @@ def _sse(*events: dict[str, Any]) -> bytes:
         b"".join(b"data: " + json.dumps(event).encode("utf-8") + b"\n\n" for event in events)
         + b"data: [DONE]\n\n"
     )
+
+
+class _MemorySocket:
+    def __init__(self, data: bytes) -> None:
+        self._file = io.BytesIO(data)
+
+    def makefile(self, *_args: Any, **_kwargs: Any) -> io.BytesIO:
+        return self._file
+
+    def close(self) -> None:
+        self._file.close()
+
+
+def _chunked_response(
+    body: bytes,
+    *,
+    content_type: str,
+    complete: bool,
+    status: int = 200,
+    reason: str = "OK",
+) -> http.client.HTTPResponse:
+    raw = (
+        f"HTTP/1.1 {status} {reason}\r\n".encode("ascii")
+        + b"Content-Type: "
+        + content_type.encode("ascii")
+        + b"\r\nTransfer-Encoding: chunked\r\n\r\n"
+        + format(len(body), "x").encode("ascii")
+        + b"\r\n"
+        + body
+        + (b"\r\n0\r\n\r\n" if complete else b"")
+    )
+    response = http.client.HTTPResponse(_MemorySocket(raw))
+    response.begin()
+    return response
 
 
 def _tool_call_payload(tool_calls: list[dict[str, Any]]) -> dict[str, Any]:
@@ -232,6 +270,126 @@ def test_chat_completions_stream_reasoning_output_and_usage_live() -> None:
         assert server.calls[0]["stream_options"] == {"include_usage": True}
     finally:
         server.close()
+
+
+def test_incomplete_json_response_is_typed_and_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    body = json.dumps(_ok_payload("must not be accepted")).encode("utf-8")
+    provider = ProviderConfig(
+        name="p_incomplete_json",
+        tier=ProviderTier.FAST,
+        base_url="http://127.0.0.1",
+        api_key_env="",
+        api_key="sk-incomplete-json",
+        model="m-incomplete-json",
+        max_retries=1,
+        cooldown_s=60.0,
+    )
+    router = Diffundo(
+        (provider,),
+        pause_timeout_s=0.01,
+        retry_base_delay_s=0.0,
+    )
+    attempts = 0
+
+    async def incomplete_post(
+        _self: Diffundo,
+        current_provider: ProviderConfig,
+        _prompt: dict[str, Any],
+        *,
+        timeout_s: float,
+        deadline: float | None,
+        on_delta: Any = None,
+    ) -> _RawResponse:
+        nonlocal attempts
+        del timeout_s, deadline, on_delta
+        assert current_provider is provider
+        attempts += 1
+        with _chunked_response(
+            body,
+            content_type="application/json",
+            complete=False,
+        ) as response:
+            _read_provider_response(response, current_provider.name)
+        raise AssertionError("incomplete response should raise before parsing")
+
+    monkeypatch.setattr(Diffundo, "_post_with_deadline", incomplete_post)
+
+    with pytest.raises(AllProvidersFailed) as raised:
+        asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+
+    error = cast(ProviderError, raised.value.last_error)
+    assert error.outcome is ProviderOutcome.ERROR
+    assert isinstance(error.cause, http.client.IncompleteRead)
+    assert error.message == "incomplete provider response"
+    assert "must not be accepted" not in error.message
+    assert attempts == 2
+    assert router.health(provider.name) is HealthState.COOLDOWN
+
+
+def test_truncated_json_http_error_preserves_auth_classification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = b'{"error":{"message":"secret unauthorized details"}}'
+
+    class ErrorOpener:
+        calls = 0
+
+        def open(self, *_args: Any, **_kwargs: Any) -> Any:
+            self.calls += 1
+            response = _chunked_response(
+                body,
+                content_type="application/json",
+                complete=False,
+                status=401,
+                reason="Unauthorized",
+            )
+            raise urllib.error.HTTPError(
+                "http://127.0.0.1/chat/completions",
+                401,
+                "Unauthorized",
+                {},
+                response,
+            )
+
+    opener = ErrorOpener()
+    monkeypatch.setattr(
+        diffundo_module.urllib.request,
+        "build_opener",
+        lambda *_handlers: opener,
+    )
+    provider = ProviderConfig(
+        name="p_truncated_json_http_error",
+        tier=ProviderTier.FAST,
+        base_url="http://127.0.0.1",
+        api_key_env="",
+        api_key="sk-truncated-json-http-error",
+        model="m-truncated-json-http-error",
+        max_retries=2,
+    )
+    router = Diffundo((provider,), pause_timeout_s=0.01)
+
+    async def direct_post(
+        _self: Diffundo,
+        current_provider: ProviderConfig,
+        prompt: dict[str, Any],
+        *,
+        timeout_s: float,
+        deadline: float | None,
+        on_delta: Any = None,
+    ) -> _RawResponse:
+        del deadline, on_delta
+        return _self._post_sync(current_provider, prompt, timeout_s)
+
+    monkeypatch.setattr(Diffundo, "_post_with_deadline", direct_post)
+    with pytest.raises(AllProvidersFailed) as raised:
+        asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+
+    error = cast(ProviderError, raised.value.last_error)
+    assert error.outcome is ProviderOutcome.AUTH_ERROR
+    assert error.http_status == 401
+    assert opener.calls == 1
+    assert router.health(provider.name) is HealthState.DISABLED
+    assert "secret unauthorized details" not in error.message
 
 
 # --------------------------------------------------------------------------- #

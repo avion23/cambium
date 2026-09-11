@@ -150,6 +150,48 @@ def test_branch_listing_distinguishes_task_and_context_policy(tmp_path: Path) ->
     assert "provider=provider-b" in output
 
 
+def test_branch_listing_prefers_resolved_context_policy(tmp_path: Path) -> None:
+    session = _write_session(tmp_path)
+    events_path = session / ".cambium" / "events.db"
+    events = [
+        {
+            "seq": 1,
+            "kind": "context_fork",
+            "task_id": "root",
+            "payload": {
+                "parent_task_id": "root",
+                "child_task_id": "child",
+                "context_mode": "semantic",
+                "placement": "spread",
+                "resolved_context_mode": "fresh",
+                "resolved_placement": "spread",
+            },
+        },
+        {
+            "seq": 2,
+            "kind": "child_admitted",
+            "task_id": "root",
+            "payload": {
+                "parent_task_id": "root",
+                "child_task_id": "child",
+                "context_mode": "semantic",
+                "placement": "spread",
+            },
+        },
+    ]
+    events_path.write_text(
+        "".join(f"{json.dumps(event)}\n" for event in events),
+        encoding="utf-8",
+    )
+
+    output = query_branch_history(session, {"action": "branches"})
+
+    assert "branch:child" in output
+    assert "context=fresh" in output
+    assert "context=semantic" not in output
+    assert "placement=spread" in output
+
+
 def test_tool_call_is_branch_local_and_independently_retrievable(tmp_path: Path) -> None:
     session = _write_session(tmp_path)
     ref = tool_ref("child", 1, 2)

@@ -182,6 +182,23 @@ def _int(payload: Mapping[str, Any], key: str, default: int = 0) -> int:
     return value if type(value) is int and value >= 0 else default
 
 
+def _set_context_policy(branch: _Branch, event: _Event, *, resolved: bool) -> None:
+    mode_key = "resolved_context_mode" if resolved else "context_mode"
+    placement_key = "resolved_placement" if resolved else "placement"
+    mode = event.payload.get(mode_key)
+    if not isinstance(mode, str):
+        mode = event.payload.get("context_mode")
+    placement = event.payload.get(placement_key)
+    if not isinstance(placement, str):
+        placement = event.payload.get("placement")
+    if resolved or branch.context_mode is None:
+        if isinstance(mode, str):
+            branch.context_mode = mode
+    if resolved or branch.placement is None:
+        if isinstance(placement, str):
+            branch.placement = placement
+
+
 def _branches(events: Sequence[_Event]) -> list[_Branch]:
     branches: dict[str, _Branch] = {}
 
@@ -198,10 +215,12 @@ def _branches(events: Sequence[_Event]) -> list[_Branch]:
             if isinstance(child, str) and child:
                 branch = get(child)
                 branch.parent_task_id = parent if isinstance(parent, str) and parent else None
-                mode = event.payload.get("context_mode")
-                placement = event.payload.get("placement")
-                branch.context_mode = mode if isinstance(mode, str) else branch.context_mode
-                branch.placement = placement if isinstance(placement, str) else branch.placement
+                _set_context_policy(branch, event, resolved=False)
+        if event.kind == "context_fork":
+            child = event.payload.get("child_task_id")
+            if isinstance(child, str) and child:
+                branch = get(child)
+                _set_context_policy(branch, event, resolved=True)
         if event.kind == "tool_event" and event.task_id is not None:
             get(event.task_id).tool_count += 1
         if event.kind == "usage_event" and event.task_id is not None:

@@ -1,36 +1,85 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from cambium import worker
 from cambium.child_policy import parse_child_policy
+from cambium.redact import Redactor
 from cambium.routing import LaneCapacityExhausted, LaneState
+from cambium.summary_trunk import SummaryEntry, append_summary_entry
 from cambium.supervisor import _Runtime
 from cambium.worker import _provider_task_tools_hash
 
 
-def _epoch() -> dict[str, Any]:
+def _checkpoint_epoch(
+    session_dir: Path,
+    *,
+    redacted: bool = False,
+    raw_tail: bool = False,
+) -> dict[str, Any]:
+    """Persist one strict parent checkpoint and expose supervisor epoch metadata."""
+    config = replace(
+        worker._PROVIDER_TOOLS_CONFIG,
+        task_id="parent",
+        generation=1,
+        checkpoint_root=session_dir / ".cambium" / "checkpoints",
+        redactor=Redactor(secret_values={"SECRETXYZ"}) if redacted else None,
+    )
+    messages: list[dict[str, str]] = [
+        {"role": "system", "content": "You are the agent."},
+        {"role": "user", "content": "<cambium-task>parent task</cambium-task>"},
+    ]
+    if raw_tail:
+        messages.extend(
+            [
+                {"role": "assistant", "content": "raw assistant output"},
+                {"role": "user", "content": "raw tool output"},
+            ]
+        )
+    else:
+        messages = append_summary_entry(
+            messages,
+            SummaryEntry(
+                type="summary_entry",
+                sequence=1,
+                source_sha256="c" * 64,
+                source_message_count=1,
+                through_turn=1,
+                objective="preserve parent context",
+                outcome="captured SECRETXYZ" if redacted else "captured parent evidence",
+                decisions_added=(),
+                decisions_superseded=(),
+                facts_added=(),
+                facts_invalidated=(),
+                files_and_symbols_changed=(),
+                verification_results=(),
+                relevant_failed_approaches=(),
+                open_items=(),
+            ),
+        )
+    checkpoint = worker._write_epoch_checkpoint(
+        config,
+        turn=1,
+        epoch=2,
+        messages=messages,
+        provider="provider-a",
+        model="model-a",
+        tools_sha256=_provider_task_tools_hash(),
+        provider_compat={"provider-a": ("http", "high")},
+        created_at=1.0,
+        wall_deadline=10.0,
+    )
+    assert checkpoint is not None
     return {
-        "epoch": 2,
-        "checkpoint_ref": "parent/epoch-002-0000000000000000-0000000000000000.json",
-        "cache_key": {
-            "provider": "provider-a",
-            "model": "model-a",
-            "protocol": "http",
-            "reasoning_effort": "high",
-            "redacted": False,
-            "system_sha256": "aaa",
-            "tools_sha256": _provider_task_tools_hash(),
-            "prefix_sha256": "ccc",
-            "suffix_sha256": "ddd",
-            "full_sha256": "eee",
-            "prefix_bytes": 100,
-            "provider_boundary": {"provider": "provider-a", "model": "model-a", "epoch": 2},
-        },
+        "epoch": checkpoint.epoch,
+        "checkpoint_ref": checkpoint.checkpoint_ref,
+        "cache_key": asdict(checkpoint.cache_key),
     }
 
 
@@ -42,7 +91,7 @@ def _runtime(tmp_path: Path) -> tuple[_Runtime, list[dict[str, Any]]]:
         events.append({"kind": kind, **payload})
 
     runtime.emit = emit  # type: ignore[method-assign]
-    runtime._task_epochs["parent"] = _epoch()
+    runtime._task_epochs["parent"] = _checkpoint_epoch(tmp_path)
     return runtime, events
 
 
@@ -60,7 +109,7 @@ def test_semantic_child_pins_summary_trunk_and_drops_provider(tmp_path: Path) ->
 
     # Semantic (incompatible by construction) sets summary_trunk_ref
     # and drops assigned_provider so the child picks a fresh provider.
-    assert child_spec.get("summary_trunk_ref") == _epoch()["checkpoint_ref"]
+    assert child_spec.get("summary_trunk_ref") == runtime._task_epochs["parent"]["checkpoint_ref"]
     assert "assigned_provider" not in child_spec
     assert "context_fork" not in child_spec
 
@@ -184,17 +233,70 @@ def test_suspended_parent_reacquires_lane_without_overbooking(tmp_path: Path) ->
     assert runtime._lanes["provider-a"].in_flight == 1
 
 
-def test_missing_parent_epoch_rejects_declared_semantic(tmp_path: Path) -> None:
-    """A declared semantic child without a parent checkpoint is rejected,
-    never silently downgraded (owner spec: no auto fallback)."""
+def test_missing_parent_epoch_resolves_declared_semantic_to_fresh(tmp_path: Path) -> None:
+    """A missing semantic checkpoint falls back to fresh without rejection."""
     runtime = _Runtime(tmp_path, None)
+    events: list[dict[str, Any]] = []
+
+    async def emit(kind: str, **payload: Any) -> None:
+        events.append({"kind": kind, **payload})
+
+    runtime.emit = emit  # type: ignore[method-assign]
     child_spec: dict[str, Any] = {
         "context_mode": "semantic",
         "placement": "spread",
+        "summary_trunk_ref": "stale-ref",
+        "context_fork": {"checkpoint_ref": "stale-ref"},
+        "parent_envelope": {"summary": "parent"},
     }
 
-    with pytest.raises(ValueError, match="requires a persisted parent checkpoint"):
-        asyncio.run(runtime._pin_fork_child(child_spec, "missing", "child", "investigation"))
+    asyncio.run(runtime._pin_fork_child(child_spec, "missing", "child", "investigation"))
+
+    assert child_spec["context_mode"] == "semantic"
+    assert child_spec["placement"] == "spread"
+    assert "summary_trunk_ref" not in child_spec
+    assert "context_fork" not in child_spec
+    assert "parent_envelope" not in child_spec
+    fork_events = [event for event in events if event["kind"] == "context_fork"]
+    assert len(fork_events) == 1
+    event = fork_events[0]
+    assert event["context_mode"] == "semantic"
+    assert event["placement"] == "spread"
+    assert event["resolved_context_mode"] == "fresh"
+    assert event["resolved_placement"] == "spread"
+    assert event["semantic_reuse"] is False
+    assert 0 < len(event["reason"]) <= 2_000
+
+
+def test_raw_tail_parent_epoch_resolves_declared_semantic_to_fresh(tmp_path: Path) -> None:
+    """A strictly valid checkpoint with raw tail is not semantic context."""
+    runtime = _Runtime(tmp_path, None)
+    events: list[dict[str, Any]] = []
+
+    async def emit(kind: str, **payload: Any) -> None:
+        events.append({"kind": kind, **payload})
+
+    runtime.emit = emit  # type: ignore[method-assign]
+    runtime._task_epochs["parent"] = _checkpoint_epoch(tmp_path, raw_tail=True)
+    child_spec: dict[str, Any] = {
+        "context_mode": "semantic",
+        "placement": "spread",
+        "parent_envelope": {"summary": "parent"},
+    }
+
+    asyncio.run(runtime._pin_fork_child(child_spec, "parent", "child", "investigation"))
+
+    assert child_spec["context_mode"] == "semantic"
+    assert child_spec["placement"] == "spread"
+    assert "summary_trunk_ref" not in child_spec
+    assert "context_fork" not in child_spec
+    assert "parent_envelope" not in child_spec
+    event = next(event for event in events if event["kind"] == "context_fork")
+    assert event["context_mode"] == "semantic"
+    assert event["resolved_context_mode"] == "fresh"
+    assert event["resolved_placement"] == "spread"
+    assert event["semantic_reuse"] is False
+    assert "summary-only" in event["reason"]
 
 
 def test_parse_child_policy_rejects_trunk_spread_combination() -> None:
@@ -203,16 +305,14 @@ def test_parse_child_policy_rejects_trunk_spread_combination() -> None:
         parse_child_policy({"context_mode": "trunk", "placement": "spread"})
 
 
-def _redacted_epoch() -> dict[str, Any]:
-    epoch = _epoch()
-    epoch["cache_key"] = {**epoch["cache_key"], "redacted": True}
-    return epoch
+def _redacted_epoch(session_dir: Path) -> dict[str, Any]:
+    return _checkpoint_epoch(session_dir, redacted=True)
 
 
 def test_redacted_parent_epoch_allows_declared_semantic(tmp_path: Path) -> None:
     """Semantic reuse may import summaries from a redacted checkpoint."""
     runtime, events = _runtime(tmp_path)
-    runtime._task_epochs["parent"] = _redacted_epoch()
+    runtime._task_epochs["parent"] = _redacted_epoch(tmp_path)
 
     child_spec: dict[str, Any] = {"context_mode": "semantic", "placement": "spread"}
     asyncio.run(
@@ -224,23 +324,25 @@ def test_redacted_parent_epoch_allows_declared_semantic(tmp_path: Path) -> None:
         )
     )
 
-    assert child_spec["summary_trunk_ref"] == _redacted_epoch()["checkpoint_ref"]
+    assert child_spec["summary_trunk_ref"] == runtime._task_epochs["parent"]["checkpoint_ref"]
     assert "context_fork" not in child_spec
     fork_events = [event for event in events if event["kind"] == "context_fork"]
     assert len(fork_events) == 1
     assert fork_events[0]["semantic_reuse"] is True
     assert fork_events[0]["compatible"] is False
+    assert fork_events[0]["context_mode"] == "semantic"
+    assert fork_events[0]["resolved_context_mode"] == "semantic"
 
 
 def test_redacted_parent_epoch_automatically_falls_back_to_semantic(tmp_path: Path) -> None:
     """Automatic incompatibility falls back to persisted semantic summaries."""
     runtime, events = _runtime(tmp_path)
-    runtime._task_epochs["parent"] = _redacted_epoch()
+    runtime._task_epochs["parent"] = _redacted_epoch(tmp_path)
     child_spec: dict[str, Any] = {"fanout_config": {"model": "other-model"}}
 
     asyncio.run(runtime._pin_fork_child(child_spec, "parent", "child", "investigation"))
 
-    assert child_spec["summary_trunk_ref"] == _redacted_epoch()["checkpoint_ref"]
+    assert child_spec["summary_trunk_ref"] == runtime._task_epochs["parent"]["checkpoint_ref"]
     assert "context_fork" not in child_spec
     fork_events = [event for event in events if event["kind"] == "context_fork"]
     assert len(fork_events) == 1
@@ -251,7 +353,7 @@ def test_redacted_parent_epoch_automatically_falls_back_to_semantic(tmp_path: Pa
 def test_redacted_parent_epoch_rejects_declared_trunk(tmp_path: Path) -> None:
     """A redacted checkpoint is never an exact fork; trunk stays a rejection."""
     runtime = _Runtime(tmp_path, None)
-    runtime._task_epochs["parent"] = _redacted_epoch()
+    runtime._task_epochs["parent"] = _redacted_epoch(tmp_path)
     child_spec: dict[str, Any] = {
         "context_mode": "trunk",
         "placement": "inherit",
@@ -278,7 +380,7 @@ def test_missing_parent_epoch_rejects_declared_trunk(tmp_path: Path) -> None:
 
 def test_fresh_child_admits_with_missing_or_redacted_parent_epoch(tmp_path: Path) -> None:
     """fresh has no checkpoint precondition: it is the usable first-batch mode."""
-    for epoch in (None, _redacted_epoch()):
+    for epoch in (None, _redacted_epoch(tmp_path)):
         runtime, events = _runtime(tmp_path)
         if epoch is None:
             runtime._task_epochs.clear()

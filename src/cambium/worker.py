@@ -2663,6 +2663,34 @@ def _summarize_transcript(
 
 
 _READ_TOOL_NAMES = frozenset({"read_file", "read_batch"})
+# Read-only calls whose returned evidence can establish progress. Keep this
+# separate from the file-read set because the latter also drives transcript
+# compaction by path.
+_EVIDENCE_READ_TOOL_NAMES = frozenset(
+    {
+        "read_file",
+        "read_batch",
+        "repo_query",
+        "branch_history",
+        "inspect_state",
+    }
+)
+
+
+def _is_evidence_read_call(call: Mapping[str, Any]) -> bool:
+    """Return whether one normalized call observes bounded read-only evidence."""
+    name = call.get("name")
+    if name in _EVIDENCE_READ_TOOL_NAMES:
+        return True
+    arguments = call.get("arguments")
+    operation = arguments.get("op") if isinstance(arguments, Mapping) else None
+    return (
+        name == "git_op"
+        and isinstance(operation, str)
+        and operation in INSPECTION_GIT_OPS
+    )
+
+
 _EDIT_TOOL_NAMES = frozenset({"edit_file", "write_file"})
 # Allowlist, not a denylist: a batch runs concurrently only when EVERY call is
 # a known read-only tool. Anything new or unknown defaults to sequential.
@@ -3438,6 +3466,7 @@ class _ProgressDetector:
         "progress_window",
         "_recent_signatures",
         "_recent_content_hashes",
+        "_recent_read_pairs",
         "no_progress_actions",
     )
 
@@ -3448,6 +3477,9 @@ class _ProgressDetector:
         self.progress_window = progress_window
         self._recent_signatures: deque[str] = deque(maxlen=progress_window)
         self._recent_content_hashes: deque[str] = deque(maxlen=MAX_PROGRESS_CONTENT_HASHES)
+        self._recent_read_pairs: deque[tuple[str, str]] = deque(
+            maxlen=MAX_PROGRESS_CONTENT_HASHES
+        )
         self.no_progress_actions = 0
 
     def observe(
@@ -3458,22 +3490,27 @@ class _ProgressDetector:
     ) -> bool:
         """Record one assistant result and return whether the loop is stalled."""
         signature = _progress_signature(content, action)
-        repeated_read = False
+        repeated_read_pair = False
         tool_calls: list[dict[str, Any]] = []
         if isinstance(action, Mapping) and action.get("type") == "tool_call":
             try:
                 tool_calls = _normalize_tool_calls(action)
             except ValueError:
                 tool_calls = []
+        result_hash: str | None = None
         if (
             tool_calls
-            and all(call["name"] in _READ_TOOL_NAMES for call in tool_calls)
+            and all(_is_evidence_read_call(call) for call in tool_calls)
             and isinstance(result_content, str)
         ):
             result_hash = _progress_content_hash(result_content)
-            repeated_read = result_hash in self._recent_content_hashes
+            repeated_read_pair = (signature, result_hash) in self._recent_read_pairs
             self._recent_content_hashes.append(result_hash)
-        novel = bool(signature) and signature not in self._recent_signatures and not repeated_read
+            self._recent_read_pairs.append((signature, result_hash))
+        signature_novel = bool(signature) and signature not in self._recent_signatures
+        # A read-only action is novel when either its evidence query or its
+        # bounded result changed. Exact repeats of both remain non-novel.
+        novel = not repeated_read_pair if result_hash is not None else signature_novel
         self.no_progress_actions = 0 if novel else self.no_progress_actions + 1
         self._recent_signatures.append(signature)
         return (
@@ -3482,10 +3519,11 @@ class _ProgressDetector:
         )
 
     def restore(self, messages: Sequence[Mapping[str, Any]]) -> None:
-        """Seed recent assistant signatures from a resumed checkpoint."""
+        """Seed recent action and read-evidence identities from a checkpoint."""
         pending_read_results = 0
         pending_read_expected = 0
         pending_read_bodies: list[str] = []
+        pending_read_signature: str | None = None
         for message in messages:
             if message.get("role") == "user" and pending_read_results:
                 content = message.get("content")
@@ -3498,11 +3536,13 @@ class _ProgressDetector:
                 pending_read_results -= 1
                 if pending_read_results == 0:
                     if len(pending_read_bodies) == pending_read_expected:
-                        self._recent_content_hashes.append(
-                            _progress_content_hash("\n".join(pending_read_bodies))
-                        )
+                        result_hash = _progress_content_hash("\n".join(pending_read_bodies))
+                        self._recent_content_hashes.append(result_hash)
+                        if pending_read_signature is not None:
+                            self._recent_read_pairs.append((pending_read_signature, result_hash))
                     pending_read_expected = 0
                     pending_read_bodies = []
+                    pending_read_signature = None
                 continue
             if message.get("role") != "assistant":
                 continue
@@ -3511,6 +3551,7 @@ class _ProgressDetector:
                 pending_read_results = 0
                 pending_read_expected = 0
                 pending_read_bodies = []
+                pending_read_signature = None
                 continue
             try:
                 action = _parse_agent_action(content)
@@ -3519,6 +3560,7 @@ class _ProgressDetector:
                 pending_read_results = 0
                 pending_read_expected = 0
                 pending_read_bodies = []
+                pending_read_signature = None
             else:
                 signature = _progress_signature(None, action=action)
                 try:
@@ -3527,15 +3569,17 @@ class _ProgressDetector:
                     pending_read_results = 0
                     pending_read_expected = 0
                     pending_read_bodies = []
+                    pending_read_signature = None
                 else:
                     pending_read_results = (
                         len(tool_calls)
                         if action.get("type") == "tool_call"
-                        and all(call["name"] in _READ_TOOL_NAMES for call in tool_calls)
+                        and all(_is_evidence_read_call(call) for call in tool_calls)
                         else 0
                     )
                     pending_read_expected = pending_read_results
                     pending_read_bodies = []
+                    pending_read_signature = signature if pending_read_results else None
             if signature:
                 self._recent_signatures.append(signature)
 
@@ -6888,7 +6932,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
             # bounded loop and wall/token limits still own termination.
             tool_calls = action["calls"] if action["type"] == "tool_call" else []
             read_action = bool(tool_calls) and all(
-                call["name"] in _READ_TOOL_NAMES for call in tool_calls
+                _is_evidence_read_call(call) for call in tool_calls
             )
             if not read_action:
                 stalled = _observe_progress(progress_detector, action=action)
@@ -7284,6 +7328,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                     transcript = _sync_context_transcript(
                         base_messages, context_continuation, transcript
                     )
+                read_stall_pending = False
                 if read_action:
                     stalled = _observe_progress(
                         progress_detector,
@@ -7291,12 +7336,9 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                         result_content="\n".join(result_contents),
                     )
                     no_progress_actions = progress_detector.no_progress_actions
-                    if stalled and not _finalization_due(
+                    read_stall_pending = stalled and not _finalization_due(
                         turn, finalized, budget_new_tokens, soft_cap, config
-                    ):
-                        return _no_progress_failure(
-                            outcome, no_progress_actions, turn, cumulative_usage, transcript
-                        )
+                    )
                 base_messages, context_continuation, transcript = await _maybe_restore_turn_context(
                     turn_checkpoint_resumed=turn_checkpoint_resumed,
                     compaction_deferred=compaction_deferred,
@@ -7349,6 +7391,10 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                             code_changed=code_changed,
                         )
                     last_turn_checkpoint = turn
+                if read_stall_pending:
+                    return _no_progress_failure(
+                        outcome, no_progress_actions, turn, cumulative_usage, transcript
+                    )
                 if batch_cancelled:
                     return _loop_result(
                         outcome, "cancelled", None, turn - 1, cumulative_usage, transcript
