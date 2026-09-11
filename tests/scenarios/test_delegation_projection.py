@@ -36,8 +36,7 @@ def test_delegate_defaults_depend_on_independent_batch() -> None:
 
 
 def test_read_only_investigation_delegates_default_to_fresh_inherit() -> None:
-    """Read-only probes must not depend on a parent checkpoint that a fresh or
-    redacted interactive session cannot offer; they complete to fresh+inherit."""
+    """Read-only probes default to fresh+inherit without a checkpoint precondition."""
 
     def call(name):
         return {

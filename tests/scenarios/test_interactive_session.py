@@ -31,7 +31,9 @@ class _Tty(io.StringIO):
         return True
 
 
-def _cache_key(provider: str = "provider-a", model: str = "model-a") -> dict[str, object]:
+def _cache_key(
+    provider: str = "provider-a", model: str = "model-a", *, redacted: bool = False
+) -> dict[str, object]:
     digest = "a" * 64
     return {
         "provider": provider,
@@ -45,13 +47,17 @@ def _cache_key(provider: str = "provider-a", model: str = "model-a") -> dict[str
         "full_sha256": digest,
         "prefix_bytes": 1024,
         "message_count": 3,
-        "redacted": False,
+        "redacted": redacted,
         "provider_boundary": {},
     }
 
 
 def _checkpoint_event(
-    ref: str, provider: str = "provider-a", model: str = "model-a"
+    ref: str,
+    provider: str = "provider-a",
+    model: str = "model-a",
+    *,
+    redacted: bool = False,
 ) -> dict[str, object]:
     return {
         "seq": 1,
@@ -60,7 +66,7 @@ def _checkpoint_event(
         "payload": {
             "checkpoint_ref": ref,
             "epoch": 3,
-            "cache_key": _cache_key(provider, model),
+            "cache_key": _cache_key(provider, model, redacted=redacted),
         },
     }
 
@@ -139,6 +145,26 @@ def test_interactive_session_carries_exact_and_semantic_seed(tmp_path: Path) -> 
     assert reloaded.provider == "provider-a"
     assert reloaded.seed is not None
     assert reloaded.seed.checkpoint_ref == checkpoint_ref
+
+
+def test_interactive_session_keeps_redacted_seed_for_semantic_continuity(tmp_path: Path) -> None:
+    root = tmp_path / "interactive"
+    session = InteractiveSession(OneShotConfig(repo=tmp_path, session_root=root))
+    first = session.prepare_turn("inspect")
+    checkpoint_ref = "interactive-main/epoch-3-" + "b" * 64 + ".json"
+    checkpoint = first.session_dir / ".cambium" / "checkpoints" / checkpoint_ref
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_text("{}", encoding="utf-8")
+
+    session.observe_event(first, _checkpoint_event(checkpoint_ref, redacted=True))
+    session.complete_turn(first, succeeded=True)
+    second = session.prepare_turn("continue")
+
+    assert second.summary_trunk_ref == checkpoint_ref
+    assert second.context_fork is not None
+    assert second.context_fork["checkpoint_ref"] == checkpoint_ref
+    assert second.context_fork["provider"] == "provider-a"
+    assert second.context_fork["model"] == "model-a"
 
 
 def test_interactive_reset_starts_fresh_branch(tmp_path: Path) -> None:

@@ -96,9 +96,11 @@ def complete_child_policy(
 
     ``read_only`` marks self-contained read-only work (``kind=investigation``).
     Such children complete to ``fresh + inherit`` because neither ``trunk`` nor
-    ``semantic`` has an unconditional admission path: both require a usable
-    parent checkpoint that a fresh or redacted session cannot offer. Explicit
-    declarations always win; a declared spread placement stays spread.
+    ``semantic`` has an unconditional admission path: ``trunk`` requires an
+    exact compatible unredacted checkpoint, while ``semantic`` requires a
+    persisted summary-only checkpoint. A fresh session's first delegation has
+    neither. Explicit declarations always win; a declared spread placement
+    stays spread.
     """
     if not isinstance(spec, Mapping):
         raise ChildPolicyError("child spec must be an object")

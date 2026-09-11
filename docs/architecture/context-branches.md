@@ -50,9 +50,9 @@ proposal is recorded:
 Explicit fields remain explicit. `trunk + spread` is contradictory. A requested
 exact fork that cannot establish compatibility is rejected, not silently made
 lossy. A read-only `investigation` delegate defaults to `fresh` because `trunk`
-and `semantic` admission both require a usable parent checkpoint, which the
-first delegation of a fresh or redacted session cannot offer. A batch is
-important: emitting one delegate on each later turn can
+requires an exact compatible unredacted checkpoint and `semantic` requires a
+persisted summary-only checkpoint; the first delegation of a fresh session has
+neither. A batch is important: emitting one delegate on each later turn can
 serialize work because the parent suspends at a successful delegation boundary.
 
 The supervisor supplies repository, private worktree, branch and inherited
@@ -74,7 +74,8 @@ proof of where tokens were generated.
 
 For a single blocking child needing the exact current context, keeping the
 parent provider/model avoids a new semantic head and preserves prefix affinity.
-For independent work, `semantic` transfers accepted summary state; `fresh`
+For independent work, `semantic` transfers accepted summary state, including
+already-redacted persisted summaries under a fresh provider head; `fresh`
 transfers only a self-contained task. Neither transfers a provider's KV cache.
 
 ## One worker, several relationships
