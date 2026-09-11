@@ -35,8 +35,8 @@ def test_delegate_defaults_depend_on_independent_batch() -> None:
     assert all(c["arguments"]["spec"]["placement"] == "spread" for c in batch["calls"])
 
 
-def test_read_only_investigation_delegates_default_to_fresh_inherit() -> None:
-    """Read-only probes default to fresh+inherit without a checkpoint precondition."""
+def test_read_only_investigation_delegates_spread_when_batched() -> None:
+    """Read-only probes use fresh context and spread independent siblings."""
 
     def call(name):
         return {
@@ -55,7 +55,7 @@ def test_read_only_investigation_delegates_default_to_fresh_inherit() -> None:
 
     batch = _parse_agent_action(json.dumps({"type": "tool_call", "calls": [call("a"), call("b")]}))
     assert all(c["arguments"]["spec"]["context_mode"] == "fresh" for c in batch["calls"])
-    assert all(c["arguments"]["spec"]["placement"] == "inherit" for c in batch["calls"])
+    assert all(c["arguments"]["spec"]["placement"] == "spread" for c in batch["calls"])
 
 
 def test_investigation_delegates_keep_explicit_policy() -> None:

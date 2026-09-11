@@ -11,7 +11,8 @@ mandatory extra planner request, no online DSPy classifier, and no fixed rule
 that splits every request mentioning two files.
 
 `prompts.CODING_POLICY` asks the model to keep tiny or coupled work local and
-batch independent workstreams with disjoint ownership and completion checks.
+to batch two or more independent targets, hosts, modules, or investigations
+with disjoint ownership and completion checks before serializing them locally.
 A GEPA experiment can change that policy text. The `should_decompose` decision
 module is an offline experiment, not a hidden step in the worker loop.
 
@@ -42,18 +43,20 @@ proposal is recorded:
 | --- | --- |
 | One child, neither field supplied | `trunk + inherit` |
 | Several children in one batch, neither field supplied | `semantic + spread` |
-| Read-only (`kind=investigation`) delegate, context omitted | `fresh + inherit` |
+| One read-only (`kind=investigation`) delegate, context omitted | `fresh + inherit` |
+| Several read-only delegates in one batch, context omitted | `fresh + spread` |
 | `placement=spread`, context omitted | `semantic + spread` |
 | `context_mode=semantic` or `fresh`, placement omitted | `spread` |
 | `context_mode=trunk`, placement omitted | `inherit` |
 
 Explicit fields remain explicit. `trunk + spread` is contradictory. A requested
 exact fork that cannot establish compatibility is rejected, not silently made
-lossy. A read-only `investigation` delegate defaults to `fresh` because `trunk`
-requires an exact compatible unredacted checkpoint and `semantic` requires a
-persisted summary-only checkpoint; the first delegation of a fresh session has
-neither. A batch is important: emitting one delegate on each later turn can
-serialize work because the parent suspends at a successful delegation boundary.
+lossy. A read-only `investigation` delegate defaults to `fresh` because it needs
+no parent checkpoint; independent read-only siblings default to `spread` so they
+can consume different provider capacity. Explicit semantic children may reuse a
+persisted summary-only checkpoint, including already-redacted summaries. A batch
+is important: emitting one delegate on each later turn can serialize work because
+the parent suspends at a successful delegation boundary.
 
 The supervisor supplies repository, private worktree, branch and inherited
 execution settings. Models supply the actual workload, not internal filesystem

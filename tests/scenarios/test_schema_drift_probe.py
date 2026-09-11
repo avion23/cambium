@@ -125,13 +125,13 @@ def test_prompt_optimize_metric_rejects_bool() -> None:
     assert metric(None, SimpleNamespace(score=0.9, report="r")).score == 0.9
 
 
-def test_read_only_delegate_defaults_still_fresh_inherit() -> None:
+def test_read_only_delegate_defaults_keep_fresh_context_and_spread_batches() -> None:
     from cambium.child_policy import complete_child_policy
 
     single = complete_child_policy({}, siblings=1, read_only=True)
     assert (single["context_mode"], single["placement"]) == ("fresh", "inherit")
     batch = complete_child_policy({}, siblings=4, read_only=True)
-    assert (batch["context_mode"], batch["placement"]) == ("fresh", "inherit")
+    assert (batch["context_mode"], batch["placement"]) == ("fresh", "spread")
 
 
 def test_resume_rejection_feedback_round_trip() -> None:

@@ -13,8 +13,9 @@ The supervisor still accepts an undeclared policy from harness-originated
 ``proposed_children`` fixtures. That internal automatic-compatibility path is
 represented by ``None``. Model calls use :func:`complete_child_policy`: one
 blocking child defaults to trunk/inherit; independent batches to semantic/spread;
-read-only (``kind=investigation``) delegates to fresh/inherit, which has no
-parent-checkpoint precondition at admission.
+read-only (``kind=investigation``) delegates use fresh context, with one child
+inheriting provider affinity and independent sibling batches spreading across
+provider lanes.
 """
 
 from __future__ import annotations
@@ -95,19 +96,18 @@ def complete_child_policy(
     """Resolve omitted model policy before recording the actual proposal.
 
     ``read_only`` marks self-contained read-only work (``kind=investigation``).
-    Such children complete to ``fresh + inherit`` because neither ``trunk`` nor
-    ``semantic`` has an unconditional admission path: ``trunk`` requires an
-    exact compatible unredacted checkpoint, while ``semantic`` requires a
-    persisted summary-only checkpoint. A fresh session's first delegation has
-    neither. Explicit declarations always win; a declared spread placement
-    stays spread.
+    Such children use ``fresh`` context because they do not need a parent
+    checkpoint. A single probe inherits provider affinity; independent sibling
+    probes spread across provider lanes so read-only fanout can increase total
+    throughput. Explicit declarations always win; an explicit semantic child
+    may reuse a persisted summary-only checkpoint, including redacted summaries.
     """
     if not isinstance(spec, Mapping):
         raise ChildPolicyError("child spec must be an object")
     resolved = dict(spec)
     if read_only and resolved.get("context_mode") is None:
         resolved.setdefault("context_mode", "fresh")
-        resolved.setdefault("placement", "inherit")
+        resolved.setdefault("placement", "spread" if siblings > 1 else "inherit")
     else:
         mode = "semantic" if siblings > 1 or resolved.get("placement") == "spread" else "trunk"
         resolved.setdefault("context_mode", mode)

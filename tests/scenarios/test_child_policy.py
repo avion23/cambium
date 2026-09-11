@@ -56,15 +56,15 @@ def test_trunk_cannot_claim_another_provider() -> None:
         require_child_policy({"context_mode": "trunk", "placement": "spread"})
 
 
-def test_read_only_delegates_complete_to_fresh_inherit() -> None:
-    """Read-only (investigation) delegates never depend on a parent checkpoint."""
+def test_read_only_delegates_use_fresh_context_and_spread_batches() -> None:
+    """Read-only delegates avoid checkpoint coupling and spread independent siblings."""
     single = complete_child_policy({}, siblings=1, read_only=True)
     assert single["context_mode"] == "fresh"
     assert single["placement"] == "inherit"
 
     batch = complete_child_policy({}, siblings=4, read_only=True)
     assert batch["context_mode"] == "fresh"
-    assert batch["placement"] == "inherit"
+    assert batch["placement"] == "spread"
 
 
 def test_read_only_completion_respects_explicit_declarations() -> None:

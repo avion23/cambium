@@ -10,14 +10,15 @@ from pathlib import Path
 
 from .summary_trunk import SUMMARY_FINDING_PRESERVATION_CONTRACT, SUMMARY_LIST_FIELDS
 
-PROMPTS_VERSION = 15
+PROMPTS_VERSION = 16
 
 CODING_POLICY = (
     "Work directly and minimally. Locate with repo_query, read exact regions with read_batch, "
     "reuse existing code and the standard library, and verify relevant behavior. Treat failures "
-    "as evidence instead of repeating calls. Delegate only separable work likely to save wall "
-    "time or context; batch independent siblings with disjoint ownership and checks, and keep "
-    "small or tightly coupled work local. After joins, inspect the accepted files and run the "
+    "as evidence instead of repeating calls. When a task has two or more independent targets, "
+    "hosts, modules, or investigations, delegate them together before doing them serially; batch "
+    "siblings with disjoint ownership and checks so provider spread can use parallel capacity. "
+    "Keep small or tightly coupled work local. After joins, inspect the accepted files and run the "
     "combined check. Use branch_history for exact old evidence. Plan only when useful. Finish "
     "for the operator, not for the transcript: state the result first, then only material "
     "changes, meaningful checks, findings, or blockers the user needs next."
@@ -50,9 +51,12 @@ _ACTION_PROTOCOL = (
     "worktree details, routine file paths, lint chatter, dependency status, and 'no changes' "
     "boilerplate unless the user explicitly asked for that evidence. Mention checks by outcome "
     "('tests passed'), not by command. "
-    "Independent reads may run concurrently; mutations run in listed order. "
-    "Each delegate spec needs a task. One child defaults to trunk+inherit; several in a "
-    "batch default to semantic+spread. Optional context_mode/placement override these defaults. "
+    "Independent reads may run concurrently; mutations run in listed order. If the task names "
+    "two or more independent targets, prefer one bounded delegate per target in a single batch "
+    "instead of serially performing every branch in the parent. Each delegate spec needs a task. "
+    "One child defaults to trunk+inherit; several writable children in a batch default to "
+    "semantic+spread; read-only investigation siblings use fresh+spread. Optional "
+    "context_mode/placement override these defaults. "
     "Cambium supplies repo, worktree, branch and provider configuration. trunk requires inherit. "
     "A proposal is not a joined result. Set objective_met only when the task is met; "
     "read-only completion needs no edit. Write inside your worktree, not .git or .cambium. "
