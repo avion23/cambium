@@ -35,16 +35,20 @@ with disjoint read scope and omitted policy fields: completion resolves them to
 `fresh + inherit`, the only context mode with no checkpoint precondition, so the
 first delegation of a fresh session admits. Do not blind-retry a rejected
 semantic batch; the rejection is structural, not transient. Two preconditions
-govern the other modes: `trunk` requires an exact compatible parent checkpoint,
-and `semantic` requires an unredacted parent checkpoint — redaction is sticky
-because one email or credential-shaped string in the transcript marks every
-subsequent checkpoint redacted, and a fresh session's first delegation has no
-checkpoint at all yet.
+govern the other modes: `trunk` requires an exact compatible **unredacted**
+parent checkpoint, while `semantic` requires a persisted parent checkpoint with
+validated summary entries and no raw tail. Redaction is sticky because one
+email or credential-shaped string in the transcript marks every subsequent
+checkpoint redacted, but it only blocks exact byte-compatible reuse: semantic
+mode may import the already-redacted persisted summaries under a fresh provider
+head. It never receives unredacted checkpoint material or claims provider-cache
+identity or a cache hit. A fresh session's first delegation has no checkpoint at
+all yet.
 
 | `context_mode` | Meaning |
 | --- | --- |
-| `trunk` | Complete compatible parent checkpoint prefix; requires `inherit` |
-| `semantic` | Immutable semantic summaries under a fresh provider head |
+| `trunk` | Complete compatible unredacted parent checkpoint prefix; requires `inherit` |
+| `semantic` | Persisted (possibly redacted) semantic summaries under a fresh provider head; no cache identity |
 | `fresh` | Task only; no parent checkpoint, summaries, or result envelope |
 
 | `placement` | Meaning |

@@ -193,7 +193,7 @@ def test_missing_parent_epoch_rejects_declared_semantic(tmp_path: Path) -> None:
         "placement": "spread",
     }
 
-    with pytest.raises(ValueError, match="requires an unredacted parent checkpoint"):
+    with pytest.raises(ValueError, match="requires a persisted parent checkpoint"):
         asyncio.run(runtime._pin_fork_child(child_spec, "missing", "child", "investigation"))
 
 
@@ -209,21 +209,43 @@ def _redacted_epoch() -> dict[str, Any]:
     return epoch
 
 
-def test_redacted_parent_epoch_rejects_declared_semantic(tmp_path: Path) -> None:
-    """A redacted checkpoint (one redactor hit, e.g. an email in the transcript)
-    defeats semantic reuse; the error must name the working alternative."""
-    runtime = _Runtime(tmp_path, None)
+def test_redacted_parent_epoch_allows_declared_semantic(tmp_path: Path) -> None:
+    """Semantic reuse may import summaries from a redacted checkpoint."""
+    runtime, events = _runtime(tmp_path)
     runtime._task_epochs["parent"] = _redacted_epoch()
 
-    with pytest.raises(ValueError, match="context_mode=fresh"):
-        asyncio.run(
-            runtime._pin_fork_child(
-                {"context_mode": "semantic", "placement": "spread"},
-                "parent",
-                "child",
-                "investigation",
-            )
+    child_spec: dict[str, Any] = {"context_mode": "semantic", "placement": "spread"}
+    asyncio.run(
+        runtime._pin_fork_child(
+            child_spec,
+            "parent",
+            "child",
+            "investigation",
         )
+    )
+
+    assert child_spec["summary_trunk_ref"] == _redacted_epoch()["checkpoint_ref"]
+    assert "context_fork" not in child_spec
+    fork_events = [event for event in events if event["kind"] == "context_fork"]
+    assert len(fork_events) == 1
+    assert fork_events[0]["semantic_reuse"] is True
+    assert fork_events[0]["compatible"] is False
+
+
+def test_redacted_parent_epoch_automatically_falls_back_to_semantic(tmp_path: Path) -> None:
+    """Automatic incompatibility falls back to persisted semantic summaries."""
+    runtime, events = _runtime(tmp_path)
+    runtime._task_epochs["parent"] = _redacted_epoch()
+    child_spec: dict[str, Any] = {"fanout_config": {"model": "other-model"}}
+
+    asyncio.run(runtime._pin_fork_child(child_spec, "parent", "child", "investigation"))
+
+    assert child_spec["summary_trunk_ref"] == _redacted_epoch()["checkpoint_ref"]
+    assert "context_fork" not in child_spec
+    fork_events = [event for event in events if event["kind"] == "context_fork"]
+    assert len(fork_events) == 1
+    assert fork_events[0]["semantic_reuse"] is True
+    assert fork_events[0]["compatible"] is False
 
 
 def test_redacted_parent_epoch_rejects_declared_trunk(tmp_path: Path) -> None:

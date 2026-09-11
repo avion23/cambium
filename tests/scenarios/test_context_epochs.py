@@ -25,7 +25,7 @@ from cambium.context_policy import CastPolicy
 from cambium.diffundo import ProviderTier
 from cambium.fencing import write_generation
 from cambium.redact import Redactor
-from cambium.summary_trunk import is_k0_entry, summary_entries
+from cambium.summary_trunk import SummaryEntry, append_summary_entry, is_k0_entry, summary_entries
 from cambium.supervisor import (
     TaskResult,
     _bounded_resume_envelope,
@@ -435,7 +435,8 @@ def test_redacted_epoch_checkpoint_roundtrip(tmp_path: Path) -> None:
 def test_email_shape_alone_marks_checkpoint_redacted(tmp_path: Path) -> None:
     """No registered secret is needed: one email in the transcript (e.g. a git
     author line from a read-only probe) redacts the checkpoint and therefore
-    defeats trunk and semantic admission for the rest of the session."""
+    defeats exact cache admission for the rest of the session. A separate
+    summary-only semantic path may still reuse its persisted redacted text."""
     config = _agent_config(tmp_path / "wt", checkpoint_root=tmp_path / "ckpts")
     checkpoint = _write_epoch(
         config,
@@ -1276,6 +1277,91 @@ def test_redacted_resume_fails_without_seeding_transcript(tmp_path: Path) -> Non
     assert router.prompts == []
     assert outcome["transcript"] == []
     assert not any(message["type"] == "context_checkpoint" for message in writer.messages())
+
+
+def test_redacted_interactive_continuation_reuses_semantic_summary_without_cache_fork(
+    tmp_path: Path,
+) -> None:
+    """Interactive continuation keeps semantic summaries when exact reuse is forbidden."""
+    worktree = _make_worktree(tmp_path / "repo")
+    redactor = Redactor(secret_values={"SECRETXYZ"})
+    base_config = _agent_config(
+        worktree,
+        checkpoint_root=tmp_path / "ckpts",
+        redactor=redactor,
+    )
+    summary_messages = append_summary_entry(
+        [
+            {"role": "system", "content": "You are the agent."},
+            {"role": "user", "content": "<cambium-task>read the files and finish</cambium-task>"},
+        ],
+        SummaryEntry(
+            type="summary_entry",
+            sequence=1,
+            source_sha256="c" * 64,
+            source_message_count=1,
+            through_turn=1,
+            objective="preserve the redacted semantic state",
+            outcome="captured SECRETXYZ as prior evidence",
+            decisions_added=(),
+            decisions_superseded=(),
+            facts_added=("F1: SECRETXYZ was observed",),
+            facts_invalidated=(),
+            files_and_symbols_changed=(),
+            verification_results=(),
+            relevant_failed_approaches=(),
+            open_items=(),
+        ),
+    )
+    checkpoint = _write_epoch(base_config, messages=summary_messages)
+    persisted = worker._load_epoch_checkpoint(
+        base_config,
+        checkpoint.checkpoint_ref,
+        expect_task_id=True,
+    )
+    assert persisted.cache_key.redacted is True
+    assert "SECRETXYZ" not in json.dumps(persisted.provider_messages)
+
+    cache_key = persisted.cache_key
+    fork_descriptor = {
+        "checkpoint_ref": persisted.checkpoint_ref,
+        "provider": cache_key.provider,
+        "model": cache_key.model,
+        "system_sha256": cache_key.system_sha256,
+        "tools_sha256": cache_key.tools_sha256,
+        "prefix_sha256": cache_key.prefix_sha256,
+        "suffix_sha256": cache_key.suffix_sha256,
+        "full_sha256": cache_key.full_sha256,
+        "prefix_bytes": cache_key.prefix_bytes,
+        "provider_boundary": cache_key.provider_boundary,
+    }
+    continuation_config = _agent_config(
+        worktree,
+        checkpoint_root=tmp_path / "ckpts",
+        context_reuse=True,
+        redactor=redactor,
+        # InteractiveSession supplies both fields for every continuation.
+        context_fork=fork_descriptor,
+        summary_trunk_ref=persisted.checkpoint_ref,
+    )
+    writer = _FakeWriter()
+    router = _ScriptedRouter(
+        ['{"type":"finish","summary":"continued","objective_met":true}']
+    )
+
+    outcome = asyncio.run(_drive_loop(continuation_config, worktree, router, writer))
+
+    assert outcome["status"] == "succeeded"
+    skipped = [
+        message for message in writer.messages() if message["type"] == "context_fork_skipped"
+    ]
+    assert [message["reason"] for message in skipped] == ["checkpoint redacted"]
+    assert router.prompts
+    prompt_text = json.dumps(router.prompts[0], sort_keys=True)
+    assert "SECRETXYZ" not in prompt_text
+    assert "***" in prompt_text
+    usage = [message for message in writer.messages() if message["type"] == "usage_event"]
+    assert usage and all(message.get("provider_cache_hit") is not True for message in usage)
 
 
 def test_invalid_context_checkpoint_fields_matrix() -> None:

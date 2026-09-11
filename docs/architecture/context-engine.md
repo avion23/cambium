@@ -173,9 +173,14 @@ context. Delegation defaults and provider placement belong to
 belong to [subagents](subagents.md). Exact values are in the
 [context-branch reference](../reference/context-branches.md).
 
-An exact fork requires compatible request identity; that proves only semantic
-compatibility, not a provider cache hit. Semantic/fresh forks do not transfer KV
-cache state.
+An exact fork requires compatible request identity and an unredacted checkpoint;
+that proves only semantic compatibility, not a provider cache hit. A redacted
+checkpoint is never an exact fork. Semantic reuse exports only validated summary
+entries from the persisted checkpoint, so already-redacted summaries may be
+reused under a fresh provider head. Semantic context is provider-neutral: it
+does not carry cache identity or claim a provider-cache hit, and it never sends
+unredacted checkpoint material. Semantic/fresh forks do not transfer KV cache
+state.
 
 ## Resource economics
 

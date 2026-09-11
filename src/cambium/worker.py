@@ -357,8 +357,9 @@ class CacheKeyDescriptor:
     and ``full_sha256`` hashes their concatenation. A fork appends another
     user message, so its full hash is different from this checkpoint hash.
     ``redacted`` records whether the session redactor altered any byte of the
-    persisted checkpoint; a redacted checkpoint is forkable for context
-    continuity but never byte-guaranteed for provider-cache reuse.
+    persisted checkpoint. A redacted checkpoint may supply semantic context
+    continuity from its persisted, already-redacted text, but exact
+    cache-compatible fork/reuse remains disallowed.
     """
 
     provider: str | None
@@ -6347,8 +6348,10 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
             semantic_checkpoint = _load_epoch_checkpoint(
                 config, config.summary_trunk_ref, expect_task_id=False
             )
-            if semantic_checkpoint.cache_key.redacted:
-                raise ContextForkError("checkpoint redacted")
+            # Semantic summaries are provider-neutral context.  The loader
+            # returns the persisted checkpoint projection, so a redacted
+            # checkpoint can safely contribute its already-redacted summary
+            # entries.  Exact cache-compatible forks remain rejected above.
             summaries = semantic_summary_messages(semantic_checkpoint.full_messages)
             semantic_prompt = _build_agent_prompt(
                 config.task,

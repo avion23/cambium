@@ -249,12 +249,13 @@ def _invalid_propose_child_fields(msg: dict[str, Any]) -> list[str]:
 
 # Reflection remedy for a fully-rejected delegate batch. ``fresh`` children
 # have no checkpoint precondition (_pin_fork_child), while ``trunk`` needs an
-# exact compatible parent checkpoint and ``semantic`` an unredacted one.
+# exact compatible parent checkpoint and ``semantic`` a persisted summary-only
+# checkpoint.
 _REJECTION_REMEDY_TEXT = (
     "Remedy: independent children should declare context_mode=fresh with "
     "placement=inherit (no parent-checkpoint precondition); context_mode=trunk "
     "requires an exact compatible parent checkpoint and context_mode=semantic "
-    "an unredacted one; a retry must use a fresh child_task_id and file "
+    "a persisted summary-only checkpoint; a retry must use a fresh child_task_id and file "
     "ownership disjoint from every admitted task."
 )
 
@@ -4640,8 +4641,8 @@ class _Runtime:
                 if not self._pin_exact_fork(child_spec, epoch, parent_task_id, child_task_id, kind):
                     raise ChildPolicyError(
                         "child context_mode=trunk requires an exact compatible "
-                        "parent checkpoint; use semantic or fresh instead "
-                        "(semantic also needs an unredacted checkpoint; fresh needs none)"
+                        "parent checkpoint (unredacted required); use semantic or fresh instead "
+                        "(semantic needs a persisted summary-only checkpoint; fresh needs none)"
                     )
                 if placement == "spread":
                     self._apply_spread(child_spec, parent_provider)
@@ -4661,15 +4662,14 @@ class _Runtime:
             if context_mode == "semantic":
                 if not (
                     isinstance(cache_key, dict)
-                    and cache_key.get("redacted") is False
+                    and type(cache_key.get("redacted")) is bool
                     and isinstance(checkpoint_ref, str)
+                    and bool(checkpoint_ref)
                 ):
                     raise ChildPolicyError(
-                        "child context_mode=semantic requires an unredacted parent "
-                        "checkpoint; the parent epoch is missing or its checkpoint is "
-                        "redacted (redaction triggers include emails and "
-                        "credential-shaped transcript text); declare "
-                        "context_mode=fresh instead"
+                        "child context_mode=semantic requires a persisted parent "
+                        "checkpoint; the parent epoch or checkpoint reference is "
+                        "missing; declare context_mode=fresh instead"
                     )
                 child_spec["summary_trunk_ref"] = checkpoint_ref
                 if placement == "spread":
@@ -4717,8 +4717,9 @@ class _Runtime:
         semantic_reuse = (
             not compatible
             and isinstance(cache_key, dict)
-            and cache_key.get("redacted") is False
+            and type(cache_key.get("redacted")) is bool
             and isinstance(epoch.get("checkpoint_ref"), str)
+            and bool(epoch.get("checkpoint_ref"))
         )
         fork_payload: dict[str, Any] = {
             "parent_task_id": parent_task_id,
