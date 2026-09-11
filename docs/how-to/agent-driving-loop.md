@@ -35,8 +35,9 @@ check. A targeted regression should fail before the fix and pass afterward when
 a reproduction is available. Use the affected suite when a shared boundary
 changes. Do not run the whole suite repeatedly while a focused failure remains.
 
-Work only in the assigned worktree. Cambium owns the publication commit; do not
-run `git commit`, `merge` or `push` from an agent tool call.
+Work only in the assigned worktree. Git commands are available for inspection:
+`git_op` exposes `status`, `diff` and `log`, and `run_shell` can run other git
+commands when shell permission is enabled.
 
 ## Delegate and recall selectively
 
