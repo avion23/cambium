@@ -406,6 +406,7 @@ def test_delegated_child_proposals_get_distinct_request_ids() -> None:
 def test_command_and_tool_edge_probes_are_stable(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    monkeypatch.setenv("TERM", "xterm-256color")
     prompts: list[str] = []
 
     async def fake_run(self: Any, turn: Any, *, on_event: Any = None) -> Any:

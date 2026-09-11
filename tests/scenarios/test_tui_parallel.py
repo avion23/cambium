@@ -17,6 +17,7 @@ class _Tty(io.StringIO):
 
 
 def test_queued_tui_prompts_use_one_flat_plan(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("TERM", "xterm-256color")
     monkeypatch.setattr(oneshot, "preflight", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(oneshot, "admit_session", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
