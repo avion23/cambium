@@ -135,8 +135,8 @@ from .situation import SECTION_ORDER
 from .store import (
     CRITICAL_KINDS,
     EventStore,
-    _PreRedactedEvent,
     StoreError,
+    _PreRedactedEvent,
     count_events_file,
     read_events_file,
 )
