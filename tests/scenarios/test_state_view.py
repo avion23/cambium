@@ -85,7 +85,7 @@ def test_inspection_does_not_interleave_turns_and_can_focus_a_child(tmp_path, mo
         session=SimpleNamespace(root=root),
         cumulative=None,
         snapshot=None,
-        cockpit=None,
+        timeline=None,
     )
     assert tool.output == operator == render_situation_frame(child)
     assert "summary: reviewed current task" in operator

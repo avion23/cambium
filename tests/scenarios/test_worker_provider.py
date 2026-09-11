@@ -31,7 +31,7 @@ from cambium.fencing import write_generation
 from cambium.ipc import MAX_LINE_BYTES, read_message
 from cambium.prompts import CODING_AGENT
 from cambium.supervisor import read_events, run_plan, run_session
-from cambium.tui_screen import Cockpit, Transcript
+from cambium.tui_screen import LinearTimeline, Transcript
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKER = "cambium.worker"
@@ -1613,9 +1613,9 @@ def test_run_shell_output_deltas_reach_supervisor_and_tui_rows(tmp_path, monkeyp
                 return True
 
         stream = _Tty()
-        cockpit = Cockpit(stream)
-        with cockpit:
-            cockpit.draw(
+        timeline = LinearTimeline(stream)
+        with timeline:
+            timeline.draw(
                 None,
                 transcript,
                 session_description="session",
@@ -1625,13 +1625,13 @@ def test_run_shell_output_deltas_reach_supervisor_and_tui_rows(tmp_path, monkeyp
                 turn_active=True,
             )
             first_frame = stream.getvalue()
-            cockpit.move_to_input()
-            cockpit.set_input("", 0)
+            timeline.move_to_input()
+            timeline.set_input("", 0)
 
             def observe(event: dict[str, Any]) -> None:
                 transcript.observe_event(event)
                 terminal = event["kind"] == "result"
-                cockpit.draw(
+                timeline.draw(
                     None,
                     transcript,
                     session_description="session",

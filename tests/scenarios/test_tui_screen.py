@@ -1,4 +1,4 @@
-"""Behavioral presentation tests for the persistent terminal cockpit.
+"""Behavioral presentation tests for the persistent linear timeline.
 
 Exact paint sequences, palette choices, and internal row choreography belong to
 manual/PTY coverage. Keep this file focused on user-visible state, bounded
@@ -6,20 +6,20 @@ streaming, and terminal-safety invariants.
 """
 
 import io
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from _helpers_g2 import _Tty  # type: ignore[reportMissingImports]
 
 from cambium import tui_screen
-from cambium.tui import _safe_live_draw
+from cambium.tui import _restore_turn_transcript, _safe_live_draw
 from cambium.tui_screen import (
     ActivityState,
-    Cockpit,
+    LinearTimeline,
     Transcript,
     _visible,
     render_markdown_lines,
-    render_primary,
 )
 
 
@@ -58,6 +58,41 @@ class _Utf8Tty(_Tty):
     def write(self, value: str) -> int:
         value.encode("utf-8")
         return super().write(value)
+
+
+@pytest.fixture(autouse=True)
+def _capable_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep cursor-oriented live tests independent of the host TERM."""
+    monkeypatch.setenv("TERM", "xterm-256color")
+
+
+def _timeline_output(
+    transcript: Transcript,
+    *,
+    snapshot: object | None = None,
+    width: int = 100,
+    session_description: str = "",
+    branch_line: str = "",
+    cumulative_line: str = "",
+) -> str:
+    """Draw one transcript through the live timeline primitive."""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(
+            tui_screen.shutil,
+            "get_terminal_size",
+            lambda _default: tui_screen.os.terminal_size((width, 24)),
+        )
+        stream = _Tty()
+        timeline = LinearTimeline(stream)
+        with timeline:
+            timeline.draw(
+                _snapshot() if snapshot is None else snapshot,
+                transcript,
+                session_description=session_description,
+                branch_line=branch_line,
+                cumulative_line=cumulative_line,
+            )
+        return stream.getvalue()
 
 
 def test_conversation_markdown_is_structured_styled_and_sanitized() -> None:
@@ -376,16 +411,12 @@ def test_heartbeats_and_private_provider_action_content_stay_out_of_timeline() -
     )
     transcript.finish_stream()
 
-    rendered = "\n".join(
-        render_primary(
-            _snapshot(),
-            transcript,
-            session_description="session",
-            branch_line="branch",
-            cumulative_line="usage: calls=0",
-            width=100,
-            color=False,
-        )
+    rendered = _timeline_output(
+        transcript,
+        width=100,
+        session_description="session",
+        branch_line="branch",
+        cumulative_line="usage: calls=0",
     )
     assert "SECRET_REASONING" not in rendered
     assert "SECRET_ACTION" not in rendered
@@ -409,16 +440,9 @@ def test_nested_reasoning_content_stays_out_of_timeline() -> None:
     )
     transcript.finish_stream()
 
-    rendered = "\n".join(
-        render_primary(
-            _snapshot(),
-            transcript,
-            session_description="",
-            branch_line="",
-            cumulative_line="",
-            width=80,
-            color=False,
-        )
+    rendered = _timeline_output(
+        transcript,
+        width=80,
     )
     assert "SECRET_REASONING" not in rendered
     assert "visible answer" not in rendered
@@ -485,16 +509,11 @@ def test_status_and_tool_identity_redact_private_values_before_bounding() -> Non
         }
     )
 
-    rendered = "\n".join(
-        render_primary(
-            snapshot,
-            transcript,
-            session_description=f"provider={action}",
-            branch_line="",
-            cumulative_line="",
-            width=160,
-            color=False,
-        )
+    rendered = _timeline_output(
+        transcript,
+        snapshot=snapshot,
+        width=160,
+        session_description=f"provider={action}",
     )
     assert transcript.status_metadata.get("cmd") is None
     assert transcript.status_metadata.get("path") is None
@@ -615,7 +634,7 @@ def test_tool_output_stream_rotates_per_tool_without_committing_a_mixture() -> N
     assert all(not ("OLD-A" in text and "NEW-B" in text) for text in texts)
 
 
-def test_live_cockpit_keeps_timeline_and_one_transient_status_input_pair(
+def test_live_timeline_keeps_timeline_and_one_transient_status_input_pair(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -626,9 +645,9 @@ def test_live_cockpit_keeps_timeline_and_one_transient_status_input_pair(
     stream = _Tty()
     transcript = Transcript()
     transcript.system("ready")
-    cockpit = Cockpit(stream)
-    with cockpit:
-        cockpit.draw(
+    timeline = LinearTimeline(stream)
+    with timeline:
+        timeline.draw(
             _snapshot(),
             transcript,
             session_description="session",
@@ -643,10 +662,10 @@ def test_live_cockpit_keeps_timeline_and_one_transient_status_input_pair(
         assert "┌ Cambium · conversation" not in first
         assert all(marker not in first for marker in ("\x1b[?1049h", "\x1b[2J", "\x1b[H"))
 
-        cockpit.move_to_input()
-        cockpit.set_input("draft", 5)
+        timeline.move_to_input()
+        timeline.set_input("draft", 5)
         transcript.assistant("completed output")
-        cockpit.draw(
+        timeline.draw(
             _snapshot(),
             transcript,
             session_description="session",
@@ -661,7 +680,7 @@ def test_live_cockpit_keeps_timeline_and_one_transient_status_input_pair(
         assert updated.count("OPERATOR RAIL") == 0
 
         unchanged = stream.getvalue()
-        cockpit.draw(
+        timeline.draw(
             _snapshot(),
             transcript,
             session_description="session",
@@ -684,9 +703,9 @@ def test_live_status_update_does_not_replay_retained_timeline(
     stream = _Tty()
     transcript = Transcript()
     transcript.assistant("retained history")
-    cockpit = Cockpit(stream)
-    with cockpit:
-        cockpit.draw(
+    timeline = LinearTimeline(stream)
+    with timeline:
+        timeline.draw(
             _snapshot(),
             transcript,
             session_description="session",
@@ -702,7 +721,7 @@ def test_live_status_update_does_not_replay_retained_timeline(
                 "payload": {"phase": "thinking", "phase_revision": 2},
             }
         )
-        cockpit.draw(
+        timeline.draw(
             _snapshot(),
             transcript,
             session_description="session",
@@ -728,14 +747,14 @@ def test_repeated_tool_failure_status_does_not_replay_retained_timeline(
     transcript = Transcript()
     for index in range(159):
         transcript.system(f"history-{index}")
-    cockpit = Cockpit(stream)
+    timeline = LinearTimeline(stream)
     failed_tool = {
         "kind": "tool_event",
         "task_id": "child-a",
         "payload": {"tool": "run_shell", "ok": False, "error": "blocked"},
     }
-    with cockpit:
-        cockpit.draw(
+    with timeline:
+        timeline.draw(
             _snapshot(),
             transcript,
             session_description="",
@@ -743,7 +762,7 @@ def test_repeated_tool_failure_status_does_not_replay_retained_timeline(
             cumulative_line="",
         )
         transcript.observe_event(failed_tool)
-        cockpit.draw(
+        timeline.draw(
             _snapshot(),
             transcript,
             session_description="",
@@ -752,7 +771,7 @@ def test_repeated_tool_failure_status_does_not_replay_retained_timeline(
         )
         first = stream.getvalue()
         transcript.observe_event(failed_tool)
-        cockpit.draw(
+        timeline.draw(
             _snapshot(),
             transcript,
             session_description="",
@@ -778,9 +797,9 @@ def test_live_resize_replaces_transient_rows_without_replaying_history(
     stream = _Tty()
     transcript = Transcript()
     transcript.assistant("resize history")
-    cockpit = Cockpit(stream)
-    with cockpit:
-        cockpit.draw(
+    timeline = LinearTimeline(stream)
+    with timeline:
+        timeline.draw(
             _snapshot(),
             transcript,
             session_description="session",
@@ -788,7 +807,7 @@ def test_live_resize_replaces_transient_rows_without_replaying_history(
             cumulative_line="usage: calls=0",
         )
         first = stream.getvalue()
-        cockpit.draw(
+        timeline.draw(
             _snapshot(),
             transcript,
             session_description="session",
@@ -871,16 +890,16 @@ def test_live_resize_does_not_replay_timeline_history(monkeypatch: pytest.Monkey
     stream = _Tty()
     transcript = Transcript()
     transcript.assistant("history row")
-    cockpit = Cockpit(stream)
-    with cockpit:
-        cockpit.draw(
+    timeline = LinearTimeline(stream)
+    with timeline:
+        timeline.draw(
             _snapshot(),
             transcript,
             session_description="session",
             branch_line="branch",
             cumulative_line="usage: calls=0",
         )
-        cockpit.draw(
+        timeline.draw(
             _snapshot(),
             transcript,
             session_description="session",
@@ -889,7 +908,7 @@ def test_live_resize_does_not_replay_timeline_history(monkeypatch: pytest.Monkey
             force=True,
         )
         transcript.assistant("new row")
-        cockpit.draw(
+        timeline.draw(
             _snapshot(),
             transcript,
             session_description="session",
@@ -949,8 +968,8 @@ def test_live_stream_switch_does_not_repeat_committed_tool_tail(
     )
     stream = _Tty()
     transcript = Transcript()
-    cockpit = Cockpit(stream)
-    with cockpit:
+    timeline = LinearTimeline(stream)
+    with timeline:
         transcript.observe_event(
             {
                 "kind": "tool_output_delta",
@@ -958,7 +977,7 @@ def test_live_stream_switch_does_not_repeat_committed_tool_tail(
                 "payload": {"tool": "run_shell", "tool_call_id": "a", "delta": "A1\n"},
             }
         )
-        cockpit.draw(
+        timeline.draw(
             _snapshot(),
             transcript,
             session_description="",
@@ -972,7 +991,7 @@ def test_live_stream_switch_does_not_repeat_committed_tool_tail(
                 "payload": {"tool": "run_shell", "tool_call_id": "b", "delta": "B1\n"},
             }
         )
-        cockpit.draw(
+        timeline.draw(
             _snapshot(),
             transcript,
             session_description="",
@@ -996,21 +1015,21 @@ def test_managed_native_input_uses_draft_and_keeps_status_row_position(
     stream = _Tty()
     transcript = Transcript()
     transcript.system("ready")
-    cockpit = Cockpit(stream)
-    with cockpit:
-        cockpit.draw(
+    timeline = LinearTimeline(stream)
+    with timeline:
+        timeline.draw(
             _snapshot(),
             transcript,
             session_description="",
             branch_line="",
             cumulative_line="",
         )
-        cockpit.move_to_input(native=True)
-        cockpit.set_input("draft", 5)
-        assert cockpit._input_line_text() == "draft"
-        cockpit.hide_cursor(commit=True)
+        timeline.move_to_input(native=True)
+        timeline.set_input("draft", 5)
+        assert timeline._input_line_text() == "draft"
+        timeline.hide_cursor(commit=True)
         transcript.assistant("after input")
-        cockpit.draw(
+        timeline.draw(
             _snapshot(),
             transcript,
             session_description="",
@@ -1038,9 +1057,9 @@ def test_live_resize_keeps_stream_suffix_arriving_with_new_width(
     monkeypatch.setattr(tui_screen.shutil, "get_terminal_size", lambda _default: next(sizes))
     stream = _Tty()
     transcript = Transcript()
-    cockpit = Cockpit(stream)
-    with cockpit:
-        cockpit.draw(
+    timeline = LinearTimeline(stream)
+    with timeline:
+        timeline.draw(
             _snapshot(),
             transcript,
             session_description="",
@@ -1048,7 +1067,7 @@ def test_live_resize_keeps_stream_suffix_arriving_with_new_width(
             cumulative_line="",
         )
         transcript.observe_event({"kind": "assistant_delta", "payload": {"delta": "first\n"}})
-        cockpit.draw(
+        timeline.draw(
             _snapshot(),
             transcript,
             session_description="",
@@ -1056,7 +1075,7 @@ def test_live_resize_keeps_stream_suffix_arriving_with_new_width(
             cumulative_line="",
         )
         transcript.observe_event({"kind": "assistant_delta", "payload": {"delta": "second\n"}})
-        cockpit.draw(
+        timeline.draw(
             _snapshot(),
             transcript,
             session_description="",
@@ -1064,7 +1083,7 @@ def test_live_resize_keeps_stream_suffix_arriving_with_new_width(
             cumulative_line="",
         )
         transcript.observe_event({"kind": "assistant_delta", "payload": {"delta": "third\n"}})
-        cockpit.draw(
+        timeline.draw(
             _snapshot(),
             transcript,
             session_description="",
@@ -1088,9 +1107,9 @@ def test_live_completion_keeps_unbroken_stream_content_together(
     )
     stream = _Tty()
     transcript = Transcript()
-    cockpit = Cockpit(stream)
-    with cockpit:
-        cockpit.draw(
+    timeline = LinearTimeline(stream)
+    with timeline:
+        timeline.draw(
             _snapshot(),
             transcript,
             session_description="",
@@ -1098,7 +1117,7 @@ def test_live_completion_keeps_unbroken_stream_content_together(
             cumulative_line="",
         )
         transcript.observe_event({"kind": "assistant_delta", "payload": {"delta": "one"}})
-        cockpit.draw(
+        timeline.draw(
             _snapshot(),
             transcript,
             session_description="",
@@ -1107,7 +1126,7 @@ def test_live_completion_keeps_unbroken_stream_content_together(
         )
         transcript.observe_event({"kind": "assistant_delta", "payload": {"delta": " two"}})
         transcript.finish_stream("one two")
-        cockpit.draw(
+        timeline.draw(
             _snapshot(),
             transcript,
             session_description="",
@@ -1130,10 +1149,10 @@ def test_live_bounded_stream_rollover_does_not_replay_retained_tail(
     )
     stream = _Tty()
     transcript = Transcript()
-    cockpit = Cockpit(stream)
-    with cockpit:
+    timeline = LinearTimeline(stream)
+    with timeline:
         transcript.observe_event({"kind": "assistant_delta", "payload": {"delta": "x\n" * 5000}})
-        cockpit.draw(
+        timeline.draw(
             _snapshot(),
             transcript,
             session_description="",
@@ -1142,7 +1161,7 @@ def test_live_bounded_stream_rollover_does_not_replay_retained_tail(
         )
         first = stream.getvalue()
         transcript.observe_event({"kind": "assistant_delta", "payload": {"delta": "y\n" * 4000}})
-        cockpit.draw(
+        timeline.draw(
             _snapshot(),
             transcript,
             session_description="",
@@ -1156,36 +1175,61 @@ def test_live_bounded_stream_rollover_does_not_replay_retained_tail(
     assert "CAMBIUM ▸ y" in delta
 
 
-def test_primary_renderer_has_one_status_row() -> None:
-    lines = render_primary(
-        _snapshot(),
+def test_live_timeline_has_one_status_row() -> None:
+    rendered = _timeline_output(
         Transcript(),
+        width=80,
         session_description="session",
         branch_line="branch",
         cumulative_line="usage: calls=0",
-        width=80,
     )
 
-    assert lines
-    assert not any(line.startswith("┌") for line in lines)
-    assert any("codex/gpt-5.6" in line for line in lines)
-    assert sum(line.startswith("Cambium · ") for line in lines) == 1
+    assert rendered
+    assert "┌" not in rendered
+    assert "codex/gpt-5.6" in rendered
+    assert rendered.count("orchestrating") == 1
+
+
+def test_dumb_tty_draws_plain_timeline_without_cursor_controls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TERM", "dumb")
+    monkeypatch.setattr(
+        tui_screen.shutil,
+        "get_terminal_size",
+        lambda _default: tui_screen.os.terminal_size((80, 24)),
+    )
+    stream = _Tty()
+    transcript = Transcript()
+    transcript.assistant("plain answer")
+    timeline = LinearTimeline(stream)
+    with timeline:
+        timeline.draw(
+            _snapshot(),
+            transcript,
+            session_description="session",
+            branch_line="branch",
+            cumulative_line="usage: calls=0",
+        )
+
+    rendered = stream.getvalue()
+    assert "\x1b" not in rendered
+    assert "CAMBIUM ▸ plain answer" in rendered
+    assert "orchestrating" in rendered
 
 
 def test_control_sequences_are_removed_and_color_is_opt_in() -> None:
     transcript = Transcript()
     transcript.error("bad\x1b[31m injected\x00 value")
-    plain = render_primary(
-        _snapshot(),
+    plain = _timeline_output(
         transcript,
+        width=100,
         session_description="session",
         branch_line="branch",
         cumulative_line="usage: calls=0",
-        width=100,
-        color=False,
     )
-    assert "\x1b" not in "".join(plain)
-    assert "injected" in "\n".join(plain)
+    assert "\x1b[31m" not in plain
+    assert "injected" in _visible(plain)
 
 
 def test_transcript_is_bounded() -> None:
@@ -1199,36 +1243,34 @@ def test_transcript_is_bounded() -> None:
 def test_assistant_deltas_render_in_the_active_tail_before_turn_completion() -> None:
     transcript = Transcript()
     transcript.observe_event({"kind": "assistant_delta", "payload": {"delta": "# Findings\n"}})
-    first = render_primary(
-        _snapshot(),
+    first = _timeline_output(
         transcript,
+        width=80,
         session_description="session",
         branch_line="branch",
         cumulative_line="usage: calls=0",
-        width=80,
     )
     transcript.observe_event(
-        {"kind": "assistant_delta", "payload": {"delta": "The stream is live."}}
+        {"kind": "assistant_delta", "payload": {"delta": "The stream is live.\n"}}
     )
-    second = render_primary(
-        _snapshot(),
+    second = _timeline_output(
         transcript,
+        width=80,
         session_description="session",
         branch_line="branch",
         cumulative_line="usage: calls=0",
-        width=80,
     )
 
-    assert "CAMBIUM ▸ Findings" in "\n".join(first)
-    assert "The stream is live." in "\n".join(second)
+    assert "CAMBIUM ▸ Findings" in _visible(first)
+    assert "The stream is live." in _visible(second)
     assert transcript.entries == ()
 
-    transcript.finish_stream("# Findings\nThe stream is live.")
+    transcript.finish_stream("# Findings\nThe stream is live.\n")
     assert transcript.streaming_text == ""
     assert transcript.entries[-1].text == "# Findings\nThe stream is live."
 
 
-def test_accepted_response_chunks_use_one_assistant_timeline_stream() -> None:
+def test_accepted_response_chunks_append_one_assistant_timeline_entry_per_chunk() -> None:
     transcript = Transcript()
     transcript.observe_event(
         {
@@ -1245,10 +1287,154 @@ def test_accepted_response_chunks_use_one_assistant_timeline_stream() -> None:
         }
     )
 
-    assert transcript.streaming_role == "assistant"
-    assert transcript.streaming_text == "# Result\n\nFull operator response."
+    assert transcript.streaming_role is None
+    assert transcript.streaming_text == ""
+    assert [entry.text for entry in transcript.entries] == [
+        "# Result\n\nFull ",
+        "operator response.",
+    ]
     transcript.finish_stream()
-    assert transcript.entries[-1].text == "# Result\n\nFull operator response."
+    assert [entry.text for entry in transcript.entries] == [
+        "# Result\n\nFull ",
+        "operator response.",
+    ]
+
+
+def test_durable_response_chunk_replaces_transient_assistant_tail() -> None:
+    transcript = Transcript()
+    transcript.observe_event(
+        {"kind": "assistant_delta", "payload": {"delta": "canonical answer"}}
+    )
+    transcript.observe_event(
+        {
+            "kind": "response_chunk",
+            "payload": {"text": "canonical answer", "final": True},
+        }
+    )
+
+    assert transcript.streaming_text == ""
+    assert [entry.text for entry in transcript.entries] == ["canonical answer"]
+
+
+def test_durable_response_chunks_preserve_answers_over_16k(tmp_path: Path) -> None:
+    chunks = ("Q" * 20_000, "Z" * 7_000)
+    chunk_events = [
+        {
+            "kind": "response_chunk",
+            "task_id": "task-long",
+            "generation": 3,
+            "request_id": "run-long",
+            "payload": {
+                "chunk_index": index,
+                "text": chunk,
+                "final": index == len(chunks) - 1,
+            },
+        }
+        for index, chunk in enumerate(chunks)
+    ]
+    result_event = {
+        "kind": "result",
+        "task_id": "task-long",
+        "generation": 3,
+        "request_id": "run-long",
+        "payload": {
+            "status": "succeeded",
+            "response_chunk_count": len(chunks),
+            "response_bytes": sum(len(chunk.encode("utf-8")) for chunk in chunks),
+        },
+    }
+    transcript = Transcript()
+    transcript.user("show the complete answer")
+    for event in chunk_events:
+        transcript.observe_event(event)
+
+    assistant = [entry.text for entry in transcript.entries if entry.role == "assistant"]
+    assert assistant == list(chunks)
+    assert "".join(assistant) == "Q" * 20_000 + "Z" * 7_000
+    assert len("".join(assistant)) > 16_384
+
+    oversized = Transcript()
+    oversized.observe_event(
+        {"kind": "response_chunk", "payload": {"text": "x" * (32 * 1024 + 1)}}
+    )
+    assert oversized.entries == ()
+
+    replayed = Transcript()
+    _restore_turn_transcript(
+        tmp_path,
+        [
+            {
+                "kind": "user_prompt",
+                "task_id": "interactive-main",
+                "payload": {"text": "show the complete answer"},
+            },
+            *chunk_events,
+            result_event,
+        ],
+        replayed,
+    )
+    assert [entry.text for entry in replayed.entries if entry.role == "assistant"] == [
+        "".join(chunks)
+    ]
+    for rendered in (
+        _timeline_output(transcript, width=120),
+        _timeline_output(replayed, width=120),
+    ):
+        visible = _visible(rendered)
+        assert visible.count("Q") == len(chunks[0])
+        assert visible.count("Z") == len(chunks[1])
+
+    invalid_replay = Transcript()
+    _restore_turn_transcript(
+        tmp_path,
+        [
+            {
+                "kind": "user_prompt",
+                "task_id": "interactive-main",
+                "payload": {"text": "show the complete answer"},
+            },
+            {
+                "kind": "assistant_delta",
+                "payload": {"delta": "unvalidated assistant tail"},
+            },
+            {
+                "kind": "tool_output_delta",
+                "task_id": "task-long",
+                "payload": {"tool": "lookup", "delta": "tool-safe"},
+            },
+            {
+                "kind": "response_chunk",
+                "task_id": "other-task",
+                "generation": 3,
+                "request_id": "run-long",
+                "payload": {"chunk_index": 0, "text": "stale"},
+            },
+            {
+                "kind": "response_chunk",
+                "task_id": "task-long",
+                "generation": 3,
+                "request_id": "run-long",
+                "payload": {"chunk_index": 0, "text": "safe", "final": False},
+            },
+            {
+                "kind": "response_chunk",
+                "task_id": "task-long",
+                "generation": 3,
+                "request_id": "run-long",
+                "payload": {"chunk_index": 2, "text": "unsafe", "final": True},
+            },
+            {
+                **result_event,
+                "payload": {
+                    **result_event["payload"],
+                    "response_bytes": len("safeunsafe"),
+                    "results": [{"summary": "unvalidated result prose"}],
+                },
+            },
+        ],
+        invalid_replay,
+    )
+    assert not any(entry.role == "assistant" for entry in invalid_replay.entries)
 
 
 def test_message_events_switch_roles_and_keep_streaming_text_bounded() -> None:
@@ -1271,19 +1457,19 @@ def test_message_events_switch_roles_and_keep_streaming_text_bounded() -> None:
     )
     for _ in range(20_000):
         transcript.observe_event({"kind": "assistant_delta", "payload": {"delta": "x"}})
+    transcript.observe_event({"kind": "assistant_delta", "payload": {"delta": "\n"}})
 
     assert any(entry.role == "tool" and "old" in entry.text for entry in transcript.entries)
     assert transcript.streaming_role == "assistant"
     assert len(transcript.streaming_text) <= 16_384
-    lines = render_primary(
-        _snapshot(),
+    rendered = _timeline_output(
         transcript,
+        width=80,
         session_description="session",
         branch_line="branch",
         cumulative_line="usage: calls=0",
-        width=80,
     )
-    assert "CAMBIUM ▸" in "\n".join(lines)
+    assert "CAMBIUM ▸" in rendered
 
 
 def test_failed_tool_event_is_one_compact_notice() -> None:
@@ -1301,15 +1487,9 @@ def test_failed_tool_event_is_one_compact_notice() -> None:
         }
     )
 
-    text = "\n".join(
-        render_primary(
-            _snapshot(),
-            transcript,
-            session_description="",
-            branch_line="",
-            cumulative_line="",
-            width=100,
-        )
+    text = _timeline_output(
+        transcript,
+        width=100,
     )
     assert "tool errors:" not in text
     assert "permission denied" not in text
@@ -1349,10 +1529,10 @@ def test_activity_keeps_tool_in_flight_until_matching_end() -> None:
 
 def test_restore_input_line_escapes_lone_surrogates_before_writing() -> None:
     stream = _Utf8Tty()
-    cockpit = Cockpit(stream)
-    with cockpit:
-        cockpit.move_to_input()
-        cockpit._restore_input_line("\udc80\udc81\udc82", force=True)
+    timeline = LinearTimeline(stream)
+    with timeline:
+        timeline.move_to_input()
+        timeline._restore_input_line("\udc80\udc81\udc82", force=True)
 
     rendered = stream.getvalue()
     assert r"\udc80\udc81\udc82" in rendered

@@ -10,7 +10,14 @@ from cambium.observability import snapshot_from_events
 from cambium.provider_scheduler import QuotaLedger, read_quota_snapshots
 from cambium.render import render_tokens_per_s
 from cambium.routing import ProviderDebt
-from cambium.tui_screen import Transcript, _display_width, render_primary, render_quota_rows
+from cambium.tui import _Cumulative
+from cambium.tui_screen import (
+    LinearTimeline,
+    Transcript,
+    _display_width,
+    _status_line,
+    render_quota_rows,
+)
 
 
 def _event(seq: int, provider: str, **payload: object) -> dict:
@@ -20,6 +27,18 @@ def _event(seq: int, provider: str, **payload: object) -> dict:
         "task_id": provider,
         "payload": {"provider": provider, "latency_s": 2.0, **payload},
     }
+
+
+@pytest.mark.parametrize(
+    ("input_tokens", "cached_tokens", "expected"),
+    [(100, 75, "75%"), (0, 0, "n/a"), (10, 20, "100%")],
+)
+def test_cumulative_usage_shows_aggregate_cache_percentage(
+    input_tokens: int, cached_tokens: int, expected: str
+) -> None:
+    line = _Cumulative(input_tokens=input_tokens, cached_tokens=cached_tokens).line()
+
+    assert f"cached={cached_tokens} ({expected})" in line
 
 
 @pytest.mark.parametrize(
@@ -105,7 +124,7 @@ def test_resource_status_keeps_provider_and_throughput_visible() -> None:
             {"seq": 2, "kind": "result", "task_id": "one", "payload": {"status": "succeeded"}},
         ]
     )
-    rows = render_primary(
+    row = _status_line(
         snapshot,
         Transcript(),
         session_description="",
@@ -113,12 +132,10 @@ def test_resource_status_keeps_provider_and_throughput_visible() -> None:
         cumulative_line="usage: calls=4 in=100 out=40 cached=70 out/s=10.0 cost=0",
         width=80,
     )
-    text = rows[-1]
-    assert "one" in text
-    assert "10.0" in text
-    assert "tok" in text
-    assert sum(line.startswith("Cambium · ") for line in rows) == 1
-    assert all(_display_width(line) <= 80 for line in rows)
+    assert "one" in row
+    assert "10.0" in row
+    assert "tok" in row
+    assert _display_width(row) <= 80
 
 
 def test_completed_status_does_not_reserve_extra_rows() -> None:
@@ -128,7 +145,7 @@ def test_completed_status_does_not_reserve_extra_rows() -> None:
             {"seq": 2, "kind": "result", "task_id": "one", "payload": {"status": "succeeded"}},
         ]
     )
-    rows = render_primary(
+    row = _status_line(
         snapshot,
         Transcript(),
         session_description="",
@@ -136,9 +153,8 @@ def test_completed_status_does_not_reserve_extra_rows() -> None:
         cumulative_line="usage: calls=1",
         width=80,
     )
-    assert all(line.strip() for line in rows)
-    assert sum(line.startswith("Cambium · ") for line in rows) == 1
-    assert any("done" in line for line in rows)
+    assert row.strip()
+    assert "done" in row
 
 
 def test_renderer_does_not_read_another_threads_native_editor(monkeypatch) -> None:
@@ -151,8 +167,8 @@ def test_renderer_does_not_read_another_threads_native_editor(monkeypatch) -> No
         raise AssertionError("renderer accessed a live native editor")
 
     monkeypatch.setattr(tui_screen, "_readline", SimpleNamespace(get_line_buffer=forbidden_read))
-    cockpit = tui_screen.Cockpit(StringIO(), enabled=True)
-    cockpit._native_input = True
-    cockpit._input_active = True
-    cockpit._input_owner = -1
-    assert cockpit._input_line_text() is None
+    timeline = LinearTimeline(StringIO(), enabled=True)
+    timeline._native_input = True
+    timeline._input_active = True
+    timeline._input_owner = -1
+    assert timeline._input_line_text() is None

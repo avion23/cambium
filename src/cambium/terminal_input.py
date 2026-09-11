@@ -1,4 +1,4 @@
-"""POSIX terminal input owned by the same event loop as the cockpit.
+"""POSIX terminal input owned by the same event loop as the timeline.
 
 No native editor buffer or input thread is shared with the renderer. Pasted
 newlines remain one prompt; Enter submits, Alt-Enter inserts a newline.
@@ -84,12 +84,12 @@ class TerminalInput:
     def __init__(
         self,
         fd: int,
-        cockpit: Any,
+        timeline: Any,
         history_path: Path,
         interrupt: Callable[[], str | None],
         focus: Callable[[], None],
     ) -> None:
-        self.fd, self.cockpit = fd, cockpit
+        self.fd, self.timeline = fd, timeline
         self.history_path, self.interrupt, self.focus = history_path, interrupt, focus
         self.loop = asyncio.get_running_loop()
         self.queue: asyncio.Queue[str | None] = asyncio.Queue()
@@ -98,7 +98,7 @@ class TerminalInput:
         self.text, self.cursor = "", 0
         self.pasting = False
         self._suppress_lf = False
-        self._bracketed_paste = supports_cursor_controls(cockpit.stream)
+        self._bracketed_paste = supports_cursor_controls(timeline.stream)
         self.reading = False
         self.block: list[str] | None = None
         self.continued: list[str] = []
@@ -143,8 +143,8 @@ class TerminalInput:
         try:
             self.loop.add_reader(fd, self._read_ready)
             if self._bracketed_paste:
-                self.cockpit.stream.write("\x1b[?2004h")
-                self.cockpit.stream.flush()
+                self.timeline.stream.write("\x1b[?2004h")
+                self.timeline.stream.flush()
         except BaseException:
             self.loop.remove_reader(fd)
             termios.tcsetattr(fd, termios.TCSANOW, self.saved)
@@ -154,8 +154,8 @@ class TerminalInput:
         self.loop.remove_reader(self.fd)
         termios.tcsetattr(self.fd, termios.TCSANOW, self.saved)
         if self._bracketed_paste:
-            self.cockpit.stream.write("\x1b[?2004l")
-            self.cockpit.stream.flush()
+            self.timeline.stream.write("\x1b[?2004l")
+            self.timeline.stream.flush()
         try:
             self.history_path.parent.mkdir(parents=True, exist_ok=True)
             self.history_path.write_text("\n".join(self.history[-1000:]) + "\n")
@@ -167,7 +167,7 @@ class TerminalInput:
         if not self.queue.empty():
             return self.queue.get_nowait()
         self.reading = True
-        self.cockpit.move_to_input(label="…" if self.block is not None else "›")
+        self.timeline.move_to_input(label="…" if self.block is not None else "›")
         self._paint()
         try:
             return await self.queue.get()
@@ -175,7 +175,7 @@ class TerminalInput:
             self.reading = False
 
     def _paint(self) -> None:
-        self.cockpit.set_input(self.text, self.cursor, paint=self.reading)
+        self.timeline.set_input(self.text, self.cursor, paint=self.reading)
 
     def _insert(self, text: str) -> None:
         self.text = self.text[: self.cursor] + text + self.text[self.cursor :]
@@ -190,7 +190,7 @@ class TerminalInput:
         self.text, self.cursor, self.draft = "", 0, ""
         self.history_index = len(self.history)
         self._paint()
-        self.cockpit.hide_cursor(commit=True)
+        self.timeline.hide_cursor(commit=True)
         self.reading = False
         self.queue.put_nowait(value)
 

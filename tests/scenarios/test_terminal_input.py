@@ -32,7 +32,7 @@ class _Tty(io.StringIO):
         return True
 
 
-class _Cockpit:
+class _Timeline:
     def __init__(self, stream: _Tty) -> None:
         self.stream = stream
         self.inputs: list[tuple[str, int, bool]] = []
@@ -57,12 +57,12 @@ def _editor(
     term: str = "xterm-256color",
     interrupt: Any = None,
     focus: Any = None,
-) -> Iterator[tuple[TerminalInput, int, _Cockpit, list[str]]]:
+) -> Iterator[tuple[TerminalInput, int, _Timeline, list[str]]]:
     """Construct the real POSIX editor over a PTY and restore its mode."""
 
     master, slave = pty.openpty()
     stream = _Tty()
-    cockpit = _Cockpit(stream)
+    timeline = _Timeline(stream)
     interrupted = []
     focused = []
     if interrupt is None:
@@ -80,13 +80,13 @@ def _editor(
     try:
         editor = TerminalInput(
             slave,
-            cockpit,
+            timeline,
             tmp_path / "history",
             interrupt=interrupt,
             focus=focus,
         )
         try:
-            yield editor, master, cockpit, focused
+            yield editor, master, timeline, focused
         finally:
             editor.close()
     finally:
@@ -165,7 +165,7 @@ def test_terminal_text_sanitizes_lone_surrogates_and_grapheme_cells() -> None:
 
 def test_terminal_input_split_crlf_submits_once(tmp_path: Path) -> None:
     async def scenario() -> None:
-        with _editor(tmp_path) as (editor, master, _cockpit, _focused):
+        with _editor(tmp_path) as (editor, master, _timeline, _focused):
             _feed(editor, master, b"hello\r", b"\n")
             assert _queued(editor) == ["hello"]
 
@@ -174,7 +174,7 @@ def test_terminal_input_split_crlf_submits_once(tmp_path: Path) -> None:
 
 def test_terminal_input_paste_keeps_multiline_crlf_split_across_reads(tmp_path: Path) -> None:
     async def scenario() -> None:
-        with _editor(tmp_path) as (editor, master, cockpit, _focused):
+        with _editor(tmp_path) as (editor, master, timeline, _focused):
             _feed(
                 editor,
                 master,
@@ -183,11 +183,11 @@ def test_terminal_input_paste_keeps_multiline_crlf_split_across_reads(tmp_path: 
                 b"\r",
             )
             assert _queued(editor) == ["first\nsecond"]
-            assert "\x1b[?2004h" in cockpit.stream.getvalue()
-            assert "\x1b[?2004l" not in cockpit.stream.getvalue()
-        assert "\x1b[?2004l" in cockpit.stream.getvalue()
+            assert "\x1b[?2004h" in timeline.stream.getvalue()
+            assert "\x1b[?2004l" not in timeline.stream.getvalue()
+        assert "\x1b[?2004l" in timeline.stream.getvalue()
 
-        with _editor(tmp_path) as (editor, master, _cockpit, _focused):
+        with _editor(tmp_path) as (editor, master, _timeline, _focused):
             _feed(editor, master, "\x1b[200~👩‍💻e\u0301\x1b[201~\r".encode())
             assert _queued(editor) == ["👩‍💻e\u0301"]
 
@@ -198,11 +198,11 @@ def test_terminal_input_split_paste_markers_and_alt_enter_are_incremental(
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
-        with _editor(tmp_path) as (editor, master, _cockpit, _focused):
+        with _editor(tmp_path) as (editor, master, _timeline, _focused):
             _feed(editor, master, b"\x1b[2", b"00~hello\x1b[20", b"1~", b"\r")
             assert _queued(editor) == ["hello"]
 
-        with _editor(tmp_path) as (editor, master, _cockpit, _focused):
+        with _editor(tmp_path) as (editor, master, _timeline, _focused):
             _feed(editor, master, b"abc\x1b", b"\r", b"\n")
             assert editor.text == "abc\n"
             assert _queued(editor) == []
@@ -216,7 +216,7 @@ def test_terminal_input_controls_preserve_multiline_draft_and_focus(tmp_path: Pa
         with _editor(tmp_path, focus=lambda: focused.append("focus")) as (
             editor,
             master,
-            _cockpit,
+            _timeline,
             _focused,
         ):
             editor.text, editor.cursor = "first\nsecond\nthird", len("first\nsec")
@@ -252,7 +252,7 @@ def test_terminal_input_controls_preserve_multiline_draft_and_focus(tmp_path: Pa
 
 def test_terminal_input_grapheme_editing_and_cell_vertical_navigation(tmp_path: Path) -> None:
     async def scenario() -> None:
-        with _editor(tmp_path) as (editor, _master, _cockpit, _focused):
+        with _editor(tmp_path) as (editor, _master, _timeline, _focused):
             editor.text, editor.cursor = "e\u0301", 2
             editor._key("\x1b[D")
             assert editor.cursor == 0
@@ -274,11 +274,16 @@ def test_terminal_input_grapheme_editing_and_cell_vertical_navigation(tmp_path: 
 
 def test_terminal_input_ctrl_c_idle_and_active_signals(tmp_path: Path) -> None:
     async def scenario() -> None:
-        with _editor(tmp_path, interrupt=lambda: None) as (editor, master, _cockpit, _focused):
+        with _editor(tmp_path, interrupt=lambda: None) as (editor, master, _timeline, _focused):
             _feed(editor, master, b"\x03")
             assert _queued(editor) == [None]
 
-        with _editor(tmp_path, interrupt=lambda: "/cancel") as (editor, master, _cockpit, _focused):
+        with _editor(tmp_path, interrupt=lambda: "/cancel") as (
+            editor,
+            master,
+            _timeline,
+            _focused,
+        ):
             _feed(editor, master, b"\x03")
             assert _queued(editor) == ["/cancel"]
 
@@ -292,13 +297,13 @@ def test_terminal_input_restores_pty_mode_and_disables_bracketed_paste_for_dumb(
         master, slave = pty.openpty()
         before = termios.tcgetattr(slave)
         stream = _Tty()
-        cockpit = _Cockpit(stream)
+        timeline = _Timeline(stream)
         old_term = os.environ.get("TERM")
         os.environ["TERM"] = "dumb"
         try:
             editor = TerminalInput(
                 slave,
-                cockpit,
+                timeline,
                 tmp_path / "history",
                 interrupt=lambda: None,
                 focus=lambda: None,

@@ -33,6 +33,12 @@ class _ChunkedTty(_Tty):
         return next(self._chunks, "")
 
 
+@pytest.fixture(autouse=True)
+def _capable_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep interactive-path scenarios independent of the host TERM."""
+    monkeypatch.setenv("TERM", "xterm-256color")
+
+
 class _History:
     def __init__(self) -> None:
         self.read: Path | None = None
@@ -124,6 +130,29 @@ def test_term_dumb_native_tty_uses_line_oriented_frontend(
     assert code == 0
     assert "cambium> " in output.getvalue()
     assert "\x1b[2K" not in output.getvalue()
+    assert "\x1b" not in output.getvalue()
+
+
+def test_term_dumb_injected_tty_uses_line_oriented_frontend(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = _Tty("/exit\n")
+    output = _Tty()
+    error = io.StringIO()
+    monkeypatch.setenv("TERM", "dumb")
+
+    code = asyncio.run(
+        tui.run_tui(
+            OneShotConfig(repo=tmp_path, session_root=tmp_path / "interactive"),
+            input_stream=source,
+            output_stream=output,
+            error_stream=error,
+        )
+    )
+
+    assert code == 0
+    assert "cambium> " in output.getvalue()
+    assert "\x1b" not in output.getvalue()
 
 
 def test_tui_operator_commands_render_without_provider_calls(tmp_path: Path) -> None:

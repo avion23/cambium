@@ -1915,7 +1915,7 @@ def test_heartbeats_publish_visible_provider_transitions_without_waiting_for_cad
         and heartbeat.get("model") == "loopback-model"
         for heartbeat in heartbeats
     )
-    # Provider responses are internal JSON actions; the cockpit shows stream
+    # Provider responses are internal JSON actions; the timeline shows stream
     # state/rate, not protocol fragments.
     assert not any(
         heartbeat.get("phase") == "streaming" and heartbeat.get("tail") for heartbeat in heartbeats

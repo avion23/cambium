@@ -29,8 +29,9 @@ from .monitor import AnsiDashboard, render_agent_lines
 from .observability import ObservabilityState, SessionSnapshot
 from .provider_scheduler import QuotaLedgerError, read_quota_snapshots
 from .store import StoreError, read_events_file
+from .supervisor import reconstruct_response
 from .terminal import SynchronizedOutput, sanitize_terminal_text, terminal_capabilities
-from .tui_screen import ActivityState, Cockpit, Transcript, render_quota_rows
+from .tui_screen import ActivityState, LinearTimeline, Transcript, render_quota_rows
 
 _readline: Any
 try:
@@ -120,6 +121,12 @@ class _Cumulative:
                 "estimated_cost_usd",
             )
         }
+        cache_rate = (
+            min(1.0, totals["cached_tokens"] / totals["input_tokens"])
+            if totals["cached_tokens"] > 0 and totals["input_tokens"] > 0
+            else None
+        )
+        cache_label = f"{cache_rate:.0%}" if cache_rate is not None else "n/a"
         rate = (
             snapshot.output_tokens_per_s if active and snapshot else self.latest_output_tokens_per_s
         )
@@ -144,7 +151,7 @@ class _Cumulative:
             f"calls={totals['calls']} summaries={totals['summary_calls']} "
             f"tokens={totals['total_tokens']} "
             f"(in={totals['input_tokens']} out={totals['output_tokens']} "
-            f"cached={totals['cached_tokens']}) "
+            f"cached={totals['cached_tokens']} ({cache_label})) "
             f"out/s={rate:.1f} "
             f"cost={cost}"
         )
@@ -298,7 +305,11 @@ def _safe_live_draw(
 @contextmanager
 def _bracketed_paste_mode(source: TextIO, out: TextIO) -> Iterator[None]:
     """Enable terminal bracketed paste only for interactive input reads."""
-    if not (_is_tty(source) and _is_tty(out)):
+    if not (
+        _is_tty(source)
+        and _is_tty(out)
+        and terminal_capabilities(out).cursor_controls
+    ):
         yield
         return
     started = False
@@ -426,19 +437,19 @@ def _read_prompt(source: TextIO, out: TextIO, *, native: bool = False) -> str | 
     )
 
 
-def _read_cockpit_prompt(source: TextIO, cockpit: Cockpit, *, native: bool) -> str | None:
+def _read_timeline_prompt(source: TextIO, timeline: LinearTimeline, *, native: bool) -> str | None:
     """Read input on the primary-buffer timeline prompt with native editing."""
 
     def read_one(label: str) -> str | None:
-        cockpit.move_to_input(label=label, native=native)
+        timeline.move_to_input(label=label, native=native)
         try:
-            return _input_line(source, cockpit.stream, "", native=native)
+            return _input_line(source, timeline.stream, "", native=native)
         finally:
             # Injected streams do not echo the line terminator themselves;
             # native readline does.  Commit only the former so the append-only
             # primary buffer does not acquire an extra blank line on a real
             # terminal.
-            cockpit.hide_cursor(commit=not native)
+            timeline.hide_cursor(commit=not native)
 
     value = read_one("›")
     if value is None:
@@ -518,6 +529,38 @@ def _event_text(payload: Mapping[str, Any], *keys: str) -> str | None:
     return None
 
 
+def _response_identity(event: Mapping[str, Any]) -> tuple[str, int, str] | None:
+    """Return a complete trusted response identity from an event envelope."""
+    task_id = event.get("task_id")
+    generation = event.get("generation")
+    request_id = event.get("request_id")
+    if (
+        not isinstance(task_id, str)
+        or not task_id
+        or type(generation) is not int
+        or generation <= 0
+        or not isinstance(request_id, str)
+        or not request_id
+    ):
+        return None
+    return task_id, generation, request_id
+
+
+def _without_result_text(event: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Remove compact result prose when durable response chunks are present."""
+    payload = event.get("payload")
+    if not isinstance(payload, Mapping) or not any(
+        key in payload for key in ("summary", "assistant_text", "output_text")
+    ):
+        return event
+    stripped = dict(payload)
+    for key in ("summary", "assistant_text", "output_text"):
+        stripped.pop(key, None)
+    sanitized = dict(event)
+    sanitized["payload"] = stripped
+    return sanitized
+
+
 def _queued_prompt_notice(prompt: str) -> str | None:
     return f"queued: {prompt}" if prompt.strip() else None
 
@@ -552,11 +595,13 @@ def _restore_turn_transcript(
     events: list[dict[str, Any]],
     transcript: Transcript,
 ) -> None:
-    """Replay durable prompt/output events into the bounded timeline tail."""
+    """Replay validated durable prompt/output events into the timeline tail."""
+    response_present = any(event.get("kind") == "response_chunk" for event in events)
+
     prompt_task_ids: set[str] = set()
     unassigned_prompt_seen = False
     result_summary: str | None = None
-    response_seen = False
+    emitted_responses: set[tuple[str, int, str]] = set()
     for event in events:
         kind = event.get("kind")
         payload = _event_payload(event)
@@ -583,10 +628,27 @@ def _restore_turn_transcript(
                 else:
                     unassigned_prompt_seen = True
         elif kind == "response_chunk":
-            response_seen = response_seen or (_event_text(payload, "text") is not None)
+            # Reconstruct the complete response from the trusted event stream
+            # at its correlated terminal result. Raw chunks are never replayed.
+            continue
+        replay_event: Mapping[str, Any] = event
         if kind == "result":
             result_summary = _event_text(payload, "summary", "output_text") or result_summary
-        transcript.observe_event(event)
+            if response_present:
+                replay_event = _without_result_text(event)
+        transcript.observe_event(replay_event, suppress_assistant_stream=response_present)
+        if kind != "result":
+            continue
+        identity = _response_identity(event)
+        validated = reconstruct_response(events, *identity) if identity is not None else None
+        if (
+            identity is not None
+            and validated is not None
+            and validated[1]
+            and identity not in emitted_responses
+        ):
+            transcript._append_validated_response(validated[0])
+            emitted_responses.add(identity)
 
     if not prompt_task_ids:
         plan_path = turn_dir / "plan.json"
@@ -605,9 +667,11 @@ def _restore_turn_transcript(
                     transcript.user(prompt)
                     prompt_task_ids.add(str(task.get("task_id", "")))
 
-    transcript.finish_stream(
-        None if response_seen else result_summary or _restore_result_summary(turn_dir)
-    )
+    if response_present:
+        transcript._discard_assistant_stream()
+        transcript.finish_stream(None)
+    else:
+        transcript.finish_stream(result_summary or _restore_result_summary(turn_dir))
 
 
 def _restore_history(
@@ -805,7 +869,7 @@ def _command_output(
     session: InteractiveSession,
     cumulative: _Cumulative,
     snapshot: SessionSnapshot,
-    cockpit: Cockpit | None = None,
+    timeline: LinearTimeline | None = None,
     active: bool = False,
 ) -> str | None:
     parts = command.split(maxsplit=1)
@@ -823,14 +887,14 @@ def _command_output(
             return "focus: " + ", ".join(choices) + " (F6 cycles without submitting input)"
         if argument not in choices:
             return f"unknown task: {argument}"
-        cockpit.selected_task_id = argument
+        timeline.selected_task_id = argument
         return f"focused: {argument}; /inspect shows its recorded state"
     if name == "/inspect":
         from .state_view import state_text
         from .store import StoreError
 
         try:
-            return state_text(session.root, argument or getattr(cockpit, "selected_task_id", None))
+            return state_text(session.root, argument or getattr(timeline, "selected_task_id", None))
         except (OSError, ValueError, StoreError) as exc:
             return f"state unavailable: {exc}"
     if name == "/context" and not argument:
@@ -887,9 +951,9 @@ def _command_output(
     if name == "/compact" and not argument:
         return session.compact()
     if name == "/detail" and not argument:
-        if cockpit is None:
+        if timeline is None:
             return "detail: unavailable"
-        state = "shown" if cockpit.toggle_detail() else "hidden"
+        state = "shown" if timeline.toggle_detail() else "hidden"
         return f"detail: {state}"
     if name in {"/events", "/tail"} and not argument:
         if not snapshot.recent_events:
@@ -970,37 +1034,37 @@ async def _run_interactive(
     failed = False
     native_input = source is sys.stdin and out is sys.stdout
     capabilities = terminal_capabilities(out)
-    cockpit_stream = SynchronizedOutput(out, enabled=capabilities.synchronized_output)
-    cockpit = Cockpit(cast(TextIO, cockpit_stream), enabled=not quiet)
-    cockpit.color = capabilities.color_depth
+    timeline_stream = SynchronizedOutput(out, enabled=capabilities.synchronized_output)
+    timeline = LinearTimeline(cast(TextIO, timeline_stream), enabled=not quiet)
+    timeline.color = capabilities.color_depth
     live_render_enabled = True
 
     def disable_live_render() -> None:
-        cockpit.enabled = False
+        timeline.enabled = False
         try:
-            cockpit_stream.flush()
+            timeline_stream.flush()
         except (BrokenPipeError, OSError, ValueError):
             pass
 
-    def _draw_cockpit(snapshot: Any, transcript_value: Transcript, **kwargs: Any) -> None:
+    def _draw_timeline(snapshot: Any, transcript_value: Transcript, **kwargs: Any) -> None:
         if isinstance(snapshot, SessionSnapshot):
             snapshot = replace(
                 snapshot,
-                selected_task_id=getattr(cockpit, "selected_task_id", None),
+                selected_task_id=getattr(timeline, "selected_task_id", None),
             )
-        with cockpit_stream.frame():
-            cockpit.draw(snapshot, transcript_value, **kwargs)
+        with timeline_stream.frame():
+            timeline.draw(snapshot, transcript_value, **kwargs)
 
-    def _draw_cockpit_activity(activity_line: str) -> None:
-        with cockpit_stream.frame():
-            cockpit.draw_activity(activity_line)
+    def _draw_timeline_activity(activity_line: str) -> None:
+        with timeline_stream.frame():
+            timeline.draw_activity(activity_line)
 
-    def _flush_cockpit() -> None:
-        if getattr(cockpit, "_pending_draw", None) is None:
-            cockpit.flush()
+    def _flush_timeline() -> None:
+        if getattr(timeline, "_pending_draw", None) is None:
+            timeline.flush()
             return
-        with cockpit_stream.frame():
-            cockpit.flush()
+        with timeline_stream.frame():
+            timeline.flush()
 
     history_path = _history_path(session)
     if native_input and os.name != "posix":
@@ -1020,7 +1084,7 @@ async def _run_interactive(
     def _redraw_for_resize() -> None:
         """Repaint the complete current frame after SIGWINCH."""
         nonlocal live_render_enabled
-        if not live_render_enabled or not cockpit.enabled:
+        if not live_render_enabled or not timeline.enabled:
             return
 
         def redraw() -> None:
@@ -1032,13 +1096,13 @@ async def _run_interactive(
                 snapshot = last_snapshot
                 activity_line = ""
                 running = False
-            _draw_cockpit(
+            _draw_timeline(
                 snapshot,
                 transcript,
                 session_description=session.describe(),
                 branch_line=_branch_line(session),
                 cumulative_line=cumulative.line(snapshot=snapshot, active=running),
-                input_label=getattr(cockpit, "_input_prompt_label", "›"),
+                input_label=getattr(timeline, "_input_prompt_label", "›"),
                 activity_line=activity_line,
                 turn_active=running,
                 force=True,
@@ -1068,9 +1132,9 @@ async def _run_interactive(
         choices = [agent.task_id for agent in snapshot.agents]
         if not choices:
             return
-        selected = getattr(cockpit, "selected_task_id", None)
+        selected = getattr(timeline, "selected_task_id", None)
         index = choices.index(selected) if selected in choices else 0
-        cockpit.selected_task_id = choices[(index + 1) % len(choices)]
+        timeline.selected_task_id = choices[(index + 1) % len(choices)]
         _redraw_for_resize()
 
     async def _read_line_source() -> str | None:
@@ -1089,7 +1153,7 @@ async def _run_interactive(
 
         def read() -> None:
             try:
-                value = _read_cockpit_prompt(source, cockpit, native=native_input)
+                value = _read_timeline_prompt(source, timeline, native=native_input)
             except BaseException as exc:
                 try:
                     loop.call_soon_threadsafe(deliver, None, exc)
@@ -1117,7 +1181,7 @@ async def _run_interactive(
         """Return queued input first, then wait for the next line source value."""
         nonlocal input_task, input_eof
         if pending_prompts:
-            _flush_cockpit()
+            _flush_timeline()
             return pending_prompts.popleft()
         _start_input_read()
         if input_task is None:
@@ -1125,13 +1189,13 @@ async def _run_interactive(
         task = input_task
         prompt = await task
         input_task = None
-        _flush_cockpit()
+        _flush_timeline()
         if prompt is None:
             input_eof = True
         return prompt
 
     async def _close_input_reader() -> None:
-        """Cancel a pending input read when the cockpit is shutting down."""
+        """Cancel a pending input read when the timeline is shutting down."""
         nonlocal input_task
         task = input_task
         input_task = None
@@ -1148,7 +1212,7 @@ async def _run_interactive(
     def _draw_final(snapshot: SessionSnapshot, *, activity_line: str = "") -> None:
         if not live_render_enabled:
             return
-        _draw_cockpit(
+        _draw_timeline(
             snapshot,
             transcript,
             session_description=session.describe(),
@@ -1164,14 +1228,14 @@ async def _run_interactive(
 
             editor = TerminalInput(
                 source.fileno(),
-                cockpit,
+                timeline,
                 history_path,
                 interrupt=lambda: "/cancel" if turn_active else None,
                 focus=focus_next,
             )
-        with cockpit:
+        with timeline:
             while True:
-                _draw_cockpit(
+                _draw_timeline(
                     last_snapshot,
                     transcript,
                     session_description=session.describe(),
@@ -1215,7 +1279,7 @@ async def _run_interactive(
                         session=session,
                         cumulative=cumulative,
                         snapshot=last_snapshot,
-                        cockpit=cockpit,
+                        timeline=timeline,
                     )
                     if output is None:
                         transcript.error(f"Unknown command: {command}. Type /help.")
@@ -1264,7 +1328,7 @@ async def _run_interactive(
                 activity.start()
                 active_turn = turn
                 active_activity = activity
-                _draw_cockpit(
+                _draw_timeline(
                     state.snapshot(session_dir=turn.session_dir),
                     transcript,
                     session_description=session.describe(),
@@ -1285,7 +1349,7 @@ async def _run_interactive(
                             await asyncio.sleep(0.1)
                             if _activity.active and live_render_enabled:
                                 live_render_enabled = _safe_live_draw(
-                                    lambda: _draw_cockpit_activity(_activity.tick()),
+                                    lambda: _draw_timeline_activity(_activity.tick()),
                                     error=err,
                                     disable=disable_live_render,
                                 )
@@ -1322,7 +1386,7 @@ async def _run_interactive(
                     live_snapshot = _state.snapshot(session_dir=_turn.session_dir)
                     if live_render_enabled:
                         live_render_enabled = _safe_live_draw(
-                            lambda: _draw_cockpit(
+                            lambda: _draw_timeline(
                                 live_snapshot,
                                 transcript,
                                 session_description=session.describe(),
@@ -1374,7 +1438,7 @@ async def _run_interactive(
                                 task = input_task
                                 input_task = None
                                 queued_prompt = task.result()
-                                _flush_cockpit()
+                                _flush_timeline()
                                 if queued_prompt is None:
                                     input_eof = True
                                 elif queued_prompt.strip() in {"!cancel", "/cancel"}:
@@ -1387,7 +1451,7 @@ async def _run_interactive(
                                             session=session,
                                             cumulative=cumulative,
                                             snapshot=state.snapshot(session_dir=turn.session_dir),
-                                            cockpit=cockpit,
+                                            timeline=timeline,
                                             active=True,
                                         )
                                         if command
@@ -1413,7 +1477,7 @@ async def _run_interactive(
                                                 snapshot: Any = queued_snapshot,
                                                 cumulative_line: str = queued_cumulative_line,
                                             ) -> None:
-                                                _draw_cockpit(
+                                                _draw_timeline(
                                                     snapshot,
                                                     transcript,
                                                     session_description=session.describe(),
@@ -1536,7 +1600,7 @@ async def _run_interactive(
                     except (OSError, ValueError):
                         pass
         try:
-            cockpit_stream.flush()
+            timeline_stream.flush()
         except (BrokenPipeError, OSError, ValueError):
             pass
         try:
@@ -1569,8 +1633,7 @@ async def run_tui(
     out = sys.stdout if output_stream is None else output_stream
     err = sys.stderr if error_stream is None else error_stream
     capabilities = terminal_capabilities(out)
-    native_streams = source is sys.stdin and out is sys.stdout
-    cursor_safe = capabilities.cursor_controls or not native_streams
+    cursor_safe = capabilities.cursor_controls
     if _is_tty(source) and _is_tty(out) and cursor_safe and not quiet:
         return await _run_interactive(
             config,

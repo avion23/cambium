@@ -14,7 +14,7 @@ the final authority.
 | Child admission, suspension, joins and failure | [subagents](architecture/subagents.md) |
 | Provider capacity, quota and routing | [provider routing](architecture/provider-routing.md) |
 | Persistent interactive sessions | [interactive TUI](architecture/interactive-tui.md) |
-| Terminal input, focus and cockpit layout | [terminal interface](architecture/terminal-interface.md) |
+| Terminal input, focus and timeline layout | [terminal interface](architecture/terminal-interface.md) |
 | Durable events | [events](architecture/events.md) |
 | Recovery and publication | [operations](architecture/operations.md) |
 | DSPy/GEPA prompt experiments | [optimization](architecture/optimization.md) |

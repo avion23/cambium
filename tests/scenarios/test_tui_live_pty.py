@@ -1,4 +1,4 @@
-"""Process-boundary regressions for the live TUI cockpit."""
+"""Process-boundary regressions for the live linear timeline."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ pytestmark = pytest.mark.slow
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_DIR = REPO_ROOT / "src"
-# The live cockpit uses a normal-buffer timeline.  Its managed input prompt
+# The live timeline uses a normal-buffer timeline.  Its managed input prompt
 # starts after a clear-line operation; there is no fixed frame to move over.
 _PROMPT_REPAINT = b"\x1b[2K\xe2\x80\xba "
 

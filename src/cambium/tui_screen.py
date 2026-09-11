@@ -1,13 +1,13 @@
 """Terminal presentation model for Cambium's interactive frontend.
 
-The cockpit is intentionally a presentation layer over immutable session and
+The linear timeline is intentionally a presentation layer over immutable session and
 observability snapshots.  It owns no provider, worker, branch, or context
 state.  The only mutable value is a bounded local transcript used for the
 operator's current terminal view.  Live output is appended to the terminal's
 primary buffer so the terminal, rather than a private alternate screen, owns
 scrollback.
 
-``Cockpit`` appends timeline rows to the terminal primary buffer and keeps
+``LinearTimeline`` appends timeline rows to the terminal primary buffer and keeps
 only one transient status row plus one input row.  There is no alternate
 screen, fixed frame, or side rail: terminal scrollback is the timeline.
 """
@@ -34,6 +34,7 @@ from .render_markdown import render_markdown_lines as _shared_markdown_lines
 from .terminal import (
     clip_terminal_text,
     sanitize_terminal_text,
+    supports_cursor_controls,
     terminal_color_depth,
     terminal_display_width,
 )
@@ -157,7 +158,10 @@ _STREAM_DELTA_KINDS = frozenset(
     }
 )
 _STREAM_TEXT_LIMIT = 16_384
-_STREAM_RENDER_LIMIT = 8_192
+# Supervisor transport frames are capped at 32 KiB.  Durable response chunks
+# bypass the transient stream tail, but each retained entry must stay within
+# that existing per-frame bound.
+_RESPONSE_CHUNK_LIMIT_BYTES = 32 * 1024
 _TOOL_DETAIL_RENDER_LIMIT = 40
 _TOOL_DETAIL_KEYS = (
     "cmd",
@@ -349,13 +353,6 @@ _PRIVATE_ACTION_TYPES = frozenset(
     }
 )
 _PRIVATE_CONTENT_TYPES = _PRIVATE_ACTION_TYPES | frozenset({"analysis", "reasoning", "thinking"})
-
-
-def _is_tty(stream: Any) -> bool:
-    try:
-        return bool(getattr(stream, "isatty", lambda: False)())
-    except (AttributeError, OSError, ValueError):
-        return False
 
 
 def _sanitize(value: Any) -> str:
@@ -1182,6 +1179,44 @@ class Transcript:
         self._stream_truncated = True
         return "…\n" + text[-(_STREAM_TEXT_LIMIT - 2) :]
 
+    def _append_response_chunk(self, role: str, text: str) -> None:
+        """Append one bounded durable response frame to normal timeline history.
+
+        Durable response chunks are already redacted and split by the
+        supervisor.  Keep their frame boundaries instead of joining them into
+        the 16 KiB transient stream tail; the transcript deque still bounds
+        total retained memory.
+        """
+        try:
+            if len(text.encode("utf-8")) > _RESPONSE_CHUNK_LIMIT_BYTES:
+                return
+        except UnicodeEncodeError:
+            return
+        clean = _sanitize(text)
+        if not clean or _is_private_runtime_text(clean):
+            return
+        self._append_response_entry(role, clean)
+
+    def _append_response_entry(self, role: str, text: str) -> None:
+        if self._stream_role == "tool":
+            self._commit_stream()
+        elif self._stream_role is not None:
+            # A durable response is canonical for the assistant stream. Do not
+            # retain a transient copy that would be rendered twice.
+            self._clear_stream()
+        self._entries.append(TranscriptEntry(role=role, text=text))
+
+    def _append_validated_response(self, text: str) -> None:
+        """Append one complete supervisor-validated response to timeline history."""
+        clean = _sanitize(text)
+        if clean and not _is_private_runtime_text(clean):
+            self._append_response_entry("assistant", clean)
+
+    def _discard_assistant_stream(self) -> None:
+        """Drop an unvalidated assistant tail when durable replay is present."""
+        if self._stream_role == "assistant":
+            self._clear_stream()
+
     def _update_stream(
         self,
         role: str,
@@ -1410,7 +1445,9 @@ class Transcript:
             found.context = list(context)
             self._refresh_failure_entry(found)
 
-    def observe_event(self, record: dict[str, Any]) -> None:
+    def observe_event(
+        self, record: Mapping[str, Any], *, suppress_assistant_stream: bool = False
+    ) -> None:
         """Promote only operator-relevant runtime events into the transcript."""
         kind = record.get("kind")
         if not isinstance(kind, str):
@@ -1450,6 +1487,13 @@ class Transcript:
                 self._commit_stream()
 
         update = _stream_update(record)
+        if kind == "response_chunk":
+            if update is not None:
+                role, text, _, _ = update
+                self._append_response_chunk(role, text)
+            return
+        if suppress_assistant_stream and update is not None and update[0] == "assistant":
+            update = None
         if update is not None:
             role, text, append, message_id = update
             tool_key: str | None = None
@@ -2456,76 +2500,6 @@ def _transcript_block_kind(block: list[tuple[str, str]]) -> str:
     return role
 
 
-def _stream_lines(
-    transcript: Transcript,
-    width: int,
-    capacity: int,
-    *,
-    color: bool = False,
-) -> list[tuple[str, str]]:
-    if not transcript.streaming_text or transcript.streaming_role is None:
-        return []
-    width = max(1, width)
-    text = transcript.streaming_text
-    if len(text) > _STREAM_RENDER_LIMIT:
-        text = "…\n" + text[-_STREAM_RENDER_LIMIT:]
-    label = _ROLE_LABELS[transcript.streaming_role]
-    owner = _safe_bounded_text(transcript._stream_owner_task_id, 72)
-    if transcript.streaming_role == "tool" and owner:
-        label = f"{label}[{owner}]"
-    label_prefix = f"{label} ▸ "
-    if transcript.streaming_role == "tool" and transcript._stream_tool_name:
-        text = f"[{transcript._stream_tool_name}] {text}"
-    body_width = max(1, width - _display_width(label_prefix))
-    lines = _dense_rendered_lines(render_markdown_lines(text, body_width, color=color))
-    rendered = [
-        (
-            transcript.streaming_role,
-            _clip(label_prefix + (lines[0] if lines else "generating…"), width),
-        )
-    ]
-    rendered.extend((transcript.streaming_role, _clip("    " + line, width)) for line in lines[1:])
-    return rendered[-max(1, capacity) :]
-
-
-def _transcript_lines(
-    transcript: Transcript,
-    width: int,
-    capacity: int,
-    *,
-    color: bool = False,
-    include_stream: bool = True,
-) -> list[tuple[str, str]]:
-    capacity = max(1, capacity)
-    active = _stream_lines(transcript, width, capacity, color=color) if include_stream else []
-    remaining = max(0, capacity - len(active))
-    rendered: list[tuple[str, str]] = []
-    if remaining:
-        history: list[tuple[str, str]] = []
-        previous_kind = ""
-        for block in _transcript_blocks(
-            transcript.entries,
-            width,
-            expanded=transcript.tool_details_expanded,
-            color=color,
-        ):
-            kind = _transcript_block_kind(block)
-            if history and kind == "tool" and previous_kind != "tool":
-                history.append(("system", ""))
-            history.extend(block)
-            previous_kind = kind
-        while len(history) > remaining:
-            try:
-                history.remove(next(row for row in history if not row[1]))
-            except StopIteration:
-                break
-        rendered = history[-remaining:]
-    rendered.extend(active)
-    if not rendered:
-        rendered = [("system", _clip(" Waiting for a prompt. Type /help for commands.", width))]
-    return rendered[-capacity:]
-
-
 def _side_clean(value: Any) -> str:
     """Return one terminal-safe, single-line field value."""
     clean = _sanitize(value).replace("\n", " ")
@@ -2659,31 +2633,6 @@ def _quota_rows(snapshot: Any, width: int) -> list[tuple[str, str]]:
 def render_quota_rows(snapshot: Any, width: int = 44) -> list[str]:
     """Return width-safe quota rows for explicit timeline inspection."""
     return [text for _, text in _quota_rows(snapshot, width)]
-
-
-def _primary_rows(
-    transcript: Transcript,
-    width: int,
-    *,
-    color: bool = False,
-    include_stream: bool = True,
-) -> list[tuple[str, str]]:
-    """Return safe, labelled transcript rows for the append-only view."""
-    width = max(8, width)
-    # The transcript itself is bounded, but a large Markdown entry may occupy
-    # many wrapped rows. Leave enough capacity for the complete local view.
-    capacity = max(64, len(transcript.entries) * 16 + 64)
-    rows = _transcript_lines(
-        transcript,
-        width,
-        capacity,
-        color=color,
-        include_stream=include_stream,
-    )
-    rendered: list[tuple[str, str]] = []
-    for role, text in rows:
-        rendered.append((role, _clip(_safe_rendered(text), width)))
-    return rendered
 
 
 _STATUS_KEYS = frozenset(
@@ -2917,45 +2866,6 @@ def _status_line(
     return _clip(prefix_text + " · ".join(visible_parts), width)
 
 
-def render_primary(
-    snapshot: Any,
-    transcript: Transcript,
-    *,
-    session_description: str,
-    branch_line: str,
-    cumulative_line: str,
-    width: int,
-    color: bool = False,
-    activity_line: str = "",
-    show_detail: bool = True,
-) -> list[str]:
-    """Render an append-only transcript followed by one compact status row."""
-    width = max(8, width)
-    lines = [
-        _paint(text, _role_color(role, color), color)
-        for role, text in _primary_rows(
-            transcript,
-            width,
-            color=color,
-            include_stream=True,
-        )
-    ]
-    status = _status_line(
-        snapshot,
-        transcript,
-        session_description=session_description,
-        branch_line=branch_line,
-        cumulative_line=cumulative_line,
-        width=width,
-        activity_line=activity_line,
-        show_detail=show_detail,
-        color=color,
-        prefix=True,
-    )
-    lines.append(_paint(status, _DIM_CYAN, color))
-    return lines
-
-
 def _suffix_prefix_overlap(previous: str, current: str) -> int:
     """Return the longest prefix of ``current`` matching ``previous``'s suffix."""
     if not previous or not current:
@@ -2989,7 +2899,7 @@ def _stream_entry_content(entry: TranscriptEntry) -> str:
     return text
 
 
-class Cockpit:
+class LinearTimeline:
     """Append-only primary-buffer terminal presentation.
 
     The terminal owns the timeline and its scrollback.  Only the final two
@@ -3002,7 +2912,12 @@ class Cockpit:
 
     def __init__(self, stream: TextIO, *, enabled: bool = True) -> None:
         self.stream = stream
-        self.enabled = enabled and _is_tty(stream)
+        # Keep the line renderer usable for direct draws to pipes and dumb
+        # terminals, but reserve cursor choreography for terminals that expose
+        # it explicitly.  The interactive TUI only constructs this class for
+        # capable terminals; direct callers still get safe plain lines.
+        self.enabled = bool(enabled)
+        self._cursor_controls = self.enabled and supports_cursor_controls(stream)
         self.color = terminal_color_depth(stream) if self.enabled else 0
         self._entered = False
         self._previous_sigterm_handler: Any = None
@@ -3015,8 +2930,8 @@ class Cockpit:
         self._managed_input_active = False
         self._last_restored_input_text: str | None = None
         self._last_restored_input_label = "›"
-        self._pending_draw: Cockpit._Request | None = None
-        self._last_request: Cockpit._Request | None = None
+        self._pending_draw: LinearTimeline._Request | None = None
+        self._last_request: LinearTimeline._Request | None = None
         self._timeline_initialized = False
         self._last_history_entries: tuple[TranscriptEntry, ...] = ()
         self._last_stream_text = ""
@@ -3041,8 +2956,8 @@ class Cockpit:
         self._show_detail = not self._show_detail
         return self._show_detail
 
-    def __enter__(self) -> Cockpit:
-        if self.enabled:
+    def __enter__(self) -> LinearTimeline:
+        if self.enabled and self._cursor_controls:
             self._previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
             try:
                 signal.signal(signal.SIGTERM, self._handle_sigterm)
@@ -3067,14 +2982,14 @@ class Cockpit:
                 # Hiding the managed draft releases the deferred-draw gate;
                 # flush the latest timeline before leaving the terminal row.
                 self.flush()
-                self.stream.write("\r\n")
+                self.stream.write("\r\n" if self._cursor_controls else "\n")
                 self.stream.flush()
             else:
                 self.flush()
                 # Commit the blank input row and return to the next prompt or
                 # shell line.  No alternate screen or full-frame cleanup is
                 # needed because all history already belongs to scrollback.
-                self.stream.write("\r\n")
+                self.stream.write("\r\n" if self._cursor_controls else "\n")
                 self.stream.flush()
             self._timeline_initialized = False
         if self._entered:
@@ -3224,6 +3139,13 @@ class Cockpit:
             and self._last_restored_input_label == label
         ):
             return
+        if not self._cursor_controls:
+            # Without cursor addressing, input is line-oriented.  Keep each
+            # draft readable and avoid carriage-return/erase sequences.
+            self.stream.write(f"{label} {rendered}\n")
+            self._last_restored_input_text = text
+            self._last_restored_input_label = label
+            return
         self.stream.write(f"\r{_CLEAR_LINE}{label} {rendered}")
         back = _display_width(rendered) - cursor_cells
         if back > 0:
@@ -3232,21 +3154,29 @@ class Cockpit:
         self._last_restored_input_label = label
 
     def _write_input_blank(self) -> None:
+        if not self._cursor_controls:
+            return
         self.stream.write(f"\r{_CLEAR_LINE}")
 
     def _move_to_status(self) -> None:
-        if self._timeline_initialized:
+        if self._cursor_controls and self._timeline_initialized:
             self.stream.write("\r\x1b[1A")
 
     def _write_status_and_input(self, status: str, input_text: str = "") -> None:
         rendered = _paint(status, _DIM_CYAN, self.color)
-        self.stream.write(f"\r{_CLEAR_LINE}{rendered}\n")
+        if self._cursor_controls:
+            self.stream.write(f"\r{_CLEAR_LINE}{rendered}\n")
+        else:
+            self.stream.write(f"{rendered}\n")
         self._write_input_blank()
         if self._input_active:
             self._restore_input_line(input_text, force=True)
 
     def _redraw_status_only(self, status: str) -> None:
         if not self._timeline_initialized:
+            return
+        if not self._cursor_controls:
+            self.stream.write(f"{_paint(status, _DIM_CYAN, self.color)}\n")
             return
         # Preserve a native editor's exact cursor column while replacing the
         # row above it.  This is needed for wrapped/mid-line readline drafts.
@@ -3259,7 +3189,10 @@ class Cockpit:
         for role, text in rows:
             clean = _clip(_safe_rendered(text), max(1, self._last_size.columns))
             rendered = _paint(clean, _role_color(role, self.color), self.color)
-            self.stream.write(f"\r{_CLEAR_LINE}{rendered}\n")
+            if self._cursor_controls:
+                self.stream.write(f"\r{_CLEAR_LINE}{rendered}\n")
+            else:
+                self.stream.write(f"{rendered}\n")
 
     def draw(
         self,
@@ -3279,7 +3212,7 @@ class Cockpit:
             return
         self._last_size = shutil.get_terminal_size((120, 40))
         label = _clip(_sanitize(input_label).replace(chr(10), " "), 8)
-        request: Cockpit._Request = (
+        request: LinearTimeline._Request = (
             snapshot,
             transcript,
             _sanitize(session_description).replace(chr(10), " "),
@@ -3309,7 +3242,7 @@ class Cockpit:
         finally:
             self._draw_in_flight = False
 
-    def _draw_now(self, request: Cockpit._Request, *, force: bool = False) -> None:
+    def _draw_now(self, request: LinearTimeline._Request, *, force: bool = False) -> None:
         (
             snapshot,
             transcript,
@@ -3526,11 +3459,13 @@ class Cockpit:
             self._write_input_blank()
             self._restore_input_line("", force=True)
         else:
-            self.stream.write(f"{label_text} ")
+            if self._cursor_controls:
+                self.stream.write(f"{label_text} ")
+            else:
+                self._restore_input_line("", force=True)
         self.stream.flush()
 
     def hide_cursor(self, *, commit: bool = False) -> None:
-        del commit
         # POSIX ``TerminalInput`` uses a managed draft while the legacy
         # readline path owns an echoed native line.  Only the latter leaves
         # the cursor one row below the prompt after Enter.
@@ -3539,6 +3474,11 @@ class Cockpit:
         self._managed_input_active = False
         self._last_restored_input_text = None
         if not self.enabled:
+            return
+        if not self._cursor_controls:
+            if commit:
+                self.stream.write("\n")
+            self.stream.flush()
             return
         if readline_echoed:
             # readline echoes Enter and leaves the cursor one row below the
@@ -3553,10 +3493,9 @@ class Cockpit:
 
 __all__ = [
     "ActivityState",
-    "Cockpit",
+    "LinearTimeline",
     "Transcript",
     "TranscriptEntry",
     "render_quota_rows",
     "render_markdown_lines",
-    "render_primary",
 ]

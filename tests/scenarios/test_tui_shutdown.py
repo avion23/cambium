@@ -22,6 +22,7 @@ class _Tty(io.StringIO):
 def test_idle_cancel_does_not_wait_for_a_blocked_input_reader(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    monkeypatch.setenv("TERM", "xterm-256color")
     started = threading.Event()
     release = threading.Event()
 
@@ -30,7 +31,7 @@ def test_idle_cancel_does_not_wait_for_a_blocked_input_reader(
         release.wait()
         return None
 
-    monkeypatch.setattr(tui, "_read_cockpit_prompt", blocked_reader)
+    monkeypatch.setattr(tui, "_read_timeline_prompt", blocked_reader)
 
     async def scenario() -> None:
         task = asyncio.create_task(
@@ -41,7 +42,10 @@ def test_idle_cancel_does_not_wait_for_a_blocked_input_reader(
                 error_stream=io.StringIO(),
             )
         )
-        await asyncio.to_thread(started.wait)
+        deadline = asyncio.get_running_loop().time() + 1.0
+        while not started.is_set() and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.01)
+        assert started.is_set()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, timeout=1.0)
