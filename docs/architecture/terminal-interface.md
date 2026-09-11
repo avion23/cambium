@@ -192,6 +192,12 @@ unfinished draft, Ctrl-C, and active `/cancel` through a real process boundary. 
 follow-up tasks and check events plus Git artifacts. A canned provider is useful
 for deterministic rendering, not proof that the agent can code.
 
+The overhead profiler primes a long session through the production event
+projection and `Cockpit`/`Transcript` timeline path. It then measures one
+durable event draw, one status-only draw, resize, and retained timeline
+bookkeeping separately. Those samples measure incremental live work after the
+retained history exists; they are not full-history snapshot-render timings.
+
 Run focused checks before broader changes:
 
 ```sh

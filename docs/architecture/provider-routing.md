@@ -186,6 +186,7 @@ PYTHONPATH=src python3 scripts/profile_overhead.py \
 ```
 
 The profile reports median/p95 wall time for a long-session event draw,
-status-only draw, and resize, plus peak bytes for a retained live render. The
-fixtures use a discard-only TTY and fixed 120/100-column sizes, so the numbers
-measure renderer work rather than provider or terminal I/O.
+status-only draw, and resize, plus retained timeline bookkeeping bytes for one
+long-session replay. The fixtures use a discard-only TTY and fixed 120/100-column
+sizes, so the numbers measure renderer and timeline work rather than provider or
+terminal I/O.

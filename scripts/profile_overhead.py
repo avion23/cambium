@@ -7,7 +7,7 @@ and a small, separate ``cProfile`` pass for the in-process CPU paths.  No
 provider or network access is used.  Git and SQLite measurements use temporary
 repositories/databases.  TUI samples exercise the live primary-buffer
 renderer: incremental event draw, status-only refresh, resize, and retained
-render peak memory.  The prompt/TUI fixtures mirror the shapes in
+timeline bookkeeping memory.  The prompt/TUI fixtures mirror the shapes in
 ``tests/scenarios/test_diffundo_codex.py`` and
 ``tests/scenarios/test_tui_screen.py``.
 
@@ -21,9 +21,9 @@ when a longer run is useful.  Import measurements launch fresh interpreters
 with ``python -X importtime``; all other measurements run in this process.
 
 The live-TUI section uses a discard-only TTY and records incremental event
-draw, status-only draw, resize, and retained-render peak memory.  It primes a
-long transcript before timing so status and event samples cover the hot path,
-not a full retained-transcript replay.
+draw, status-only draw, resize, and retained timeline bookkeeping memory.  It
+folds thousands of durable child/tool/output events before timing so status
+and event samples cover the hot path, not a full retained-transcript replay.
 """
 
 from __future__ import annotations
@@ -195,7 +195,7 @@ def _terminal_size_provider(
         tui_screen.shutil.get_terminal_size = previous
 
 
-def _measure_peak_memory(
+def _measure_retained_memory(
     name: str,
     operation: Callable[[], Any],
     *,
@@ -203,23 +203,24 @@ def _measure_peak_memory(
     warmups: int,
     load: str,
 ) -> Measurement:
-    """Measure peak allocations made by one live-render operation."""
+    """Measure bytes retained by one long-session timeline and live cockpit."""
     for _ in range(warmups):
         operation()
     samples: list[float] = []
     for _ in range(iterations):
-        # Remove garbage left by a previous render before tracing the next
-        # operation.  ``tracemalloc`` reports only allocations made after its
-        # start, so retained transcript state is not counted as new output.
         gc.collect()
         tracemalloc.start()
+        retained: Any = None
         try:
-            operation()
-            _current, peak = tracemalloc.get_traced_memory()
+            baseline, _peak = tracemalloc.get_traced_memory()
+            retained = operation()
+            gc.collect()
+            current, _peak = tracemalloc.get_traced_memory()
         finally:
             tracemalloc.stop()
-        samples.append(float(peak))
-    return Measurement(name, tuple(samples), load, unit="bytes/op")
+        samples.append(float(max(0, current - baseline)))
+        del retained
+    return Measurement(name, tuple(samples), load, unit="bytes/session")
 
 
 class _RequestConstructed(RuntimeError):
@@ -639,13 +640,17 @@ def _tui_snapshot() -> SimpleNamespace:
     )
 
 
+_TUI_DURABLE_EVENTS = 4_096
 _TUI_RETAINED_ENTRIES = 160
+_TUI_EVENTS_PER_CHILD = 8
 
 
 def _tui_event(index: int) -> dict[str, Any]:
     """Return one bounded durable event from a representative child turn."""
-    child = f"profile-child-{index % 12:02d}"
-    phase = index % 7
+    child_index, phase = divmod(index, _TUI_EVENTS_PER_CHILD)
+    child = f"profile-child-{child_index:04d}"
+    call_id = f"profile-call-{child_index:04d}"
+    turn = child_index + 1
     if phase == 0:
         return {
             "kind": "child_admitted",
@@ -666,18 +671,19 @@ def _tui_event(index: int) -> dict[str, Any]:
                 "task": "Inspect one bounded path",
                 "assigned_provider": "zai",
                 "model": "glm-5.3",
+                "turn": turn,
             },
         }
     if phase == 2:
         return {
-            "kind": "tool_event",
+            "kind": "tool_output_delta",
             "task_id": child,
             "payload": {
                 "tool": "read_batch",
-                "tool_call_id": f"call-{index:04d}",
-                "ok": True,
-                "duration_ms": 20 + index % 30,
-                "paths": ["src/cambium/tui_screen.py"],
+                "tool_call_id": call_id,
+                "turn": turn,
+                "stream": "stdout",
+                "delta": f"child {child_index} result: ",
             },
         }
     if phase == 3:
@@ -686,40 +692,68 @@ def _tui_event(index: int) -> dict[str, Any]:
             "task_id": child,
             "payload": {
                 "tool": "read_batch",
-                "tool_call_id": f"call-{index - 1:04d}",
+                "tool_call_id": call_id,
+                "turn": turn,
+                "stream": "stdout",
                 "delta": "one bounded result\n",
             },
         }
     if phase == 4:
         return {
-            "kind": "context_checkpoint",
-            "task_id": "profile-task-0",
-            "payload": {"epoch": 4 + index // 24, "summary_segments": 3},
+            "kind": "tool_event",
+            "task_id": child,
+            "payload": {
+                "tool": "read_batch",
+                "tool_call_id": call_id,
+                "turn": turn,
+                "ok": True,
+                "duration_ms": 20 + child_index % 30,
+                "cmd": "read_batch --paths src/cambium/tui_screen.py",
+                "paths": ["src/cambium/tui_screen.py"],
+            },
         }
     if phase == 5:
         return {
-            "kind": "usage_event",
-            "task_id": child,
+            "kind": "context_checkpoint",
+            "task_id": "profile-task-0",
             "payload": {
-                "provider": "zai",
-                "model": "glm-5.3",
-                "usage": {"total_tokens": 128 + index, "completion_tokens": 16},
-                "output_tokens_per_s": 47.5,
+                "epoch": 4 + child_index // 24,
+                "summary_segments": 3,
+                "turn": turn,
             },
         }
-    return {
-        "kind": "result",
-        "task_id": child,
-        "payload": {"status": "succeeded", "summary": "bounded child result"},
-    }
+    if phase == 6:
+        return {
+            "kind": "child_result",
+            "task_id": child,
+            "payload": {
+                "parent_task_id": "profile-task-0",
+                "status": "succeeded",
+                "summary": "bounded child result",
+                "turn": turn,
+            },
+        }
+    if phase == 7:
+        return {
+            "kind": "context_resume",
+            "task_id": "profile-task-0",
+            "payload": {
+                "child_count": 1,
+                "epoch": 4 + child_index // 24,
+                "turn": turn,
+            },
+        }
+    raise AssertionError(f"unknown TUI fixture phase: {phase}")
 
 
-def _tui_transcript(*, entries: int = _TUI_RETAINED_ENTRIES) -> Transcript:
+def _tui_transcript(
+    *, events: int = _TUI_DURABLE_EVENTS, entries: int = _TUI_RETAINED_ENTRIES
+) -> Transcript:
+    if events < 1:
+        raise ValueError("events must be positive")
     transcript = Transcript(max_entries=entries)
-    index = 0
-    while len(transcript.entries) < entries:
+    for index in range(events):
         transcript.observe_event(_tui_event(index))
-        index += 1
     transcript.finish_stream()
     return transcript
 
@@ -747,6 +781,28 @@ def _tui_draw(
     )
 
 
+def _tui_prime_live(
+    snapshot: Any,
+    *,
+    size_provider: Callable[[tuple[int, int]], os.terminal_size],
+) -> tuple[_ProfileTty, Transcript, Cockpit]:
+    """Replay a long durable session through the production live sink seams."""
+    stream = _ProfileTty()
+    transcript = Transcript(max_entries=_TUI_RETAINED_ENTRIES)
+    cockpit = Cockpit(stream, enabled=True)
+    with _terminal_size_provider(size_provider):
+        for index in range(_TUI_DURABLE_EVENTS):
+            transcript.observe_event(_tui_event(index))
+            _tui_draw(
+                cockpit,
+                snapshot,
+                transcript,
+                activity_line=f"▸ STREAMING · {index + 1}s",
+            )
+    transcript.finish_stream()
+    return stream, transcript, cockpit
+
+
 def _tui_measurements(*, iterations: int, warmups: int) -> list[Measurement]:
     snapshot = _tui_snapshot()
     measurements: list[Measurement] = []
@@ -754,63 +810,75 @@ def _tui_measurements(*, iterations: int, warmups: int) -> list[Measurement]:
     def fixed_size(_default: tuple[int, int]) -> os.terminal_size:
         return os.terminal_size((120, 40))
 
-    # Prime the live renderer once, then measure only incremental work against
-    # a long retained transcript.  The discard-only TTY keeps output writes
-    # from dominating the timing or memory samples.
-    event_stream = _ProfileTty()
-    event_transcript = _tui_transcript()
-    event_cockpit = Cockpit(event_stream, enabled=True)
+    # Prime one live session through the same observe/draw sequence used by
+    # ``cambium.tui``.  Reusing this initialized timeline keeps the benchmark
+    # modest while every measured seam still runs after thousands of events.
+    _stream, transcript, cockpit = _tui_prime_live(snapshot, size_provider=fixed_size)
+    if len(transcript.entries) != _TUI_RETAINED_ENTRIES:
+        raise AssertionError(
+            "long-session fixture did not reach its bounded transcript cap: "
+            f"{len(transcript.entries)} != {_TUI_RETAINED_ENTRIES}"
+        )
+    expected_tool_events = _TUI_DURABLE_EVENTS // _TUI_EVENTS_PER_CHILD
+    if transcript.tool_count != expected_tool_events:
+        raise AssertionError(
+            "long-session fixture did not process every tool completion: "
+            f"{transcript.tool_count} != {expected_tool_events}"
+        )
+
+    # Measure one additional event after the long-session replay.  This keeps
+    # the timed operation at the production per-event boundary (reducer plus
+    # incremental primary-buffer draw), rather than a snapshot renderer.
+    event_index = [_TUI_DURABLE_EVENTS]
+
+    def event_draw() -> None:
+        index = event_index[0]
+        event_index[0] += 1
+        _tui_append_event(transcript, index)
+        _tui_draw(
+            cockpit,
+            snapshot,
+            transcript,
+            activity_line=f"▸ STREAMING · {index + 1}s",
+        )
+
     with _terminal_size_provider(fixed_size):
-        _tui_draw(event_cockpit, snapshot, event_transcript, activity_line="◌ THINKING · 1s")
-        event_index = [0]
-
-        def event_draw() -> None:
-            index = event_index[0]
-            event_index[0] += 1
-            _tui_append_event(event_transcript, _TUI_RETAINED_ENTRIES + index)
-            _tui_draw(
-                event_cockpit,
-                snapshot,
-                event_transcript,
-                activity_line=f"▸ STREAMING · {index + 2}s",
-            )
-
         measurements.append(
             _measure(
                 "TUI live event draw (retained timeline)",
                 event_draw,
                 iterations=iterations,
                 warmups=warmups,
-                load=f"{_TUI_RETAINED_ENTRIES} retained entries; one durable child event; 120x40",
+                load=(
+                    f"{_TUI_DURABLE_EVENTS:,} durable tool/output/child/context events processed; "
+                    f"{_TUI_RETAINED_ENTRIES} retained entries; 120x40"
+                ),
             )
         )
 
-        status_stream = _ProfileTty()
-        status_cockpit = Cockpit(status_stream, enabled=True)
-        status_transcript = _tui_transcript()
-        _tui_draw(status_cockpit, snapshot, status_transcript, activity_line="◌ THINKING · 1s")
-        status_index = [0]
+    status_index = [0]
 
-        def status_draw() -> None:
-            index = status_index[0]
-            status_index[0] += 1
-            status_cockpit.draw_activity(f"◌ THINKING · {index + 2}s")
+    def status_draw() -> None:
+        index = status_index[0]
+        status_index[0] += 1
+        cockpit.draw_activity(f"◌ THINKING · {index + 1}s")
 
+    with _terminal_size_provider(fixed_size):
         measurements.append(
             _measure(
                 "TUI live status-only draw",
                 status_draw,
                 iterations=iterations,
                 warmups=warmups,
-                load=f"{_TUI_RETAINED_ENTRIES} retained entries; activity row only; 120x40",
+                load=(
+                    f"{_TUI_DURABLE_EVENTS:,} durable tool/output/child/context events processed; "
+                    f"{_TUI_RETAINED_ENTRIES} retained entries; activity row only; 120x40"
+                ),
             )
         )
 
     # Alternate widths after the initial draw.  A resize is a viewport change,
     # not new timeline output, so this operation must not replay retained rows.
-    resize_stream = _ProfileTty()
-    resize_transcript = _tui_transcript()
-    resize_cockpit = Cockpit(resize_stream, enabled=True)
     resize_sizes = (os.terminal_size((100, 40)), os.terminal_size((120, 40)))
     resize_index = [0]
 
@@ -819,41 +887,49 @@ def _tui_measurements(*, iterations: int, warmups: int) -> list[Measurement]:
         resize_index[0] += 1
         return size
 
-    with _terminal_size_provider(fixed_size):
-        _tui_draw(resize_cockpit, snapshot, resize_transcript, activity_line="◌ THINKING · 1s")
     with _terminal_size_provider(resize_size):
         measurements.append(
             _measure(
                 "TUI live resize",
                 lambda: _tui_draw(
-                    resize_cockpit,
+                    cockpit,
                     snapshot,
-                    resize_transcript,
+                    transcript,
                     activity_line="◌ THINKING · 2s",
                 ),
                 iterations=iterations,
                 warmups=warmups,
-                load=f"{_TUI_RETAINED_ENTRIES} retained entries; alternating 100/120 columns",
+                load=(
+                    f"{_TUI_DURABLE_EVENTS:,} durable tool/output/child/context events processed; "
+                    f"{_TUI_RETAINED_ENTRIES} retained entries; alternating 100/120 columns"
+                ),
             )
         )
 
-    # Measure the public live draw seam with a fresh Cockpit and an already
-    # retained transcript.  This captures the memory required to render a long
-    # session without exposing private row-building helpers in the profiler.
-    retained_transcript = _tui_transcript()
-
-    def retained_render() -> None:
+    # Measure the retained bookkeeping owned by the production timeline and
+    # cockpit after a long session.  The operation returns both objects so the
+    # traced current bytes include their live state rather than only temporary
+    # allocations made by one draw.  The full per-event replay above is not
+    # traced: tracing every allocation in thousands of draws obscures this
+    # retained-bookkeeping number and makes the profile needlessly slow.
+    def retained_bookkeeping() -> tuple[Transcript, Cockpit]:
+        retained_transcript = _tui_transcript()
         retained_cockpit = Cockpit(_ProfileTty(), enabled=True)
         _tui_draw(retained_cockpit, snapshot, retained_transcript)
+        return retained_transcript, retained_cockpit
 
     with _terminal_size_provider(fixed_size):
         measurements.append(
-            _measure_peak_memory(
-                "TUI retained render peak memory",
-                retained_render,
-                iterations=iterations,
-                warmups=warmups,
-                load=f"{_TUI_RETAINED_ENTRIES} retained entries; fresh live Cockpit draw; 120x40",
+            _measure_retained_memory(
+                "TUI retained timeline bookkeeping memory",
+                retained_bookkeeping,
+                iterations=1,
+                warmups=0,
+                load=(
+                    f"{_TUI_DURABLE_EVENTS:,} durable tool/output/child/context events processed; "
+                    f"{_TUI_RETAINED_ENTRIES} retained entries; live Cockpit state; "
+                    "one traced bookkeeping replay; 120x40"
+                ),
             )
         )
     return measurements

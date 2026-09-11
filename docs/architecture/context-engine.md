@@ -215,6 +215,11 @@ projection, and `branch_history` for the raw tool evidence it covers. A tool
 proposal, child admission, accepted child artifact and passing combined check
 are different events; do not fold them all into "the child finished".
 
+A context checkpoint, cache descriptor, or compatible exact fork proves only
+that a prefix is eligible for reuse. Count a cache outcome only when a
+`usage_event` carries provider-reported `provider_cache_hit` or cached-token
+evidence; leave the outcome unknown when those fields are absent.
+
 For example, a failed check followed by a corrected edit should retain the
 current result, the relevant failure constraint and any check still owed.
 A summary that says only "tests run" has lost that distinction. The model must
