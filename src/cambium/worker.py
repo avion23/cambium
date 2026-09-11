@@ -5845,11 +5845,6 @@ async def _bound_context_continuation(
         declared_summary_model = router.declared_model(summary_result.provider)
         if declared_summary_model and summary_result.model != declared_summary_model:
             raise ContextForkError("summary response model mismatch")
-        _bind_router_provider(router, summary_result, config.task_id)
-        fallback_origin = getattr(summary_result, "fell_back_from", None)
-        if isinstance(fallback_origin, str):
-            outcome["fell_back_from"] = fallback_origin
-            outcome["model"] = summary_result.model
         invalid_usage_fields = _invalid_usage_fields(summary_result.usage)
         if invalid_usage_fields:
             raise ContextForkError("summary usage contains invalid token counts")
@@ -5976,6 +5971,31 @@ async def _bound_context_continuation(
             # lineage's prompt length.
             previous_prompt_tokens = 0
             rollover_reason = "cast_k0_rollover"
+        # The summary result is provider-neutral semantic state.  Preserve
+        # the coding route's cache affinity in the checkpoint instead of
+        # persisting a sibling that only served this summary.  A concrete
+        # router lease is authoritative; a prior checkpoint is the fallback
+        # for resumed workers that have not made their first call yet.  When
+        # neither exists, leave the provider unset rather than inventing a
+        # coding pin from the summary provider.
+        coding_lease = getattr(router, "provider_lease", None)
+        coding_provider = getattr(coding_lease, "provider", None)
+        coding_model = getattr(coding_lease, "model", None)
+        if not isinstance(coding_provider, str) or not coding_provider:
+            coding_provider = None
+        if not isinstance(coding_model, str) or not coding_model:
+            coding_model = None
+        if coding_provider is None and current_epoch_checkpoint is not None:
+            prior_cache_key = current_epoch_checkpoint.cache_key
+            prior_provider = prior_cache_key.provider
+            if isinstance(prior_provider, str) and prior_provider:
+                coding_provider = prior_provider
+                if coding_model is None and isinstance(prior_cache_key.model, str):
+                    coding_model = prior_cache_key.model
+        checkpoint_model = coding_model or model
+        checkpoint_boundary = (
+            provider_boundaries.get(coding_provider) if coding_provider is not None else None
+        )
         checkpoint = await asyncio.to_thread(
             _write_epoch_checkpoint,
             config,
@@ -5984,11 +6004,11 @@ async def _bound_context_continuation(
             provider_messages=copy.deepcopy(new_trunk),
             continuation_suffix=[],
             admitted_child_task_ids=_resume_child_task_ids(raw_tail),
-            provider=summary_result.provider,
-            model=model,
+            provider=coding_provider,
+            model=checkpoint_model,
             tools_sha256=_sha256_hex(json.dumps(tools, sort_keys=True).encode("utf-8")),
             provider_compat=provider_compat,
-            provider_boundary=provider_boundaries.get(summary_result.provider),
+            provider_boundary=checkpoint_boundary,
             code_changed=code_changed,
             verified_after_change=verified_after_change,
             verification_failed=verification_failed,

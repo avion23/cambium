@@ -99,6 +99,7 @@ from the request shape. The worker bounds transcript growth directly instead.
 from __future__ import annotations
 
 import asyncio
+import copy
 import errno
 import hashlib
 import json
@@ -2702,6 +2703,11 @@ class Diffundo:
         # routing order. Keep it local to this router/process: a fresh Diffundo
         # instance is the explicit recovery/probe boundary.
         self._terminal_death_providers: frozenset[str] = frozenset()
+        # A summary auth failure must quarantine its credential immediately,
+        # but defer invalidating the coding lease until the next real call.
+        # Keep the fingerprint so a credential rotation between calls clears
+        # the pending evidence instead of poisoning the new credential.
+        self._pending_summary_auth_deaths: tuple[tuple[str, str], ...] = ()
         self._call_budget_s = call_budget_s
         if summary_call_budget_s is None:
             self._summary_call_budget_s = max(
@@ -2774,6 +2780,7 @@ class Diffundo:
         an outer cap without extending the configured logical budget.
         """
         validate_prompt_structure(prompt)
+        self._consume_summary_auth_deaths()
         effective_call_budget_s = self._call_budget_s if call_budget_s is None else call_budget_s
         if (
             isinstance(effective_call_budget_s, bool)
@@ -2945,6 +2952,14 @@ class Diffundo:
                 continue
             raise self._all_providers_failed(tried, last_error)
 
+    def _summary_router(self) -> Diffundo:
+        """Build a provider-neutral router without sharing mutable routing state."""
+        summary = copy.copy(self)
+        summary._runtimes = tuple(self._summary_runtime(runtime) for runtime in self._runtimes)
+        summary._pauses = tuple(_PauseTracker() for _ in ProviderTier)
+        summary._summary_parent = self
+        return summary
+
     async def summary_call(
         self,
         tier: ProviderTier,
@@ -2960,27 +2975,128 @@ class Diffundo:
     ) -> CallResult:
         """Run a semantic summary with extra provider response headroom.
 
-        Summary prompts contain the complete raw execution tail and the model
-        must produce a structured entry, so they can take materially longer
-        than the short action calls that precede them.  This remains the same
-        router (and therefore the same provider lease/cascade); only its
-        bounded transport deadline is extended for the summary call.  A
-        caller-supplied maximum acts as an upper bound so a worker task wall
-        deadline can cap the extra summary headroom without removing it when
-        the wall budget is ample.
+        Summary prompts contain the complete execution tail and the model must
+        produce a structured entry, so they can take materially longer than
+        the short action calls that precede them. A provider-neutral summary
+        may fall back to a sibling, but it must not acquire or release the
+        coding branch's provider/model lease. The summary uses a shallow copy
+        with isolated routing health/circuit state; provider rate admission,
+        quota accounting and transport seams remain shared. A caller-supplied
+        maximum acts as an upper bound so a worker task wall deadline can cap
+        the extra summary headroom without removing it when the wall budget is
+        ample.
         """
-        return await self.call(
-            tier,
-            prompt,
-            model=model,
-            budget_usd=budget_usd,
-            allow_model_substitution=allow_model_substitution,
-            requirements=requirements,
-            call_budget_s=self._summary_call_budget_s,
-            max_call_budget_s=max_call_budget_s,
-            on_delta=on_delta,
-            on_status=on_status,
-        )
+        summary_router = self._summary_router()
+        with self._all_provider_failure_lock:
+            initial_failures = self._consecutive_all_provider_failures
+        try:
+            return await summary_router.call(
+                tier,
+                prompt,
+                model=model,
+                budget_usd=budget_usd,
+                allow_model_substitution=allow_model_substitution,
+                requirements=requirements,
+                call_budget_s=self._summary_call_budget_s,
+                max_call_budget_s=max_call_budget_s,
+                on_delta=on_delta,
+                on_status=on_status,
+            )
+        finally:
+            # The counter is a cross-call circuit safeguard. Propagate only
+            # the summary router's delta so a concurrent coding call cannot be
+            # overwritten by the shallow copy's private counter.
+            with self._all_provider_failure_lock:
+                summary_failures = summary_router._consecutive_all_provider_failures
+                if (
+                    summary_failures == 0
+                    and initial_failures != 0
+                    and self._consecutive_all_provider_failures == initial_failures
+                ):
+                    self._consecutive_all_provider_failures = 0
+                elif summary_failures > initial_failures:
+                    self._consecutive_all_provider_failures += (
+                        summary_failures - initial_failures
+                    )
+
+    def _consume_summary_auth_deaths(self) -> None:
+        """Apply deferred summary auth-death evidence before a real call."""
+        pending = self._pending_summary_auth_deaths
+        if not pending:
+            return
+        self._pending_summary_auth_deaths = ()
+        terminal = self._terminal_death_providers
+        lease = self._provider_lease
+        for provider_name, fingerprint in pending:
+            try:
+                runtime = self._runtime(provider_name)
+            except KeyError:
+                continue
+            if self._credential_fingerprint(runtime.provider) != fingerprint:
+                continue
+            terminal = terminal | {provider_name}
+            if lease is not None and lease.provider == provider_name:
+                lease = None
+        self._terminal_death_providers = terminal
+        self._provider_lease = lease
+
+    def _merge_summary_disable(
+        self,
+        provider: ProviderConfig,
+        *,
+        auth_quarantine: bool,
+        fingerprint: str | None,
+    ) -> None:
+        """Carry summary auth/config quarantine into the live router."""
+        runtime = self._runtime(provider.name)
+        if auth_quarantine:
+            if fingerprint is None or self._credential_fingerprint(runtime.provider) != fingerprint:
+                return
+        self._record_disable(runtime.provider, auth_quarantine=auth_quarantine)
+        if auth_quarantine and fingerprint is not None:
+            self._pending_summary_auth_deaths = tuple(
+                (name, old)
+                for name, old in self._pending_summary_auth_deaths
+                if name != provider.name
+            ) + ((provider.name, fingerprint),)
+
+    def _merge_summary_retry_after(
+        self,
+        provider: ProviderConfig,
+        retry_after_s: float,
+        source_runtime: _ProviderRuntime,
+    ) -> None:
+        """Carry summary Retry-After cooldown without migrating routing state."""
+        target = self._runtime(provider.name)
+        self._record_failure(target.provider, retry_after_s=retry_after_s)
+        if target.health is HealthState.DISABLED:
+            return
+        if source_runtime.health is HealthState.OPEN:
+            target.health = HealthState.OPEN
+            target.open_until = max(target.open_until, source_runtime.open_until)
+            return
+        if source_runtime.health is HealthState.COOLDOWN and target.health is not HealthState.OPEN:
+            target.health = HealthState.COOLDOWN
+            target.cooldown_until = max(target.cooldown_until, source_runtime.cooldown_until)
+
+    @staticmethod
+    def _summary_runtime(source: _ProviderRuntime) -> _ProviderRuntime:
+        """Copy provider admission state for one isolated summary router."""
+        target = _ProviderRuntime(source.provider, source.outcomes.maxlen or 1)
+        target.health = source.health
+        target.cooldown_until = source.cooldown_until
+        target.open_until = source.open_until
+        # The request-rate bucket is shared: a summary request consumes the
+        # same provider capacity as a coding request.
+        target.bucket = source.bucket
+        target.lock = source.lock
+        target.outcomes = deque(source.outcomes, maxlen=source.outcomes.maxlen)
+        target.auth_quarantine_fingerprint = source.auth_quarantine_fingerprint
+        # The shared lock serializes a summary attempt with any in-flight
+        # coding probe. Do not copy the guard by value: a stale ``True`` would
+        # strand the summary lane after the coding probe releases it.
+        target.probe_in_flight = False
+        return target
 
     def _all_provider_failure_limit_reached(self) -> bool:
         with self._all_provider_failure_lock:
@@ -3127,6 +3243,7 @@ class Diffundo:
         self._fallback_origin = None
         self._active_tier = None
         self._terminal_death_providers = frozenset()
+        self._pending_summary_auth_deaths = ()
 
     def _routing_request(
         self,
@@ -4093,6 +4210,18 @@ class Diffundo:
         ):
             runtime.health = HealthState.OPEN
             runtime.open_until = now + cooldown_s * self._open_backoff_base
+        if (
+            retry_after_s is not None
+            and math.isfinite(retry_after_s)
+            and retry_after_s >= 0
+        ):
+            summary_parent = getattr(self, "_summary_parent", None)
+            if isinstance(summary_parent, Diffundo):
+                summary_parent._merge_summary_retry_after(
+                    provider,
+                    float(retry_after_s),
+                    runtime,
+                )
         return self.status(provider.name).value
 
     def _record_disable(self, provider: ProviderConfig, *, auth_quarantine: bool = False) -> None:
@@ -4101,6 +4230,13 @@ class Diffundo:
         runtime.auth_quarantine_fingerprint = (
             self._credential_fingerprint(provider) if auth_quarantine else None
         )
+        summary_parent = getattr(self, "_summary_parent", None)
+        if isinstance(summary_parent, Diffundo):
+            summary_parent._merge_summary_disable(
+                provider,
+                auth_quarantine=auth_quarantine,
+                fingerprint=runtime.auth_quarantine_fingerprint,
+            )
 
     # -- helpers ------------------------------------------------------------- #
 

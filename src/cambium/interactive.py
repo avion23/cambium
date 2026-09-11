@@ -737,8 +737,6 @@ class InteractiveSession:
                 raise InteractiveSessionError("interactive model preferences are invalid")
             parsed_model_preferences[provider] = model
         self._model_preferences = parsed_model_preferences
-        if provider_preference is not None and model_preference is not None:
-            self._model_preferences.setdefault(provider_preference, model_preference)
         seed = document.get("seed")
         if seed is None:
             return
@@ -918,9 +916,29 @@ class InteractiveSession:
             pass
         return None
 
-    def _set_serving_preference(self, provider: str, model: str | None) -> None:
-        """Persist the pair that actually served, without erasing /model history."""
+    def _has_explicit_model_preference(self) -> bool:
+        """Return whether the current pair came from an interactive ``/model`` command."""
+        provider = self.provider
+        model = self.model
+        return (
+            provider is not None
+            and model is not None
+            and self._model_preferences.get(provider) == model
+        )
+
+    def _set_serving_preference(
+        self, provider: str, model: str | None, *, force: bool = False
+    ) -> None:
+        """Persist an actual serving pair unless ``/model`` explicitly pinned one."""
         if not isinstance(provider, str) or not provider:
+            return
+        if not force and self._has_explicit_model_preference():
+            if self._pending_seed is not None:
+                self._pending_seed = replace(
+                    self._pending_seed,
+                    provider=provider,
+                    model=model,
+                )
             return
         changed = self._provider_preference != provider or self._model_preference != model
         self._provider_preference = provider
@@ -964,7 +982,7 @@ class InteractiveSession:
             options[0],
         )
         if selected[0] != provider or selected[1] != self.model:
-            self._set_serving_preference(*selected)
+            self._set_serving_preference(*selected, force=True)
 
     def _record_serving_preference(
         self, turn: InteractiveTurn, provider: str, model: str | None
@@ -1079,8 +1097,15 @@ class InteractiveSession:
             )
 
         if self.provider == requested_provider and self.model == requested_model:
-            if self._model_preferences.get(requested_provider) != requested_model:
-                self._model_preferences[requested_provider] = requested_model
+            changed = (
+                self._provider_preference != requested_provider
+                or self._model_preference != requested_model
+                or self._model_preferences.get(requested_provider) != requested_model
+            )
+            self._provider_preference = requested_provider
+            self._model_preference = requested_model
+            self._model_preferences[requested_provider] = requested_model
+            if changed:
                 self._write_manifest()
             return (
                 f"model preference unchanged: provider={requested_provider} model={requested_model}"
@@ -1387,6 +1412,8 @@ class InteractiveSession:
             serving = payload.get("provider_metadata") if kind == "result" else payload
             if not isinstance(serving, Mapping):
                 serving = payload
+            if payload.get("call_kind") == "summary" or serving.get("call_kind") == "summary":
+                return
             provider = serving.get("provider")
             model = serving.get("model")
             if isinstance(provider, str) and provider:
@@ -1422,12 +1449,6 @@ class InteractiveSession:
             model=model if isinstance(model, str) and model else None,
             epoch=epoch if type(epoch) is int and epoch >= 0 else 0,
         )
-        if self._serving_turn == turn.number:
-            self._pending_seed = replace(
-                self._pending_seed,
-                provider=self.provider,
-                model=self.model,
-            )
         if (
             self._serving_turn != turn.number
             and isinstance(provider, str)

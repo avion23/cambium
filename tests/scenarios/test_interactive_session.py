@@ -543,6 +543,110 @@ def test_serving_reconciliation_preserves_per_provider_model_choices(
     assert session.model == "codex-model"
 
 
+def test_explicit_model_preference_survives_fallback_result_and_next_turn(
+    tmp_path: Path,
+) -> None:
+    provider_config = _two_provider_config(tmp_path / "providers.json")
+    session = InteractiveSession(
+        OneShotConfig(
+            repo=tmp_path,
+            session_root=tmp_path / "interactive",
+            provider_config_path=provider_config,
+            provider="dead-zen",
+            model="zen-model",
+        )
+    )
+
+    assert "preference unchanged" in session.set_model_preference("dead-zen:zen-model")
+    first = session.prepare_turn("fallback")
+    session.observe_result(
+        first,
+        PlanResult(
+            results=(
+                TaskResult(
+                    task_id="interactive-main",
+                    status="succeeded",
+                    exit_code=0,
+                    provider="healthy-codex",
+                    fell_back_from="dead-zen",
+                ),
+            )
+        ),
+    )
+
+    assert session.provider == "dead-zen"
+    assert session.model == "zen-model"
+    session.complete_turn(first, succeeded=False)
+    second = session.prepare_turn("continue")
+    assert second.config.provider == "dead-zen"
+    assert second.config.model == "zen-model"
+    manifest = json.loads(
+        (tmp_path / "interactive" / ".cambium" / "interactive.json").read_text(encoding="utf-8")
+    )
+    assert manifest["provider_preference"] == "dead-zen"
+    assert manifest["model_preference"] == "zen-model"
+
+    reloaded = InteractiveSession(
+        OneShotConfig(
+            repo=tmp_path,
+            session_root=tmp_path / "interactive",
+            provider_config_path=provider_config,
+        )
+    )
+    reloaded.observe_result(
+        first,
+        PlanResult(
+            results=(
+                TaskResult(
+                    task_id="interactive-main",
+                    status="succeeded",
+                    exit_code=0,
+                    provider="healthy-codex",
+                    fell_back_from="dead-zen",
+                ),
+            )
+        ),
+    )
+    assert reloaded.provider == "dead-zen"
+    assert reloaded.model == "zen-model"
+
+
+def test_summary_serving_observations_do_not_set_interactive_preference(
+    tmp_path: Path,
+) -> None:
+    provider_config = _two_provider_config(tmp_path / "providers.json")
+    session = InteractiveSession(
+        OneShotConfig(
+            repo=tmp_path,
+            session_root=tmp_path / "interactive",
+            provider_config_path=provider_config,
+        )
+    )
+    turn = session.prepare_turn("summary")
+
+    for kind in ("usage_event", "result"):
+        session.observe_event(
+            turn,
+            {
+                "kind": kind,
+                "payload": {
+                    "provider": "healthy-codex",
+                    "model": "codex-model",
+                    "call_kind": "summary",
+                },
+            },
+        )
+
+    assert session.provider is None
+    assert session.model is None
+    session.complete_turn(turn, succeeded=False)
+    manifest = json.loads(
+        (tmp_path / "interactive" / ".cambium" / "interactive.json").read_text(encoding="utf-8")
+    )
+    assert manifest["provider_preference"] is None
+    assert manifest["model_preference"] is None
+
+
 def test_tui_multiline_input() -> None:
     source = io.StringIO("<<<\nline one\nline two\n>>>\n")
     out = io.StringIO()

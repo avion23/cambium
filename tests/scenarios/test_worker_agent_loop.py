@@ -265,6 +265,57 @@ class _SummaryFlushRouter:
         )
 
 
+class _StickySummaryFlushRouter(_SummaryFlushRouter):
+    """Summary double that exposes coding-lease binding and call provenance."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.bind_calls: list[tuple[str, str]] = []
+        self.call_kinds: list[tuple[str, str, str]] = []
+        self._lease: SimpleNamespace | None = None
+
+    @property
+    def provider_lease(self) -> SimpleNamespace | None:
+        return self._lease
+
+    def bind_provider(
+        self,
+        provider: str,
+        model: str,
+        *,
+        root_task_id: str = "task",
+    ) -> None:
+        del root_task_id
+        self.bind_calls.append((provider, model))
+        if self._lease is None:
+            self._lease = SimpleNamespace(provider=provider, model=model)
+            return
+        if (self._lease.provider, self._lease.model) != (provider, model):
+            raise AssertionError("coding provider lease moved")
+
+    async def call(
+        self,
+        tier: ProviderTier,
+        prompt: dict[str, Any],
+        *,
+        model: str | None = None,
+        budget_usd: float | None = None,
+        allow_model_substitution: bool = False,
+        max_call_budget_s: float | None = None,
+    ) -> _FakeCallResult:
+        result = await super().call(
+            tier,
+            prompt,
+            model=model,
+            budget_usd=budget_usd,
+            allow_model_substitution=allow_model_substitution,
+            max_call_budget_s=max_call_budget_s,
+        )
+        kind = "summary" if allow_model_substitution else "agent"
+        self.call_kinds.append((kind, result.provider, result.model))
+        return result
+
+
 @pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
 def test_env_float_rejects_non_finite_values(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
     default = 17.5
@@ -467,7 +518,69 @@ def test_semantic_child_summary_substitution_and_failure(tmp_path: Path, all_dea
         assert "summary provider call failed" in outcome["failure_reason"]
     else:
         assert outcome["status"] == "suspended"
-        assert outcome["provider"] == "healthy-substitute"
+        assert outcome["provider"] == "dead-primary"
+        assert "fell_back_from" not in outcome
+
+
+def test_summary_fallback_does_not_move_coding_lease_for_later_agent_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def direct_to_thread(function: Any, *args: Any, **kwargs: Any) -> Any:
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(worker.asyncio, "to_thread", direct_to_thread)
+    worktree = _make_worktree(tmp_path / "repo")
+    summary_config = _agent_config(
+        worktree,
+        context_reuse=True,
+        checkpoint_root=tmp_path / "checkpoints",
+        max_turns=4,
+    )
+    router = _StickySummaryFlushRouter(
+        responses=[
+            json.dumps(
+                {
+                    "name": "delegate",
+                    "arguments": {
+                        "child_task_id": "review",
+                        "kind": "investigation",
+                        "spec": {
+                            "task": "Review alpha.txt",
+                            "context_mode": "semantic",
+                            "placement": "spread",
+                        },
+                    },
+                }
+            )
+        ]
+    )
+
+    suspended = asyncio.run(_drive_loop(summary_config, worktree, router))
+    assert suspended["status"] == "suspended"
+    assert router.call_kinds == [
+        ("agent", "dead-primary", "dead-model"),
+        ("summary", "healthy-substitute", "healthy-model"),
+    ]
+    assert router.bind_calls == [("dead-primary", "dead-model")]
+    assert suspended["provider"] == "dead-primary"
+    assert "fell_back_from" not in suspended
+    checkpoint = worker._load_epoch_checkpoint(
+        summary_config, suspended["checkpoint_ref"], expect_task_id=True
+    )
+    assert checkpoint.cache_key.provider == "dead-primary"
+    assert checkpoint.cache_key.model == "dead-model"
+
+    router.responses.append('{"type":"finish","summary":"done","objective_met":true}')
+    later_config = _agent_config(worktree, context_reuse=False, max_turns=1)
+    completed = asyncio.run(_drive_loop(later_config, worktree, router))
+
+    assert completed["status"] == "succeeded"
+    assert completed["provider"] == "dead-primary"
+    assert router.call_kinds[-1] == ("agent", "dead-primary", "dead-model")
+    assert router.bind_calls == [
+        ("dead-primary", "dead-model"),
+        ("dead-primary", "dead-model"),
+    ]
 
 
 def test_agent_call_receives_remaining_wall_cap(tmp_path: Path) -> None:

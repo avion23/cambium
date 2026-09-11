@@ -2015,6 +2015,218 @@ def test_summary_call_keeps_headroom_and_honors_wall_cap(monkeypatch) -> None:
     assert observed[1] == pytest.approx(0.07)
 
 
+def test_summary_router_does_not_copy_stale_probe_guard() -> None:
+    provider = ProviderConfig(
+        name="summary-probe-provider",
+        tier=ProviderTier.FAST,
+        base_url="http://127.0.0.1:1",
+        api_key_env="K_SUMMARY_PROBE",
+        api_key="sk-test-summary-probe",
+        model="summary-model",
+    )
+    router = Diffundo((provider,), pause_timeout_s=0.0)
+    live_runtime = router._runtime(provider.name)
+    live_runtime.health = HealthState.HALF_OPEN
+    live_runtime.probe_in_flight = True
+
+    summary = router._summary_router()
+    live_runtime.probe_in_flight = False
+
+    assert summary._runtime(provider.name).probe_in_flight is False
+    assert summary._candidates(ProviderTier.FAST, None) == [provider]
+
+
+def test_summary_fallback_does_not_rebind_coding_provider(monkeypatch) -> None:
+    primary = ProviderConfig(
+        name="summary-primary",
+        tier=ProviderTier.FAST,
+        base_url="http://127.0.0.1:1",
+        api_key_env="K_SUMMARY_PRIMARY",
+        api_key="sk-test-summary-primary",
+        model="primary-model",
+    )
+    sibling = ProviderConfig(
+        name="summary-sibling",
+        tier=ProviderTier.FAST,
+        base_url="http://127.0.0.1:2",
+        api_key_env="K_SUMMARY_SIBLING",
+        api_key="sk-test-summary-sibling",
+        model="sibling-model",
+        allow_model_substitution=True,
+    )
+    router = Diffundo(
+        (primary, sibling),
+        primary_provider=primary.name,
+        pause_timeout_s=0.0,
+    )
+    attempts: list[str] = []
+
+    async def scripted_attempt(
+        _self: Diffundo,
+        provider: ProviderConfig,
+        _prompt: dict[str, Any],
+        *,
+        deadline: float | None = None,
+        on_delta: Any = None,
+    ) -> CallResult:
+        del deadline, on_delta
+        attempts.append(provider.name)
+        if provider.name == primary.name and attempts.count(primary.name) == 2:
+            _self._record_failure(provider)
+            raise ProviderError(
+                provider.name,
+                ProviderOutcome.ERROR,
+                "connection refused",
+                ConnectionRefusedError("summary endpoint unavailable"),
+            )
+        _self._record_success(provider)
+        return CallResult(
+            provider=provider.name,
+            model=provider.model,
+            tier=provider.tier,
+            content="ok",
+            latency_s=0.0,
+            usage={"total_tokens": 1},
+        )
+
+    monkeypatch.setattr(Diffundo, "_attempt", scripted_attempt)
+
+    async def scenario() -> None:
+        first = await router.call(ProviderTier.FAST, PROMPT, model=primary.model)
+        router.bind_provider(first.provider, first.model)
+        summary = await router.summary_call(
+            ProviderTier.FAST,
+            PROMPT,
+            model=primary.model,
+            allow_model_substitution=True,
+        )
+        assert summary.provider == sibling.name
+        assert summary.fell_back_from == primary.name
+        assert router.provider_lease is not None
+        assert router.provider_lease.provider == primary.name
+        assert router.provider_lease.model == primary.model
+        assert router.health(primary.name) is HealthState.HEALTHY
+        later = await router.call(ProviderTier.FAST, PROMPT, model=primary.model)
+        assert later.provider == primary.name
+
+    asyncio.run(scenario())
+    assert attempts == [primary.name, primary.name, sibling.name, primary.name]
+
+
+def test_summary_auth_quarantine_defers_hard_fallback_until_agent_call(monkeypatch) -> None:
+    primary = ProviderConfig(
+        name="summary-auth-primary",
+        tier=ProviderTier.FAST,
+        base_url="http://127.0.0.1:1",
+        api_key_env="K_SUMMARY_AUTH_PRIMARY",
+        api_key="sk-test-summary-auth-primary",
+        model="primary-model",
+    )
+    sibling = ProviderConfig(
+        name="summary-auth-sibling",
+        tier=ProviderTier.FAST,
+        base_url="http://127.0.0.1:2",
+        api_key_env="K_SUMMARY_AUTH_SIBLING",
+        api_key="sk-test-summary-auth-sibling",
+        model="sibling-model",
+        allow_model_substitution=True,
+    )
+    router = Diffundo(
+        (primary, sibling),
+        primary_provider=primary.name,
+        pause_timeout_s=0.0,
+    )
+    attempts: list[str] = []
+
+    async def scripted_post(
+        _self: Diffundo,
+        provider: ProviderConfig,
+        _prompt: dict[str, Any],
+        *,
+        timeout_s: float,
+        deadline: float | None,
+        on_delta: Any = None,
+    ) -> _RawResponse:
+        del timeout_s, deadline, on_delta
+        attempts.append(provider.name)
+        if provider.name == primary.name and attempts.count(primary.name) == 2:
+            raise ProviderError(
+                provider.name,
+                ProviderOutcome.AUTH_ERROR,
+                "HTTP 401 invalid credential",
+                http_status=401,
+            )
+        return _RawResponse(
+            _ok_payload("ok", model=provider.model, usage={"total_tokens": 1}),
+            0.0,
+        )
+
+    monkeypatch.setattr(Diffundo, "_post_with_deadline", scripted_post)
+
+    async def scenario() -> None:
+        first = await router.call(ProviderTier.FAST, PROMPT, model=primary.model)
+        router.bind_provider(first.provider, first.model)
+        summary = await router.summary_call(
+            ProviderTier.FAST,
+            PROMPT,
+            model=primary.model,
+            allow_model_substitution=True,
+        )
+        assert summary.provider == sibling.name
+        assert router.provider_lease is not None
+        assert router.provider_lease.provider == primary.name
+        assert router.health(primary.name) is HealthState.DISABLED
+
+        later = await router.call(ProviderTier.FAST, PROMPT, model=primary.model)
+        assert later.provider == sibling.name
+        assert later.fell_back_from == primary.name
+
+    asyncio.run(scenario())
+    assert attempts == [primary.name, primary.name, sibling.name, sibling.name]
+
+
+def test_summary_retry_after_cooldown_reaches_live_router(monkeypatch) -> None:
+    provider = ProviderConfig(
+        name="summary-retry-provider",
+        tier=ProviderTier.FAST,
+        base_url="http://127.0.0.1:1",
+        api_key_env="K_SUMMARY_RETRY",
+        api_key="sk-test-summary-retry",
+        model="summary-model",
+        cooldown_s=1.0,
+        max_retries=0,
+    )
+    router = Diffundo((provider,), pause_timeout_s=0.0)
+
+    async def scripted_post(
+        _self: Diffundo,
+        candidate: ProviderConfig,
+        _prompt: dict[str, Any],
+        *,
+        timeout_s: float,
+        deadline: float | None,
+        on_delta: Any = None,
+    ) -> _RawResponse:
+        del timeout_s, deadline, on_delta
+        raise ProviderError(
+            candidate.name,
+            ProviderOutcome.QUOTA,
+            "HTTP 429 rate limit",
+            retry_after_s=60.0,
+            http_status=429,
+        )
+
+    monkeypatch.setattr(Diffundo, "_post_with_deadline", scripted_post)
+    started = time.monotonic()
+
+    with pytest.raises(AllProvidersFailed):
+        asyncio.run(router.summary_call(ProviderTier.FAST, PROMPT, model=provider.model))
+
+    runtime = router._runtime(provider.name)
+    assert router.health(provider.name) is HealthState.COOLDOWN
+    assert runtime.cooldown_until >= started + 59.0
+
+
 @pytest.mark.slow  # 0.3s scripted provider delays; timing assertion
 def test_call_budget_bounds_slow_attempts() -> None:
     # call_budget_s is a hard deadline over the WHOLE cascade, not just
