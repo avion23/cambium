@@ -1,6 +1,6 @@
-"""Supervisor acceptance of situation-frame provenance on usage events.
+"""Supervisor acceptance of usage-event provenance.
 
-The worker emits five bounded provenance fields on every ``usage_event``
+The worker emits bounded situation provenance and fallback provenance on ``usage_event`` records.
 (``situation_frame_version``, ``situation_frame_source_watermark``,
 ``situation_frame_sha256``, ``situation_frame_bytes``,
 ``situation_frame_truncated_sections``).  The supervisor whitelist must
@@ -39,6 +39,7 @@ def _worker_usage_event(task_id: str = "parent", generation: int = 3) -> dict[st
         "generation": generation,
         "turn": 4,
         "provider": "loopback-provider",
+        "fell_back_from": "primary-provider",
         "model": "loopback-model",
         "usage": {"input_tokens": 7, "output_tokens": 3, "total_tokens": 10},
         "estimated_cost_usd": 0.0025,
@@ -112,6 +113,7 @@ def test_usage_event_with_frame_provenance_is_forwarded_and_folded(
     assert emitted["situation_frame_truncated_sections"] == ["OPEN", "CHILDREN"]
     # Accounting fields still forwarded next to provenance.
     assert emitted["provider"] == "loopback-provider"
+    assert emitted["fell_back_from"] == "primary-provider"
     assert emitted["usage"] == {"input_tokens": 7, "output_tokens": 3, "total_tokens": 10}
     assert emitted["estimated_cost_usd"] == 0.0025
     assert emitted["latency_s"] == 0.75
@@ -140,6 +142,9 @@ def test_rejected_provenance_drops_event_and_skips_ledger(tmp_path: Path) -> Non
         {"situation_frame_truncated_sections": ["BOGUS_SECTION"]},
         {"situation_frame_truncated_sections": ["OPEN", "OPEN"]},
         {"situation_frame_truncated_sections": ["OPEN" * 100]},
+        {"fell_back_from": ""},
+        {"fell_back_from": 7},
+        {"fell_back_from": True},
     ]
 
     async def scenario() -> None:
@@ -161,6 +166,7 @@ def test_rejected_provenance_drops_event_and_skips_ledger(tmp_path: Path) -> Non
     assert rejected_fields[9] == ["situation_frame_truncated_sections"]
     assert rejected_fields[10] == ["situation_frame_truncated_sections"]
     assert rejected_fields[11] == ["situation_frame_truncated_sections"]
+    assert rejected_fields[-3:] == [["fell_back_from"]] * 3
     # No durable usage_event and no ledger fold for any rejected variant.
     assert runtime._debt_store.as_mapping() == {}
 

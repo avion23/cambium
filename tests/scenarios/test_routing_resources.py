@@ -96,7 +96,7 @@ def test_quota_expiry_and_cooldown_use_observations_not_decayed_debt(tmp_path, r
     assert assignment.provider == "b"
 
 
-def test_serving_provider_moves_the_reservation_once(tmp_path):
+def test_serving_provider_moves_reservation_only_with_fallback_provenance(tmp_path):
     config = tmp_path / "providers.json"
     config.write_text(
         json.dumps(
@@ -139,10 +139,20 @@ def test_serving_provider_moves_the_reservation_once(tmp_path):
             "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5},
         }
         await runtime._handle_usage_event_message(state, event)
+        assert spec["assigned_provider"] == spec["fanout_config"]["model"] == "a"
+        assert runtime._lanes["a"].in_flight == 1
+        assert runtime._lanes["b"].in_flight == 0
+        await runtime._handle_usage_event_message(
+            state, {**event, "turn": 2, "fell_back_from": "a"}
+        )
         assert spec["assigned_provider"] == spec["fanout_config"]["model"] == "b"
         assert runtime._lanes["a"].in_flight == 0
         assert runtime._lanes["b"].in_flight == 1
-        await runtime._handle_usage_event_message(state, {**event, "turn": 2})
+        _release_lane(runtime._lanes, spec)
+        assert runtime._lanes["b"].in_flight == 0
+        await runtime._handle_usage_event_message(state, {**event, "turn": 3})
+        assert spec["assigned_provider"] == "b"
+        assert runtime._lanes["a"].in_flight == 0
         assert runtime._lanes["b"].in_flight == 1
         await runtime._handle_usage_event_message(
             state,
@@ -213,6 +223,7 @@ def test_summary_serving_provider_does_not_move_coding_reservation(tmp_path):
             "generation": 1,
             "provider": "summary",
             "model": "summary-model",
+            "fell_back_from": "coding",
             "call_kind": "summary",
             "turn": 1,
             "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5},
@@ -233,6 +244,7 @@ def test_summary_serving_provider_does_not_move_coding_reservation(tmp_path):
         payload = events[0]["payload"]
         assert payload["provider"] == "summary"
         assert payload["model"] == "summary-model"
+        assert payload["fell_back_from"] == "coding"
         assert payload["call_kind"] == "summary"
         assert payload["usage"] == {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}
         assert payload["estimated_cost_usd"] == 0.004

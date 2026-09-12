@@ -1234,6 +1234,7 @@ _USAGE_EVENT_FORWARD_FIELDS = frozenset(
     {
         "turn",
         "provider",
+        "fell_back_from",
         "model",
         "usage",
         "estimated_cost_usd",
@@ -1378,6 +1379,7 @@ def _invalid_usage_event_fields(msg: dict[str, Any]) -> list[str]:
         "request_rate_status",
         "account_quota_owner",
         "failure_reason",
+        "fell_back_from",
     ):
         if field in msg and not (type(msg[field]) is str and msg[field]):
             invalid.append(field)
@@ -7649,8 +7651,9 @@ class _Runtime:
             generation=state.generation,
             **forwarded,
         )
-        # Count the lane that actually served a coding/child task, including
-        # call-time fallback; isolated summary calls must not rebind the coding lease.
+        # Count the lane that actually served a coding/child task, promoting a
+        # call-time fallback only with its matching incumbent origin; isolated
+        # summary calls must not rebind the coding lease.
         spec = getattr(state, "spec", None)
         served = msg.get("provider")
         if (
@@ -7659,7 +7662,18 @@ class _Runtime:
             and not msg.get("failure_reason")
             and msg.get("call_kind") != "summary"
         ):
-            if served != spec.get("assigned_provider") or not spec.get("_lane_reserved"):
+            assigned = spec.get("assigned_provider")
+            provider_changed = served != assigned
+            genuine_fallback = (
+                provider_changed
+                and msg.get("call_kind") == "agent"
+                and isinstance(assigned, str)
+                and isinstance(msg.get("fell_back_from"), str)
+                and msg["fell_back_from"] == assigned
+            )
+            if (not provider_changed or genuine_fallback) and (
+                provider_changed or not spec.get("_lane_reserved")
+            ):
                 providers = load_providers(_provider_config_path(os.environ, spec))
                 configured = next((p for p in providers if p.name == served), None)
                 if configured is not None:

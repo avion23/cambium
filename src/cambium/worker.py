@@ -4396,6 +4396,9 @@ def _success_usage_event(
         "latency_s": max(0.0, latency),
         **_prompt_context_usage_fields(prompt or {}, call_kind=call_kind),
     }
+    fell_back_from = getattr(result, "fell_back_from", None)
+    if isinstance(fell_back_from, str) and fell_back_from:
+        event["fell_back_from"] = fell_back_from
     if situation_provenance is not None:
         event.update(dict(situation_provenance))
     usage = _usage_counts(result.usage)
