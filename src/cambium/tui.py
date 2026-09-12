@@ -565,18 +565,6 @@ def _queued_prompt_notice(prompt: str) -> str | None:
     return f"queued: {prompt}" if prompt.strip() else None
 
 
-def _take_queued_task_prompts(pending: deque[str], first: str) -> list[str]:
-    """Take adjacent ordinary prompts, leaving queued commands in order."""
-    prompts = [first]
-    while pending:
-        prompt = pending[0]
-        stripped = prompt.strip()
-        if not stripped or stripped == "v" or _is_quit_prompt(prompt) or stripped.startswith("/"):
-            break
-        prompts.append(pending.popleft())
-    return prompts
-
-
 def _restore_result_summary(turn_dir: Path) -> str | None:
     result_path = turn_dir / ".cambium" / "result.json"
     try:
@@ -1392,16 +1380,8 @@ async def _run_interactive(
                     continue
 
                 transcript.user(prompt)
-                prompts = _take_queued_task_prompts(pending_prompts, prompt)
-                queued_prompt: str | None
-                for queued_prompt in prompts[1:]:
-                    transcript.user(queued_prompt)
-                turns = (
-                    (session.prepare_turn(prompts[0]),)
-                    if len(prompts) == 1
-                    else session.prepare_turns(prompts)
-                )
-                dispatch = turns[0] if len(turns) == 1 else turns
+                turns = (session.prepare_turn(prompt),)
+                dispatch = turns[0]
                 turn = turns[0]
                 state = ObservabilityState(recent_limit=16)
                 state.seed_context(last_snapshot.context)

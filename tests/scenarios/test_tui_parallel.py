@@ -1,4 +1,4 @@
-"""Parallel dispatch coverage for queued interactive TUI prompts."""
+"""FIFO turn coverage for queued interactive TUI prompts."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ class _Tty(io.StringIO):
         return True
 
 
-def test_queued_tui_prompts_use_one_flat_plan(monkeypatch, tmp_path: Path) -> None:
+def test_queued_tui_prompts_run_as_successive_turns(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("TERM", "xterm-256color")
     monkeypatch.setattr(oneshot, "preflight", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(oneshot, "admit_session", lambda *_args, **_kwargs: None)
@@ -54,6 +54,15 @@ def test_queued_tui_prompts_use_one_flat_plan(monkeypatch, tmp_path: Path) -> No
     )
 
     assert code == 0
-    assert [len(plan["tasks"]) for _session, plan, _kwargs in calls] == [1, 2]
-    assert [task["task"] for task in calls[1][1]["tasks"]] == ["second", "third"]
+    assert [len(plan["tasks"]) for _session, plan, _kwargs in calls] == [1, 1, 1]
+    assert [plan["tasks"][0]["task"] for _session, plan, _kwargs in calls] == [
+        "first",
+        "second",
+        "third",
+    ]
+    assert [session.name for session, _plan, _kwargs in calls] == [
+        "turn-0001",
+        "turn-0002",
+        "turn-0003",
+    ]
     assert all(kwargs["max_concurrent_tasks"] == 2 for _session, _plan, kwargs in calls)
