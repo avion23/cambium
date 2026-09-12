@@ -2077,6 +2077,53 @@ def test_turn_checkpoint_restart_preserves_no_progress_streak(
     assert "no progress" in (resumed_outcome["failure_reason"] or "")
 
 
+def test_plan_checkpoint_restart_preserves_no_progress_streak(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def direct_to_thread(function: Any, *args: Any, **kwargs: Any) -> Any:
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(worker.asyncio, "to_thread", direct_to_thread)
+    worktree = _make_worktree(tmp_path / "repo")
+    checkpoint_root = tmp_path / "checkpoints"
+    config = _agent_config(
+        worktree,
+        checkpoint_root=checkpoint_root,
+        max_no_progress_actions=2,
+        progress_window=3,
+    )
+    action = '{"type":"plan","steps":["repeat"]}'
+    writer = _FakeWriter()
+    first_router = _ScriptedRouter(
+        [action, action, '{"type":"finish","summary":"first run","objective_met":true}']
+    )
+
+    first_outcome = asyncio.run(_drive_loop(config, worktree, first_router, writer))
+
+    assert first_outcome["status"] == "succeeded"
+    checkpoint_path = checkpoint_root / "loop-agent" / "turn-002.json"
+    persisted = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    assert persisted["no_progress_actions"] == 1
+    resume = worker._validate_resume(
+        {
+            "checkpoint_ref": "loop-agent/turn-002.json",
+            "epoch": 2,
+            "child_results": [],
+            "child_results_truncated": False,
+            "workspace_changed": False,
+            "rejection_feedback": None,
+        }
+    )
+    resumed_config = replace(config, resume=resume)
+    resumed_router = _ScriptedRouter([action])
+
+    resumed_outcome = asyncio.run(_drive_loop(resumed_config, worktree, resumed_router))
+
+    assert resumed_outcome["status"] == "failed"
+    assert resumed_outcome["turn"] == 3
+    assert "no progress" in (resumed_outcome["failure_reason"] or "")
+
+
 @pytest.mark.parametrize("invalid", [True, -1, "1", None])
 def test_turn_checkpoint_rejects_invalid_no_progress_count(tmp_path: Path, invalid: Any) -> None:
     worktree = _make_worktree(tmp_path / "repo")

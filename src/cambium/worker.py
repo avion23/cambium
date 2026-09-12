@@ -7450,6 +7450,20 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                     forced_finalization=forced_finalization,
                     finalization_grace_used=finalization_grace_used,
                 )
+                if writer is not None:
+                    await _persist_checkpoint(
+                        writer,
+                        config,
+                        turn,
+                        transcript,
+                        cumulative_usage,
+                        [],
+                        compaction_deferred=compaction_deferred,
+                        consecutive_compaction_deferrals=consecutive_compaction_deferrals,
+                        code_changed=code_changed,
+                        no_progress_actions=no_progress_actions,
+                    )
+                    last_turn_checkpoint = turn
                 progress.tool = "plan"
                 continue
             if action["type"] == "finish":
