@@ -436,32 +436,228 @@ def test_pre_redacted_chunks_are_not_redacted_again_in_runtime_or_store(
     assert result["response_bytes"] == len(expected.encode())
 
 
-def test_supervisor_marks_identity_mismatched_result_invalid_for_replay() -> None:
+_MISSING = object()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("task_id", _MISSING),
+        ("task_id", None),
+        ("task_id", "other"),
+        ("task_id", 1),
+        ("generation", _MISSING),
+        ("generation", None),
+        ("generation", True),
+        ("generation", 2),
+        ("generation", "3"),
+        ("request_id", _MISSING),
+        ("request_id", None),
+        ("request_id", 1),
+        ("request_id", []),
+        ("request_id", "other"),
+    ],
+)
+def test_supervisor_rejects_result_without_exact_identity(field: str, value: Any) -> None:
     runtime = _RuntimeProbe()
     state = _state()
-    asyncio.run(
-        runtime._handle_response_chunk_message(state, _chunk(0, "safe", final=True))
+    message: dict[str, Any] = {
+        "type": "result_envelope",
+        "task_id": "task",
+        "generation": 3,
+        "request_id": "run-1",
+        "status": "succeeded",
+        "turn": 99,
+        "response_chunk_count": 1,
+        "response_bytes": 4,
+    }
+    if value is _MISSING:
+        message.pop(field)
+    else:
+        message[field] = value
+
+    asyncio.run(runtime._handle_result_message(state, message))
+
+    result = next(payload for kind, payload in runtime.records if kind == "result")
+    assert result["response_valid"] is False
+    assert result["request_id"] == "run-1"
+    assert state.envelope is None
+    assert state.correlated is False
+    assert state.protocol_failure == "INVALID_RESULT_IDENTITY"
+    assert state.turn == 0
+    assert state.response_expected_count is None
+    assert state.response_expected_bytes is None
+    assert state.response_redaction_done is False
+    protocol = next(payload for kind, payload in runtime.records if kind == "protocol")
+    assert protocol["error_type"] == "INVALID_RESULT_IDENTITY"
+    assert protocol["note"] == (
+        "result request_id mismatch" if field == "request_id" else f"result {field} mismatch"
     )
+    expected_got = "run-1"
+    if field == "request_id":
+        expected_got = value if type(value) is str and value else None
+    assert protocol["got"] == expected_got
+
+
+def test_identity_rejection_cannot_be_superseded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _RuntimeProbe()
+    state = _state()
+    state.proc = "worker"
+    killed: list[Any] = []
+
+    async def kill(proc: Any) -> None:
+        killed.append(proc)
+
+    monkeypatch.setattr(supervisor, "_kill_worker", kill)
+    bad = {
+        "type": "result_envelope",
+        "generation": 3,
+        "request_id": "run-1",
+        "status": "succeeded",
+    }
+    good = {
+        **bad,
+        "task_id": "task",
+    }
+
+    assert asyncio.run(runtime._handle_generation_message(state, bad)) is True
+    assert state.protocol_failure == "INVALID_RESULT_IDENTITY"
+    assert asyncio.run(runtime._handle_generation_message(state, good)) is True
+    assert state.envelope is None
+    assert killed == ["worker"]
+
+
+def test_identity_rejected_result_invalidates_matching_replay() -> None:
+    runtime = _RuntimeProbe()
+    state = _state()
+
+    async def scenario() -> None:
+        assert not await runtime._handle_response_chunk_message(
+            state, _chunk(0, "safe", final=True)
+        )
+        await runtime._handle_result_message(
+            state,
+            {
+                "type": "result_envelope",
+                "generation": 3,
+                "request_id": "run-1",
+                "status": "succeeded",
+                "response_chunk_count": 1,
+                "response_bytes": 4,
+            },
+        )
+
+    asyncio.run(scenario())
+
+    chunk_events = [
+        {
+            "kind": "response_chunk",
+            "task_id": payload["task_id"],
+            "generation": payload["generation"],
+            "request_id": payload["request_id"],
+            "payload": {
+                "chunk_index": payload["chunk_index"],
+                "text": payload["text"],
+                "final": payload["final"],
+            },
+        }
+        for kind, payload in runtime.records
+        if kind == "response_chunk"
+    ]
+    result = next(payload for kind, payload in runtime.records if kind == "result")
+    result_event = {
+        "kind": "result",
+        "task_id": result["task_id"],
+        "generation": result["generation"],
+        "request_id": result["request_id"],
+        "payload": {
+            "status": result["status"],
+            "response_valid": result["response_valid"],
+            "response_chunk_count": result["response_chunk_count"],
+            "response_bytes": result["response_bytes"],
+        },
+    }
+    assert supervisor.reconstruct_response([*chunk_events, result_event], "task", 3, "run-1") == (
+        "safe",
+        False,
+    )
+
+
+def test_request_id_rejected_result_invalidates_matching_replay() -> None:
+    runtime = _RuntimeProbe()
+    state = _state()
+
+    async def scenario() -> None:
+        assert not await runtime._handle_response_chunk_message(
+            state, _chunk(0, "safe", final=True)
+        )
+        await runtime._handle_result_message(
+            state,
+            {
+                "type": "result_envelope",
+                "task_id": "task",
+                "generation": 3,
+                "request_id": "other",
+                "status": "succeeded",
+                "response_chunk_count": 1,
+                "response_bytes": 4,
+            },
+        )
+
+    asyncio.run(scenario())
+
+    result = next(payload for kind, payload in runtime.records if kind == "result")
+    result_event = {
+        "kind": "result",
+        "task_id": result["task_id"],
+        "generation": result["generation"],
+        "request_id": result["request_id"],
+        "payload": {
+            "status": result["status"],
+            "response_valid": result["response_valid"],
+            "response_chunk_count": result["response_chunk_count"],
+            "response_bytes": result["response_bytes"],
+        },
+    }
+    assert result["request_id"] == "run-1"
+    assert supervisor.reconstruct_response(
+        [_event(0, "safe", final=True), result_event], "task", 3, "run-1"
+    ) == ("safe", False)
+
+
+def test_rejected_result_metadata_is_bounded_and_safe() -> None:
+    runtime = _RuntimeProbe()
+    state = _state()
+    status = "x" * (worker.MAX_ENVELOPE_FIELD_CHARS * 2)
+    request_id = "r" * (worker.MAX_ENVELOPE_FIELD_CHARS * 2)
 
     asyncio.run(
         runtime._handle_result_message(
             state,
             {
                 "type": "result_envelope",
-                "task_id": "other",
                 "generation": 3,
-                "request_id": "run-1",
-                "status": "succeeded",
-                "summary": "compact",
-                "response_chunk_count": 1,
-                "response_bytes": 4,
+                "request_id": request_id,
+                "status": status,
+                "provider_metadata": {
+                    "provider": "p" * (worker.MAX_ENVELOPE_FIELD_CHARS * 2),
+                    "model": "m" * (worker.MAX_ENVELOPE_FIELD_CHARS * 2),
+                },
             },
         )
     )
 
     result = next(payload for kind, payload in runtime.records if kind == "result")
+    protocol = next(payload for kind, payload in runtime.records if kind == "protocol")
+    assert len(result["status"].encode("utf-8")) <= worker.MAX_ENVELOPE_FIELD_CHARS
+    assert result["request_id"] == "run-1"
+    assert len(protocol["got"].encode("utf-8")) <= worker.MAX_ENVELOPE_FIELD_CHARS
     assert result["response_valid"] is False
+    assert "provider_metadata" not in result
     assert state.envelope is None
+    assert state.protocol_failure == "INVALID_RESULT_IDENTITY"
 
 
 def test_replay_rejects_supervisor_rejected_duplicate_result() -> None:

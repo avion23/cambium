@@ -4,8 +4,10 @@ Speaks the Nuntius JSON-Lines wire protocol (docs/architecture.md §5) with N
 worker subprocesses under one ``asyncio.TaskGroup``: spawn ``python -m
 cambium.worker`` (or a task's ``worker`` script) inside a git worktree,
 correlate ``init`` -> ``ready`` -> ``run_task`` -> ``result_envelope`` ->
-``exit_message`` by request_id, and publish a changed worker branch onto
-``refs/heads/main`` atomically through ``cambium.merge.MergeSequencer``. A
+``exit_message`` by request IDs, with result envelopes fenced by exact
+task/generation identity, and publish a changed worker branch onto
+``refs/heads/main`` atomically through
+``cambium.merge.MergeSequencer``. A
 successful clean worker already at the resolved base is a no-op; otherwise a
 successful worker must merge. There is no pre-merge gate.
 
@@ -742,6 +744,16 @@ def _wire_str(value: Any) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def _bounded_result_string(value: Any) -> str | None:
+    """Return a bounded UTF-8 string for rejected result metadata."""
+    if type(value) is not str:
+        return None
+    try:
+        return _cap_utf8(value, MAX_ENVELOPE_FIELD_CHARS)
+    except UnicodeEncodeError:
+        return None
+
+
 def _protocol_version_mismatch(msg: dict[str, Any]) -> bool:
     if msg.get("type") == "ready":
         return msg.get("proto") != PROTO
@@ -750,8 +762,16 @@ def _protocol_version_mismatch(msg: dict[str, Any]) -> bool:
 
 def _result_identity_note(msg: Mapping[str, Any], task_id: str, generation: int) -> str | None:
     """Return why a result envelope fails worker identity, or None."""
-    identity_field = _claimed_identity_mismatch(msg, task_id, generation)
-    return f"result {identity_field} mismatch" if identity_field is not None else None
+    # Result envelopes are terminal and cannot use the optional identity
+    # claims allowed on older/custom lifecycle messages. Require both fields
+    # and their canonical wire types before request correlation can admit one.
+    claimed_task = msg.get("task_id")
+    if type(claimed_task) is not str or claimed_task != task_id:
+        return "result task_id mismatch"
+    claimed_generation = msg.get("generation")
+    if type(claimed_generation) is not int or claimed_generation != generation:
+        return "result generation mismatch"
+    return None
 
 
 def _invalid_result_envelope_fields(msg: Mapping[str, Any]) -> list[str]:
@@ -1194,6 +1214,7 @@ def _terminal_action_for_event(value: Any) -> dict[str, Any] | None:
     summary = value.get("summary")
     if not isinstance(summary, str):
         summary = ""
+    summary = _bounded_result_string(summary) or ""
     summary_present = value.get("summary_present")
     if type(summary_present) is not bool:
         summary_present = bool(summary)
@@ -1201,7 +1222,7 @@ def _terminal_action_for_event(value: Any) -> dict[str, Any] | None:
         "type": "finish",
         "objective_met": value["objective_met"],
         "summary_present": summary_present,
-        "summary": _cap_utf8(summary, MAX_ENVELOPE_FIELD_CHARS),
+        "summary": summary,
     }
 
 
@@ -7156,20 +7177,36 @@ class _Runtime:
 
     async def _handle_result_message(self, state: _GenerationState, msg: dict[str, Any]) -> None:
         _ensure_response_state(state)
-        result_turn = msg.get("turn")
-        if type(result_turn) is int and result_turn >= 0:
-            state.turn = max(state.turn, result_turn)
         identity_note = _result_identity_note(msg, state.task_id, state.generation)
-        state.correlated = state.run_rid is not None and msg.get("request_id") == state.run_rid
+        request_id = msg.get("request_id")
+        protocol_request_id = _bounded_result_string(request_id)
+        request_correlated = (
+            type(state.run_rid) is str
+            and bool(state.run_rid)
+            and type(request_id) is str
+            and bool(request_id)
+            and request_id == state.run_rid
+        )
+        state.correlated = request_correlated and identity_note is None
         if not state.correlated and identity_note is None:
             identity_note = "result request_id mismatch"
+        if identity_note is not None and state.protocol_failure is None:
+            state.protocol_failure = "INVALID_RESULT_IDENTITY"
+        # EventStore treats result.request_id as replay correlation. Preserve
+        # only the supervisor's trusted id. A stale, malformed, or otherwise
+        # untrusted worker id must not be copied into the replay marker.
+        event_request_id = (
+            state.run_rid if type(state.run_rid) is str and bool(state.run_rid) else None
+        )
         if identity_note is not None:
             await self.emit(
                 "protocol",
                 task_id=state.task_id,
+                generation=state.generation,
+                error_type=state.protocol_failure,
                 note=identity_note,
                 expected=state.run_rid,
-                got=msg.get("request_id"),
+                got=protocol_request_id,
             )
         if state.envelope is not None:
             # One accepted terminal envelope per run request; a stale or
@@ -7207,7 +7244,7 @@ class _Runtime:
             if state.response_next_index > 0 and not state.response_redaction_done:
                 if await self._flush_response_chunks(state):
                     response_accepted = False
-        result_payload: dict[str, Any] = {"status": msg.get("status")}
+        result_payload: dict[str, Any] = {"status": _bounded_result_string(msg.get("status"))}
         if state.response_redaction_done:
             result_payload["response_chunk_count"] = state.response_durable_next_index
             result_payload["response_bytes"] = state.response_durable_bytes
@@ -7232,21 +7269,22 @@ class _Runtime:
             # rejected locally.  The marker is bounded metadata; response text
             # remains exclusively in accepted response_chunk events.
             result_payload["response_valid"] = False
-        provider_metadata = _redacted_provider_metadata(msg.get("provider_metadata"))
-        if provider_metadata is not None:
-            result_payload["provider_metadata"] = provider_metadata
+        if response_accepted:
+            provider_metadata = _redacted_provider_metadata(msg.get("provider_metadata"))
+            if provider_metadata is not None:
+                result_payload["provider_metadata"] = provider_metadata
         terminal_action = _terminal_action_for_event(msg.get("terminal_action"))
         if terminal_action is not None:
             result_payload["terminal_action"] = terminal_action
         await self.emit(
             "result",
             task_id=state.task_id,
-            request_id=msg.get("request_id"),
+            request_id=event_request_id,
             generation=state.generation,
             **result_payload,
         )
         if invalid_fields:
-            state.protocol_failure = "INVALID_RESULT_ENVELOPE"
+            state.protocol_failure = state.protocol_failure or "INVALID_RESULT_ENVELOPE"
             await self.emit(
                 "protocol",
                 task_id=state.task_id,
@@ -7257,8 +7295,12 @@ class _Runtime:
             proc = getattr(state, "proc", None)
             if proc is not None:
                 await _kill_worker(proc)
+        if identity_note is not None and not invalid_fields:
+            proc = getattr(state, "proc", None)
+            if proc is not None:
+                await _kill_worker(proc)
         if completion_error is not None:
-            state.protocol_failure = "INCOMPLETE_RESPONSE"
+            state.protocol_failure = state.protocol_failure or "INCOMPLETE_RESPONSE"
             await self.emit(
                 "protocol",
                 task_id=state.task_id,
@@ -7276,6 +7318,9 @@ class _Runtime:
             and state.protocol_failure is None
         )
         if accepted:
+            result_turn = msg.get("turn")
+            if type(result_turn) is int and result_turn >= 0:
+                state.turn = max(state.turn, result_turn)
             if state.sandbox_failure_reason is not None and msg.get("status") != "succeeded":
                 msg = {**msg, "failure_reason": state.sandbox_failure_reason}
             state.envelope = msg
@@ -7842,9 +7887,9 @@ class _Runtime:
             await _kill_worker(state.proc)
             return True
         # Identity is optional for compatibility workers, but any non-null
-        # claim must belong to this task generation. Result keeps its existing
-        # request-correlation path; ready performs its request check before
-        # its dedicated identity fence.
+        # claim must belong to this task generation. Result envelopes use a
+        # strict three-field fence in _handle_result_message; ready performs
+        # its request check before its dedicated identity fence.
         if mtype not in ("ready", "result", "result_envelope"):
             identity_field = _claimed_identity_mismatch(msg, state.task_id, state.generation)
             if identity_field is not None:

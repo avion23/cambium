@@ -53,6 +53,7 @@ _SUPERVISOR_WORKER = dedent(
         "type": "result_envelope",
         "request_id": run["request_id"],
         "task_id": init["task_id"],
+        "generation": generation,
         "status": "succeeded",
     }
     if MODE != "wrong-ready":

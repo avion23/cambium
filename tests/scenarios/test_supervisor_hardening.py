@@ -1029,6 +1029,7 @@ def test_tool_event_worker_controlled_fields_are_type_validated_before_persist(
         "    commit = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=run['worktree_path'], "
         "check=True, capture_output=True, text=True).stdout.strip()\n"
         "    send({'type': 'result_envelope', 'request_id': run['request_id'], "
+        "'task_id': init['task_id'], 'generation': init['generation'], "
         "'status': 'succeeded', 'commits': [commit]})\n"
         "    send({'type': 'exit_message', 'reason': 'done'})\n",
         encoding="utf-8",

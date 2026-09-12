@@ -2033,10 +2033,17 @@ def test_result_identity_note_matrix() -> None:
         _result_identity_note({"task_id": "other", "generation": 1}, "t", 1)
         == "result task_id mismatch"
     )
-    assert _result_identity_note({"generation": 2}, "t", 1) == "result generation mismatch"
-    assert _result_identity_note({"generation": True}, "t", 1) == "result generation mismatch"
-    # Absent identity fields are tolerated (older workers omit them).
-    assert _result_identity_note({}, "t", 1) is None
+    assert _result_identity_note({"task_id": "t"}, "t", 1) == "result generation mismatch"
+    assert (
+        _result_identity_note({"task_id": "t", "generation": 2}, "t", 1)
+        == "result generation mismatch"
+    )
+    assert (
+        _result_identity_note({"task_id": "t", "generation": True}, "t", 1)
+        == "result generation mismatch"
+    )
+    assert _result_identity_note({"generation": 1}, "t", 1) == "result task_id mismatch"
+    assert _result_identity_note({}, "t", 1) == "result task_id mismatch"
 
 
 @pytest.mark.slow
