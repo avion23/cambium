@@ -590,6 +590,137 @@ def _restore_result_summary(turn_dir: Path) -> str | None:
     return summary if isinstance(summary, str) and summary.strip() else None
 
 
+def _reconstruct_response_batch(
+    events: list[dict[str, Any]],
+    response_identities: set[tuple[str, int, str]],
+) -> dict[tuple[str, int, str], tuple[str, bool]]:
+    """Reconstruct correlated responses from one sparse pass over a turn.
+
+    ``reconstruct_response`` intentionally accepts a complete event stream so
+    its validation rules stay simple and auditable. Replaying a turn with many
+    concurrent responses should not make each identity rescan unrelated tool
+    and lifecycle records. Keep only response records that can affect each
+    identity, and summarize lifecycle state by its latest matching assignment.
+    Lifecycle records only affect completion, never the safe text prefix.
+    """
+    if not response_identities:
+        return {}
+
+    response_events: dict[tuple[str, int, str], list[dict[str, Any]]] = {
+        identity: [] for identity in response_identities
+    }
+    latest_task: dict[str, tuple[int, bool]] = {}
+    latest_generation: dict[tuple[str, int], tuple[int, bool]] = {}
+    latest_request: dict[tuple[str, str], tuple[int, bool]] = {}
+    latest_identity: dict[tuple[str, int, str], tuple[int, bool]] = {}
+    latest_session: tuple[int, bool] | None = None
+
+    def remember_latest(
+        target: dict[Any, tuple[int, bool]], key: Any, sequence: int, blocked: bool
+    ) -> None:
+        previous = target.get(key)
+        if previous is None or sequence > previous[0]:
+            target[key] = (sequence, blocked)
+
+    def remember_lifecycle(
+        event: Mapping[str, Any], sequence: int, blocked: bool, *, clear: bool = False
+    ) -> None:
+        task_id = event.get("task_id")
+        if not isinstance(task_id, str):
+            return
+        generation = event.get("generation")
+        if clear:
+            if type(generation) is not int:
+                return
+        elif generation is not None and type(generation) is not int:
+            return
+
+        request_id = event.get("request_id")
+        if request_id is None:
+            if generation is None:
+                remember_latest(latest_task, task_id, sequence, blocked)
+            else:
+                remember_latest(latest_generation, (task_id, generation), sequence, blocked)
+            return
+        if not isinstance(request_id, str):
+            return
+        if generation is None:
+            remember_latest(latest_request, (task_id, request_id), sequence, blocked)
+        else:
+            remember_latest(latest_identity, (task_id, generation, request_id), sequence, blocked)
+
+    identity_fields = ("task_id", "generation", "request_id")
+    for sequence, event in enumerate(events):
+        kind = event.get("kind")
+        if kind == "response_chunk":
+            identity = _response_identity(event)
+            envelope_identity_present = all(event.get(key) is not None for key in identity_fields)
+            if identity in response_events:
+                response_events[identity].append(event)
+            elif not envelope_identity_present:
+                payload = event.get("payload")
+                fields = payload if isinstance(payload, Mapping) else event
+                payload_identity = _response_identity(fields)
+                if payload_identity in response_events:
+                    response_events[payload_identity].append(event)
+        elif kind == "result":
+            identity = _response_identity(event)
+            if identity in response_events:
+                response_events[identity].append(event)
+
+        if kind in {
+            "worker_failed",
+            "task_failed",
+            "worker_terminated",
+            "join_invariant_failed",
+            "merge_failed",
+        }:
+            payload = event.get("payload")
+            recoverable_merge_diagnostic = (
+                kind == "merge_failed"
+                and isinstance(payload, Mapping)
+                and payload.get("internal") is True
+                and payload.get("recoverable") is True
+            )
+            if not recoverable_merge_diagnostic:
+                remember_lifecycle(event, sequence, True)
+        elif kind in {"merge_committed", "resolver_succeeded"}:
+            remember_lifecycle(event, sequence, False, clear=True)
+        elif kind == "exit":
+            payload = event.get("payload")
+            reason = payload.get("reason") if isinstance(payload, Mapping) else None
+            if reason not in {"done", "succeeded", "success"}:
+                remember_lifecycle(event, sequence, True)
+        elif kind == "session_ended":
+            payload = event.get("payload")
+            if not isinstance(payload, Mapping):
+                continue
+            if payload.get("session_status") == "cancelled":
+                latest_session = (sequence, True)
+            statuses = payload.get("results")
+            if isinstance(statuses, Mapping):
+                for task_id, status in statuses.items():
+                    if isinstance(task_id, str) and status != "succeeded":
+                        remember_latest(latest_task, task_id, sequence, True)
+
+    replayed: dict[tuple[str, int, str], tuple[str, bool]] = {}
+    for identity in response_identities:
+        prefix, complete = reconstruct_response(response_events[identity], *identity)
+        task_id, generation, request_id = identity
+        candidates = (
+            latest_session,
+            latest_task.get(task_id),
+            latest_generation.get((task_id, generation)),
+            latest_request.get((task_id, request_id)),
+            latest_identity.get(identity),
+        )
+        latest = max((candidate for candidate in candidates if candidate is not None), default=None)
+        if latest is not None and latest[1]:
+            complete = False
+        replayed[identity] = (prefix, complete)
+    return replayed
+
+
 def _restore_turn_transcript(
     turn_dir: Path,
     events: list[dict[str, Any]],
@@ -602,6 +733,7 @@ def _restore_turn_transcript(
         if event.get("kind") == "response_chunk"
         and (identity := _response_identity(event)) is not None
     }
+    reconstructed_responses = _reconstruct_response_batch(events, response_identities)
 
     prompt_task_ids: set[str] = set()
     unassigned_prompt_seen = False
@@ -637,7 +769,7 @@ def _restore_turn_transcript(
             # once per correlated identity. Raw chunks are never replayed.
             identity = _response_identity(event)
             if identity is not None and identity not in emitted_responses:
-                prefix, _complete = reconstruct_response(events, *identity)
+                prefix, _complete = reconstructed_responses[identity]
                 transcript._append_validated_response(prefix, stream_key=repr(identity))
                 emitted_responses.add(identity)
             continue
