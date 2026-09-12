@@ -8,9 +8,13 @@ import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 
-from .summary_trunk import SUMMARY_FINDING_PRESERVATION_CONTRACT, SUMMARY_LIST_FIELDS
+from .summary_trunk import (
+    SUMMARY_FINDING_PRESERVATION_CONTRACT,
+    SUMMARY_LIST_FIELDS,
+    SUMMARY_VERBATIM_FIELD,
+)
 
-PROMPTS_VERSION = 18
+PROMPTS_VERSION = 19
 
 CODING_POLICY = (
     "Work directly and minimally. Locate with repo_query, read exact regions with read_batch, "
@@ -68,9 +72,12 @@ _SUMMARY_PROTOCOL = (
     "<cambium-summary-entry> and before the control block. Earlier entries are immutable; "
     "do not repeat or rewrite them.",
     'Required: non-empty "objective" and "outcome" strings. Optional short-string lists: '
-    + ", ".join(SUMMARY_LIST_FIELDS)
-    + ". No other fields; the harness supplies identity, sequence, and source metadata. "
-    "Do not put summary tags inside values. Limit each list to 32 items.",
+    + ", ".join(field for field in SUMMARY_LIST_FIELDS if field != SUMMARY_VERBATIM_FIELD)
+    + ". No other fields except optional verbatim_evidence. The harness supplies identity, "
+    "sequence, and source metadata. Do not put summary tags inside values. Limit ordinary "
+    "lists to 32 items. verbatim_evidence is limited to 4 exact snippets, 512 UTF-8 bytes "
+    "each and 2048 bytes total; each item must be copied byte-for-byte from one new raw "
+    "message. Omit it when unsure and never invent or truncate an item.",
 )
 SUMMARY_PROTOCOL_LINES = (*_SUMMARY_PROTOCOL, SUMMARY_POLICY)
 SEMANTIC_SUMMARIZER = "\n".join(SUMMARY_PROTOCOL_LINES)

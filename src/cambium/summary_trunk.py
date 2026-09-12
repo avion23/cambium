@@ -13,6 +13,7 @@ import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
+from dataclasses import field as dataclass_field
 from typing import Any
 
 from .provider_scheduler import (
@@ -31,6 +32,13 @@ SUMMARY_CONTROL_CLOSE = "\n</cambium-summary-control>"
 SUMMARY_MAX_ITEMS = 32
 SUMMARY_MAX_TEXT_BYTES = 2_000
 SUMMARY_MAX_ENTRY_BYTES = 24 * 1024
+# Verbatim evidence is an optional semantic payload, not an identity field.
+# Keep it small enough to carry one compact artifact without allowing a model
+# to turn a summary entry into a second transcript.
+SUMMARY_MAX_VERBATIM_ITEMS = 4
+SUMMARY_MAX_VERBATIM_ITEM_BYTES = 512
+SUMMARY_MAX_VERBATIM_BYTES = 1_536
+SUMMARY_VERBATIM_FIELD = "verbatim_evidence"
 SUMMARY_MAX_COERCE_DEPTH = 64
 SUMMARY_TRUNCATION_MARKER = "…[truncated]"
 _SUMMARY_DIGEST_LENGTH = 64
@@ -58,6 +66,7 @@ SUMMARY_LIST_FIELDS = (
     "open_items",
     "open_items_resolved",
     "verification_invalidated",
+    "verbatim_evidence",
 )
 SUMMARY_ENTRY_FIELDS = frozenset(
     {
@@ -79,7 +88,12 @@ class SummaryTrunkError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class SummaryEntry:
-    """One immutable semantic delta over one exact raw message range."""
+    """One immutable semantic delta over one exact raw message range.
+
+    ``verbatim_evidence`` contains small exact excerpts copied from the source
+    raw range.  It is semantic payload only: it does not alter the source
+    digest used for exact-range identity.
+    """
 
     type: str
     sequence: int
@@ -98,16 +112,25 @@ class SummaryEntry:
     open_items: tuple[str, ...]
     open_items_resolved: tuple[str, ...] = ()
     verification_invalidated: tuple[str, ...] = ()
+    verbatim_evidence: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
 class SummaryExpectation:
-    """Values the model must copy from the summary control block exactly."""
+    """Values the model must copy from the summary control block exactly.
+
+    ``raw_tail`` is transient validation input.  It is retained only long
+    enough to verify claimed verbatim evidence and is never rendered or
+    persisted as part of the expectation.
+    """
 
     sequence: int
     source_sha256: str
     source_message_count: int
     through_turn: int
+    # Transient source content used only to validate model-claimed verbatim
+    # evidence.  It is never rendered, persisted, or included in identity.
+    raw_tail: tuple[str, ...] = dataclass_field(default=(), repr=False, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +153,7 @@ class K0Projection:
     constraints: tuple[str, ...]
     verification_state: tuple[str, ...]
     open_work: tuple[str, ...]
+    verbatim_evidence: tuple[str, ...]
 
     @property
     def verification_results(self) -> tuple[str, ...]:
@@ -149,6 +173,7 @@ class K0Projection:
             "constraints": list(self.constraints),
             "verification_state": list(self.verification_state),
             "open_work": list(self.open_work),
+            "verbatim_evidence": list(self.verbatim_evidence),
         }
 
 
@@ -211,6 +236,7 @@ _SUMMARY_LIST_TRIM_ORDER = (
     "open_items_resolved",
     "verification_invalidated",
     "open_items",
+    "verbatim_evidence",
 )
 _SUMMARY_TEXT_TRIM_ORDER = (
     *SUMMARY_LIST_FIELDS,
@@ -329,6 +355,70 @@ def _bounded_items(value: Any, field: str) -> tuple[str, ...]:
     return tuple(items)
 
 
+def _bounded_verbatim_items(value: Any) -> tuple[str, ...]:
+    """Normalize compact exact evidence without changing its bytes.
+
+    Verbatim evidence is not ordinary prose: truncating or otherwise
+    rewriting an item would make it impossible to prove that the model copied
+    it from the raw tail.  Reject an item or collection that exceeds its
+    dedicated bounds instead of persisting a misleading prefix.
+    """
+    field = SUMMARY_VERBATIM_FIELD
+    if isinstance(value, tuple | list):
+        items_raw: list[Any] = list(value)
+    elif value is None:
+        items_raw = []
+    else:
+        raise SummaryTrunkError(f"summary entry {field} must be a list")
+    if len(items_raw) > SUMMARY_MAX_VERBATIM_ITEMS:
+        raise SummaryTrunkError(f"summary entry {field} exceeds the item cap")
+
+    items: list[str] = []
+    total_bytes = 0
+    for index, item in enumerate(items_raw):
+        if not isinstance(item, str):
+            raise SummaryTrunkError(f"summary entry {field}[{index}] must be a string")
+        if not item.strip():
+            raise SummaryTrunkError(f"summary entry {field}[{index}] must be non-empty")
+        try:
+            item.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise SummaryTrunkError(
+                f"summary entry {field}[{index}] must be valid UTF-8"
+            ) from exc
+        for marker in _SUMMARY_FORBIDDEN_MARKERS:
+            if marker and marker in item:
+                raise SummaryTrunkError(
+                    f"summary entry {field}[{index}] must not contain the reserved marker "
+                    f"{marker!r}"
+                )
+        item_bytes = len(item.encode("utf-8"))
+        if item_bytes > SUMMARY_MAX_VERBATIM_ITEM_BYTES:
+            raise SummaryTrunkError(f"summary entry {field}[{index}] exceeds the byte cap")
+        total_bytes += item_bytes
+        if total_bytes > SUMMARY_MAX_VERBATIM_BYTES:
+            raise SummaryTrunkError(f"summary entry {field} exceeds the byte cap")
+        items.append(item)
+    return tuple(items)
+
+
+def _validate_verbatim_evidence(
+    items: Sequence[str], raw_tail_contents: Sequence[str]
+) -> None:
+    """Accept only snippets that occur byte-for-byte in one raw message."""
+    if not items:
+        return
+    if not raw_tail_contents:
+        raise SummaryTrunkError(
+            "summary entry verbatim_evidence requires the supplied raw tail"
+        )
+    for index, item in enumerate(items):
+        if not any(item in content for content in raw_tail_contents):
+            raise SummaryTrunkError(
+                f"summary entry verbatim_evidence[{index}] is not present in the raw tail"
+            )
+
+
 def _positive_int(value: Any, field: str, *, allow_zero: bool = False) -> int:
     minimum = 0 if allow_zero else 1
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
@@ -372,7 +462,10 @@ def _entry_from_mapping(value: Any) -> SummaryEntry:
         "outcome": _bounded_text(value.get("outcome"), "outcome"),
     }
     for field in SUMMARY_LIST_FIELDS:
-        kwargs[field] = _bounded_items(value.get(field, []), field)
+        if field == SUMMARY_VERBATIM_FIELD:
+            kwargs[field] = _bounded_verbatim_items(value.get(field, []))
+        else:
+            kwargs[field] = _bounded_items(value.get(field, []), field)
     entry = SummaryEntry(**kwargs)
     return _fit_entry_size(entry)
 
@@ -453,6 +546,7 @@ def _fallback_entry(entry: SummaryEntry) -> SummaryEntry:
         verification_results=(),
         relevant_failed_approaches=(),
         open_items=entry.open_items[:1],
+        verbatim_evidence=(),
     )
     text_fields: list[tuple[str, int | None]] = [("outcome", None), ("objective", None)]
     if fallback.open_items:
@@ -471,6 +565,10 @@ def _fit_entry_size(entry: SummaryEntry) -> SummaryEntry:
 
     fitted = entry
     for field in _SUMMARY_LIST_TRIM_ORDER:
+        if field == SUMMARY_VERBATIM_FIELD:
+            # Never shorten an exact excerpt.  If the rest of the entry cannot
+            # fit, the optional section is dropped as a whole below.
+            continue
         items = getattr(fitted, field)
         while len(items) > 1 and _entry_size_bytes(fitted) > SUMMARY_MAX_ENTRY_BYTES:
             fitted = _replace_entry_field(fitted, field, items[:-1])
@@ -478,7 +576,14 @@ def _fit_entry_size(entry: SummaryEntry) -> SummaryEntry:
         if _entry_size_bytes(fitted) <= SUMMARY_MAX_ENTRY_BYTES:
             return fitted
 
+    if fitted.verbatim_evidence:
+        fitted = replace(fitted, verbatim_evidence=())
+        if _entry_size_bytes(fitted) <= SUMMARY_MAX_ENTRY_BYTES:
+            return fitted
+
     for field in _SUMMARY_TEXT_TRIM_ORDER:
+        if field == SUMMARY_VERBATIM_FIELD:
+            continue
         values = getattr(fitted, field)
         if field in SUMMARY_LIST_FIELDS:
             for index in range(len(values)):
@@ -671,6 +776,26 @@ def _unique_semantic_items(entries: Sequence[SummaryEntry], field: str) -> tuple
     return tuple(values.values())
 
 
+def _unique_verbatim_items(entries: Sequence[SummaryEntry]) -> tuple[str, ...]:
+    """Retain bounded exact snippets in source order for a K0 projection."""
+    values: list[str] = []
+    seen: set[str] = set()
+    total_bytes = 0
+    for entry in entries:
+        for item in entry.verbatim_evidence:
+            if item in seen:
+                continue
+            item_bytes = len(item.encode("utf-8"))
+            if len(values) >= SUMMARY_MAX_VERBATIM_ITEMS:
+                return tuple(values)
+            if total_bytes + item_bytes > SUMMARY_MAX_VERBATIM_BYTES:
+                continue
+            seen.add(item)
+            values.append(item)
+            total_bytes += item_bytes
+    return tuple(values)
+
+
 def compile_k0_projection(entries: Sequence[SummaryEntry]) -> K0Projection:
     """Compile the active state of immutable summary segments into K0.
 
@@ -703,10 +828,17 @@ def compile_k0_projection(entries: Sequence[SummaryEntry]) -> K0Projection:
             ("verification_invalidated",),
         ),
         open_work=_active_semantic_items(normalized, ("open_items",), ("open_items_resolved",)),
+        verbatim_evidence=_unique_verbatim_items(normalized),
     )
 
 
 def _k0_source_sha256(entries: Sequence[SummaryEntry]) -> str:
+    """Digest the complete semantic inputs used to construct K0.
+
+    Verbatim excerpts remain provider-neutral semantic payload rather than
+    provider cache identity, but they are still part of K0's durable content.
+    Changing one must therefore change this provenance digest.
+    """
     return hashlib.sha256(
         _canonical_json_bytes([entry_mapping(entry) for entry in entries])
     ).hexdigest()
@@ -743,6 +875,7 @@ def k0_entry(
         verification_results=active.verification_state,
         relevant_failed_approaches=active.constraints,
         open_items=active.open_work,
+        verbatim_evidence=active.verbatim_evidence,
     )
     return _entry_from_mapping(entry_mapping(entry))
 
@@ -880,6 +1013,7 @@ def build_summary_request(
         source_sha256=source_sha256,
         source_message_count=len(raw),
         through_turn=validated_through_turn,
+        raw_tail=tuple(message["content"] for message in raw),
     )
     control = {
         "type": "summarize_tail",
@@ -892,6 +1026,16 @@ def build_summary_request(
             "required": {"objective": "non-empty string", "outcome": "non-empty string"},
             "optional_string_lists": list(SUMMARY_LIST_FIELDS),
             "max_items_per_list": SUMMARY_MAX_ITEMS,
+            "verbatim_evidence": {
+                "max_items": SUMMARY_MAX_VERBATIM_ITEMS,
+                "max_item_bytes": SUMMARY_MAX_VERBATIM_ITEM_BYTES,
+                "max_total_bytes": SUMMARY_MAX_VERBATIM_BYTES,
+                "instruction": (
+                    "Copy each compact evidence/artifact string byte-for-byte from one "
+                    "message in the new raw range; omit the field when no exact snippet "
+                    "is useful."
+                ),
+            },
             "instruction": (
                 "Return only summary JSON. Summarize the new raw range, not earlier entries."
             ),
@@ -900,7 +1044,9 @@ def build_summary_request(
             "Use stable D1/F1/O1/V1 labels for decisions, facts, obligations and checks. "
             "Keep the label when replacing an item. Close O labels in open_items_resolved; "
             "retract stale V labels in verification_invalidated, naming the checked Git head. "
-            "An already absent label is harmless; do not invent completion evidence."
+            "An already absent label is harmless; do not invent completion evidence. "
+            "Only exact snippets copied from the new raw range may appear in "
+            "verbatim_evidence; invented or relabeled snippets are rejected."
         ),
     }
     control_message = {
@@ -914,8 +1060,16 @@ def build_summary_request(
     return {"messages": [*trunk, *raw, control_message]}, expectation
 
 
-def parse_summary_response(content: str, expected: SummaryExpectation) -> SummaryEntry:
+def parse_summary_response(
+    content: str,
+    expected: SummaryExpectation,
+    raw_tail: Sequence[Mapping[str, Any]] | None = None,
+) -> SummaryEntry:
     """Validate model-owned summary CONTENT and stamp OUR identity onto it.
+
+    ``raw_tail`` is an optional explicit validation source. When supplied, it
+    must have the same count and digest as ``expected``. Normal callers use
+    the transient copy captured by :func:`build_summary_request`.
 
     The control block's sequence/hash/count/through_turn fields describe the
     range WE chose to summarize — bookkeeping the caller already knows.
@@ -930,6 +1084,18 @@ def parse_summary_response(content: str, expected: SummaryExpectation) -> Summar
     """
     if not isinstance(content, str) or not content.strip():
         raise SummaryTrunkError("summary response must be non-empty JSON")
+    if raw_tail is None:
+        raw_tail_contents = expected.raw_tail
+    else:
+        copied_raw_tail = [
+            _copy_message(message, f"raw_tail[{index}]")
+            for index, message in enumerate(raw_tail)
+        ]
+        if len(copied_raw_tail) != expected.source_message_count:
+            raise SummaryTrunkError("supplied raw tail does not match the summary expectation")
+        if raw_tail_sha256(copied_raw_tail) != expected.source_sha256:
+            raise SummaryTrunkError("supplied raw tail does not match the summary expectation")
+        raw_tail_contents = tuple(message["content"] for message in copied_raw_tail)
     try:
         try:
             decoded = json.loads(content)
@@ -960,7 +1126,12 @@ def parse_summary_response(content: str, expected: SummaryExpectation) -> Summar
         )
         for field in SUMMARY_LIST_FIELDS:
             value = decoded[field] if field in decoded else []
-            normalized[field] = list(_bounded_items(value, field))
+            if field == SUMMARY_VERBATIM_FIELD:
+                verbatim_items = _bounded_verbatim_items(value)
+                _validate_verbatim_evidence(verbatim_items, raw_tail_contents)
+                normalized[field] = list(verbatim_items)
+            else:
+                normalized[field] = list(_bounded_items(value, field))
         return _entry_from_mapping(normalized)
     except SummaryTrunkError:
         raise
@@ -997,6 +1168,10 @@ def append_summary_entry(
 __all__ = [
     "SUMMARY_ENTRY_PROVENANCE",
     "SUMMARY_FINDING_PRESERVATION_CONTRACT",
+    "SUMMARY_MAX_VERBATIM_BYTES",
+    "SUMMARY_MAX_VERBATIM_ITEM_BYTES",
+    "SUMMARY_MAX_VERBATIM_ITEMS",
+    "SUMMARY_VERBATIM_FIELD",
     "K0Projection",
     "SummaryEntry",
     "SummaryExpectation",

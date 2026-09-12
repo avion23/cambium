@@ -51,6 +51,11 @@ all yet.
 | `semantic` | Persisted (possibly redacted) semantic summaries under a fresh provider head; no cache identity |
 | `fresh` | Task only; no parent checkpoint, summaries, or result envelope |
 
+Semantic summaries may carry bounded, validated `verbatim_evidence`. The
+normal persistence redactor applies to this field before reuse, so
+secret-shaped content is scrubbed; it never grants exact lineage or
+provider-cache identity.
+
 | `placement` | Meaning |
 | --- | --- |
 | `inherit` | Preserve parent provider/model affinity when known and feasible |

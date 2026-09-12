@@ -49,6 +49,13 @@ The published prefix through `S2` therefore remains byte-identical. The old
 request's raw suffix is replaced, so reuse is of that common prefix, not a
 promise that the entire next request is cached.
 
+An entry may include an optional `verbatim_evidence` list for compact source
+artifacts, such as one log line or a small JSON value. Each item must occur
+byte-for-byte in one message of that fold's raw range. The parser rejects an
+absent, invented, or over-sized claim. The limits are four items, 512 UTF-8
+bytes per item, and 2,048 bytes in total. This evidence is semantic payload;
+it does not change the raw-range digest or grant exact/cache identity.
+
 An epoch number identifies a published checkpoint snapshot. Ordinary folds
 advance that number too; it does not mean that every epoch change rewrites the
 trunk. Distinguish an **append-only fold** from a **prefix-replacing K0 rollover**.
@@ -136,6 +143,9 @@ and still-applicable checks. Invalidations apply before additions in the same
 delta, so a replacement is not accidentally deleted. Repeated closure of an
 already absent label is harmless; it must not block compaction.
 
+K0 also carries the first unique `verbatim_evidence` items that fit the same
+limits. It does not create, relabel, or revalidate evidence after the fold.
+
 Original entries remain unchanged and accessible through history. The model
 must identify a correction or completion from actual evidence. K0 does not infer
 semantic contradiction, automatically prove an obligation complete, or turn a
@@ -181,6 +191,9 @@ reused under a fresh provider head. Semantic context is provider-neutral: it
 does not carry cache identity or claim a provider-cache hit, and it never sends
 unredacted checkpoint material. Semantic/fresh forks do not transfer KV cache
 state.
+
+Semantic reuse can carry validated, redacted `verbatim_evidence`. Those items
+remain semantic payload and never make the fork exact or cache-compatible.
 
 ## Resource economics
 

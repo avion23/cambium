@@ -17,6 +17,8 @@ from cambium.summary_trunk import (
     SUMMARY_MAX_ENTRY_BYTES,
     SUMMARY_MAX_ITEMS,
     SUMMARY_MAX_TEXT_BYTES,
+    SUMMARY_MAX_VERBATIM_ITEM_BYTES,
+    SUMMARY_MAX_VERBATIM_ITEMS,
     SUMMARY_TRUNCATION_MARKER,
     SummaryExpectation,
     SummaryTrunkError,
@@ -46,34 +48,40 @@ TAIL_2 = [
 ]
 
 
-def _response(expectation: SummaryExpectation, *, label: str) -> str:
-    return json.dumps(
-        {
-            "type": "summary_entry",
-            "sequence": expectation.sequence,
-            "source_sha256": expectation.source_sha256,
-            "source_message_count": expectation.source_message_count,
-            "through_turn": expectation.through_turn,
-            "objective": f"objective {label}",
-            "outcome": f"outcome {label}",
-            "decisions_added": [f"decision {label}"],
-            "decisions_superseded": [],
-            "facts_added": [f"fact {label}"],
-            "facts_invalidated": [],
-            "files_and_symbols_changed": [f"file {label}"],
-            "verification_results": [f"test {label}"],
-            "relevant_failed_approaches": [],
-            "open_items": [],
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
+def _response(
+    expectation: SummaryExpectation,
+    *,
+    label: str,
+    verbatim_evidence: tuple[str, ...] = (),
+) -> str:
+    payload = {
+        "type": "summary_entry",
+        "sequence": expectation.sequence,
+        "source_sha256": expectation.source_sha256,
+        "source_message_count": expectation.source_message_count,
+        "through_turn": expectation.through_turn,
+        "objective": f"objective {label}",
+        "outcome": f"outcome {label}",
+        "decisions_added": [f"decision {label}"],
+        "decisions_superseded": [],
+        "facts_added": [f"fact {label}"],
+        "facts_invalidated": [],
+        "files_and_symbols_changed": [f"file {label}"],
+        "verification_results": [f"test {label}"],
+        "relevant_failed_approaches": [],
+        "open_items": [],
+    }
+    if verbatim_evidence:
+        payload["verbatim_evidence"] = list(verbatim_evidence)
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
-def _append(trunk, tail, turn, label):
+def _append(trunk, tail, turn, label, *, verbatim_evidence=()):
     request, expectation = build_summary_request(trunk, tail, through_turn=turn)
     assert request["messages"][: len(trunk) + len(tail)] == [*trunk, *tail]
-    entry = parse_summary_response(_response(expectation, label=label), expectation)
+    entry = parse_summary_response(
+        _response(expectation, label=label, verbatim_evidence=verbatim_evidence), expectation
+    )
     return append_summary_entry(trunk, entry), entry
 
 
@@ -165,6 +173,9 @@ def test_summary_request_control_is_json_with_finding_contract() -> None:
     assert control_message["role"] == "user"
     assert control["type"] == "summarize_tail"
     assert control["finding_preservation_contract"] == SUMMARY_FINDING_PRESERVATION_CONTRACT
+    verbatim_control = control["response"]["verbatim_evidence"]
+    assert verbatim_control["max_items"] == summary_trunk.SUMMARY_MAX_VERBATIM_ITEMS
+    assert "byte-for-byte" in verbatim_control["instruction"]
 
 
 def test_legacy_checkpoint_tail_is_migrated_on_next_flush() -> None:
@@ -202,6 +213,112 @@ def test_summary_response_identity_is_stamped_not_echoed() -> None:
     entry = parse_summary_response(json.dumps(payload), expectation)
     assert entry.source_sha256 == expectation.source_sha256
     assert entry.sequence == expectation.sequence
+
+
+def test_verbatim_evidence_requires_an_exact_raw_tail_substring() -> None:
+    _request, expectation = build_summary_request(HEAD, TAIL_1, through_turn=2)
+    source = "large output"
+    payload = json.loads(_response(expectation, label="one"))
+    payload["verbatim_evidence"] = [source]
+
+    entry = parse_summary_response(json.dumps(payload), expectation)
+
+    assert entry.verbatim_evidence == (source,)
+    assert entry.source_sha256 == raw_tail_sha256(TAIL_1)
+    assert parse_summary_response(json.dumps(payload), expectation, raw_tail=TAIL_1) == entry
+    with pytest.raises(SummaryTrunkError, match="does not match the summary expectation"):
+        parse_summary_response(json.dumps(payload), expectation, raw_tail=TAIL_2)
+
+    payload["verbatim_evidence"] = ["large  output"]
+    with pytest.raises(SummaryTrunkError, match="not present in the raw tail"):
+        parse_summary_response(json.dumps(payload), expectation)
+
+    without_source = SummaryExpectation(
+        expectation.sequence,
+        expectation.source_sha256,
+        expectation.source_message_count,
+        expectation.through_turn,
+    )
+    with pytest.raises(SummaryTrunkError, match="requires the supplied raw tail"):
+        parse_summary_response(
+            json.dumps({**payload, "verbatim_evidence": [source]}), without_source
+        )
+
+
+def test_verbatim_evidence_is_strictly_bounded_without_truncation() -> None:
+    _request, expectation = build_summary_request(HEAD, TAIL_1, through_turn=2)
+    payload = json.loads(_response(expectation, label="one"))
+    payload["verbatim_evidence"] = ["x"] * (SUMMARY_MAX_VERBATIM_ITEMS + 1)
+    with pytest.raises(SummaryTrunkError, match="verbatim_evidence exceeds the item cap"):
+        parse_summary_response(json.dumps(payload), expectation)
+
+    payload["verbatim_evidence"] = ["x" * (SUMMARY_MAX_VERBATIM_ITEM_BYTES + 1)]
+    with pytest.raises(SummaryTrunkError, match=r"verbatim_evidence\[0\].*byte cap"):
+        parse_summary_response(json.dumps(payload), expectation)
+
+    payload["verbatim_evidence"] = ["😀" * (SUMMARY_MAX_VERBATIM_ITEM_BYTES // 4 + 1)]
+    with pytest.raises(SummaryTrunkError, match=r"verbatim_evidence\[0\].*byte cap"):
+        parse_summary_response(json.dumps(payload), expectation)
+
+    payload["verbatim_evidence"] = [
+        "x" * SUMMARY_MAX_VERBATIM_ITEM_BYTES,
+        "x" * SUMMARY_MAX_VERBATIM_ITEM_BYTES,
+        "x" * SUMMARY_MAX_VERBATIM_ITEM_BYTES,
+        "y",
+    ]
+    with pytest.raises(SummaryTrunkError, match="verbatim_evidence exceeds the byte cap"):
+        parse_summary_response(json.dumps(payload), expectation)
+
+    payload["verbatim_evidence"] = [{"evidence": "x"}]
+    with pytest.raises(SummaryTrunkError, match=r"verbatim_evidence\[0\].*string"):
+        parse_summary_response(json.dumps(payload), expectation)
+
+
+def test_verbatim_evidence_survives_append_k0_and_semantic_reuse() -> None:
+    first_snippet = "large output"
+    second_snippet = "changed a.py"
+    tail_2 = [
+        *TAIL_2[:-1],
+        {**TAIL_2[-1], "content": TAIL_2[-1]["content"] + "\n" + first_snippet},
+    ]
+    trunk, first = _append(
+        HEAD,
+        TAIL_1,
+        2,
+        "one",
+        verbatim_evidence=(first_snippet,),
+    )
+    trunk, second = _append(
+        trunk,
+        tail_2,
+        4,
+        "two",
+        verbatim_evidence=(second_snippet, first_snippet),
+    )
+
+    assert first.verbatim_evidence == (first_snippet,)
+    assert second.verbatim_evidence == (second_snippet, first_snippet)
+    reused = semantic_summary_messages(trunk)
+    assert [parse_summary_message(message).verbatim_evidence for message in reused] == [
+        (first_snippet,),
+        (second_snippet, first_snippet),
+    ]
+
+    rolled, projection, _sources = summary_trunk.rollover_summary_trunk(trunk)
+    assert projection.verbatim_evidence == (first_snippet, second_snippet)
+    assert summary_entries(rolled)[0].verbatim_evidence == projection.verbatim_evidence
+
+    identity_trunk = [
+        *HEAD,
+        render_summary_message(replace(first, verbatim_evidence=())),
+        render_summary_message(replace(second, verbatim_evidence=())),
+    ]
+    identity_rolled, _identity_projection, _identity_sources = (
+        summary_trunk.rollover_summary_trunk(identity_trunk)
+    )
+    assert summary_entries(rolled)[0].source_sha256 != summary_entries(identity_rolled)[
+        0
+    ].source_sha256
 
 
 def test_summary_response_missing_type_is_normalized() -> None:

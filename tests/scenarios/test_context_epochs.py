@@ -1314,6 +1314,7 @@ def test_redacted_interactive_continuation_reuses_semantic_summary_without_cache
             verification_results=(),
             relevant_failed_approaches=(),
             open_items=(),
+            verbatim_evidence=("SECRETXYZ",),
         ),
     )
     checkpoint = _write_epoch(base_config, messages=summary_messages)
