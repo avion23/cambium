@@ -305,6 +305,74 @@ def test_unset_key_provider_is_skipped_and_persisted_as_infeasible(
     }
 
 
+def test_legacy_env_key_authorization_uses_credential_readiness(
+    tmp_path: Path,
+) -> None:
+    missing = "legacy-missing-provider"
+    ready = "legacy-ready-provider"
+    missing_key = "CAMBIUM_PROVIDER_LEGACY_MISSING_PROVIDER_API_KEY"
+    ready_key = "CAMBIUM_PROVIDER_LEGACY_READY_PROVIDER_API_KEY"
+    config = _provider_config(
+        tmp_path / "providers.json",
+        [_provider(missing) | {"api_key": ""}, _provider(ready)],
+    )
+    spec = {
+        "task_id": "legacy-candidate",
+        "fanout_config": {},
+        "model_candidates": ["m1"],
+        "provider_config_path": str(config),
+        "provider_env_keys": [missing_key, ready_key],
+    }
+
+    assert _resolve_model_candidates(
+        spec,
+        {},
+        {},
+        provider_environment={missing_key: "", ready_key: "usable-key"},
+    )
+    assert spec["assigned_provider"] == ready
+    assert spec["authorized_providers"] == [ready]
+    assert spec["_provider_infeasible"] == [(missing, "credential unavailable")]
+
+
+def test_legacy_env_key_authorization_fails_before_spawn_when_none_ready(
+    tmp_path: Path,
+) -> None:
+    provider_name = "legacy-missing-provider"
+    provider_key = "CAMBIUM_PROVIDER_LEGACY_MISSING_PROVIDER_API_KEY"
+    repo, base = init_repo(tmp_path, "supervisor-test", "supervisor@test")
+    config = _provider_config(
+        tmp_path / "providers.json", [_provider(provider_name) | {"api_key": ""}]
+    )
+    session_dir = tmp_path / "session"
+    task = {
+        "task_id": "legacy-no-credentials",
+        "task": "must not spawn",
+        "repo": str(repo),
+        "worktree_path": str(session_dir / "wt"),
+        "branch": "legacy-no-credentials",
+        "base_commit": base,
+        "fanout_config": {},
+        "model_candidates": ["m1"],
+        "provider_config_path": str(config),
+        "provider_env_keys": [provider_key],
+        "max_restarts": 0,
+    }
+
+    result = asyncio.run(run_plan(session_dir, {"tasks": [task]}))
+    events = read_events(session_dir)
+
+    assert result.results[0].reason == "no credential-feasible providers"
+    assert not [event for event in events if event["kind"] == "spawned"]
+    assert not [event for event in events if event["kind"] == "task_assigned"]
+    infeasible = [event for event in events if event["kind"] == "provider_infeasible"]
+    assert len(infeasible) == 1
+    assert infeasible[0]["payload"] == {
+        "provider": provider_name,
+        "reason": "credential unavailable",
+    }
+
+
 @pytest.mark.parametrize(
     ("authorized_providers", "explicit"),
     [(["missing-provider"], True), ([], True)],

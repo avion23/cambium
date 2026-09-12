@@ -9607,12 +9607,12 @@ def _resolve_model_candidates(
         # authorized carrier when present (OAuth providers have no env name).
         authorized_provider_keys = _provider_env_keys(spec)
         if authorized_provider_keys:
-            providers = [
-                provider
+            authorized = frozenset(
+                provider.name
                 for provider in providers
                 if provider.api_key_env in authorized_provider_keys
-            ]
-    else:
+            )
+    if authorized is not None:
         feasible: list[Any] = []
         infeasible: list[tuple[str, str]] = []
         for provider in providers:
