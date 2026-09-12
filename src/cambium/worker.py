@@ -11,7 +11,8 @@ rebind init on stdin (eval-3 ADOPT warm pool):
     run_task                    ->  heartbeat(s) every ~1s while working
                                 ->  response_chunk(s) when finish returns a
                                     user-facing response -> result_envelope
-                                    (echoes the run_task request_id) ->
+                                    (echoes the run_task request_id, task_id,
+                                    and generation) ->
                                     exit_message (connection level; carries
                                     NO request_id)
                                 ->  with ``worker_reuse``: result_envelope
