@@ -1434,7 +1434,111 @@ def test_durable_response_chunks_preserve_answers_over_16k(tmp_path: Path) -> No
         ],
         invalid_replay,
     )
-    assert not any(entry.role == "assistant" for entry in invalid_replay.entries)
+    assert [entry.text for entry in invalid_replay.entries if entry.role == "assistant"] == [
+        "unvalidated assistant tail",
+        "safe",
+    ]
+
+
+@pytest.mark.parametrize("terminal_status", ["cancelled", "failed"])
+def test_replay_restores_safe_prefix_without_claiming_success(
+    tmp_path: Path, terminal_status: str
+) -> None:
+    identity = {
+        "task_id": "task-prefix",
+        "generation": 2,
+        "request_id": "run-prefix",
+    }
+    events: list[dict[str, object]] = [
+        {
+            "kind": "response_chunk",
+            **identity,
+            "payload": {"chunk_index": 0, "text": "safe prefix", "final": False},
+        }
+    ]
+    events.append(
+        {
+            "kind": "result",
+            **identity,
+            "payload": {
+                "status": terminal_status,
+                "summary": "must not replace the durable prefix",
+            },
+        }
+    )
+
+    transcript = Transcript()
+    _restore_turn_transcript(tmp_path, events, transcript)
+
+    assert [entry.text for entry in transcript.entries if entry.role == "assistant"] == [
+        "safe prefix"
+    ]
+    assert not any("must not replace" in entry.text for entry in transcript.entries)
+
+
+def test_replay_restores_safe_prefix_without_terminal_result(tmp_path: Path) -> None:
+    transcript = Transcript()
+    _restore_turn_transcript(
+        tmp_path,
+        [
+            {
+                "kind": "response_chunk",
+                "task_id": "orphan",
+                "generation": 1,
+                "request_id": "orphan-run",
+                "payload": {"chunk_index": 0, "text": "orphan", "final": False},
+            }
+        ],
+        transcript,
+    )
+
+    assert [entry.text for entry in transcript.entries if entry.role == "assistant"] == ["orphan"]
+
+
+def test_replay_scopes_response_suppression_to_matching_identity(tmp_path: Path) -> None:
+    response_identity = {
+        "task_id": "task-a",
+        "generation": 1,
+        "request_id": "run-a",
+    }
+    unrelated_identity = {
+        "task_id": "task-a",
+        "generation": 2,
+        "request_id": "run-b",
+    }
+    events: list[dict[str, object]] = [
+        {
+            "kind": "assistant_delta",
+            **unrelated_identity,
+            "payload": {"delta": "unrelated stream"},
+        },
+        {
+            "kind": "assistant_delta",
+            **response_identity,
+            "payload": {"delta": "duplicate stream"},
+        },
+        {
+            "kind": "response_chunk",
+            **response_identity,
+            "payload": {"chunk_index": 0, "text": "canonical prefix", "final": True},
+        },
+        {
+            "kind": "result",
+            **response_identity,
+            "payload": {"status": "succeeded", "summary": "duplicate result"},
+        },
+        {
+            "kind": "result",
+            **unrelated_identity,
+            "payload": {"status": "succeeded", "summary": "unrelated result"},
+        },
+    ]
+
+    transcript = Transcript()
+    _restore_turn_transcript(tmp_path, events, transcript)
+    assistant = [entry.text for entry in transcript.entries if entry.role == "assistant"]
+
+    assert assistant == ["unrelated stream", "canonical prefix", "unrelated result"]
 
 
 def test_message_events_switch_roles_and_keep_streaming_text_bounded() -> None:

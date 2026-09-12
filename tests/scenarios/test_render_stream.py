@@ -378,6 +378,28 @@ async def _scripted_run(config, on_event=None) -> PlanResult:
     return PlanResult((TaskResult(task_id="oneshot", status="succeeded", exit_code=0),))
 
 
+async def _scripted_run_with_response_transport(config, on_event=None) -> PlanResult:
+    assert on_event is not None
+    on_event(
+        {
+            "kind": "tool_event",
+            "payload": {
+                "tool": "run_shell",
+                "cmd": "df -h",
+                "ok": True,
+                "duration_ms": 5,
+            },
+        }
+    )
+    on_event(
+        {
+            "kind": "response_chunk",
+            "payload": {"chunk_index": 0, "text": "transport-only", "final": False},
+        }
+    )
+    return PlanResult((TaskResult(task_id="oneshot", status="succeeded", exit_code=0),))
+
+
 def test_tui_non_tty_keeps_legacy_bytes(monkeypatch, tmp_path):
     monkeypatch.setattr(oneshot, "run_oneshot", _scripted_run)
     out = io.StringIO()
@@ -395,6 +417,32 @@ def test_tui_non_tty_keeps_legacy_bytes(monkeypatch, tmp_path):
     text = out.getvalue()
     assert "\r\033[K" not in text
     assert "run_shell df -h OK 5ms" in text
+
+
+def test_tui_legacy_tty_uses_line_output_without_dashboard_frames(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setattr(oneshot, "run_oneshot", _scripted_run_with_response_transport)
+    out = _TtyStream()
+    assert (
+        asyncio.run(
+            tui.run_tui(
+                oneshot.OneShotConfig(repo=tmp_path),
+                input_stream=io.StringIO("hi\n"),
+                output_stream=out,
+                error_stream=io.StringIO(),
+            )
+        )
+        == 0
+    )
+    text = out.getvalue()
+    assert "run_shell df -h" in text
+    assert "OK" in text
+    assert "┌ Cambium" not in text
+    assert "live: out/s=" not in text
+    assert "response_chunk" not in text
+    assert "transport-only" not in text
 
 
 # ---------------------------------------------------------------------------

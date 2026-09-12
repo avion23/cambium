@@ -25,7 +25,7 @@ from .interactive import (
     InteractiveSessionBusyError,
     InteractiveSessionError,
 )
-from .monitor import AnsiDashboard, render_agent_lines
+from .monitor import render_agent_lines
 from .observability import ObservabilityState, SessionSnapshot
 from .provider_scheduler import QuotaLedgerError, read_quota_snapshots
 from .store import StoreError, read_events_file
@@ -596,7 +596,12 @@ def _restore_turn_transcript(
     transcript: Transcript,
 ) -> None:
     """Replay validated durable prompt/output events into the timeline tail."""
-    response_present = any(event.get("kind") == "response_chunk" for event in events)
+    response_identities = {
+        identity
+        for event in events
+        if event.get("kind") == "response_chunk"
+        and (identity := _response_identity(event)) is not None
+    }
 
     prompt_task_ids: set[str] = set()
     unassigned_prompt_seen = False
@@ -628,27 +633,22 @@ def _restore_turn_transcript(
                 else:
                     unassigned_prompt_seen = True
         elif kind == "response_chunk":
-            # Reconstruct the complete response from the trusted event stream
-            # at its correlated terminal result. Raw chunks are never replayed.
+            # Reconstruct the safe durable prefix from the trusted event stream
+            # once per correlated identity. Raw chunks are never replayed.
+            identity = _response_identity(event)
+            if identity is not None and identity not in emitted_responses:
+                prefix, _complete = reconstruct_response(events, *identity)
+                transcript._append_validated_response(prefix, stream_key=repr(identity))
+                emitted_responses.add(identity)
             continue
+        identity = _response_identity(event)
+        response_match = identity is not None and identity in response_identities
         replay_event: Mapping[str, Any] = event
         if kind == "result":
             result_summary = _event_text(payload, "summary", "output_text") or result_summary
-            if response_present:
+            if response_match:
                 replay_event = _without_result_text(event)
-        transcript.observe_event(replay_event, suppress_assistant_stream=response_present)
-        if kind != "result":
-            continue
-        identity = _response_identity(event)
-        validated = reconstruct_response(events, *identity) if identity is not None else None
-        if (
-            identity is not None
-            and validated is not None
-            and validated[1]
-            and identity not in emitted_responses
-        ):
-            transcript._append_validated_response(validated[0])
-            emitted_responses.add(identity)
+        transcript.observe_event(replay_event, suppress_assistant_stream=response_match)
 
     if not prompt_task_ids:
         plan_path = turn_dir / "plan.json"
@@ -667,11 +667,11 @@ def _restore_turn_transcript(
                     transcript.user(prompt)
                     prompt_task_ids.add(str(task.get("task_id", "")))
 
-    if response_present:
-        transcript._discard_assistant_stream()
-        transcript.finish_stream(None)
-    else:
-        transcript.finish_stream(result_summary or _restore_result_summary(turn_dir))
+    transcript.finish_stream(
+        None
+        if response_identities
+        else result_summary or _restore_result_summary(turn_dir)
+    )
 
 
 def _restore_history(
@@ -758,9 +758,6 @@ async def _run_legacy(
     from cambium.cli import ExitCode
     from cambium.supervisor import SessionAlreadyRunningError
 
-    capabilities = terminal_capabilities(out)
-    dashboard_enabled = render.should_color(out) and not quiet
-    dashboard_stream = SynchronizedOutput(out, enabled=capabilities.synchronized_output)
     failed = False
     live_render_enabled = True
     try:
@@ -781,54 +778,29 @@ async def _run_legacy(
                     else oneshot.allocate_session_dir(oneshot.resolve_repo(config.repo))
                 )
                 prompt_config = replace(config, prompt=prompt, session_root=session_dir)
-                state = ObservabilityState()
-                dashboard = AnsiDashboard(
-                    session_dir,
-                    stream=cast(TextIO, dashboard_stream),
-                    enabled=dashboard_enabled,
-                )
 
                 def _live_sink(
                     record: dict[str, Any],
-                    _state: ObservabilityState = state,
-                    _dashboard: AnsiDashboard = dashboard,
-                    _session_dir: Path = session_dir,
                 ) -> None:
                     nonlocal live_render_enabled
-                    _state.apply(record)
                     if not live_render_enabled:
                         return
 
                     def draw_live() -> None:
-                        if _dashboard.enabled:
-                            with dashboard_stream.frame():
-                                _dashboard.draw(_state.snapshot(session_dir=_session_dir))
-                        elif not quiet:
+                        if not quiet and record.get("kind") != "response_chunk":
                             _write_line(out, render.render_event_line(record, stream=out))
-                            snapshot = _state.snapshot()
-                            _write_line(
-                                out,
-                                "live: "
-                                f"out/s={snapshot.output_tokens_per_s:.1f} · "
-                                f"active={snapshot.active_agents} · "
-                                f"tokens={snapshot.total_tokens}",
-                            )
                         out.flush()
 
                     live_render_enabled = _safe_live_draw(
                         draw_live,
                         error=err,
-                        disable=lambda: setattr(_dashboard, "enabled", False),
+                        disable=lambda: None,
                     )
 
-                with dashboard:
-                    response = await oneshot.run_oneshot(
-                        prompt_config,
-                        on_event=_live_sink,
-                    )
-                    if dashboard.enabled:
-                        with dashboard_stream.frame():
-                            dashboard.draw(state.snapshot(session_dir=session_dir))
+                response = await oneshot.run_oneshot(
+                    prompt_config,
+                    on_event=_live_sink,
+                )
                 if response.exit_code != 0:
                     failed = True
             except BrokenPipeError:

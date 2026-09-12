@@ -644,6 +644,23 @@ def _stream_update(
     return None
 
 
+def _response_stream_key(record: Mapping[str, Any]) -> str | None:
+    """Return a bounded internal key for one response stream identity."""
+    task_id = record.get("task_id")
+    generation = record.get("generation")
+    request_id = record.get("request_id")
+    if (
+        isinstance(task_id, str)
+        and task_id
+        and type(generation) is int
+        and generation > 0
+        and isinstance(request_id, str)
+        and request_id
+    ):
+        return repr((task_id, generation, request_id))
+    return request_id if isinstance(request_id, str) and request_id else None
+
+
 def _duration_ms(value: Any) -> int | float | None:
     if type(value) not in (int, float):
         return None
@@ -1179,7 +1196,9 @@ class Transcript:
         self._stream_truncated = True
         return "…\n" + text[-(_STREAM_TEXT_LIMIT - 2) :]
 
-    def _append_response_chunk(self, role: str, text: str) -> None:
+    def _append_response_chunk(
+        self, role: str, text: str, *, stream_key: str | None = None
+    ) -> None:
         """Append one bounded durable response frame to normal timeline history.
 
         Durable response chunks are already redacted and split by the
@@ -1195,27 +1214,29 @@ class Transcript:
         clean = _sanitize(text)
         if not clean or _is_private_runtime_text(clean):
             return
-        self._append_response_entry(role, clean)
+        self._append_response_entry(role, clean, stream_key=stream_key)
 
-    def _append_response_entry(self, role: str, text: str) -> None:
+    def _append_response_entry(
+        self, role: str, text: str, *, stream_key: str | None = None
+    ) -> None:
         if self._stream_role == "tool":
             self._commit_stream()
         elif self._stream_role is not None:
-            # A durable response is canonical for the assistant stream. Do not
-            # retain a transient copy that would be rendered twice.
-            self._clear_stream()
+            # A durable response is canonical for its assistant stream. Keep a
+            # concurrent unrelated stream instead of dropping its transient
+            # text when response identities overlap in one replayed turn.
+            same_stream = stream_key is None or self._stream_message_id == stream_key
+            if role == "assistant" and not same_stream:
+                self._commit_stream()
+            else:
+                self._clear_stream()
         self._entries.append(TranscriptEntry(role=role, text=text))
 
-    def _append_validated_response(self, text: str) -> None:
-        """Append one complete supervisor-validated response to timeline history."""
+    def _append_validated_response(self, text: str, *, stream_key: str | None = None) -> None:
+        """Append one supervisor-validated durable response prefix to history."""
         clean = _sanitize(text)
         if clean and not _is_private_runtime_text(clean):
-            self._append_response_entry("assistant", clean)
-
-    def _discard_assistant_stream(self) -> None:
-        """Drop an unvalidated assistant tail when durable replay is present."""
-        if self._stream_role == "assistant":
-            self._clear_stream()
+            self._append_response_entry("assistant", clean, stream_key=stream_key)
 
     def _update_stream(
         self,
@@ -1490,12 +1511,18 @@ class Transcript:
         if kind == "response_chunk":
             if update is not None:
                 role, text, _, _ = update
-                self._append_response_chunk(role, text)
+                self._append_response_chunk(
+                    role,
+                    text,
+                    stream_key=_response_stream_key(record),
+                )
             return
         if suppress_assistant_stream and update is not None and update[0] == "assistant":
             update = None
         if update is not None:
             role, text, append, message_id = update
+            if role == "assistant":
+                message_id = _response_stream_key(record) or message_id
             tool_key: str | None = None
             if role == "tool":
                 # One stream identity per task/tool operation: concurrent
