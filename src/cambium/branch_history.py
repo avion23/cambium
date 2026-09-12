@@ -31,6 +31,26 @@ MAX_HISTORY_OUTPUT_BYTES = 32 * 1024
 MAX_CHECKPOINT_BYTES = 4 * 1024 * 1024
 MAX_MESSAGE_BYTES = 8 * 1024
 
+_TERMINAL_EVENT_KINDS = frozenset(
+    {
+        "result",
+        "result_envelope",
+        "child_result",
+        "task_failed",
+        "worker_failed",
+        "child_failed",
+        "child_rejected",
+        "worker_exit",
+        "worker_terminated",
+        "exit",
+    }
+)
+_EXIT_SUCCESS_REASONS = frozenset({"done", "succeeded", "success"})
+_EXIT_STATUS_REASONS = {
+    "cancelled": "cancelled",
+    "suspended": "suspended",
+}
+
 
 class HistoryAction(StrEnum):
     """Queries exposed by the branch-history tool."""
@@ -199,6 +219,81 @@ def _set_context_policy(branch: _Branch, event: _Event, *, resolved: bool) -> No
             branch.placement = placement
 
 
+def _terminal_task_id(event: _Event) -> str | None:
+    """Return the branch that owns a terminal event.
+
+    Child lifecycle verdicts are often emitted by the parent supervisor.  The
+    payload's child identity is therefore authoritative when one is present;
+    using the envelope owner for ``child_rejected`` would incorrectly mark the
+    parent branch instead of the rejected child.
+    """
+    child_id = event.payload.get("child_task_id")
+    if event.kind == "child_rejected":
+        return child_id if isinstance(child_id, str) and child_id else None
+    if event.kind == "child_failed":
+        if isinstance(child_id, str) and child_id:
+            return child_id
+    return event.task_id
+
+
+def _terminal_status(event: _Event) -> str:
+    """Project one durable terminal event to a truthful branch status."""
+    if event.kind in {"task_failed", "worker_failed", "child_failed"}:
+        return "failed"
+    if event.kind == "child_rejected":
+        return "rejected"
+    if event.kind == "worker_exit":
+        status = event.payload.get("status")
+        if isinstance(status, str) and status:
+            return status
+        exit_code = event.payload.get("exit_code")
+        if type(exit_code) is int:
+            return "succeeded" if exit_code == 0 else "failed"
+        return "unknown"
+    if event.kind == "exit":
+        reason = event.payload.get("reason")
+        if isinstance(reason, str):
+            normalized = reason.casefold()
+            if normalized in _EXIT_SUCCESS_REASONS:
+                return "succeeded"
+            status = _EXIT_STATUS_REASONS.get(normalized)
+            if status is not None:
+                return status
+        return "failed"
+    if event.kind == "worker_terminated":
+        return "failed"
+    status = event.payload.get("status")
+    return status if isinstance(status, str) and status else "unknown"
+
+
+def _record_child_relation(branches: dict[str, _Branch], get_branch: Any, event: _Event) -> None:
+    if event.kind == "child_admitted":
+        child = event.payload.get("child_task_id")
+        parent = event.payload.get("parent_task_id") or event.task_id
+        if isinstance(child, str) and child:
+            branch = get_branch(child)
+            branch.parent_task_id = parent if isinstance(parent, str) and parent else None
+            _set_context_policy(branch, event, resolved=False)
+        return
+    if event.kind not in {"child_failed", "child_rejected"}:
+        return
+    child = _terminal_task_id(event)
+    if child is None:
+        return
+    branch = get_branch(child)
+    parent = event.payload.get("parent_task_id") or event.task_id
+    if isinstance(parent, str) and parent and parent != child:
+        branch.parent_task_id = parent
+
+
+def _record_terminal_status(branches: dict[str, _Branch], get_branch: Any, event: _Event) -> None:
+    if event.kind not in _TERMINAL_EVENT_KINDS:
+        return
+    task_id = _terminal_task_id(event)
+    if task_id is not None:
+        get_branch(task_id).status = _terminal_status(event)
+
+
 def _branches(events: Sequence[_Event]) -> list[_Branch]:
     branches: dict[str, _Branch] = {}
 
@@ -209,13 +304,7 @@ def _branches(events: Sequence[_Event]) -> list[_Branch]:
         if event.task_id is not None:
             branch = get(event.task_id)
             branch.last_turn = max(branch.last_turn, _int(event.payload, "turn"))
-        if event.kind == "child_admitted":
-            child = event.payload.get("child_task_id")
-            parent = event.payload.get("parent_task_id")
-            if isinstance(child, str) and child:
-                branch = get(child)
-                branch.parent_task_id = parent if isinstance(parent, str) and parent else None
-                _set_context_policy(branch, event, resolved=False)
+        _record_child_relation(branches, get, event)
         if event.kind == "context_fork":
             child = event.payload.get("child_task_id")
             if isinstance(child, str) and child:
@@ -227,14 +316,7 @@ def _branches(events: Sequence[_Event]) -> list[_Branch]:
             provider = event.payload.get("provider")
             if isinstance(provider, str) and provider:
                 get(event.task_id).provider = provider
-        if event.kind in {"result", "task_failed", "worker_exit", "worker_terminated"}:
-            task_id = event.task_id
-            if task_id is None:
-                continue
-            status = event.payload.get("status")
-            if not isinstance(status, str):
-                status = "failed" if event.kind == "task_failed" else event.kind
-            get(task_id).status = status
+        _record_terminal_status(branches, get, event)
     return sorted(
         branches.values(),
         key=lambda branch: (branch.parent_task_id or "", branch.task_id),
@@ -341,8 +423,26 @@ def _regular_json(path: Path) -> dict[str, Any]:
     return value
 
 
-def _checkpoint_messages(path: Path) -> list[dict[str, str]]:
+def _checkpoint_messages(
+    path: Path,
+    *,
+    task_id: str | None = None,
+    generation: int | None = None,
+    turn: int | None = None,
+) -> list[dict[str, str]]:
     value = _regular_json(path)
+    for key in ("generation", "turn"):
+        actual = value.get(key)
+        if type(actual) is not int or actual <= 0:
+            raise BranchHistoryError(f"checkpoint {key} is missing or invalid")
+    for key, expected in (("task_id", task_id), ("generation", generation), ("turn", turn)):
+        actual = value.get(key)
+        if (
+            expected is not None
+            and actual is not None
+            and (type(actual) is not type(expected) or actual != expected)
+        ):
+            raise BranchHistoryError(f"checkpoint {key} does not match the recorded tool exchange")
     candidates: Any = value.get("transcript")
     if candidates is None:
         content = value.get("content")
@@ -402,12 +502,12 @@ def _extract_tool_exchange(
         content = message.get("content", "")
         try:
             action = json.loads(content)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError):
             continue
         if not isinstance(action, Mapping) or action.get("type") != "tool_call":
             continue
         calls = action.get("calls") if "calls" in action else [action]
-        if not isinstance(calls, list) or batch_index >= len(calls):
+        if not isinstance(calls, list) or batch_index < 0 or batch_index >= len(calls):
             continue
         selected_call = calls[batch_index]
         if not isinstance(selected_call, Mapping) or selected_call.get("name") != tool:
@@ -430,6 +530,32 @@ def _extract_tool_exchange(
     return "", ""
 
 
+_TOOL_OBSERVATION_RE = re.compile(
+    r"\Atool (?P<name>\S+) ok=(?P<ok>true|false)(?:\n|\Z)", re.IGNORECASE
+)
+
+
+def _validate_tool_event(event: _Event) -> tuple[str, bool]:
+    tool = event.payload.get("tool")
+    if not isinstance(tool, str) or not tool.strip():
+        raise BranchHistoryError("tool event has no valid tool name")
+    ok = event.payload.get("ok")
+    if type(ok) is not bool:
+        raise BranchHistoryError("tool event has no valid boolean result")
+    return tool, ok
+
+
+def _validate_tool_observation(observation: str, tool: str, expected_ok: bool) -> None:
+    match = _TOOL_OBSERVATION_RE.match(observation)
+    if match is None:
+        raise BranchHistoryError("recorded tool observation is missing its exact header")
+    if match.group("name") != tool:
+        raise BranchHistoryError("recorded tool observation does not match the tool event")
+    observed_ok = match.group("ok").casefold() == "true"
+    if observed_ok != expected_ok:
+        raise BranchHistoryError("recorded tool observation disagrees with the tool event")
+
+
 def _read_tool(events: Sequence[_Event], ref: Any) -> str:
     task_id, generation, turn, batch_index, session = _parse_tool_ref(ref)
     matches = [
@@ -445,25 +571,34 @@ def _read_tool(events: Sequence[_Event], ref: Any) -> str:
             "ambiguous tool ref across interactive turns; list tools for scoped refs"
         )
     event = matches[-1]
-    tool = event.payload.get("tool")
-    tool_name = tool if isinstance(tool, str) else "unknown"
+    tool_name, tool_ok = _validate_tool_event(event)
     lines = [
         str(ref),
         f"branch={branch_ref(task_id)} generation={generation} turn={turn} "
         f"batch_index={batch_index}",
-        f"tool={tool_name} ok={str(bool(event.payload.get('ok'))).lower()} ",
+        f"tool={tool_name} ok={str(tool_ok).lower()} ",
         f"cmd={event.payload.get('cmd', '-')}",
     ]
     checkpoint = _checkpoint_event(events, task_id, generation, turn, session=event.session)
-    if checkpoint is not None:
-        state_ref = checkpoint.payload.get("state_ref")
-        if isinstance(state_ref, str):
-            messages = _checkpoint_messages(Path(state_ref).expanduser().resolve())
-            action, observation = _extract_tool_exchange(messages, tool_name, batch_index)
-            if action:
-                lines.extend(("assistant_action:", _bounded(action, MAX_MESSAGE_BYTES)))
-            if observation:
-                lines.extend(("tool_observation:", _bounded(observation, MAX_MESSAGE_BYTES)))
+    if checkpoint is None:
+        raise BranchHistoryError(f"tool call has no matching checkpoint evidence: {ref}")
+    state_ref = checkpoint.payload.get("state_ref")
+    if not isinstance(state_ref, str) or not state_ref:
+        raise BranchHistoryError(f"tool call checkpoint has no state_ref: {ref}")
+    messages = _checkpoint_messages(
+        Path(state_ref).expanduser(),
+        task_id=task_id,
+        generation=generation,
+        turn=turn,
+    )
+    action, observation = _extract_tool_exchange(messages, tool_name, batch_index)
+    if not action:
+        raise BranchHistoryError(f"tool call has no matching assistant action: {ref}")
+    if not observation:
+        raise BranchHistoryError(f"tool call has no matching observation: {ref}")
+    _validate_tool_observation(observation, tool_name, tool_ok)
+    lines.extend(("assistant_action:", _bounded(action, MAX_MESSAGE_BYTES)))
+    lines.extend(("tool_observation:", _bounded(observation, MAX_MESSAGE_BYTES)))
     return _bounded("\n".join(lines))
 
 
@@ -474,7 +609,7 @@ def _latest_transcript(events: Sequence[_Event], task_id: str, offset: int, limi
     state_ref = checkpoint.payload.get("state_ref")
     if not isinstance(state_ref, str):
         raise BranchHistoryError(f"branch checkpoint has no state_ref: {task_id}")
-    messages = _checkpoint_messages(Path(state_ref).expanduser().resolve())
+    messages = _checkpoint_messages(Path(state_ref).expanduser())
     lines = [f"branch={branch_ref(task_id)} messages={len(messages)}"]
     for index, message in enumerate(messages):
         content = _bounded(message["content"], MAX_MESSAGE_BYTES)

@@ -21,6 +21,8 @@ def _write_session(
     checkpoint.write_text(
         json.dumps(
             {
+                "generation": 1,
+                "turn": 2,
                 "transcript": [
                     {"role": "user", "content": "inspect parser"},
                     {
@@ -37,7 +39,7 @@ def _write_session(
                         "role": "user",
                         "content": f"tool read_batch ok=True\n{evidence}",
                     },
-                ]
+                ],
             }
         ),
         encoding="utf-8",
@@ -217,6 +219,8 @@ def test_batched_tool_calls_have_distinct_retrievable_references(tmp_path: Path)
     checkpoint.write_text(
         json.dumps(
             {
+                "generation": 1,
+                "turn": 2,
                 "transcript": [
                     {"role": "user", "content": "inspect parser"},
                     {
@@ -243,7 +247,7 @@ def test_batched_tool_calls_have_distinct_retrievable_references(tmp_path: Path)
                     },
                     {"role": "user", "content": "tool read_batch ok=True\nalpha evidence"},
                     {"role": "user", "content": "tool read_batch ok=True\nbeta evidence"},
-                ]
+                ],
             }
         ),
         encoding="utf-8",
@@ -298,3 +302,163 @@ def test_unknown_tool_reference_fails_cleanly(tmp_path: Path) -> None:
             session,
             {"action": "tool", "ref": tool_ref("missing", 1, 1)},
         )
+
+
+def test_branch_listing_projects_all_terminal_event_forms(tmp_path: Path) -> None:
+    session = tmp_path / "terminal-events"
+    event_dir = session / ".cambium"
+    event_dir.mkdir(parents=True)
+    events = [
+        {
+            "seq": 1,
+            "kind": "child_admitted",
+            "task_id": "parent",
+            "payload": {
+                "parent_task_id": "parent",
+                "child_task_id": "child-rejected",
+            },
+        },
+        {
+            "seq": 2,
+            "kind": "worker_failed",
+            "task_id": "worker-failed",
+            "payload": {"reason": "provider unavailable"},
+        },
+        {
+            "seq": 3,
+            "kind": "child_failed",
+            "task_id": "child-failed",
+            "payload": {
+                "parent_task_id": "parent",
+                "reason": "timeout",
+            },
+        },
+        {
+            "seq": 4,
+            "kind": "child_rejected",
+            "task_id": "parent",
+            "payload": {
+                "parent_task_id": "parent",
+                "child_task_id": "child-rejected",
+                "reason": "ChildPolicyError",
+            },
+        },
+        {
+            "seq": 5,
+            "kind": "exit",
+            "task_id": "exit-succeeded",
+            "payload": {"reason": "done"},
+        },
+        {
+            "seq": 6,
+            "kind": "exit",
+            "task_id": "exit-cancelled",
+            "payload": {"reason": "cancelled"},
+        },
+        {
+            "seq": 7,
+            "kind": "exit",
+            "task_id": "exit-suspended",
+            "payload": {"reason": "suspended"},
+        },
+        {
+            "seq": 8,
+            "kind": "exit",
+            "task_id": "exit-failed",
+            "payload": {"reason": "crash"},
+        },
+        {
+            "seq": 9,
+            "kind": "worker_exit",
+            "task_id": "worker-exit",
+            "payload": {"exit_code": 0},
+        },
+        {
+            "seq": 10,
+            "kind": "worker_exit",
+            "task_id": "worker-exit-unknown",
+            "payload": {},
+        },
+        {
+            "seq": 11,
+            "kind": "worker_terminated",
+            "task_id": "worker-terminated",
+            "payload": {"status": "terminated"},
+        },
+        {
+            "seq": 12,
+            "kind": "child_rejected",
+            "task_id": "parent",
+            "payload": {"reason": "missing child identity"},
+        },
+    ]
+    (event_dir / "events.db").write_text(
+        "".join(json.dumps(event) + "\n" for event in events), encoding="utf-8"
+    )
+
+    output = query_branch_history(session, {"action": "branches"})
+
+    assert "branch:worker-failed parent=- status=failed" in output
+    assert "branch:child-failed parent=parent status=failed" in output
+    assert "branch:child-rejected parent=parent status=rejected" in output
+    assert "branch:exit-succeeded parent=- status=succeeded" in output
+    assert "branch:exit-cancelled parent=- status=cancelled" in output
+    assert "branch:exit-suspended parent=- status=suspended" in output
+    assert "branch:exit-failed parent=- status=failed" in output
+    assert "branch:worker-exit parent=- status=succeeded" in output
+    assert "branch:worker-exit-unknown parent=- status=unknown" in output
+    assert "branch:worker-terminated parent=- status=failed" in output
+    assert "branch:parent parent=- status=unknown" in output
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("checkpoint", "checkpoint evidence"),
+        ("checkpoint_generation", "checkpoint generation"),
+        ("checkpoint_turn", "checkpoint turn"),
+        ("action", "assistant action"),
+        ("observation", "observation"),
+        ("observation_tool", "does not match"),
+        ("observation_ok", "disagrees"),
+        ("event_tool", "valid tool name"),
+        ("event_ok", "boolean result"),
+    ],
+)
+def test_tool_reopen_fails_without_matching_recorded_exchange(
+    tmp_path: Path, mutation: str, message: str
+) -> None:
+    session = _write_session(tmp_path)
+    events_path = session / ".cambium" / "events.db"
+    events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+    checkpoint = session / ".cambium" / "checkpoints" / "child" / "turn-002.json"
+    document = json.loads(checkpoint.read_text(encoding="utf-8"))
+
+    if mutation == "checkpoint":
+        events = [event for event in events if event["kind"] != "checkpoint"]
+    elif mutation == "checkpoint_generation":
+        document.pop("generation")
+    elif mutation == "checkpoint_turn":
+        document.pop("turn")
+    elif mutation == "action":
+        document["transcript"][1]["content"] = json.dumps(
+            {"type": "tool_call", "name": "write_file", "arguments": {}}
+        )
+    elif mutation == "observation":
+        document["transcript"] = document["transcript"][:-1]
+    elif mutation == "observation_tool":
+        document["transcript"][2]["content"] = "tool write_file ok=True\nparser evidence"
+    elif mutation == "observation_ok":
+        document["transcript"][2]["content"] = "tool read_batch ok=False\nparser evidence"
+    elif mutation == "event_tool":
+        next(event for event in events if event["kind"] == "tool_event")["payload"]["tool"] = ""
+    elif mutation == "event_ok":
+        next(event for event in events if event["kind"] == "tool_event")["payload"]["ok"] = 1
+    else:  # pragma: no cover - guarded by the parameter table
+        raise AssertionError(mutation)
+
+    checkpoint.write_text(json.dumps(document), encoding="utf-8")
+    events_path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+
+    with pytest.raises(BranchHistoryError, match=message):
+        query_branch_history(session, {"action": "tool", "ref": tool_ref("child", 1, 2)})

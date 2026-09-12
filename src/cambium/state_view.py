@@ -2,13 +2,57 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 from .branch_history import _session_event_stores
 from .branch_state import BranchState, Identity, inspect_state, reduce
 from .situation import render_situation_frame
 from .store import read_events_file
+
+
+def _is_child_admission_for(event: Mapping[str, Any], task_id: str) -> bool:
+    """Return whether a parent-owned admission names ``task_id``."""
+
+    if event.get("kind") != "child_admitted":
+        return False
+    payload = event.get("payload")
+    return isinstance(payload, Mapping) and payload.get("child_task_id") == task_id
+
+
+def _project_child_admission(
+    state: BranchState, event: Mapping[str, Any], task_id: str
+) -> BranchState:
+    """Promote one parent-owned admission into the focused child state.
+
+    ``child_admitted`` is owned by the parent, but its durable payload is the
+    only evidence for a child that has not started yet.  The reducer already
+    validates and records that event as a child, so use it once and promote
+    the resulting child fields into the focused branch identity instead of
+    manufacturing a child-owned event.
+    """
+
+    admitted = reduce(state, event)
+    child = next(
+        (candidate for candidate in admitted.children if candidate.branch_id == task_id),
+        None,
+    )
+    if child is None:
+        raise ValueError(f"child admission did not record child {task_id}")
+    return replace(
+        admitted,
+        identity=replace(
+            admitted.identity,
+            branch_id=task_id,
+            parent_branch_id=child.parent_branch_id,
+            generation=child.generation,
+            lifecycle=child.lifecycle,
+            turn=child.turn,
+        ),
+        children=tuple(candidate for candidate in admitted.children if candidate is not child),
+    )
 
 
 def load_state(session_dir: str | Path, task_id: str | None = None) -> BranchState:
@@ -20,12 +64,18 @@ def load_state(session_dir: str | Path, task_id: str | None = None) -> BranchSta
         if task_id is None:
             state = inspect_state(events)
         else:
-            if not any(event.get("task_id") == task_id for event in events):
+            if not any(
+                event.get("task_id") == task_id or _is_child_admission_for(event, task_id)
+                for event in events
+            ):
                 continue
             descendants = {task_id}
             state = BranchState(identity=Identity(branch_id=task_id))
             for event in events:
                 payload = dict(event.get("payload") or {})
+                if _is_child_admission_for(event, task_id):
+                    state = _project_child_admission(state, event, task_id)
+                    continue
                 if payload.get("parent_task_id") in descendants:
                     child = payload.get("child_task_id")
                     if isinstance(child, str):

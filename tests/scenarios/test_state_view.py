@@ -13,6 +13,37 @@ from cambium.tui import _command_output
 from cambium.worker import _strip_situation_frame
 
 
+def test_inspection_can_focus_a_queued_admitted_child(tmp_path):
+    path = tmp_path / ".cambium" / "events.db"
+    path.parent.mkdir()
+    store = EventStore(path)
+    try:
+        store.append(
+            {
+                "kind": "child_admitted",
+                "task_id": "root",
+                "payload": {
+                    "parent_task_id": "root",
+                    "child_task_id": "queued-review",
+                    "child_kind": "review",
+                },
+            }
+        )
+        state = load_state(tmp_path, "queued-review")
+        assert state.identity.branch_id == "queued-review"
+        assert state.identity.parent_branch_id == "root"
+        assert state.lifecycle.value == "queued"
+        assert state.children == ()
+        assert state.mission.objective is None
+        assert state.result is None
+        assert state.source_watermark == 1
+        assert state.last_event_kind == "child_admitted"
+        assert state.last_event_seq == 1
+        assert "lifecycle: queued" in state_text(tmp_path, "queued-review")
+    finally:
+        store.close()
+
+
 def test_inspection_does_not_interleave_turns_and_can_focus_a_child(tmp_path, monkeypatch):
     root = tmp_path / "session"
     for turn, objective in ((1, "obsolete task"), (2, "current task")):
