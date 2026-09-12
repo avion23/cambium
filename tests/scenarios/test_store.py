@@ -243,12 +243,14 @@ def test_large_event_store_cursor_stays_within_read_cap(tmp_path, monkeypatch) -
 def test_crash_durability_critical_events_survive(tmp_path) -> None:
     path = tmp_path / "crash" / "events.db"
     n = 50
+    critical_kinds = ("result", "checkpoint", "usage_event", "child_result", "child_failed")
     script = (
         "import os, sys\n"
         "from cambium.store import EventStore\n"
         "store = EventStore(sys.argv[1])\n"
+        f"kinds = {critical_kinds!r}\n"
         f"for i in range({n}):\n"
-        "    kind = 'result' if i % 2 == 0 else 'checkpoint'\n"
+        "    kind = kinds[i % len(kinds)]\n"
         "    store.append({'kind': kind, 'payload': {'i': i}, 'task_id': 't'})\n"
         "os._exit(9)\n"
     )

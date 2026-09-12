@@ -106,6 +106,13 @@ CRITICAL_KINDS = frozenset(
         "context_epoch_advanced",
         "compaction_failed",
         "child_admitted",
+        # Provider usage carries the authoritative success/failure evidence
+        # used by retries, fallback, quota accounting, and replay.
+        "usage_event",
+        # Child outcomes are the durable state consumed by parent joins and
+        # resume, so queue pressure must not silently erase them.
+        "child_result",
+        "child_failed",
         # These lifecycle verdicts can invalidate a provisional successful
         # result during replay, so dropping one must not revive response text.
         "worker_failed",
