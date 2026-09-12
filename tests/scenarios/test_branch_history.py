@@ -304,6 +304,13 @@ def test_unknown_tool_reference_fails_cleanly(tmp_path: Path) -> None:
         )
 
 
+def test_legacy_tool_reference_without_batch_index_is_rejected(tmp_path: Path) -> None:
+    session = _write_session(tmp_path)
+
+    with pytest.raises(BranchHistoryError, match="generation>:<turn>:<index>"):
+        query_branch_history(session, {"action": "tool", "ref": "tool:child:1:2"})
+
+
 def test_branch_listing_projects_all_terminal_event_forms(tmp_path: Path) -> None:
     session = tmp_path / "terminal-events"
     event_dir = session / ".cambium"

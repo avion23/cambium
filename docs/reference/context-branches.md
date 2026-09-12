@@ -145,9 +145,6 @@ the reference returned by `tools`; do not remove its suffix. An unscoped
 reference matching several interactive turns is rejected as ambiguous rather
 than returning whichever event happened to be last.
 
-Older three-coordinate tool references remain readable as index zero when
-unambiguous because existing durable sessions use them.
-
 ## Tools, prompts, and future state
 
 The active schema exposes `write_file`, `edit_file`, `git_op`, `run_shell`,

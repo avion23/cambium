@@ -106,14 +106,13 @@ def _parse_tool_ref(value: Any) -> tuple[str, int, int, int, str | None]:
     if separator and not re.fullmatch(r"turn-[0-9]+", session):
         raise BranchHistoryError("tool ref session must be turn-<number>")
     parts = identity.split(":")
-    if len(parts) not in (4, 5) or parts[0] != "tool":
-        raise BranchHistoryError("tool ref must be tool:<task>:<generation>:<turn>[:<index>]")
-    legacy = len(parts) == 4
+    if len(parts) != 5 or parts[0] != "tool":
+        raise BranchHistoryError("tool ref must be tool:<task>:<generation>:<turn>:<index>")
     try:
         task_id = unquote(parts[1])
         generation = int(parts[2])
         turn = int(parts[3])
-        batch_index = int(parts[4]) if not legacy else 0
+        batch_index = int(parts[4])
     except ValueError:
         raise BranchHistoryError("tool ref generation, turn, and index must be integers") from None
     if not task_id or generation < 0 or turn < 1 or batch_index < 0:
