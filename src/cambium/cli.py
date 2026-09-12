@@ -460,8 +460,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     tui = commands.add_parser(
         "tui",
-        help="start the terminal dashboard",
-        description="Start the Cambium terminal dashboard.",
+        help="start the terminal interface",
+        description="Start the Cambium terminal interface.",
     )
     _add_routing_budget_arguments(tui)
     tui.add_argument(

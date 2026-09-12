@@ -103,7 +103,7 @@ class RecentEvent:
 
 @dataclass(frozen=True, slots=True)
 class SessionSnapshot:
-    """Immutable dashboard state derived from one ordered event prefix."""
+    """Immutable session projection derived from one ordered event prefix."""
 
     session_status: str
     agents: tuple[AgentSnapshot, ...]
@@ -584,7 +584,7 @@ class ObservabilityState:
             if "tool" in payload and payload.get("tool") is None:
                 # A heartbeat with tool=None is an explicit "no tool running"
                 # signal (the worker clears the field after each tool); keep
-                # the operator rail from showing a completed tool forever.
+                # the transient status row from showing a completed tool forever.
                 agent.tool = None
             else:
                 tool = _string(payload.get("tool"))
