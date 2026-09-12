@@ -265,9 +265,28 @@ def test_should_color_mirrors_render_markdown_if_tty_gate(
     assert should_color(sys.stdout) is False
 
 
+@pytest.mark.parametrize("term", ["DUMB", " dumb ", "\tdUmB\t", "   "])
+def test_should_color_uses_normalized_terminal_capabilities(
+    monkeypatch: pytest.MonkeyPatch, term: str
+) -> None:
+    stream = _TtyStream()
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("TERM", term)
+
+    assert should_color(stream) is False
+
+    monkeypatch.setenv("TERM", " xterm-256color ")
+    assert should_color(stream) is True
+
+    # NO_COLOR disables color by presence, including an explicitly empty value.
+    monkeypatch.setenv("NO_COLOR", "")
+    assert should_color(stream) is False
+
+
 def test_severity_accents_on_only_for_color_capable_stream(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _color_stream(monkeypatch)
     tty = _TtyStream()
     ok = _line(
         "tool_event",
@@ -541,6 +560,12 @@ def test_display_width_handles_wide_and_combining_text(monkeypatch: object) -> N
     _fixed_columns(monkeypatch, 80)
     line = render_status_bar(_bar_events(), session_label="界e\u0301")
     assert _display_width(line) == 80
+
+
+def test_display_width_uses_grapheme_cells_and_surrogate_safe_text() -> None:
+    assert _display_width("👍🏽") == 2
+    assert _display_width("👩‍💻x") == 3
+    assert _display_width("left\ud800right") == len(r"left\ud800right")
 
 
 def test_tokens_per_s_skips_huge_integer_latency() -> None:

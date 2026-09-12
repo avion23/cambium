@@ -23,6 +23,7 @@ from cambium.terminal import (
     terminal_capabilities,
     terminal_color_depth,
     terminal_display_width,
+    terminal_grapheme_spans,
 )
 from cambium.terminal_input import TerminalInput
 
@@ -158,6 +159,21 @@ def test_terminal_text_sanitizes_lone_surrogates_and_grapheme_cells() -> None:
     clean = sanitize_terminal_text("left\ud800right\udfff")
     assert clean == r"left\ud800right\udfff"
     clean.encode("utf-8")
+
+    text = sanitize_terminal_text("👍🏽👩‍💻🇺🇸e\u0301界", single_line=True)
+    spans = terminal_grapheme_spans("👍🏽👩‍💻🇺🇸e\u0301界")
+    assert [(text[start:end], width) for start, end, width in spans] == [
+        ("👍🏽", 2),
+        ("👩‍💻", 2),
+        ("🇺🇸", 2),
+        ("e\u0301", 1),
+        ("界", 2),
+    ]
+
+    surrogate_text = sanitize_terminal_text("left\ud800right", single_line=True)
+    surrogate_spans = terminal_grapheme_spans("left\ud800right")
+    assert "\ud800" not in surrogate_text
+    assert all("\ud800" not in surrogate_text[start:end] for start, end, _ in surrogate_spans)
 
     assert terminal_display_width("👍🏽👩‍💻e\u0301界") == 2 + 2 + 1 + 2
     assert clip_terminal_text("👍🏽👩‍💻", 3) == "👍🏽…"

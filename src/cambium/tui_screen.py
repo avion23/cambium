@@ -37,6 +37,7 @@ from .terminal import (
     supports_cursor_controls,
     terminal_color_depth,
     terminal_display_width,
+    terminal_grapheme_spans,
 )
 
 try:
@@ -416,35 +417,63 @@ def _char_width(char: str) -> int:
 
 
 def _display_width(text: str) -> int:
-    return sum(_char_width(char) for char in _visible(text))
+    return terminal_display_width(text)
 
 
-def _take_display_width(text: str, width: int) -> tuple[str, str]:
-    """Split text at a terminal column boundary without splitting code points."""
-    if width <= 0:
-        return "", text
-    used = 0
-    rendered = _safe_rendered(text)
-    left: list[str] = []
+def _rendered_visible_offsets(rendered: str) -> tuple[str, list[int]]:
+    """Return visible text and rendered offsets for each visible code point."""
+    visible_chars: list[str] = []
+    visible_offsets: list[int] = []
     index = 0
     while index < len(rendered):
         match = _ANSI_STYLE.match(rendered, index)
-        if match is not None:
-            code = match.group(0)
-            if _safe_sgr(code):
-                left.append(code)
-                index = match.end()
-                continue
-        char = rendered[index]
-        char_width = _char_width(char)
-        if used and used + char_width > width:
-            return "".join(left), rendered[index:]
-        if not used and char_width > width:
-            return "", rendered[index:]
-        left.append(char)
-        used += char_width
+        if match is not None and _safe_sgr(match.group(0)):
+            index = match.end()
+            continue
+        visible_chars.append(rendered[index])
+        visible_offsets.append(index)
         index += 1
-    return rendered, ""
+    return "".join(visible_chars), visible_offsets
+
+
+def _take_first_grapheme(text: str) -> tuple[str, str]:
+    """Split styled text after its first grapheme, retaining renderer SGR."""
+    rendered = _safe_rendered(text)
+    visible, visible_offsets = _rendered_visible_offsets(rendered)
+    spans = terminal_grapheme_spans(visible)
+    if not spans:
+        return rendered, ""
+    end = visible_offsets[spans[0][1] - 1] + 1
+    return rendered[:end], rendered[end:]
+
+
+def _take_display_width(text: str, width: int) -> tuple[str, str]:
+    """Split styled text at a terminal column boundary without splitting graphemes."""
+    rendered = _safe_rendered(text)
+    if width <= 0:
+        return "", rendered
+
+    # Keep renderer-owned SGR sequences in the returned halves while asking
+    # the shared terminal helper for grapheme boundaries and cell widths.
+    visible, visible_offsets = _rendered_visible_offsets(rendered)
+    spans = terminal_grapheme_spans(visible)
+    if not spans:
+        return rendered, ""
+    if terminal_display_width(rendered) <= width:
+        return rendered, ""
+
+    used = 0
+    for start, end, span_width in spans:
+        if used and used + span_width > width:
+            split = visible_offsets[start]
+            return rendered[:split], rendered[split:]
+        if not used and span_width > width:
+            # Keep any leading SGR with the tail.  The caller can then render
+            # the grapheme as a whole instead of receiving a partial cluster.
+            return "", rendered
+        used += span_width
+        split = visible_offsets[end - 1] + 1
+    return rendered[:split], rendered[split:]
 
 
 def _clip(text: str, width: int) -> str:
@@ -2154,7 +2183,10 @@ def _wrap_display_cells(line: str, width: int) -> list[str]:
         while remaining:
             head, tail = _take_display_width(remaining, width)
             if not head:
-                head, tail = "?", remaining[1:]
+                _, tail = _take_first_grapheme(remaining)
+                if tail == remaining:
+                    tail = remaining[1:]
+                head = "?"
             pieces.append(head)
             remaining = tail
         output.extend(pieces[:-1])
@@ -2327,7 +2359,10 @@ def _wrap_markdown(text: str, width: int) -> list[str]:
                 head, tail = _take_display_width(chunk, line_width)
                 if not head:
                     # Keep this helper bounded for direct callers too.
-                    head, tail = "?", chunk[1:]
+                    _, tail = _take_first_grapheme(chunk)
+                    if tail == chunk:
+                        tail = chunk[1:]
+                    head = "?"
                 output_lines.append(head)
                 chunk = tail
             output_lines.append(chunk)
@@ -3153,10 +3188,22 @@ class LinearTimeline:
         text = display(text)
         cursor = len(before)
         room = max(1, self._last_size.columns - _display_width(label) - 3)
+        spans = terminal_grapheme_spans(text)
+        # The editor normally keeps the cursor on a grapheme boundary. Clamp
+        # defensively when display sanitization changes a code-point index.
+        cursor = min(cursor, len(text))
+        for span_start, span_end, _span_width in spans:
+            if span_start < cursor < span_end:
+                cursor = span_start
+                break
         start, cells = cursor, 0
-        while start and cells + _display_width(text[start - 1]) < room - 1:
-            start -= 1
-            cells += _display_width(text[start])
+        for span_start, span_end, span_width in reversed(spans):
+            if span_end > cursor:
+                continue
+            if cells + span_width >= room - 1:
+                break
+            start = span_start
+            cells += span_width
         marker = "‹" if start else ""
         rendered = _clip(marker + text[start:], room)
         cursor_cells = _display_width(marker + text[start:cursor])

@@ -20,10 +20,8 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import shutil
 import sys
-import unicodedata
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
@@ -31,7 +29,7 @@ from typing import Any
 
 from .results import CHILD_RESULT_KEYS, ROOT_RESULT_KEYS, Result, result_to_dict
 from .stats import usage_stats_from_events
-from .terminal import sanitize_terminal_text
+from .terminal import sanitize_terminal_text, terminal_color_depth, terminal_display_width
 
 _SUPERVISOR_RESULT_FIELDS = frozenset(
     {
@@ -86,18 +84,12 @@ _DIM = "\x1b[2m"
 def should_color(stream: Any = None) -> bool:
     """Return whether ``stream`` (default ``sys.stdout``) may receive ANSI color.
 
-    Mirrors the ``render_markdown_if_tty`` gate: a tty stream, no
-    ``NO_COLOR`` in the environment, and ``TERM`` other than ``dumb``.
+    Use the shared terminal capability probe so every renderer applies the
+    same normalized ``TERM`` and ``NO_COLOR`` policy.  A zero color depth also
+    covers non-TTY streams and terminals whose capabilities are unknown.
     """
     target = sys.stdout if stream is None else stream
-    try:
-        if not bool(target.isatty()):
-            return False
-    except (AttributeError, OSError, ValueError):
-        return False
-    if os.environ.get("NO_COLOR"):
-        return False
-    return os.environ.get("TERM", "") != "dumb"
+    return terminal_color_depth(target) > 0
 
 
 def _accent(text: str, code: str, stream: Any = None) -> str:
@@ -374,14 +366,8 @@ def _sanitize_field(text: str) -> str:
 
 
 def _display_width(text: str) -> int:
-    return sum(
-        0
-        if unicodedata.combining(char)
-        else 2
-        if unicodedata.east_asian_width(char) in {"W", "F"}
-        else 1
-        for char in text
-    )
+    """Return the sanitized terminal-cell width of ``text``."""
+    return terminal_display_width(text)
 
 
 def _scalar(value: Any) -> str:

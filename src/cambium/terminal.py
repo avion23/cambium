@@ -322,16 +322,52 @@ def _cell_len(text: str) -> int:
     return cell_len(text)
 
 
+def _is_regional_indicator(char: str) -> bool:
+    return "\U0001F1E6" <= char <= "\U0001F1FF"
+
+
 def _grapheme_spans(text: str) -> list[tuple[int, int, int]]:
     """Return Rich grapheme spans, with a dependency-light code-point fallback."""
     try:
         from rich.cells import split_graphemes
     except ImportError:
-        return [
+        spans = [
             (index, index + 1, _fallback_cell_width(char))
             for index, char in enumerate(text)
         ]
-    return split_graphemes(text)[0]
+    else:
+        spans = split_graphemes(text)[0]
+    # Rich's splitter does not pair regional indicators (the two symbols in a
+    # flag) even though UAX #29 treats each pair as one extended grapheme.
+    # Merge adjacent one-code-point RI spans in pairs so clipping cannot place
+    # half a flag on the next terminal row.
+    merged: list[tuple[int, int, int]] = []
+    for start, end, width in spans:
+        if (
+            merged
+            and end == start + 1
+            and merged[-1][1] == start
+            and merged[-1][1] == merged[-1][0] + 1
+            and _is_regional_indicator(text[merged[-1][0]])
+            and _is_regional_indicator(text[start])
+        ):
+            previous_start, _previous_end, previous_width = merged.pop()
+            merged.append((previous_start, end, previous_width + width))
+        else:
+            merged.append((start, end, width))
+    return merged
+
+
+def terminal_grapheme_spans(value: Any) -> list[tuple[int, int, int]]:
+    """Return grapheme spans and cell widths for sanitized single-line text.
+
+    Each span is ``(start, end, width)`` using code-point offsets in the
+    returned value of :func:`sanitize_terminal_text` with ``single_line=True``.
+    Sanitizing before splitting keeps terminal controls and lone surrogates out
+    of the grapheme metric implementation.
+    """
+
+    return _grapheme_spans(sanitize_terminal_text(value, single_line=True))
 
 
 def _cell_width(char: str) -> int:
@@ -393,4 +429,5 @@ __all__ = [
     "terminal_capabilities",
     "terminal_color_depth",
     "terminal_display_width",
+    "terminal_grapheme_spans",
 ]

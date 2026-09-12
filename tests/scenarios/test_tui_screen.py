@@ -18,6 +18,9 @@ from cambium.tui_screen import (
     ActivityState,
     LinearTimeline,
     Transcript,
+    _clip,
+    _display_width,
+    _take_display_width,
     _visible,
     render_markdown_lines,
 )
@@ -93,6 +96,28 @@ def _timeline_output(
                 cumulative_line=cumulative_line,
             )
         return stream.getvalue()
+
+
+def test_tui_width_and_clipping_follow_terminal_graphemes() -> None:
+    assert _display_width("👍🏽") == 2
+    assert _take_display_width("👩‍💻x", 2) == ("👩‍💻", "x")
+    assert _take_display_width("🇺🇸x", 2) == ("🇺🇸", "x")
+
+    styled_head, styled_tail = _take_display_width("\x1b[31m👩‍💻x\x1b[0m", 2)
+    assert styled_head == "\x1b[31m👩‍💻"
+    assert styled_tail == "x\x1b[0m"
+    assert _clip("👩‍💻x", 3) == "👩‍💻x"
+    assert _clip("👩‍💻x", 2) == "…"
+
+
+def test_tui_width_and_clipping_escape_lone_surrogates() -> None:
+    escaped = _clip("\ud800", 6)
+    _head, tail = _take_display_width("\ud800", 0)
+
+    assert _display_width("\ud800") == 6
+    assert escaped == r"\ud800"
+    assert tail == r"\ud800"
+    escaped.encode("utf-8")
 
 
 def test_conversation_markdown_is_structured_styled_and_sanitized() -> None:
@@ -1641,6 +1666,21 @@ def test_restore_input_line_escapes_lone_surrogates_before_writing() -> None:
     rendered = stream.getvalue()
     assert r"\udc80\udc81\udc82" in rendered
     assert all(value not in rendered for value in ("\udc80", "\udc81", "\udc82"))
+
+
+def test_restore_input_line_keeps_grapheme_suffixes_intact() -> None:
+    stream = _Utf8Tty()
+    timeline = LinearTimeline(stream)
+    timeline._cursor_controls = False
+    timeline._input_active = True
+    timeline._managed_input_active = True
+    timeline._managed_input = ("a👩‍💻x", len("a👩‍💻x"))
+    timeline._input_prompt_label = "›"
+    timeline._last_size = tui_screen.os.terminal_size((9, 24))
+
+    timeline._restore_input_line("a👩‍💻x", force=True)
+
+    assert "👩‍💻x" in stream.getvalue()
 
 
 def test_live_draw_failure_is_contained_and_disables_rendering() -> None:
