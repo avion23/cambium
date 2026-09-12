@@ -57,6 +57,7 @@ def _measured_debt() -> dict[str, ProviderDebt]:
         "opencode-go": ProviderDebt(
             requests=110,
             cache_hit_count=109,
+            cache_report_count=110,
             latency_total_s=2.93 * 110,
             latency_count=110,
             last_seen=now,
@@ -64,6 +65,7 @@ def _measured_debt() -> dict[str, ProviderDebt]:
         "zai": ProviderDebt(
             requests=49,
             cache_hit_count=48,
+            cache_report_count=49,
             latency_total_s=4.58 * 49,
             latency_count=49,
             last_seen=now,
@@ -71,6 +73,7 @@ def _measured_debt() -> dict[str, ProviderDebt]:
         "codex": ProviderDebt(
             requests=56,
             cache_hit_count=7,
+            cache_report_count=56,
             latency_total_s=7.21 * 56,
             latency_count=56,
             last_seen=now,
@@ -113,6 +116,7 @@ def test_quality_score_ranks_measured_data_and_neutral_defaults() -> None:
     mapping = {
         "requests": 10,
         "cache_hit_count": 5,
+        "cache_report_count": 10,
         "latency_total_s": 10.0,
         "latency_count": 5,
         "last_seen": now,
@@ -177,6 +181,7 @@ def test_unknown_provider_keeps_priority_position_not_bottom(monkeypatch) -> Non
         "bad": ProviderDebt(
             requests=56,
             cache_hit_count=7,
+            cache_report_count=56,
             latency_total_s=7.21 * 56,
             latency_count=56,
             last_seen=now,
@@ -263,6 +268,7 @@ def test_cooldown_skips_best_quality_provider(monkeypatch) -> None:
         "p_good": ProviderDebt(
             requests=110,
             cache_hit_count=109,
+            cache_report_count=110,
             latency_total_s=2.93 * 110,
             latency_count=110,
             last_seen=now,
@@ -270,6 +276,7 @@ def test_cooldown_skips_best_quality_provider(monkeypatch) -> None:
         "p_bad": ProviderDebt(
             requests=56,
             cache_hit_count=7,
+            cache_report_count=56,
             latency_total_s=7.21 * 56,
             latency_count=56,
             last_seen=now,

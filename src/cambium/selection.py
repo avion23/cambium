@@ -99,8 +99,9 @@ def quality_score(
         expected_cost = cost / successes
     else:
         expected_cost = float(math.inf)
-    cache_hits = _bounded_int(_field(entry, "cache_hit_count", 0), requests)
-    cache_fraction = cache_hits / requests
+    cache_reports = _bounded_int(_field(entry, "cache_report_count", 0), requests)
+    cache_hits = _bounded_int(_field(entry, "cache_hit_count", 0), cache_reports)
+    cache_fraction = cache_hits / cache_reports if cache_reports else 0.0
     # ``tokens_per_s`` is folded by routing.ProviderDebt from the existing
     # usage-event output-token and latency fields.  Keep it in the final
     # tie-break dimension so configured priority, failure/SLO evidence, and

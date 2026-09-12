@@ -311,7 +311,7 @@ def test_durable_usage_events_redacted_and_missing_fields_omitted(tmp_path, monk
 
         first = usage_events[0]["payload"]
         assert first["usage"] == DEFAULT_USAGE
-        assert first["provider_cache_hit"] is False  # usage present, no cache fields
+        assert "provider_cache_hit" not in first  # usage present, no cache evidence
         assert "retry_after_s" not in first
         assert "account_quota_owner" not in first
         assert "failure_reason" not in first

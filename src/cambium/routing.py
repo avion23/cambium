@@ -136,8 +136,11 @@ class ProviderDebt:
     cost: float = 0.0
     retry_after_count: int = 0
     # Provider-reported cache hits and call latency, folded for later routing
-    # evidence (H2 uses them; H1 only records them).
+    # evidence (H2 uses them; H1 only records them). ``cache_report_count``
+    # is the denominator for reported hit/miss values; omitted evidence is
+    # not counted as a miss.
     cache_hit_count: int = 0
+    cache_report_count: int = 0
     latency_total_s: float = 0.0
     latency_count: int = 0
     # Generation throughput evidence.  ``tokens_per_s`` is the public
@@ -236,7 +239,10 @@ class ProviderDebt:
                 )
         elif not failure_present:
             self.retry_at = None
-        if event.get("provider_cache_hit") is True:
+        provider_cache_hit = event.get("provider_cache_hit")
+        if type(provider_cache_hit) is bool:
+            self.cache_report_count += 1
+        if provider_cache_hit is True:
             self.cache_hit_count += 1
         latency = event.get("latency_s")
         if isinstance(latency, int | float) and not isinstance(latency, bool):
@@ -267,6 +273,7 @@ def _debt_from_mapping(entry: Mapping[str, Any]) -> ProviderDebt:
         ("failed_requests", int),
         ("retry_after_count", int),
         ("cache_hit_count", int),
+        ("cache_report_count", int),
         ("latency_count", int),
         ("tokens_per_s_count", int),
     ):
@@ -405,6 +412,7 @@ class DebtStore:
             "failed_requests",
             "retry_after_count",
             "cache_hit_count",
+            "cache_report_count",
             "latency_count",
             "tokens_per_s_count",
         )
@@ -502,6 +510,7 @@ class DebtStore:
                     failed_requests=round(debt.failed_requests * factor),
                     retry_after_count=round(debt.retry_after_count * factor),
                     cache_hit_count=round(debt.cache_hit_count * factor),
+                    cache_report_count=round(debt.cache_report_count * factor),
                     latency_total_s=latency_total,
                     latency_count=latency_count,
                     tokens_per_s=debt.tokens_per_s if rate_count else 0.0,
@@ -549,6 +558,7 @@ class DebtStore:
                         "cost": debt.cost,
                         "retry_after_count": debt.retry_after_count,
                         "cache_hit_count": debt.cache_hit_count,
+                        "cache_report_count": debt.cache_report_count,
                         "latency_total_s": debt.latency_total_s,
                         "latency_count": debt.latency_count,
                         "tokens_per_s": debt.tokens_per_s,

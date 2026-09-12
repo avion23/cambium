@@ -15,13 +15,14 @@ NOW = 1_000_000.0
 WEIGHTS = QualityWeights()
 
 
-def _debt(*, failures=0, latency=1.0, cache=0, cost=0.0, seen=NOW):
+def _debt(*, failures=0, latency=1.0, cache=0, cache_reports=10, cost=0.0, seen=NOW):
     return {
         "requests": 10,
         "failed_requests": failures,
         "latency_count": 10,
         "latency_total_s": latency * 10,
         "cache_hit_count": cache,
+        "cache_report_count": cache_reports,
         "cost": cost,
         "last_seen": seen,
     }
@@ -118,6 +119,20 @@ def test_weights_are_tuning_seam() -> None:
     cache_first = QualityWeights(latency_weight=0, cache_weight=1)
     assert _names(_order(items, debt, weights=latency_first))[0] == "uncached_fast"
     assert _names(_order(items, debt, weights=cache_first))[0] == "cached_slow"
+
+
+def test_cache_fraction_ignores_unknown_calls() -> None:
+    items = [Item("mostly_unknown"), Item("reported_half")]
+    debt = {
+        "mostly_unknown": _debt(cache=1, cache_reports=1),
+        "reported_half": _debt(cache=5, cache_reports=10),
+    }
+    cache_only = QualityWeights(latency_weight=0, cache_weight=1)
+
+    assert _names(_order(items, debt, weights=cache_only))[0] == "mostly_unknown"
+    assert quality_score(debt["mostly_unknown"], now=NOW, weights=cache_only) < quality_score(
+        debt["reported_half"], now=NOW, weights=cache_only
+    )
 
 
 def test_empty_and_single_candidate() -> None:

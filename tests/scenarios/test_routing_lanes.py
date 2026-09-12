@@ -253,6 +253,7 @@ def test_provider_debt_folds_cache_hits_and_latency() -> None:
     debt.record({"provider": "a", "provider_cache_hit": False, "latency_s": 0.5})
     debt.record({"provider": "a"})  # no cache field, no latency field
     assert debt.cache_hit_count == 1
+    assert debt.cache_report_count == 2
     assert debt.latency_total_s == 2.0
     assert debt.latency_count == 2
     # a bogus latency value is ignored, not folded
@@ -271,6 +272,7 @@ def test_debt_store_round_trips_cache_and_latency_fields(tmp_path) -> None:
     loaded.load()
     entry = loaded.as_mapping()["a"]
     assert entry.cache_hit_count == 1
+    assert entry.cache_report_count == 1
     assert entry.latency_total_s == 1.5
     assert entry.latency_count == 1
 

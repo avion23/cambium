@@ -47,6 +47,7 @@ from cambium.diffundo import (
     ProviderStatus,
     ProviderTier,
     _codex_usage,
+    _provider_cache_hit,
     _RawResponse,
     _read_provider_response,
     prompt_prefix_bytes,
@@ -2326,7 +2327,7 @@ def test_summary_fallback_does_not_rebind_coding_provider(monkeypatch) -> None:
     assert attempts == [primary.name, primary.name, sibling.name, primary.name]
 
 
-def test_summary_auth_quarantine_defers_hard_fallback_until_agent_call(monkeypatch) -> None:
+def test_summary_auth_quarantine_does_not_move_coding_ownership(monkeypatch) -> None:
     primary = ProviderConfig(
         name="summary-auth-primary",
         tier=ProviderTier.FAST,
@@ -2350,6 +2351,7 @@ def test_summary_auth_quarantine_defers_hard_fallback_until_agent_call(monkeypat
         pause_timeout_s=0.0,
     )
     attempts: list[str] = []
+    errors: list[ProviderError] = []
 
     async def scripted_post(
         _self: Diffundo,
@@ -2384,18 +2386,22 @@ def test_summary_auth_quarantine_defers_hard_fallback_until_agent_call(monkeypat
             PROMPT,
             model=primary.model,
             allow_model_substitution=True,
+            on_provider_error=errors.append,
         )
         assert summary.provider == sibling.name
         assert router.provider_lease is not None
         assert router.provider_lease.provider == primary.name
-        assert router.health(primary.name) is HealthState.DISABLED
+        assert router.health(primary.name) is HealthState.HEALTHY
+        assert len(errors) == 1
+        assert errors[0].provider == primary.name
+        assert errors[0].outcome is ProviderOutcome.AUTH_ERROR
 
         later = await router.call(ProviderTier.FAST, PROMPT, model=primary.model)
-        assert later.provider == sibling.name
-        assert later.fell_back_from == primary.name
+        assert later.provider == primary.name
+        assert later.fell_back_from is None
 
     asyncio.run(scenario())
-    assert attempts == [primary.name, primary.name, sibling.name, sibling.name]
+    assert attempts == [primary.name, primary.name, sibling.name, primary.name]
 
 
 def test_summary_retry_after_cooldown_reaches_live_router(monkeypatch) -> None:
@@ -2725,6 +2731,19 @@ def test_usage_metric_fields_follow_provider_reports() -> None:
                 0.0,
             ),
             (200, _ok_payload("no usage"), 0.0),
+            (
+                200,
+                _ok_payload(
+                    "reported miss",
+                    usage={
+                        "prompt_tokens": 3,
+                        "completion_tokens": 1,
+                        "total_tokens": 4,
+                        "prompt_tokens_details": {"cached_tokens": 0},
+                    },
+                ),
+                0.0,
+            ),
         ]
     )
     router = Diffundo((_config("p_metric", server, "K_METRIC"),))
@@ -2732,9 +2751,13 @@ def test_usage_metric_fields_follow_provider_reports() -> None:
         r1 = asyncio.run(router.call(ProviderTier.FAST, STATIC_HEAD))
         r2 = asyncio.run(router.call(ProviderTier.FAST, STATIC_HEAD))
         r3 = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
-        assert r1.provider_cache_hit is False  # usage present, no cache fields
+        r4 = asyncio.run(router.call(ProviderTier.FAST, STATIC_HEAD))
+        assert r1.provider_cache_hit is None  # usage present, no cache fields
         assert r2.provider_cache_hit is True  # provider reports cached tokens
         assert r3.provider_cache_hit is None  # no usage -> unknown, never an error
+        assert r4.provider_cache_hit is False  # provider reports zero cached tokens
+        assert r4.usage is not None
+        assert r4.usage["cached_tokens"] == 0
         expected_prefix = len(STATIC_HEAD["messages"][0]["content"].encode("utf-8"))
         # stable prefix across turns of the same fixed prompt fixture
         assert r1.prompt_prefix_bytes == r2.prompt_prefix_bytes == expected_prefix
@@ -2746,6 +2769,22 @@ def test_usage_metric_fields_follow_provider_reports() -> None:
         assert r3.request_rate_status == "available"
     finally:
         server.close()
+
+
+@pytest.mark.parametrize(
+    ("usage", "expected"),
+    [
+        ({"prompt_tokens": 3}, None),
+        ({"prompt_tokens_details": {"cached_tokens": 0}}, False),
+        ({"prompt_tokens_details": {"cached_tokens": 2}}, True),
+        (None, None),
+    ],
+)
+def test_provider_cache_hit_requires_reported_cache_evidence(
+    usage: dict[str, Any] | None,
+    expected: bool | None,
+) -> None:
+    assert _provider_cache_hit(usage) is expected
 
 
 @pytest.mark.parametrize(
