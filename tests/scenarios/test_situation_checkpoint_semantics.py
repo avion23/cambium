@@ -207,7 +207,14 @@ def test_turn_checkpoint_preserves_explicit_inspection(tmp_path: Path) -> None:
             "tool inspect_state ok=True\n" + worker.render_situation_frame(worker.BranchState())
         ),
     }
-    path = worker._write_checkpoint_file(config, 1, [transient, observation], {}, [])
+    path = worker._write_checkpoint_file(
+        config,
+        1,
+        [transient, observation],
+        {},
+        [],
+        no_progress_actions=0,
+    )
     recorded = json.loads(path.read_text())["transcript"]
     assert "<cambium-situation " not in recorded[0]["content"]
     assert recorded[1] == observation

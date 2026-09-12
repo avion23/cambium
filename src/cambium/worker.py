@@ -209,6 +209,18 @@ MAX_CONSECUTIVE_INVALID_ACTIONS = 3
 MAX_PROGRESS_CONTENT_HASHES = 8
 MAX_PROGRESS_CONTENT_BYTES = 256 * 1024
 _READ_RESULT_HEADER_RE = re.compile(r"(?m)^--- [^\r\n]* ---\r?\n")
+# ``branch_history`` and ``inspect_state`` include a projection of the
+# worker's own event bookkeeping.  Keep the projection useful for progress
+# detection, but do not let counters and the latest evidence query itself
+# masquerade as new evidence.
+_BRANCH_HISTORY_COUNT_RE = re.compile(r"^tool_calls=([0-9]+)$")
+_BRANCH_HISTORY_TOOL_ROW_RE = re.compile(r"^tool:[^\s]+(?:\s+.*)?$")
+_BRANCH_HISTORY_TOOL_FIELD_RE = re.compile(r"(?:^|\s)tool=([^\s]+)")
+_BRANCH_HISTORY_BRANCH_COUNTER_RE = re.compile(r"\s+(?:tools|turn)=[0-9]+(?=\s|$)")
+_BRANCH_HISTORY_BRANCH_REF_RE = re.compile(r"^(branch:[^\s]+)")
+_BRANCH_HISTORY_COUNTER_VALUE_RE = re.compile(r"\s+(tools|turn)=([0-9]+)(?=\s|$)")
+_SITUATION_HEADER_BOOKKEEPING_RE = re.compile(r'\s+(?:source_watermark|frame_sha256)="[^"]*"')
+_SITUATION_SCALAR_RE = re.compile(r"^(\s+)([a-z_]+):\s*(.*)$")
 # Do not retry a provider that keeps returning invalid semantic summaries.
 MAX_CONSECUTIVE_COMPACTION_DEFERRALS = 2
 # A provider-boundary lookup may fall back to the unknown boundary, but never
@@ -3481,9 +3493,185 @@ def _progress_signature(content: str | None, action: Mapping[str, Any] | None = 
     return _cap_utf8(value, MAX_ACTION_CONTENT_BYTES)
 
 
-def _progress_content_hash(content: str) -> str:
-    """Hash a bounded UTF-8 result body and its full byte length."""
+def _progress_tool_calls(
+    tool_calls: Sequence[Mapping[str, Any]] | None,
+) -> tuple[Mapping[str, Any], ...]:
+    """Return the normalized read calls used to scope evidence cleanup."""
+    if tool_calls is None:
+        return ()
+    return tuple(call for call in tool_calls if isinstance(call, Mapping))
+
+
+def _progress_evidence_tool_names(
+    tool_calls: Sequence[Mapping[str, Any]],
+) -> frozenset[str]:
+    names = {name for call in tool_calls if isinstance((name := call.get("name")), str) and name}
+    return frozenset(names)
+
+
+_ProgressBranchRow = tuple[int | None, int | None, str]
+
+
+def _progress_branch_rows(content: str) -> dict[str, _ProgressBranchRow]:
+    """Parse branch-list rows without retaining their result body."""
+    rows: dict[str, _ProgressBranchRow] = {}
+    for line in content.splitlines():
+        reference_match = _BRANCH_HISTORY_BRANCH_REF_RE.match(line)
+        if reference_match is None:
+            continue
+        tools: int | None = None
+        turn: int | None = None
+        for counter_match in _BRANCH_HISTORY_COUNTER_VALUE_RE.finditer(line):
+            value = int(counter_match.group(2))
+            if counter_match.group(1) == "tools":
+                tools = value
+            else:
+                turn = value
+        rows[reference_match.group(1)] = (
+            tools,
+            turn,
+            _BRANCH_HISTORY_BRANCH_COUNTER_RE.sub("", line),
+        )
+    return rows
+
+
+def _replace_progress_branch_counters(
+    line: str,
+    counters: tuple[int | None, int | None],
+) -> str:
+    tools, turn = counters
+
+    def replace(match: re.Match[str]) -> str:
+        value = tools if match.group(1) == "tools" else turn
+        return match.group(0) if value is None else f" {match.group(1)}={value}"
+
+    return _BRANCH_HISTORY_COUNTER_VALUE_RE.sub(replace, line)
+
+
+def _progress_inspect_fields(
+    content: str,
+    evidence_names: frozenset[str],
+) -> tuple[str, str, str, str, bool]:
+    """Return volatile state values and whether they describe a read."""
+    current_tool = "unknown"
+    last_delta = "unknown"
+    lifecycle = "unknown"
+    last_event = "unknown"
+    for line in content.splitlines():
+        scalar_match = _SITUATION_SCALAR_RE.fullmatch(line)
+        if scalar_match is None:
+            continue
+        _indent, label, value = scalar_match.groups()
+        if label == "current_tool":
+            current_tool = value
+        elif label == "last_meaningful_delta":
+            last_delta = value
+        elif label == "lifecycle":
+            lifecycle = value
+        elif label == "last_event":
+            last_event = value
+    delta_match = re.fullmatch(r"tool\s+([^:]+):.*", last_delta)
+    delta_tool = delta_match.group(1) if delta_match is not None else None
+    is_evidence = current_tool in evidence_names or delta_tool in evidence_names
+    return current_tool, last_delta, lifecycle, last_event, is_evidence
+
+
+def _normalize_progress_content(
+    content: str,
+    tool_calls: Sequence[Mapping[str, Any]] | None = None,
+    *,
+    inspect_state_values: tuple[str, str, str, str] | None = None,
+    branch_counter_replacements: Mapping[str, tuple[int | None, int | None]] | None = None,
+    preserve_branch_counters: bool = False,
+) -> str:
+    """Remove only worker bookkeeping from observable read results.
+
+    The history/state tools read the same event stream that records their own
+    calls.  Their counters, watermarks, and latest-read fields therefore
+    change after an otherwise identical query.  Normalize those fields at the
+    worker boundary while retaining rows for other tools and all substantive
+    state/evidence.  The persisted transcript remains byte-for-byte intact.
+    """
     content = _READ_RESULT_HEADER_RE.sub("", content)
+    calls = _progress_tool_calls(tool_calls)
+    names = _progress_evidence_tool_names(calls)
+    branch_history_query = any(call.get("name") == "branch_history" for call in calls)
+    branch_tools_query = any(
+        call.get("name") == "branch_history"
+        and isinstance(call.get("arguments"), Mapping)
+        and call["arguments"].get("action") == "tools"
+        for call in calls
+    )
+    inspect_state_query = "inspect_state" in names
+    if not (branch_history_query or inspect_state_query):
+        return content
+
+    evidence_names = _EVIDENCE_READ_TOOL_NAMES | {"git_op"}
+    self_evidence_names = frozenset({"branch_history", "inspect_state"})
+    lines: list[str] = []
+    retained_tool_rows = 0
+    saw_tool_calls_count = False
+    for line in content.splitlines():
+        count_match = _BRANCH_HISTORY_COUNT_RE.fullmatch(line)
+        if count_match and branch_tools_query:
+            saw_tool_calls_count = True
+            continue
+        if branch_tools_query and line.startswith("next_offset="):
+            continue
+        if branch_tools_query and _BRANCH_HISTORY_TOOL_ROW_RE.fullmatch(line):
+            tool_match = _BRANCH_HISTORY_TOOL_FIELD_RE.search(line)
+            tool_name = tool_match.group(1) if tool_match is not None else None
+            if tool_name in self_evidence_names:
+                continue
+            retained_tool_rows += 1
+            # Duration is an event-store detail, not evidence.  Keep the
+            # target reference, command, and outcome fields unchanged.
+            line = re.sub(r"\s+duration_ms=[0-9]+(?=\s|$)", "", line)
+        if branch_history_query and line.startswith("branch:"):
+            reference_match = _BRANCH_HISTORY_BRANCH_REF_RE.match(line)
+            replacement = (
+                branch_counter_replacements.get(reference_match.group(1))
+                if reference_match is not None and branch_counter_replacements is not None
+                else None
+            )
+            if replacement is not None:
+                line = _replace_progress_branch_counters(line, replacement)
+            elif not preserve_branch_counters:
+                line = _BRANCH_HISTORY_BRANCH_COUNTER_RE.sub("", line)
+        if inspect_state_query:
+            if line.startswith("<cambium-situation "):
+                line = _SITUATION_HEADER_BOOKKEEPING_RE.sub("", line)
+            scalar_match = _SITUATION_SCALAR_RE.fullmatch(line)
+            if scalar_match is not None:
+                indent, label, value = scalar_match.groups()
+                if label == "current_tool" and inspect_state_values is not None:
+                    line = f"{indent}{label}: {inspect_state_values[0]}"
+                elif label == "current_tool" and value in evidence_names:
+                    line = f"{indent}{label}: <worker-evidence-read>"
+                elif label == "last_meaningful_delta" and inspect_state_values is not None:
+                    line = f"{indent}{label}: {inspect_state_values[1]}"
+                elif label == "last_meaningful_delta":
+                    delta_match = re.fullmatch(r"tool\s+([^:]+):.*", value)
+                    if delta_match is not None and delta_match.group(1) in evidence_names:
+                        line = f"{indent}{label}: <worker-evidence-read>"
+                elif label == "lifecycle" and inspect_state_values is not None:
+                    line = f"{indent}{label}: {inspect_state_values[2]}"
+                elif label == "last_event" and inspect_state_values is not None:
+                    line = f"{indent}{label}: {inspect_state_values[3]}"
+                elif label == "last_event" and value in {"unknown", "tool_event", "usage_event"}:
+                    line = f"{indent}{label}: <worker-bookkeeping>"
+        lines.append(line)
+    if saw_tool_calls_count:
+        lines.insert(0, f"tool_calls={retained_tool_rows}")
+    return "\n".join(lines)
+
+
+def _progress_content_hash(
+    content: str,
+    tool_calls: Sequence[Mapping[str, Any]] | None = None,
+) -> str:
+    """Hash a normalized, bounded UTF-8 result body and its full byte length."""
+    content = _normalize_progress_content(content, tool_calls)
     encoded = content.encode("utf-8")
     bounded = encoded[:MAX_PROGRESS_CONTENT_BYTES]
     return hashlib.sha256(len(encoded).to_bytes(8, "big") + bounded).hexdigest()
@@ -3498,6 +3686,9 @@ class _ProgressDetector:
         "_recent_signatures",
         "_recent_content_hashes",
         "_recent_read_pairs",
+        "_branch_snapshots",
+        "_inspect_snapshots",
+        "_bookkeeping_read_count",
         "no_progress_actions",
     )
 
@@ -3511,7 +3702,124 @@ class _ProgressDetector:
         self._recent_read_pairs: deque[tuple[str, str]] = deque(
             maxlen=MAX_PROGRESS_CONTENT_HASHES
         )
+        self._branch_snapshots: dict[
+            str,
+            tuple[
+                dict[str, _ProgressBranchRow],
+                dict[str, tuple[int | None, int | None]],
+                int,
+            ],
+        ] = {}
+        self._inspect_snapshots: dict[str, tuple[str, str, str, str]] = {}
+        self._bookkeeping_read_count = 0
         self.no_progress_actions = 0
+
+    def _remember_branch_snapshot(
+        self,
+        signature: str,
+        rows: dict[str, _ProgressBranchRow],
+        canonical: dict[str, tuple[int | None, int | None]],
+    ) -> None:
+        if signature in self._branch_snapshots:
+            del self._branch_snapshots[signature]
+        elif len(self._branch_snapshots) >= MAX_PROGRESS_CONTENT_HASHES:
+            del self._branch_snapshots[next(iter(self._branch_snapshots))]
+        self._branch_snapshots[signature] = (
+            rows,
+            canonical,
+            self._bookkeeping_read_count,
+        )
+
+    def _read_result_hash(
+        self,
+        signature: str,
+        result_content: str,
+        tool_calls: Sequence[Mapping[str, Any]],
+    ) -> str:
+        """Hash one read result after query-aware bookkeeping cleanup."""
+        calls = _progress_tool_calls(tool_calls)
+        names = _progress_evidence_tool_names(calls)
+        branch_branches_query = any(
+            call.get("name") == "branch_history"
+            and isinstance(call.get("arguments"), Mapping)
+            and call["arguments"].get("action") == "branches"
+            for call in calls
+        )
+        branch_replacements: dict[str, tuple[int | None, int | None]] = {}
+        preserve_branch_counters = branch_branches_query
+        if branch_branches_query:
+            rows = _progress_branch_rows(result_content)
+            previous = self._branch_snapshots.get(signature)
+            canonical = {key: (row[0], row[1]) for key, row in rows.items()}
+            if previous is not None:
+                previous_rows, previous_canonical, previous_reads = previous
+                intervening_reads = self._bookkeeping_read_count - previous_reads
+                changed_rows = []
+                attributable = intervening_reads >= 0
+                if attributable:
+                    for key, row in rows.items():
+                        prior = previous_rows.get(key)
+                        if prior is None or row[2] != prior[2]:
+                            attributable = False
+                            break
+                        current_tools, prior_tools = row[0], prior[0]
+                        if current_tools is None or prior_tools is None:
+                            if current_tools != prior_tools:
+                                attributable = False
+                                break
+                            continue
+                        delta = current_tools - prior_tools
+                        if delta < 0:
+                            attributable = False
+                            break
+                        if delta:
+                            changed_rows.append((key, delta))
+                    if set(previous_rows) != set(rows):
+                        attributable = False
+                    if sum(delta for _key, delta in changed_rows) != intervening_reads:
+                        attributable = False
+                    if len(changed_rows) > 1:
+                        attributable = False
+                if attributable:
+                    branch_replacements = {
+                        key: previous_canonical[key] for key, _delta in changed_rows
+                    }
+                    for key, _delta in changed_rows:
+                        canonical[key] = previous_canonical[key]
+            self._remember_branch_snapshot(signature, rows, canonical)
+        inspect_values: tuple[str, str, str, str] | None = None
+        if "inspect_state" in names:
+            current_tool, last_delta, lifecycle, last_event, is_evidence = _progress_inspect_fields(
+                result_content, _EVIDENCE_READ_TOOL_NAMES | {"git_op"}
+            )
+            if is_evidence:
+                inspect_values = self._inspect_snapshots.get(
+                    signature,
+                    (
+                        "<worker-evidence-read>",
+                        "<worker-evidence-read>",
+                        lifecycle,
+                        "<worker-bookkeeping>",
+                    ),
+                )
+            else:
+                inspect_values = (current_tool, last_delta, lifecycle, last_event)
+            self._inspect_snapshots[signature] = inspect_values
+            if len(self._inspect_snapshots) > MAX_PROGRESS_CONTENT_HASHES:
+                del self._inspect_snapshots[next(iter(self._inspect_snapshots))]
+        normalized = _normalize_progress_content(
+            result_content,
+            calls,
+            inspect_state_values=inspect_values,
+            branch_counter_replacements=branch_replacements,
+            preserve_branch_counters=preserve_branch_counters,
+        )
+        self._bookkeeping_read_count += sum(
+            1 for call in calls if call.get("name") in {"branch_history", "inspect_state"}
+        )
+        encoded = normalized.encode("utf-8")
+        bounded = encoded[:MAX_PROGRESS_CONTENT_BYTES]
+        return hashlib.sha256(len(encoded).to_bytes(8, "big") + bounded).hexdigest()
 
     def observe(
         self,
@@ -3534,7 +3842,7 @@ class _ProgressDetector:
             and all(_is_evidence_read_call(call) for call in tool_calls)
             and isinstance(result_content, str)
         ):
-            result_hash = _progress_content_hash(result_content)
+            result_hash = self._read_result_hash(signature, result_content, tool_calls)
             repeated_read_pair = (signature, result_hash) in self._recent_read_pairs
             self._recent_content_hashes.append(result_hash)
             self._recent_read_pairs.append((signature, result_hash))
@@ -3555,6 +3863,7 @@ class _ProgressDetector:
         pending_read_expected = 0
         pending_read_bodies: list[str] = []
         pending_read_signature: str | None = None
+        pending_read_calls: tuple[Mapping[str, Any], ...] = ()
         for message in messages:
             if message.get("role") == "user" and pending_read_results:
                 content = message.get("content")
@@ -3567,13 +3876,18 @@ class _ProgressDetector:
                 pending_read_results -= 1
                 if pending_read_results == 0:
                     if len(pending_read_bodies) == pending_read_expected:
-                        result_hash = _progress_content_hash("\n".join(pending_read_bodies))
+                        result_hash = self._read_result_hash(
+                            pending_read_signature or "",
+                            "\n".join(pending_read_bodies),
+                            pending_read_calls,
+                        )
                         self._recent_content_hashes.append(result_hash)
                         if pending_read_signature is not None:
                             self._recent_read_pairs.append((pending_read_signature, result_hash))
                     pending_read_expected = 0
                     pending_read_bodies = []
                     pending_read_signature = None
+                    pending_read_calls = ()
                 continue
             if message.get("role") != "assistant":
                 continue
@@ -3583,6 +3897,7 @@ class _ProgressDetector:
                 pending_read_expected = 0
                 pending_read_bodies = []
                 pending_read_signature = None
+                pending_read_calls = ()
                 continue
             try:
                 action = _parse_agent_action(content)
@@ -3592,6 +3907,7 @@ class _ProgressDetector:
                 pending_read_expected = 0
                 pending_read_bodies = []
                 pending_read_signature = None
+                pending_read_calls = ()
             else:
                 signature = _progress_signature(None, action=action)
                 try:
@@ -3601,6 +3917,7 @@ class _ProgressDetector:
                     pending_read_expected = 0
                     pending_read_bodies = []
                     pending_read_signature = None
+                    pending_read_calls = ()
                 else:
                     pending_read_results = (
                         len(tool_calls)
@@ -3611,6 +3928,7 @@ class _ProgressDetector:
                     pending_read_expected = pending_read_results
                     pending_read_bodies = []
                     pending_read_signature = signature if pending_read_results else None
+                    pending_read_calls = tuple(tool_calls) if pending_read_results else ()
             if signature:
                 self._recent_signatures.append(signature)
 
@@ -4260,9 +4578,16 @@ def _write_checkpoint_file(
     compaction_deferred: bool = False,
     consecutive_compaction_deferrals: int = 0,
     code_changed: bool = False,
+    no_progress_actions: int,
 ) -> Path | None:
     if config.checkpoint_root is None:
         return None
+    if (
+        isinstance(no_progress_actions, bool)
+        or not isinstance(no_progress_actions, int)
+        or no_progress_actions < 0
+    ):
+        raise ValueError("invalid no-progress action count")
     if (
         isinstance(consecutive_compaction_deferrals, bool)
         or not isinstance(consecutive_compaction_deferrals, int)
@@ -4286,6 +4611,7 @@ def _write_checkpoint_file(
         "compaction_deferred": compaction_deferred,
         "consecutive_compaction_deferrals": consecutive_compaction_deferrals,
         "code_changed": code_changed,
+        "no_progress_actions": no_progress_actions,
     }
     redactor = config.redactor or _checkpoint_redactor(config.provider_env_keys)
     payload = cast(dict[str, Any], redactor.redact_mapping(payload))
@@ -4324,6 +4650,7 @@ async def _persist_checkpoint(
     compaction_deferred: bool = False,
     consecutive_compaction_deferrals: int = 0,
     code_changed: bool = False,
+    no_progress_actions: int,
 ) -> None:
     path = await asyncio.to_thread(
         _write_checkpoint_file,
@@ -4335,6 +4662,7 @@ async def _persist_checkpoint(
         compaction_deferred=compaction_deferred,
         consecutive_compaction_deferrals=consecutive_compaction_deferrals,
         code_changed=code_changed,
+        no_progress_actions=no_progress_actions,
     )
     if path is not None:
         await _emit_checkpoint(writer, config, turn, path, commits_so_far)
@@ -5224,6 +5552,7 @@ def _load_turn_checkpoint(config: AgentConfig, checkpoint_ref: str) -> dict[str,
             "usage",
             "commits_so_far",
             "workspace_hash",
+            "no_progress_actions",
         }
     )
     checkpoint_keys = set(data)
@@ -5265,6 +5594,13 @@ def _load_turn_checkpoint(config: AgentConfig, checkpoint_ref: str) -> dict[str,
     workspace_hash = data.get("workspace_hash")
     if not isinstance(workspace_hash, str) or _SHA256_HEX_RE.fullmatch(workspace_hash) is None:
         raise ContextForkError("checkpoint workspace_hash invalid")
+    no_progress_actions = data.get("no_progress_actions")
+    if (
+        isinstance(no_progress_actions, bool)
+        or not isinstance(no_progress_actions, int)
+        or no_progress_actions < 0
+    ):
+        raise ContextForkError("checkpoint no_progress_actions invalid")
     compaction_deferred = data.get("compaction_deferred", False)
     if type(compaction_deferred) is not bool:
         raise ContextForkError("checkpoint compaction_deferred invalid")
@@ -5287,6 +5623,7 @@ def _load_turn_checkpoint(config: AgentConfig, checkpoint_ref: str) -> dict[str,
         "usage": dict(usage),
         "commits_so_far": list(commits),
         "workspace_hash": workspace_hash,
+        "no_progress_actions": no_progress_actions,
         "compaction_deferred": compaction_deferred,
         "consecutive_compaction_deferrals": consecutive_compaction_deferrals,
         "code_changed": code_changed,
@@ -6054,6 +6391,7 @@ async def _bound_context_continuation(
                 compaction_deferred=True,
                 consecutive_compaction_deferrals=consecutive_compaction_deferrals,
                 code_changed=code_changed,
+                no_progress_actions=no_progress_actions,
             )
             deferred_reason = str(exc).strip() or exc.__class__.__name__
             if writer is not None:
@@ -6290,6 +6628,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
         "latency_s": 0.0,
         "transcript": [],
         "commits_so_far": [],
+        "no_progress_actions": 0,
     }
     absolute_wall_deadline = time.time() + config.max_wall_s
     cumulative_usage: dict[str, int] = {}
@@ -6367,6 +6706,9 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
             previous_prompt_tokens = restored_prompt if restored_prompt is not None else 0
             code_changed = turn_checkpoint["code_changed"]
             progress_detector.restore(transcript)
+            no_progress_actions = turn_checkpoint["no_progress_actions"]
+            progress_detector.no_progress_actions = no_progress_actions
+            outcome["no_progress_actions"] = no_progress_actions
             first_turn = turn_checkpoint["turn"] + 1
             turn_checkpoint_resumed = True
             _append_resume_situation_events(
@@ -6429,6 +6771,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
         verified_after_change = resume_checkpoint.verified_after_change and not workspace_changed
         verification_failed = False if workspace_changed else resume_checkpoint.verification_failed
         no_progress_actions = resume_checkpoint.no_progress_actions
+        outcome["no_progress_actions"] = no_progress_actions
         progress_detector.restore(resume_checkpoint.full_messages)
         progress_detector.no_progress_actions = no_progress_actions
         budget_new_tokens = resume_checkpoint.budget_new_tokens
@@ -7054,6 +7397,9 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                     finalization_grace_used=finalization_grace_used,
                 )
                 consecutive_invalid_actions += 1
+                stalled = _observe_progress(progress_detector, response_content)
+                no_progress_actions = progress_detector.no_progress_actions
+                outcome["no_progress_actions"] = no_progress_actions
                 if writer is not None:
                     # Preserve the failed response and repair feedback too, not
                     # only the last valid tool call. This is existing history,
@@ -7068,6 +7414,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                         compaction_deferred=compaction_deferred,
                         consecutive_compaction_deferrals=consecutive_compaction_deferrals,
                         code_changed=code_changed,
+                        no_progress_actions=no_progress_actions,
                     )
                     last_turn_checkpoint = turn
                     await send(
@@ -7090,8 +7437,6 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                         cumulative_usage,
                         transcript,
                     )
-                stalled = _observe_progress(progress_detector, response_content)
-                no_progress_actions = progress_detector.no_progress_actions
                 if stalled and not _finalization_due(
                     turn, finalized, budget_new_tokens, soft_cap, config
                 ):
@@ -7113,6 +7458,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
             if not read_action:
                 stalled = _observe_progress(progress_detector, action=action)
                 no_progress_actions = progress_detector.no_progress_actions
+                outcome["no_progress_actions"] = no_progress_actions
                 if stalled and not _finalization_due(
                     turn, finalized, budget_new_tokens, soft_cap, config
                 ):
@@ -7512,6 +7858,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                         result_content="\n".join(result_contents),
                     )
                     no_progress_actions = progress_detector.no_progress_actions
+                    outcome["no_progress_actions"] = no_progress_actions
                     read_stall_pending = stalled and not _finalization_due(
                         turn, finalized, budget_new_tokens, soft_cap, config
                     )
@@ -7579,6 +7926,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                             compaction_deferred=compaction_deferred,
                             consecutive_compaction_deferrals=consecutive_compaction_deferrals,
                             code_changed=code_changed,
+                            no_progress_actions=no_progress_actions,
                         )
                     last_turn_checkpoint = turn
                 if read_stall_pending:
@@ -8197,6 +8545,7 @@ def _finalize_worktree(
                 loop_outcome.get("consecutive_compaction_deferrals", 0)
             ),
             code_changed=True,
+            no_progress_actions=int(loop_outcome.get("no_progress_actions", 0)),
         )
         terminal_checkpoint = _write_terminal_epoch()
         outcome.update(

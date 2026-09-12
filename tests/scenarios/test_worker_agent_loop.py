@@ -24,6 +24,7 @@ from typing import Any, cast
 import pytest
 
 from cambium import tools, worker
+from cambium.branch_history import query_branch_history
 from cambium.diffundo import (
     ProviderError,
     ProviderOutcome,
@@ -32,6 +33,7 @@ from cambium.diffundo import (
     validate_prompt_structure,
 )
 from cambium.fencing import write_generation
+from cambium.state_view import state_text
 
 
 class _FakeWriter:
@@ -657,6 +659,7 @@ def test_turn_resume_fallback_note_survives_delegate_checkpoint(tmp_path: Path) 
         [{"role": "user", "content": "prior turn evidence"}],
         {},
         [],
+        no_progress_actions=0,
     )
     assert state_ref is not None
     resume = worker._validate_resume(
@@ -1555,6 +1558,328 @@ def test_repeated_evidence_gets_one_finish_directive_before_stall(tmp_path: Path
     ) == 1
 
 
+def _write_progress_session(session: Path, events: list[dict[str, Any]]) -> None:
+    event_dir = session / ".cambium"
+    event_dir.mkdir(parents=True, exist_ok=True)
+    (event_dir / "events.db").write_text(
+        "".join(f"{json.dumps(event, sort_keys=True)}\n" for event in events),
+        encoding="utf-8",
+    )
+
+
+def _progress_session_events() -> list[dict[str, Any]]:
+    return [
+        {
+            "seq": 1,
+            "kind": "task_assigned",
+            "task_id": "loop-agent",
+            "generation": 1,
+            "payload": {
+                "task_id": "loop-agent",
+                "session_id": "progress-session",
+                "task": "inspect existing evidence",
+                "repo": "/repo",
+                "worktree": "/worktree",
+                "branch": "cambium/loop-agent",
+            },
+        },
+        {
+            "seq": 2,
+            "kind": "tool_event",
+            "task_id": "loop-agent",
+            "generation": 1,
+            "payload": {
+                "task_id": "loop-agent",
+                "generation": 1,
+                "turn": 1,
+                "batch_index": 0,
+                "tool": "read_batch",
+                "cmd": 'read_batch {"paths":["alpha.txt"]}',
+                "ok": True,
+                "duration_ms": 1,
+            },
+        },
+    ]
+
+
+def _append_progress_tool_event(
+    events: list[dict[str, Any]],
+    name: str,
+    *,
+    turn: int,
+) -> None:
+    events.append(
+        {
+            "seq": len(events) + 1,
+            "kind": "tool_event",
+            "task_id": "loop-agent",
+            "generation": 1,
+            "payload": {
+                "task_id": "loop-agent",
+                "generation": 1,
+                "turn": turn,
+                "batch_index": 0,
+                "tool": name,
+                "cmd": "",
+                "ok": True,
+                "duration_ms": 1,
+            },
+        }
+    )
+
+
+def _run_supervised_read(
+    session: Path,
+    name: str,
+    arguments: dict[str, Any],
+) -> str:
+    if name == "branch_history":
+        return query_branch_history(session, arguments)
+    assert name == "inspect_state"
+    return state_text(session, arguments["task_id"])
+
+
+@pytest.mark.parametrize(
+    ("name", "arguments"),
+    [
+        ("branch_history", {"action": "tools", "task_id": "loop-agent"}),
+        ("branch_history", {"action": "branches"}),
+        ("inspect_state", {"task_id": "loop-agent"}),
+    ],
+)
+def test_repeated_bookkeeping_only_evidence_is_not_progress(
+    tmp_path: Path,
+    name: str,
+    arguments: dict[str, Any],
+) -> None:
+    session = tmp_path / "session"
+    events = _progress_session_events()
+    action = {
+        "type": "tool_call",
+        "calls": [{"name": name, "arguments": arguments}],
+    }
+    outputs: list[str] = []
+    for turn in range(2, 5):
+        _write_progress_session(session, events)
+        outputs.append(_run_supervised_read(session, name, arguments))
+        _append_progress_tool_event(events, name, turn=turn)
+
+    assert len(set(outputs)) == 3
+    detector = worker._ProgressDetector(max_no_progress_actions=2, progress_window=3)
+    assert not detector.observe(action=action, result_content=outputs[0])
+    assert detector.no_progress_actions == 0
+    assert not detector.observe(action=action, result_content=outputs[1])
+    assert detector.no_progress_actions == 1
+    assert detector.observe(action=action, result_content=outputs[2])
+    assert detector.no_progress_actions == 2
+
+
+@pytest.mark.parametrize(
+    ("name", "arguments"),
+    [
+        ("branch_history", {"action": "tools", "task_id": "loop-agent"}),
+        ("branch_history", {"action": "branches"}),
+        ("inspect_state", {"task_id": "loop-agent"}),
+    ],
+)
+def test_material_evidence_change_remains_progress_after_bookkeeping_normalization(
+    tmp_path: Path,
+    name: str,
+    arguments: dict[str, Any],
+) -> None:
+    session = tmp_path / "session"
+    events = _progress_session_events()
+    _write_progress_session(session, events)
+    first = _run_supervised_read(session, name, arguments)
+    _append_progress_tool_event(events, name, turn=2)
+    _append_progress_tool_event(events, "run_shell", turn=3)
+    _write_progress_session(session, events)
+    changed = _run_supervised_read(session, name, arguments)
+    action = {
+        "type": "tool_call",
+        "calls": [{"name": name, "arguments": arguments}],
+    }
+    detector = worker._ProgressDetector(max_no_progress_actions=1, progress_window=1)
+
+    assert first != changed
+    assert not detector.observe(action=action, result_content=first)
+    assert not detector.observe(action=action, result_content=changed)
+    assert detector.no_progress_actions == 0
+
+
+def test_different_real_evidence_queries_remain_progress(tmp_path: Path) -> None:
+    session = tmp_path / "session"
+    events = _progress_session_events()
+    _write_progress_session(session, events)
+    calls = [
+        {
+            "name": "branch_history",
+            "arguments": {"action": "tools", "task_id": "loop-agent"},
+        },
+        {
+            "name": "branch_history",
+            "arguments": {"action": "branches"},
+        },
+    ]
+    detector = worker._ProgressDetector(max_no_progress_actions=1, progress_window=1)
+
+    for call in calls:
+        output = _run_supervised_read(session, call["name"], call["arguments"])
+        assert not detector.observe(
+            action={"type": "tool_call", "calls": [call]},
+            result_content=output,
+        )
+        assert detector.no_progress_actions == 0
+
+
+@pytest.mark.parametrize(
+    ("name", "events"),
+    [
+        ("inspect_state", _progress_session_events()[:1]),
+        (
+            "inspect_state",
+            [
+                *_progress_session_events(),
+                {
+                    "seq": 3,
+                    "kind": "tool_event",
+                    "task_id": "loop-agent",
+                    "generation": 1,
+                    "payload": {
+                        "task_id": "loop-agent",
+                        "generation": 1,
+                        "turn": 2,
+                        "batch_index": 0,
+                        "tool": "run_shell",
+                        "cmd": "",
+                        "ok": True,
+                        "duration_ms": 1,
+                    },
+                },
+            ],
+        ),
+    ],
+)
+def test_first_real_inspect_read_preserves_prior_state(
+    tmp_path: Path,
+    name: str,
+    events: list[dict[str, Any]],
+) -> None:
+    session = tmp_path / "session"
+    arguments = {"task_id": "loop-agent"}
+    action = {
+        "type": "tool_call",
+        "calls": [{"name": name, "arguments": arguments}],
+    }
+    _write_progress_session(session, events)
+    first = _run_supervised_read(session, name, arguments)
+    _append_progress_tool_event(events, name, turn=3)
+    _write_progress_session(session, events)
+    second = _run_supervised_read(session, name, arguments)
+    detector = worker._ProgressDetector(max_no_progress_actions=2, progress_window=3)
+
+    assert first != second
+    assert not detector.observe(action=action, result_content=first)
+    assert not detector.observe(action=action, result_content=second)
+    assert detector.no_progress_actions == 1
+
+
+@pytest.mark.parametrize(
+    ("name", "arguments"),
+    [
+        ("branch_history", {"action": "tools", "task_id": "loop-agent"}),
+        ("branch_history", {"action": "branches"}),
+        ("inspect_state", {"task_id": "loop-agent"}),
+    ],
+)
+def test_restore_real_evidence_bookkeeping_identity(
+    tmp_path: Path,
+    name: str,
+    arguments: dict[str, Any],
+) -> None:
+    session = tmp_path / "session"
+    events = _progress_session_events()
+    _write_progress_session(session, events)
+    first = _run_supervised_read(session, name, arguments)
+    _append_progress_tool_event(events, name, turn=2)
+    _write_progress_session(session, events)
+    second = _run_supervised_read(session, name, arguments)
+    action = {
+        "type": "tool_call",
+        "calls": [{"name": name, "arguments": arguments}],
+    }
+    restored = worker._ProgressDetector(max_no_progress_actions=1, progress_window=1)
+    restored.restore(
+        [
+            worker._canonical_action_message(action),
+            {"role": "user", "content": f"tool {name} ok=True\n{first}"},
+        ]
+    )
+
+    assert restored.observe(action=action, result_content=second)
+
+
+def test_repeated_real_evidence_gets_one_finish_directive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def direct_to_thread(function: Any, *args: Any, **kwargs: Any) -> Any:
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(worker.asyncio, "to_thread", direct_to_thread)
+    worktree = _make_worktree(tmp_path / "repo")
+    session = tmp_path / "session"
+    events = _progress_session_events()
+    _write_progress_session(session, events)
+    monkeypatch.setenv("CAMBIUM_SESSION_ID", str(session))
+
+    async def run_and_record(
+        name: str, arguments: dict[str, Any], ctx: tools.ToolContext
+    ) -> worker.ToolResult:
+        del ctx
+        result = worker.ToolResult(
+            ok=True,
+            output=_run_supervised_read(session, name, arguments),
+            duration_ms=1,
+        )
+        _append_progress_tool_event(events, name, turn=len(events))
+        _write_progress_session(session, events)
+        return result
+
+    monkeypatch.setattr(worker, "run_tool", run_and_record)
+    action = json.dumps(
+        {
+            "type": "tool_call",
+            "calls": [
+                {
+                    "name": "branch_history",
+                    "arguments": {"action": "tools", "task_id": "loop-agent"},
+                }
+            ],
+        }
+    )
+    router = _ScriptedRouter(
+        [action, action, '{"type":"finish","summary":"evidence complete","objective_met":true}']
+    )
+    config = _agent_config(
+        worktree,
+        max_no_progress_actions=2,
+        progress_window=3,
+    )
+
+    outcome = asyncio.run(_drive_loop(config, worktree, router))
+
+    assert outcome["status"] == "succeeded"
+    final_messages = router.prompts[-1]["messages"]
+    assert (
+        sum(
+            message.get("content") == worker.REPEATED_EVIDENCE_DIRECTIVE
+            for message in final_messages
+            if isinstance(message, dict)
+        )
+        == 1
+    )
+
+
 def test_repeated_read_failure_persists_causal_tool_event_and_checkpoint(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1594,6 +1919,7 @@ def test_repeated_read_failure_persists_causal_tool_event_and_checkpoint(
     assert checkpoint_path == checkpoint_root / "loop-agent" / "turn-003.json"
     persisted = json.loads(checkpoint_path.read_text(encoding="utf-8"))
     assert persisted["transcript"] == outcome["transcript"]
+    assert persisted["no_progress_actions"] == 2
     assert persisted["transcript"][-1]["content"].startswith("tool read_batch ok=True\n")
 
 
@@ -1700,6 +2026,101 @@ def test_restore_recognizes_observable_read_evidence(
     )
 
     assert restored.observe(action=action, result_content=result)
+
+
+def test_turn_checkpoint_restart_preserves_no_progress_streak(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def direct_to_thread(function: Any, *args: Any, **kwargs: Any) -> Any:
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(worker.asyncio, "to_thread", direct_to_thread)
+    worktree = _make_worktree(tmp_path / "repo")
+    checkpoint_root = tmp_path / "checkpoints"
+    config = _agent_config(
+        worktree,
+        checkpoint_root=checkpoint_root,
+        max_no_progress_actions=2,
+        progress_window=3,
+    )
+    action = json.dumps(
+        {
+            "type": "tool_call",
+            "calls": [{"name": "read_batch", "arguments": {"paths": ["alpha.txt"]}}],
+        }
+    )
+    writer = _FakeWriter()
+    first_router = _ScriptedRouter(
+        [action, action, '{"type":"finish","summary":"first run","objective_met":true}']
+    )
+
+    first_outcome = asyncio.run(_drive_loop(config, worktree, first_router, writer))
+
+    assert first_outcome["status"] == "succeeded"
+    checkpoint_path = checkpoint_root / "loop-agent" / "turn-002.json"
+    persisted = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    assert persisted["no_progress_actions"] == 1
+    resume = worker._validate_resume(
+        {
+            "checkpoint_ref": "loop-agent/turn-002.json",
+            "epoch": 2,
+            "child_results": [],
+            "child_results_truncated": False,
+            "workspace_changed": False,
+            "rejection_feedback": None,
+        }
+    )
+    resumed_config = replace(config, resume=resume)
+    resumed_router = _ScriptedRouter([action])
+
+    resumed_outcome = asyncio.run(_drive_loop(resumed_config, worktree, resumed_router))
+
+    assert resumed_outcome["status"] == "failed"
+    assert resumed_outcome["turn"] == 3
+    assert "no progress" in (resumed_outcome["failure_reason"] or "")
+
+
+@pytest.mark.parametrize("invalid", [True, -1, "1", None])
+def test_turn_checkpoint_rejects_invalid_no_progress_count(tmp_path: Path, invalid: Any) -> None:
+    worktree = _make_worktree(tmp_path / "repo")
+    checkpoint_root = tmp_path / "checkpoints"
+    config = _agent_config(worktree, checkpoint_root=checkpoint_root)
+    path = worker._write_checkpoint_file(
+        config,
+        1,
+        [{"role": "user", "content": "evidence"}],
+        {},
+        [],
+        no_progress_actions=0,
+    )
+    assert path is not None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["no_progress_actions"] = invalid
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(worker.ContextForkError, match="no_progress"):
+        worker._load_turn_checkpoint(config, "loop-agent/turn-001.json")
+
+
+def test_turn_checkpoint_requires_no_progress_count(tmp_path: Path) -> None:
+    worktree = _make_worktree(tmp_path / "repo")
+    checkpoint_root = tmp_path / "checkpoints"
+    config = _agent_config(worktree, checkpoint_root=checkpoint_root)
+    path = worker._write_checkpoint_file(
+        config,
+        1,
+        [{"role": "user", "content": "evidence"}],
+        {},
+        [],
+        no_progress_actions=0,
+    )
+    assert path is not None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    del payload["no_progress_actions"]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(worker.ContextForkError, match="invalid key set"):
+        worker._load_turn_checkpoint(config, "loop-agent/turn-001.json")
 
 
 def test_tool_call_batch_cap_rejects_text_and_native_actions(tmp_path: Path) -> None:
