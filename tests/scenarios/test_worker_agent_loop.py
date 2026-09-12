@@ -765,7 +765,6 @@ def test_malformed_summary_defers_and_task_completes(tmp_path: Path) -> None:
         context_reuse=True,
         rolling_compact=True,
         rolling_compact_threshold_high=1,
-        rolling_compact_threshold_low=1,
         checkpoint_root=tmp_path / "checkpoints",
         max_turns=10,
     )
@@ -836,7 +835,6 @@ def test_semantic_delegate_fold_failure_does_not_suspend_stale_checkpoint(
         context_reuse=True,
         rolling_compact=True,
         rolling_compact_threshold_high=1,
-        rolling_compact_threshold_low=1,
         checkpoint_root=checkpoint_root,
         resume={
             "checkpoint_ref": prior_checkpoint.checkpoint_ref,
@@ -885,7 +883,6 @@ def test_two_malformed_summaries_fail_on_the_third_fold_attempt(tmp_path: Path) 
         context_reuse=True,
         rolling_compact=True,
         rolling_compact_threshold_high=1,
-        rolling_compact_threshold_low=1,
         checkpoint_root=tmp_path / "checkpoints",
         max_turns=10,
     )

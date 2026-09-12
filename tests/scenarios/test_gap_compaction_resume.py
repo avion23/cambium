@@ -149,7 +149,6 @@ def _config(worktree: Path, checkpoint_root: Path, **overrides: Any) -> worker.A
         "context_reuse": True,
         "rolling_compact": True,
         "rolling_compact_threshold_high": 1,
-        "rolling_compact_threshold_low": 1,
     }
     values.update(overrides)
     return worker.AgentConfig(**values)
@@ -398,7 +397,6 @@ def _write_restart_worker(path: Path, wire_log: Path, prompt_log: Path, init_log
                 run = json.loads(sys.stdin.readline())
                 configured = dict(init)
                 configured["rolling_compact_threshold_high"] = 1
-                configured["rolling_compact_threshold_low"] = 1
                 config = worker.AgentConfig.from_init(configured)
                 config = worker._merge_task_config(config, configured, run)
                 outcome = await worker._run_agent_loop(

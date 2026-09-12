@@ -117,7 +117,6 @@ def _config_for(tmp_path: Path) -> worker.AgentConfig:
         max_turns=4,
         context_reuse=True,
         rolling_compact_threshold_high=1,
-        rolling_compact_threshold_low=1,
         max_tokens=200_000,
         shell_permission=True,
         network_permission=False,

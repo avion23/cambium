@@ -1295,33 +1295,17 @@ def _positive_float(value: Any, name: str, default: float) -> float:
     return float(value)
 
 
-def _rolling_compact_thresholds(
+def _rolling_compact_threshold(
     values: Mapping[str, Any],
     max_transcript_chars: int,
     source: str,
-) -> tuple[int, int]:
-    """Parse rolling-fold character thresholds with a hysteresis band.
-
-    The high threshold defaults to the existing transcript budget and the low
-    threshold defaults to half of that high threshold.  These are character
-    counts, so the legacy transcript budget and provider token accounting stay
-    unchanged.
-    """
-    threshold_high = _positive_int(
+) -> int:
+    """Parse the rolling-fold character threshold."""
+    return _positive_int(
         values.get("rolling_compact_threshold_high"),
         f"{source} rolling_compact_threshold_high",
         max_transcript_chars,
     )
-    threshold_low = _positive_int(
-        values.get("rolling_compact_threshold_low"),
-        f"{source} rolling_compact_threshold_low",
-        max(1, threshold_high // 2),
-    )
-    if threshold_low > threshold_high:
-        raise ValueError(
-            f"{source} rolling_compact_threshold_low must not exceed rolling_compact_threshold_high"
-        )
-    return threshold_high, threshold_low
 
 
 def _cast_policy(value: Any, source: str) -> CastPolicy:
@@ -1375,11 +1359,10 @@ class AgentConfig:
     # ref and bounded child-result envelopes a suspended parent continues from.
     context_reuse: bool = True
     # Rolling compaction is the default context-reuse policy. Internal callers
-    # can disable it explicitly. Thresholds are character counts: high defaults
-    # to the transcript budget and low defaults to half of high.
+    # can disable it explicitly. The character threshold defaults to the
+    # transcript budget.
     rolling_compact: bool = True
     rolling_compact_threshold_high: int = 0
-    rolling_compact_threshold_low: int = 0
     # Supervisor-resolved context policy.  ``None`` preserves automatic
     # compatibility behavior; an explicit trunk/semantic mode is mandatory.
     required_context_mode: str | None = None
@@ -1403,13 +1386,9 @@ class AgentConfig:
         threshold_high = self.rolling_compact_threshold_high
         if threshold_high == 0:
             threshold_high = self.max_transcript_chars
-        threshold_low = self.rolling_compact_threshold_low
-        if threshold_low == 0:
-            threshold_low = max(1, threshold_high // 2)
-        if threshold_high <= 0 or threshold_low <= 0 or threshold_low > threshold_high:
-            raise ValueError("invalid rolling compaction thresholds")
+        if threshold_high <= 0:
+            raise ValueError("invalid rolling compaction threshold")
         object.__setattr__(self, "rolling_compact_threshold_high", threshold_high)
-        object.__setattr__(self, "rolling_compact_threshold_low", threshold_low)
         if (
             isinstance(self.max_no_progress_actions, bool)
             or not isinstance(self.max_no_progress_actions, int)
@@ -1476,9 +1455,7 @@ class AgentConfig:
             "init max_transcript_chars",
             MAX_TRANSCRIPT_CHARS,
         )
-        rolling_threshold_high, rolling_threshold_low = _rolling_compact_thresholds(
-            init, max_transcript_chars, "init"
-        )
+        rolling_threshold_high = _rolling_compact_threshold(init, max_transcript_chars, "init")
         max_no_progress_actions, progress_window = _progress_limits(init, "init")
         return cls(
             task_id=task_id,
@@ -1513,7 +1490,6 @@ class AgentConfig:
             context_reuse=_strict_bool(init.get("context_reuse"), "init context_reuse"),
             rolling_compact=_strict_bool(init.get("rolling_compact", True), "init rolling_compact"),
             rolling_compact_threshold_high=rolling_threshold_high,
-            rolling_compact_threshold_low=rolling_threshold_low,
             required_context_mode=_validate_required_context_mode(
                 init.get("required_context_mode"), "init"
             ),
@@ -1568,15 +1544,12 @@ def _merge_task_config(
         rolling_compact = _strict_bool(run.get("rolling_compact"), "run_task rolling_compact")
     threshold_values: dict[str, Any] = {
         "rolling_compact_threshold_high": config.rolling_compact_threshold_high,
-        "rolling_compact_threshold_low": config.rolling_compact_threshold_low,
     }
     if "rolling_compact_threshold_high" not in init:
         threshold_values["rolling_compact_threshold_high"] = run.get(
             "rolling_compact_threshold_high"
         )
-    if "rolling_compact_threshold_low" not in init:
-        threshold_values["rolling_compact_threshold_low"] = run.get("rolling_compact_threshold_low")
-    rolling_threshold_high, rolling_threshold_low = _rolling_compact_thresholds(
+    rolling_threshold_high = _rolling_compact_threshold(
         threshold_values, config.max_transcript_chars, "run_task"
     )
     max_no_progress_actions = config.max_no_progress_actions
@@ -1622,7 +1595,6 @@ def _merge_task_config(
         context_reuse=config.context_reuse,
         rolling_compact=rolling_compact,
         rolling_compact_threshold_high=rolling_threshold_high,
-        rolling_compact_threshold_low=rolling_threshold_low,
         required_context_mode=config.required_context_mode,
         context_fork=config.context_fork,
         summary_trunk_ref=summary_trunk_ref,
@@ -1651,9 +1623,7 @@ def _config_from_run(run: dict[str, Any]) -> AgentConfig:
         "run_task max_transcript_chars",
         MAX_TRANSCRIPT_CHARS,
     )
-    rolling_threshold_high, rolling_threshold_low = _rolling_compact_thresholds(
-        run, max_transcript_chars, "run_task"
-    )
+    rolling_threshold_high = _rolling_compact_threshold(run, max_transcript_chars, "run_task")
     max_no_progress_actions, progress_window = _progress_limits(run, "run_task")
     return AgentConfig(
         task_id=task_id,
@@ -1688,7 +1658,6 @@ def _config_from_run(run: dict[str, Any]) -> AgentConfig:
         context_reuse=_strict_bool(run.get("context_reuse"), "run_task context_reuse"),
         rolling_compact=_strict_bool(run.get("rolling_compact", True), "run_task rolling_compact"),
         rolling_compact_threshold_high=rolling_threshold_high,
-        rolling_compact_threshold_low=rolling_threshold_low,
         required_context_mode=_validate_required_context_mode(
             run.get("required_context_mode"), "run_task"
         ),
@@ -5956,7 +5925,6 @@ async def _bound_context_continuation(
     context_continuation: list[dict[str, Any]],
     current_epoch_checkpoint: ContextCheckpoint | None,
     epoch_count: int,
-    compaction_armed: bool,
     compaction_deferred: bool,
     consecutive_compaction_deferrals: int,
     usage_epoch: int | None,
@@ -5994,7 +5962,6 @@ async def _bound_context_continuation(
                 context_continuation,
                 current_epoch_checkpoint,
                 epoch_count,
-                compaction_armed,
                 compaction_deferred,
                 usage_epoch,
                 cumulative_usage,
@@ -6019,7 +5986,6 @@ async def _bound_context_continuation(
                 context_continuation,
                 current_epoch_checkpoint,
                 epoch_count,
-                compaction_armed,
                 compaction_deferred,
                 usage_epoch,
                 cumulative_usage,
@@ -6054,7 +6020,6 @@ async def _bound_context_continuation(
                         context_continuation,
                         current_epoch_checkpoint,
                         epoch_count,
-                        compaction_armed,
                         compaction_deferred,
                         usage_epoch,
                         cumulative_usage,
@@ -6078,7 +6043,6 @@ async def _bound_context_continuation(
                     context_continuation,
                     current_epoch_checkpoint,
                     epoch_count,
-                    compaction_armed,
                     compaction_deferred,
                     usage_epoch,
                     cumulative_usage,
@@ -6092,14 +6056,8 @@ async def _bound_context_continuation(
                     transcript,
                 ),
             )
-        if raw_size <= config.rolling_compact_threshold_low:
-            compaction_armed = True
         if not (
-            compaction_armed
-            and (
-                raw_size > config.rolling_compact_threshold_high
-                or len(raw_tail) > MAX_CONTEXT_MESSAGES
-            )
+            raw_size > config.rolling_compact_threshold_high or len(raw_tail) > MAX_CONTEXT_MESSAGES
         ):
             return (
                 False,
@@ -6109,7 +6067,6 @@ async def _bound_context_continuation(
                     context_continuation,
                     current_epoch_checkpoint,
                     epoch_count,
-                    compaction_armed,
                     compaction_deferred,
                     usage_epoch,
                     cumulative_usage,
@@ -6132,7 +6089,6 @@ async def _bound_context_continuation(
                 context_continuation,
                 current_epoch_checkpoint,
                 epoch_count,
-                compaction_armed,
                 compaction_deferred,
                 usage_epoch,
                 cumulative_usage,
@@ -6155,7 +6111,6 @@ async def _bound_context_continuation(
                 context_continuation,
                 current_epoch_checkpoint,
                 epoch_count,
-                compaction_armed,
                 compaction_deferred,
                 usage_epoch,
                 cumulative_usage,
@@ -6410,7 +6365,6 @@ async def _bound_context_continuation(
                     context_continuation,
                     current_epoch_checkpoint,
                     epoch_count,
-                    compaction_armed,
                     compaction_deferred,
                     usage_epoch,
                     cumulative_usage,
@@ -6521,7 +6475,6 @@ async def _bound_context_continuation(
                 context_continuation,
                 current_epoch_checkpoint,
                 epoch_count,
-                compaction_armed,
                 compaction_deferred,
                 usage_epoch,
                 cumulative_usage,
@@ -6543,7 +6496,6 @@ async def _bound_context_continuation(
     current_epoch_checkpoint = checkpoint
     epoch_count = checkpoint.epoch
     usage_epoch = checkpoint.epoch
-    compaction_armed = True
     compaction_deferred = False
     consecutive_compaction_deferrals = 0
     transcript = _sync_context_transcript(base_messages, context_continuation, transcript)
@@ -6572,7 +6524,6 @@ async def _bound_context_continuation(
             context_continuation,
             current_epoch_checkpoint,
             epoch_count,
-            compaction_armed,
             compaction_deferred,
             usage_epoch,
             cumulative_usage,
@@ -6663,7 +6614,6 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
     continuation_suffix: list[dict[str, Any]] = []
     epoch_count = 0
     current_epoch_checkpoint: ContextCheckpoint | None = None
-    compaction_armed = True
     compaction_deferred = False
     consecutive_compaction_deferrals = 0
     consecutive_invalid_actions = 0
@@ -6979,7 +6929,6 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                             context_continuation,
                             current_epoch_checkpoint,
                             epoch_count,
-                            compaction_armed,
                             compaction_deferred,
                             usage_epoch,
                             cumulative_usage,
@@ -7010,7 +6959,6 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                         context_continuation=context_continuation,
                         current_epoch_checkpoint=current_epoch_checkpoint,
                         epoch_count=epoch_count,
-                        compaction_armed=compaction_armed,
                         compaction_deferred=compaction_deferred,
                         consecutive_compaction_deferrals=consecutive_compaction_deferrals,
                         usage_epoch=usage_epoch,
@@ -7970,7 +7918,6 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                                 context_continuation,
                                 current_epoch_checkpoint,
                                 epoch_count,
-                                compaction_armed,
                                 compaction_deferred,
                                 usage_epoch,
                                 cumulative_usage,
@@ -8002,7 +7949,6 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                             context_continuation=context_continuation,
                             current_epoch_checkpoint=current_epoch_checkpoint,
                             epoch_count=epoch_count,
-                            compaction_armed=compaction_armed,
                             compaction_deferred=compaction_deferred,
                             consecutive_compaction_deferrals=consecutive_compaction_deferrals,
                             usage_epoch=usage_epoch,

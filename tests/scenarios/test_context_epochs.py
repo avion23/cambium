@@ -611,7 +611,6 @@ def test_cast_rollover_is_durable_before_epoch_publication(tmp_path: Path) -> No
         checkpoint_root=checkpoint_root,
         context_reuse=True,
         rolling_compact_threshold_high=1,
-        rolling_compact_threshold_low=1,
         cast_policy=CastPolicy(max_segments=1),
     )
     writer = _FakeWriter()
@@ -897,7 +896,6 @@ def test_rolling_compact_fold_advances_epoch_and_preserves_head(
         context_reuse=True,
         rolling_compact=True,
         rolling_compact_threshold_high=100,
-        rolling_compact_threshold_low=50,
         resume=resume,
         max_turns=2,
     )
@@ -965,7 +963,7 @@ def test_rolling_compact_fold_advances_epoch_and_preserves_head(
     )
 
 
-def test_rolling_compact_hysteresis_does_not_refold_below_low(
+def test_rolling_compact_does_not_refold_below_high(
     tmp_path: Path,
 ) -> None:
     worktree = _make_worktree(tmp_path / "repo")
@@ -988,7 +986,6 @@ def test_rolling_compact_hysteresis_does_not_refold_below_low(
         context_reuse=True,
         rolling_compact=True,
         rolling_compact_threshold_high=1_000,
-        rolling_compact_threshold_low=900,
         resume=resume,
         max_turns=3,
     )
@@ -1004,7 +1001,7 @@ def test_rolling_compact_hysteresis_does_not_refold_below_low(
                 ]
             ),
             writer,
-            run_request_id="run-hysteresis",
+            run_request_id="run-below-high",
         )
     )
 
@@ -1038,7 +1035,6 @@ def test_rolling_compact_failure_is_fail_closed_and_preserves_checkpoint(
         context_reuse=True,
         rolling_compact=True,
         rolling_compact_threshold_high=100,
-        rolling_compact_threshold_low=50,
         resume=resume,
         max_turns=2,
     )

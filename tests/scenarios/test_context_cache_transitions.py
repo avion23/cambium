@@ -222,7 +222,6 @@ def test_summary_flush_keeps_head_and_appends_entry_at_head_length(
         context_reuse=True,
         rolling_compact=True,
         rolling_compact_threshold_high=threshold_high,
-        rolling_compact_threshold_low=max(1, threshold_high // 2),
         resume={
             "checkpoint_ref": checkpoint.checkpoint_ref,
             "epoch": checkpoint.epoch,
@@ -292,14 +291,12 @@ def test_summary_flush_appends_second_entry_after_raw_tail_crosses_threshold(
         ],
     )
     threshold_high = 100
-    threshold_low = 50
     config = _agent_config(
         worktree,
         checkpoint_root=checkpoint_root,
         context_reuse=True,
         rolling_compact=True,
         rolling_compact_threshold_high=threshold_high,
-        rolling_compact_threshold_low=threshold_low,
         resume={
             "checkpoint_ref": checkpoint.checkpoint_ref,
             "epoch": checkpoint.epoch,
