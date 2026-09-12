@@ -681,6 +681,7 @@ def test_resume_seeds_transcript_and_usage_epoch(tmp_path: Path) -> None:
         worktree,
         checkpoint_root=tmp_path / "ckpts",
         context_reuse=True,
+        required_context_mode="trunk",
         resume={
             "checkpoint_ref": checkpoint.checkpoint_ref,
             "epoch": checkpoint.epoch,
@@ -1240,6 +1241,98 @@ def test_fork_descriptor_artifact_mismatch_falls_back(tmp_path: Path) -> None:
     assert "mismatch" in skipped[0]["reason"]
     usage = [message for message in writer.messages() if message["type"] == "usage_event"]
     assert usage and "fork_of" not in usage[0]
+
+
+def test_required_trunk_fork_race_fails_before_provider_call(tmp_path: Path) -> None:
+    """An admitted exact fork that mutates before worker load cannot go fresh."""
+    worktree = _make_worktree(tmp_path / "repo")
+    checkpoint_root = tmp_path / "ckpts"
+    base_config = _agent_config(worktree, checkpoint_root=checkpoint_root)
+    checkpoint = _write_epoch(base_config)
+    cache_key = checkpoint.cache_key
+    fork_descriptor = {
+        "checkpoint_ref": checkpoint.checkpoint_ref,
+        "provider": cache_key.provider,
+        "model": cache_key.model,
+        "system_sha256": cache_key.system_sha256,
+        "tools_sha256": cache_key.tools_sha256,
+        "prefix_sha256": cache_key.prefix_sha256,
+        "suffix_sha256": cache_key.suffix_sha256,
+        "full_sha256": cache_key.full_sha256,
+        "prefix_bytes": cache_key.prefix_bytes,
+        "provider_boundary": cache_key.provider_boundary,
+    }
+    path = checkpoint_root / checkpoint.checkpoint_ref
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["content"]["provider_messages"][1]["content"] = "mutated after admission"
+    path.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
+
+    config = _agent_config(
+        worktree,
+        checkpoint_root=checkpoint_root,
+        context_reuse=True,
+        context_fork=fork_descriptor,
+        required_context_mode="trunk",
+    )
+    writer = _FakeWriter()
+    router = _ScriptedRouter([])
+
+    outcome = asyncio.run(_drive_loop(config, worktree, router, writer))
+
+    assert outcome["status"] == "failed"
+    assert router.prompts == []
+    assert not any(message["type"] == "context_fork_skipped" for message in writer.messages())
+
+
+def test_required_semantic_fork_race_fails_before_provider_call(tmp_path: Path) -> None:
+    """An admitted semantic checkpoint mutation cannot become a fresh call."""
+    worktree = _make_worktree(tmp_path / "repo")
+    checkpoint_root = tmp_path / "ckpts"
+    base_config = _agent_config(worktree, checkpoint_root=checkpoint_root)
+    summary_messages = append_summary_entry(
+        [
+            {"role": "system", "content": "You are the agent."},
+            {"role": "user", "content": "<cambium-task>parent task</cambium-task>"},
+        ],
+        SummaryEntry(
+            type="summary_entry",
+            sequence=1,
+            source_sha256="c" * 64,
+            source_message_count=1,
+            through_turn=1,
+            objective="preserve parent context",
+            outcome="captured parent evidence",
+            decisions_added=(),
+            decisions_superseded=(),
+            facts_added=(),
+            facts_invalidated=(),
+            files_and_symbols_changed=(),
+            verification_results=(),
+            relevant_failed_approaches=(),
+            open_items=(),
+        ),
+    )
+    checkpoint = _write_epoch(base_config, messages=summary_messages)
+    path = checkpoint_root / checkpoint.checkpoint_ref
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["content"]["provider_messages"][-1]["content"] = "mutated after admission"
+    path.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
+
+    config = _agent_config(
+        worktree,
+        checkpoint_root=checkpoint_root,
+        context_reuse=True,
+        summary_trunk_ref=checkpoint.checkpoint_ref,
+        required_context_mode="semantic",
+    )
+    writer = _FakeWriter()
+    router = _ScriptedRouter([])
+
+    outcome = asyncio.run(_drive_loop(config, worktree, router, writer))
+
+    assert outcome["status"] == "failed"
+    assert router.prompts == []
+    assert not any(message["type"] == "context_fork_skipped" for message in writer.messages())
 
 
 def test_redacted_resume_fails_without_seeding_transcript(tmp_path: Path) -> None:

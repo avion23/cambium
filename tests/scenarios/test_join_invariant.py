@@ -423,6 +423,7 @@ def test_resolver_rechecks_parent_join_before_publication(tmp_path: Path) -> Non
         "base_commit": base,
         "parent_task_id": "parent",
         "provider_env_keys": [],
+        "_required_context_mode": "trunk",
     }
     store = _Store()
     runtime = _runtime(session, store)
@@ -435,6 +436,14 @@ def test_resolver_rechecks_parent_join_before_publication(tmp_path: Path) -> Non
         "diff_truncated": False,
         "integration_head": integration_head,
     }
+    resolver_spec = runtime._build_resolver_spec(
+        child_spec,
+        conflict,
+        {"summary": "child intent", "status": "succeeded"},
+        attempt=1,
+        max_attempts=1,
+    )
+    assert "_required_context_mode" not in resolver_spec
 
     result = asyncio.run(
         runtime._resolve_merge_conflict(

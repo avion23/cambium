@@ -50,13 +50,19 @@ proposal is recorded:
 | `context_mode=trunk`, placement omitted | `inherit` |
 
 Explicit fields remain explicit. `trunk + spread` is contradictory. A requested
-exact fork that cannot establish compatibility is rejected, not silently made
-lossy. A read-only `investigation` delegate defaults to `fresh` because it needs
-no parent checkpoint; independent read-only siblings default to `spread` so they
-can consume different provider capacity. Explicit semantic children may reuse a
-persisted summary-only checkpoint, including already-redacted summaries. A batch
-is important: emitting one delegate on each later turn can serialize work because
-the parent suspends at a successful delegation boundary.
+exact or semantic fork that cannot establish its required checkpoint is rejected,
+not silently made lossy or fresh. A read-only `investigation` delegate defaults
+to `fresh` because it needs no parent checkpoint; independent read-only siblings
+default to `spread` so they can consume different provider capacity. Explicit
+semantic children may reuse a persisted summary-only checkpoint, including
+already-redacted summaries. The supervisor carries the resolved required mode to
+the worker. The worker loads that mandatory context again immediately before its
+first provider call; a missing, mutated, or invalid checkpoint fails the child
+instead of emitting `context_fork_skipped` and continuing fresh. This strict
+path applies only to declared modes; undeclared harness proposals retain their
+automatic compatibility fallback. A batch is important: emitting one delegate
+on each later turn can serialize work because the parent suspends at a successful
+delegation boundary.
 
 The supervisor supplies repository, private worktree, branch and inherited
 execution settings. Models supply the actual workload, not internal filesystem

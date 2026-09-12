@@ -41,14 +41,18 @@ validated summary entries and no raw tail. Redaction is sticky because one
 email or credential-shaped string in the transcript marks every subsequent
 checkpoint redacted, but it only blocks exact byte-compatible reuse: semantic
 mode may import the already-redacted persisted summaries under a fresh provider
-head. It never receives unredacted checkpoint material or claims provider-cache
-identity or a cache hit. A fresh session's first delegation has no checkpoint at
-all yet.
+head. For an explicit semantic request, that persisted summary checkpoint is
+mandatory. The supervisor records the required mode and the worker validates the
+same checkpoint before its first provider call; a race, mutation, or invalid
+summary fails the child rather than degrading to fresh. It never receives
+unredacted checkpoint material or claims provider-cache identity or a cache hit.
+The undeclared harness compatibility path may still fall back automatically. A
+fresh session's first delegation has no checkpoint at all yet.
 
 | `context_mode` | Meaning |
 | --- | --- |
 | `trunk` | Complete compatible unredacted parent checkpoint prefix; requires `inherit` |
-| `semantic` | Persisted (possibly redacted) semantic summaries under a fresh provider head; no cache identity |
+| `semantic` | Mandatory persisted (possibly redacted) semantic summaries under a fresh provider head; no cache identity |
 | `fresh` | Task only; no parent checkpoint, summaries, or result envelope |
 
 Semantic summaries may carry bounded, validated `verbatim_evidence`. The

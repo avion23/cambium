@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from cambium import worker
-from cambium.child_policy import parse_child_policy
+from cambium.child_policy import ChildPolicyError, parse_child_policy
 from cambium.redact import Redactor
 from cambium.routing import LaneCapacityExhausted, LaneState
 from cambium.summary_trunk import SummaryEntry, append_summary_entry
@@ -112,6 +112,7 @@ def test_semantic_child_pins_summary_trunk_and_drops_provider(tmp_path: Path) ->
     assert child_spec.get("summary_trunk_ref") == runtime._task_epochs["parent"]["checkpoint_ref"]
     assert "assigned_provider" not in child_spec
     assert "context_fork" not in child_spec
+    assert child_spec["_required_context_mode"] == "semantic"
 
     # The context_fork event carries the semantic_reuse flag.
     fork_events = [e for e in events if e["kind"] == "context_fork"]
@@ -141,6 +142,7 @@ def test_exact_compatible_child_inherits_provider_and_model(tmp_path: Path) -> N
     assert child_spec.get("assigned_provider") == "provider-a"
     assert child_spec.get("fanout_config", {}).get("model") == "model-a"
     assert "context_fork" in child_spec
+    assert child_spec["_required_context_mode"] == "trunk"
 
     # No summary_trunk_ref for exact forks.
     assert "summary_trunk_ref" not in child_spec
@@ -233,8 +235,8 @@ def test_suspended_parent_reacquires_lane_without_overbooking(tmp_path: Path) ->
     assert runtime._lanes["provider-a"].in_flight == 1
 
 
-def test_missing_parent_epoch_resolves_declared_semantic_to_fresh(tmp_path: Path) -> None:
-    """A missing semantic checkpoint falls back to fresh without rejection."""
+def test_missing_parent_epoch_rejects_declared_semantic(tmp_path: Path) -> None:
+    """An explicit semantic child cannot become fresh when its checkpoint is missing."""
     runtime = _Runtime(tmp_path, None)
     events: list[dict[str, Any]] = []
 
@@ -250,26 +252,16 @@ def test_missing_parent_epoch_resolves_declared_semantic_to_fresh(tmp_path: Path
         "parent_envelope": {"summary": "parent"},
     }
 
-    asyncio.run(runtime._pin_fork_child(child_spec, "missing", "child", "investigation"))
+    with pytest.raises(ChildPolicyError, match="semantic"):
+        asyncio.run(runtime._pin_fork_child(child_spec, "missing", "child", "investigation"))
 
     assert child_spec["context_mode"] == "semantic"
     assert child_spec["placement"] == "spread"
-    assert "summary_trunk_ref" not in child_spec
-    assert "context_fork" not in child_spec
-    assert "parent_envelope" not in child_spec
-    fork_events = [event for event in events if event["kind"] == "context_fork"]
-    assert len(fork_events) == 1
-    event = fork_events[0]
-    assert event["context_mode"] == "semantic"
-    assert event["placement"] == "spread"
-    assert event["resolved_context_mode"] == "fresh"
-    assert event["resolved_placement"] == "spread"
-    assert event["semantic_reuse"] is False
-    assert 0 < len(event["reason"]) <= 2_000
+    assert events == []
 
 
-def test_raw_tail_parent_epoch_resolves_declared_semantic_to_fresh(tmp_path: Path) -> None:
-    """A strictly valid checkpoint with raw tail is not semantic context."""
+def test_raw_tail_parent_epoch_rejects_declared_semantic(tmp_path: Path) -> None:
+    """A checkpoint with raw tail is not a valid explicit semantic context."""
     runtime = _Runtime(tmp_path, None)
     events: list[dict[str, Any]] = []
 
@@ -284,19 +276,12 @@ def test_raw_tail_parent_epoch_resolves_declared_semantic_to_fresh(tmp_path: Pat
         "parent_envelope": {"summary": "parent"},
     }
 
-    asyncio.run(runtime._pin_fork_child(child_spec, "parent", "child", "investigation"))
+    with pytest.raises(ChildPolicyError, match="semantic"):
+        asyncio.run(runtime._pin_fork_child(child_spec, "parent", "child", "investigation"))
 
     assert child_spec["context_mode"] == "semantic"
     assert child_spec["placement"] == "spread"
-    assert "summary_trunk_ref" not in child_spec
-    assert "context_fork" not in child_spec
-    assert "parent_envelope" not in child_spec
-    event = next(event for event in events if event["kind"] == "context_fork")
-    assert event["context_mode"] == "semantic"
-    assert event["resolved_context_mode"] == "fresh"
-    assert event["resolved_placement"] == "spread"
-    assert event["semantic_reuse"] is False
-    assert "summary-only" in event["reason"]
+    assert events == []
 
 
 def test_parse_child_policy_rejects_trunk_spread_combination() -> None:
@@ -394,3 +379,22 @@ def test_fresh_child_admits_with_missing_or_redacted_parent_epoch(tmp_path: Path
         assert len(fork_events) == 1
         assert fork_events[0]["resolved_context_mode"] == "fresh"
         assert fork_events[0]["semantic_reuse"] is False
+
+
+def test_fresh_child_drops_parent_context_when_reuse_is_disabled(tmp_path: Path) -> None:
+    """fresh stays task-only even when the session has no context reuse."""
+    runtime = _Runtime(tmp_path, None, context_reuse=False)
+    child_spec: dict[str, Any] = {
+        "context_mode": "fresh",
+        "placement": "inherit",
+        "parent_envelope": {"summary": "must not cross the fresh boundary"},
+        "context_fork": {"checkpoint_ref": "stale"},
+        "summary_trunk_ref": "stale",
+    }
+
+    asyncio.run(runtime._pin_fork_child(child_spec, "parent", "child", "investigation"))
+
+    assert child_spec["_required_context_mode"] == "fresh"
+    assert "parent_envelope" not in child_spec
+    assert "context_fork" not in child_spec
+    assert "summary_trunk_ref" not in child_spec

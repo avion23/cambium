@@ -617,6 +617,17 @@ def _validate_summary_trunk_ref(value: Any) -> str | None:
     return value
 
 
+def _validate_required_context_mode(value: Any, source: str) -> str | None:
+    """Validate the supervisor's resolved context requirement, if present."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or value not in {"trunk", "semantic", "fresh"}:
+        raise ContextForkError(
+            f"{source} required_context_mode must be trunk, semantic, fresh, or null"
+        )
+    return value
+
+
 def _validate_resume(value: Any) -> dict[str, Any] | None:
     """Strictly validate the run_task ``resume`` payload, or return None.
 
@@ -1357,6 +1368,9 @@ class AgentConfig:
     rolling_compact: bool = True
     rolling_compact_threshold_high: int = 0
     rolling_compact_threshold_low: int = 0
+    # Supervisor-resolved context policy.  ``None`` preserves automatic
+    # compatibility behavior; an explicit trunk/semantic mode is mandatory.
+    required_context_mode: str | None = None
     context_fork: dict[str, Any] | None = None
     # Provider-neutral summary history used when an exact cache fork is illegal.
     summary_trunk_ref: str | None = None
@@ -1488,6 +1502,9 @@ class AgentConfig:
             rolling_compact=_strict_bool(init.get("rolling_compact", True), "init rolling_compact"),
             rolling_compact_threshold_high=rolling_threshold_high,
             rolling_compact_threshold_low=rolling_threshold_low,
+            required_context_mode=_validate_required_context_mode(
+                init.get("required_context_mode"), "init"
+            ),
             context_fork=_validate_context_fork(init.get("context_fork")),
             summary_trunk_ref=_validate_summary_trunk_ref(init.get("summary_trunk_ref")),
             max_no_progress_actions=max_no_progress_actions,
@@ -1594,6 +1611,7 @@ def _merge_task_config(
         rolling_compact=rolling_compact,
         rolling_compact_threshold_high=rolling_threshold_high,
         rolling_compact_threshold_low=rolling_threshold_low,
+        required_context_mode=config.required_context_mode,
         context_fork=config.context_fork,
         summary_trunk_ref=summary_trunk_ref,
         resume=resume,
@@ -1659,6 +1677,9 @@ def _config_from_run(run: dict[str, Any]) -> AgentConfig:
         rolling_compact=_strict_bool(run.get("rolling_compact", True), "run_task rolling_compact"),
         rolling_compact_threshold_high=rolling_threshold_high,
         rolling_compact_threshold_low=rolling_threshold_low,
+        required_context_mode=_validate_required_context_mode(
+            run.get("required_context_mode"), "run_task"
+        ),
         context_fork=_validate_context_fork(run.get("context_fork")),
         summary_trunk_ref=_validate_summary_trunk_ref(run.get("summary_trunk_ref")),
         resume=_validate_resume(run.get("resume")),
@@ -6431,8 +6452,43 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
             resume_checkpoint.full_messages,
             resume_checkpoint.admitted_child_task_ids,
         )
-    elif config.context_fork is not None:
+    required_context_mode = config.required_context_mode
+    # A resumed task has already loaded its own checkpoint.  The supervisor
+    # removes the admission-only fork descriptor before restarting it, so the
+    # one-shot required mode must not reject that valid continuation.
+    if resume is None and required_context_mode == "trunk" and config.context_fork is None:
+        return _loop_result(
+            outcome,
+            "failed",
+            "required context_mode=trunk unavailable: context_fork is missing",
+            0,
+            cumulative_usage,
+            transcript,
+        )
+    if resume is None and required_context_mode == "semantic" and config.summary_trunk_ref is None:
+        return _loop_result(
+            outcome,
+            "failed",
+            "required context_mode=semantic unavailable: summary_trunk_ref is missing",
+            0,
+            cumulative_usage,
+            transcript,
+        )
+
+    if resume is None and config.context_fork is not None and required_context_mode in {
+        None,
+        "trunk",
+    }:
         fork_messages, fork_skip = _resolve_fork_prefix(config, tools, model)
+        if required_context_mode == "trunk" and fork_skip is not None:
+            return _loop_result(
+                outcome,
+                "failed",
+                f"required context_mode=trunk unavailable: {fork_skip}",
+                0,
+                cumulative_usage,
+                transcript,
+            )
         if fork_messages is not None:
             try:
                 fork_checkpoint = _load_epoch_checkpoint(
@@ -6462,7 +6518,12 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                 },
             )
 
-    if base_messages is None and config.summary_trunk_ref is not None:
+    if (
+        resume is None
+        and base_messages is None
+        and config.summary_trunk_ref is not None
+        and required_context_mode != "fresh"
+    ):
         try:
             semantic_checkpoint = _load_epoch_checkpoint(
                 config, config.summary_trunk_ref, expect_task_id=False
@@ -6488,6 +6549,15 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
             usage_fork_of = config.summary_trunk_ref
             transcript = _sync_context_transcript(base_messages, context_continuation, transcript)
         except (ContextForkError, SummaryTrunkError) as exc:
+            if required_context_mode == "semantic":
+                return _loop_result(
+                    outcome,
+                    "failed",
+                    f"required context_mode=semantic unavailable: {exc}",
+                    0,
+                    cumulative_usage,
+                    transcript,
+                )
             if writer is not None:
                 await send(
                     writer,
@@ -7543,6 +7613,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                             for name, args, value in batch_results
                         )
                     ):
+                        pre_fold_checkpoint = current_epoch_checkpoint
                         (
                             _folded,
                             compaction_failure,
@@ -7615,7 +7686,31 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                                 cumulative_usage,
                                 transcript,
                             )
+                        if not _folded:
+                            return _loop_result(
+                                outcome,
+                                "failed",
+                                "compaction_failed: semantic delegate requires a new context "
+                                "checkpoint",
+                                turn,
+                                cumulative_usage,
+                                transcript,
+                            )
                         batch_checkpoint = current_epoch_checkpoint
+                        if batch_checkpoint is None or (
+                            pre_fold_checkpoint is not None
+                            and batch_checkpoint.checkpoint_ref
+                            == pre_fold_checkpoint.checkpoint_ref
+                        ):
+                            return _loop_result(
+                                outcome,
+                                "failed",
+                                "compaction_failed: semantic delegate requires a new context "
+                                "checkpoint",
+                                turn,
+                                cumulative_usage,
+                                transcript,
+                            )
                         batch_checkpoint_was_emitted = batch_checkpoint is not None
                     if batch_checkpoint is None:
                         epoch_count += 1

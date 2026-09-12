@@ -71,9 +71,14 @@ Normal work appends actions and observations to `R`. The worker folds when the
 raw working set crosses its threshold, or when a semantic child needs the new
 knowledge. Finishing a task, spawning an exact-trunk child, and spawning a fresh
 child do **not** force a summary. They save an exact checkpoint with its recent
-raw continuation; a later consumer can compact when necessary. One semantic
-batch shares one fold, not one summary request per child. The conditions live in
-`worker._bound_context_continuation` and `worker._run_agent_loop`.
+raw continuation; a later consumer can compact when necessary. A semantic
+delegate does force a fold before suspension. Suspension is allowed only after
+that fold publishes a newer checkpoint. A provider error, checkpoint write
+failure, or deferred malformed summary leaves the previous checkpoint unchanged
+and fails the semantic delegation; it must not suspend against that stale
+pre-fold checkpoint. One semantic batch shares one fold, not one summary request
+per child. The conditions live in `worker._bound_context_continuation` and
+`worker._run_agent_loop`.
 
 Checkpointing is local persistence. Summarizing is a paid model operation.
 Keeping them separate means a completed short task does not fail merely because
@@ -189,8 +194,11 @@ checkpoint is never an exact fork. Semantic reuse exports only validated summary
 entries from the persisted checkpoint, so already-redacted summaries may be
 reused under a fresh provider head. Semantic context is provider-neutral: it
 does not carry cache identity or claim a provider-cache hit, and it never sends
-unredacted checkpoint material. Semantic/fresh forks do not transfer KV cache
-state.
+unredacted checkpoint material. For an explicit semantic child, the resolved
+required mode crosses the supervisor-worker boundary and the worker fails before
+its first provider call if that persisted checkpoint cannot be loaded exactly.
+Undeclared automatic compatibility may still report `context_fork_skipped` and
+continue fresh. Semantic/fresh forks do not transfer KV cache state.
 
 Semantic reuse can carry validated, redacted `verbatim_evidence`. Those items
 remain semantic payload and never make the fork exact or cache-compatible.

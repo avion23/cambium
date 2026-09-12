@@ -4111,6 +4111,9 @@ class _Runtime:
             payload["resume"] = spec["resume"]
         if isinstance(spec.get("summary_trunk_ref"), str):
             payload["summary_trunk_ref"] = spec["summary_trunk_ref"]
+        required_context_mode = spec.get("_required_context_mode")
+        if required_context_mode is not None:
+            payload["required_context_mode"] = required_context_mode
         if spec.get("_resolver_child"):
             # Resolver context is explicit and bounded.  Do not rely on the
             # worker inferring the conflict from a dirty index: the dedicated
@@ -4651,11 +4654,21 @@ class _Runtime:
         provider/model. An undeclared child keeps the automatic
         compatibility resolution (exact fork when legal, otherwise semantic).
         """
+        declared = _declared_child_policy(child_spec)
         if not self._context_reuse:
+            if declared is not None and declared[0] in {"trunk", "semantic"}:
+                raise ChildPolicyError(
+                    f"child context_mode={declared[0]} requires context reuse to be enabled"
+                )
+            if declared is not None:
+                if declared[0] == "fresh":
+                    child_spec.pop("summary_trunk_ref", None)
+                    child_spec.pop("context_fork", None)
+                    child_spec.pop("parent_envelope", None)
+                child_spec["_required_context_mode"] = declared[0]
             return
         epoch = self._task_epochs.get(parent_task_id)
         cache_key = epoch.get("cache_key") if isinstance(epoch, dict) else None
-        declared = _declared_child_policy(child_spec)
         if declared is not None:
             context_mode, placement = declared
             parent_provider = cache_key.get("provider") if isinstance(cache_key, dict) else None
@@ -4666,6 +4679,7 @@ class _Runtime:
                         "parent checkpoint (unredacted required); use semantic or fresh instead "
                         "(semantic needs a persisted summary-only checkpoint; fresh needs none)"
                     )
+                child_spec["_required_context_mode"] = context_mode
                 if placement == "spread":
                     self._apply_spread(child_spec, parent_provider)
                 await self._emit_child_fork_event(
@@ -4699,33 +4713,12 @@ class _Runtime:
                     except (OSError, TypeError, ValueError) as exc:
                         semantic_error = str(exc) or exc.__class__.__name__
                 if semantic_error is not None:
-                    child_spec.pop("summary_trunk_ref", None)
-                    child_spec.pop("context_fork", None)
-                    child_spec.pop("parent_envelope", None)
-                    if placement == "spread":
-                        self._apply_spread(child_spec, parent_provider)
-                    else:
-                        self._pin_parent_provider(child_spec, parent_provider, cache_key)
-                    await self._emit_child_fork_event(
-                        parent_task_id,
-                        child_task_id,
-                        kind,
-                        epoch,
-                        compatible=False,
-                        semantic_reuse=False,
-                        context_mode=context_mode,
-                        placement=placement,
-                        resolved_context_mode="fresh",
-                        reason=_cap_utf8(
-                            f"semantic context unavailable: {semantic_error}",
-                            MAX_ENVELOPE_FIELD_CHARS,
-                        ),
-                        spread_from_provider=(
-                            parent_provider if placement == "spread" else None
-                        ),
+                    raise ChildPolicyError(
+                        "child context_mode=semantic requires a persisted summary-only "
+                        f"parent checkpoint: {semantic_error}"
                     )
-                    return
                 child_spec["summary_trunk_ref"] = checkpoint_ref
+                child_spec["_required_context_mode"] = context_mode
                 if placement == "spread":
                     self._apply_spread(child_spec, parent_provider)
                 else:
@@ -4746,6 +4739,7 @@ class _Runtime:
             child_spec.pop("summary_trunk_ref", None)
             child_spec.pop("context_fork", None)
             child_spec.pop("parent_envelope", None)
+            child_spec["_required_context_mode"] = context_mode
             if placement == "spread":
                 self._apply_spread(child_spec, parent_provider)
             else:
@@ -6453,6 +6447,9 @@ class _Runtime:
         if spec.get("fanout_config") is not None:
             init_msg["fanout_config"] = spec["fanout_config"]
             init_msg["provider_env_keys"] = sorted(_provider_env_keys(spec))
+        required_context_mode = spec.get("_required_context_mode")
+        if required_context_mode is not None:
+            init_msg["required_context_mode"] = required_context_mode
         if isinstance(spec.get("assigned_provider"), str):
             # Admission balancing (solution C): the worker presets Diffundo's
             # sticky primary from this value instead of the seeded first pick.
@@ -8530,7 +8527,13 @@ class _Runtime:
         intent_summaries = self._resolver_intent_summaries(spec, envelope, integration_head)
 
         resolver_spec = copy.deepcopy(spec)
-        for field in ("proposed_children", "resume", "context_fork", "summary_trunk_ref"):
+        for field in (
+            "proposed_children",
+            "resume",
+            "context_fork",
+            "summary_trunk_ref",
+            "_required_context_mode",
+        ):
             resolver_spec.pop(field, None)
         resolver_spec.update(
             {

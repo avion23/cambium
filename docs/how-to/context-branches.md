@@ -36,7 +36,10 @@ Use `trunk+inherit` when the complete current checkpoint/raw tail is needed.
 Use `semantic` when summary conclusions are enough, and `fresh` for an
 independent view without inherited assumptions. For semantic/fresh work,
 `spread` can use another provider resource; `inherit` preserves affinity.
-`trunk+spread` is invalid. Explicit exact context does not silently downgrade.
+`trunk+spread` is invalid. Explicit trunk and semantic context do not silently
+downgrade: if the required checkpoint is unavailable or changes before worker
+load, admission or the worker fails before a provider call. Only undeclared
+harness proposals retain automatic fallback.
 
 A successful delegate tool response means the task was proposed. The supervisor
 still has to admit and execute it. The child is the same worker abstraction as

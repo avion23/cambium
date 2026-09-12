@@ -796,6 +796,84 @@ def test_malformed_summary_defers_and_task_completes(tmp_path: Path) -> None:
     assert not any(message["type"] == "compaction_failed" for message in writer.messages())
 
 
+def test_semantic_delegate_fold_failure_does_not_suspend_stale_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deferred forced fold cannot publish the pre-fold checkpoint."""
+    async def direct_to_thread(function: Any, *args: Any, **kwargs: Any) -> Any:
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(worker.asyncio, "to_thread", direct_to_thread)
+    worktree = _make_worktree(tmp_path / "repo")
+    checkpoint_root = tmp_path / "checkpoints"
+    seed_config = _agent_config(
+        worktree,
+        context_reuse=True,
+        checkpoint_root=checkpoint_root,
+    )
+    prior_checkpoint = worker._write_epoch_checkpoint(
+        seed_config,
+        turn=1,
+        epoch=1,
+        messages=[
+            {"role": "system", "content": "You are the agent."},
+            {"role": "user", "content": "<cambium-task>prior task</cambium-task>"},
+        ],
+        provider="loopback-provider",
+        model="loopback-model",
+        tools_sha256=worker._sha256_hex(
+            json.dumps(worker._exposed_tool_schemas(seed_config), sort_keys=True).encode("utf-8")
+        ),
+        provider_compat={"loopback-provider": ("loopback", None)},
+    )
+    assert prior_checkpoint is not None
+    prior_bytes = (checkpoint_root / prior_checkpoint.checkpoint_ref).read_bytes()
+    config = _agent_config(
+        worktree,
+        context_reuse=True,
+        rolling_compact=True,
+        rolling_compact_threshold_high=1,
+        rolling_compact_threshold_low=1,
+        checkpoint_root=checkpoint_root,
+        resume={
+            "checkpoint_ref": prior_checkpoint.checkpoint_ref,
+            "epoch": prior_checkpoint.epoch,
+            "child_results": [],
+            "child_results_truncated": False,
+            "rejection_feedback": None,
+            "workspace_changed": False,
+        },
+        max_turns=4,
+    )
+    delegate = json.dumps(
+        {
+            "type": "tool_call",
+            "name": "delegate",
+            "arguments": {
+                "child_task_id": "review",
+                "kind": "investigation",
+                "spec": {
+                    "task": "Review alpha.txt",
+                    "context_mode": "semantic",
+                    "placement": "spread",
+                },
+            },
+        }
+    )
+    writer = _FakeWriter()
+    router = _SummaryFlushRouter(malformed_summaries=2, responses=[delegate])
+
+    outcome = asyncio.run(_drive_loop(config, worktree, router, writer, "forced-fold-race"))
+
+    assert outcome["status"] == "failed"
+    assert "compaction" in (outcome["failure_reason"] or "")
+    assert not any(message["type"] == "context_checkpoint" for message in writer.messages())
+    assert (checkpoint_root / prior_checkpoint.checkpoint_ref).read_bytes() == prior_bytes
+    assert len(
+        [message for message in writer.messages() if message["type"] == "compaction_deferred"]
+    ) == 1
+
+
 def test_two_malformed_summaries_fail_on_the_third_fold_attempt(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     worktree = _make_worktree(repo)
