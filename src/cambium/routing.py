@@ -203,7 +203,8 @@ class ProviderDebt:
         if isinstance(cost, int | float) and not isinstance(cost, bool):
             self.cost += float(cost)
         failure_reason = event.get("failure_reason")
-        if isinstance(failure_reason, str) and failure_reason:
+        failure_present = isinstance(failure_reason, str) and bool(failure_reason)
+        if failure_present:
             self.failed_requests += 1
             if failure_reason.startswith("config_error:") or failure_reason.startswith(
                 "auth_error:"
@@ -216,14 +217,24 @@ class ProviderDebt:
             # failure classifications leave it untouched.
             self.disable_reason = None
             self.disable_at = None
-        if event.get("request_rate_status") == "cooldown" or (
-            isinstance(failure_reason, str) and "429" in failure_reason
+        retry_after = event.get("retry_after_s")
+        retry_after_valid = (
+            type(retry_after) in (int, float)
+            and math.isfinite(cast(int | float, retry_after))
+            and cast(int | float, retry_after) >= 0
+        )
+        if failure_present and (
+            event.get("request_rate_status") == "cooldown"
+            or "429" in failure_reason
+            or retry_after_valid
         ):
             self.retry_after_count += 1
-            delay = event.get("retry_after_s")
-            if type(delay) in (int, float) and math.isfinite(delay) and delay >= 0:
-                self.retry_at = max(self.retry_at or 0.0, timestamp + delay)
-        elif not failure_reason:
+            if retry_after_valid:
+                self.retry_at = max(
+                    self.retry_at or 0.0,
+                    timestamp + cast(int | float, retry_after),
+                )
+        elif not failure_present:
             self.retry_at = None
         if event.get("provider_cache_hit") is True:
             self.cache_hit_count += 1

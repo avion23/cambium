@@ -3887,6 +3887,18 @@ class Diffundo:
                             # A real provider response was observed before the
                             # budget ran out; preserve its outcome and reset
                             # evidence (e.g. Retry-After) for scheduler use.
+                            if last_exc.outcome in (
+                                ProviderOutcome.CONTENT_FLAGGED,
+                                ProviderOutcome.SANDBOX_RESTRICTED,
+                                ProviderOutcome.REFUSAL,
+                                ProviderOutcome.AUTH_ERROR,
+                                ProviderOutcome.CONFIG_ERROR,
+                            ):
+                                request_rate_status = self.status(provider.name).value
+                            else:
+                                request_rate_status = self._record_failure(
+                                    provider, retry_after_s=last_retry_after
+                                )
                             raise ProviderError(
                                 provider.name,
                                 last_exc.outcome,
@@ -3894,6 +3906,7 @@ class Diffundo:
                                 last_exc.cause,
                                 budget_exhausted=True,
                                 retry_after_s=last_retry_after,
+                                request_rate_status=request_rate_status,
                                 account_quota_owner=last_quota_owner,
                             ) from last_exc
                         raise ProviderError(

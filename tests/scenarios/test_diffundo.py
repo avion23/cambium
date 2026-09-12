@@ -1904,6 +1904,56 @@ def test_call_budget_outer_deadline_bounds_threaded_post(monkeypatch) -> None:
     asyncio.run(scenario())
 
 
+def test_budget_expiry_after_provider_error_preserves_retry_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ProviderConfig(
+        name="p_budget_retry_after",
+        tier=ProviderTier.FAST,
+        base_url="http://127.0.0.1:1",
+        api_key_env="K_BUDGET_RETRY_AFTER",
+        api_key="sk-test-budget-retry-after",
+        max_retries=1,
+        cooldown_s=60.0,
+    )
+    router = Diffundo((provider,), pause_timeout_s=0.01)
+    remaining = iter((60.0, 60.0, -1.0))
+
+    async def failing_post(
+        _self: Diffundo,
+        _provider: ProviderConfig,
+        _prompt: dict[str, Any],
+        *,
+        timeout_s: float,
+        deadline: float | None,
+        on_delta: Any = None,
+    ) -> _RawResponse:
+        del timeout_s, deadline, on_delta
+        raise ProviderError(
+            provider.name,
+            ProviderOutcome.ERROR,
+            "HTTP 503 unavailable",
+            retry_after_s=30.0,
+            http_status=503,
+        )
+
+    async def no_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(Diffundo, "_post_with_deadline", failing_post)
+    monkeypatch.setattr(router, "_remaining", lambda _deadline: next(remaining))
+    monkeypatch.setattr(diffundo_module.asyncio, "sleep", no_sleep)
+
+    with pytest.raises(ProviderError) as raised:
+        asyncio.run(router._quota_wrapped_attempt(provider, PROMPT, deadline=123.0))
+
+    error = raised.value
+    assert error.budget_exhausted is True
+    assert error.retry_after_s == 30.0
+    assert error.request_rate_status == ProviderStatus.COOLDOWN.value
+    assert router.health(provider.name) is HealthState.COOLDOWN
+
+
 def test_cancelled_post_consumes_late_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     provider = ProviderConfig(
         name="p_cancelled_post",

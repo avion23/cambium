@@ -286,6 +286,27 @@ def test_generation_init_carries_durable_provider_blocks(tmp_path):
     assert cooling["retry_at"] > time.time()
 
 
+def test_retry_after_is_durable_even_without_cooldown_status(tmp_path):
+    now = time.time()
+    store = DebtStore(tmp_path / "retry-after.json")
+    store.record(
+        {
+            "provider": "a",
+            "failure_reason": "error: HTTP 503 unavailable",
+            "request_rate_status": "available",
+            "retry_after_s": 45.0,
+        }
+    )
+    store.save()
+
+    reloaded = DebtStore(tmp_path / "retry-after.json")
+    reloaded.load()
+    debt = reloaded.as_mapping()["a"]
+    assert debt.retry_after_count == 1
+    assert debt.retry_at is not None
+    assert debt.retry_at >= now + 45.0
+
+
 def test_busy_lane_queues_until_release_without_starting_another_worker(tmp_path):
     config = tmp_path / "providers.json"
     config.write_text(
