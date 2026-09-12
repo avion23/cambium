@@ -15,6 +15,7 @@ from cambium import tui
 from cambium.interactive import InteractiveSession, InteractiveSessionError
 from cambium.monitor import monitor_session
 from cambium.oneshot import OneShotConfig, default_session_root
+from cambium.results import Result, write_result
 from cambium.store import EventStore
 from cambium.supervisor import (
     EventCursor,
@@ -69,6 +70,44 @@ def _checkpoint_event(
             "cache_key": _cache_key(provider, model, redacted=redacted),
         },
     }
+
+
+def _write_success_result(turn_dir: Path) -> None:
+    session_id = str(turn_dir.resolve())
+    result = Result(
+        status="done",
+        exit_code=0,
+        commits=(),
+        files_changed=(),
+        unified_diff="",
+        diff_truncated=False,
+        summary="completed",
+        metric_score=0.0,
+        metric_breakdown={},
+        parent_task_id=None,
+        event_log_ref=f"sqlite:{turn_dir.resolve() / '.cambium' / 'events.db'}",
+        session_id=session_id,
+        started_at=1.0,
+        ended_at=2.0,
+        failure_reason=None,
+    )
+    write_result(result, turn_dir, session_id=session_id)
+
+
+def _write_branch_plan(turn) -> None:
+    (turn.session_dir / "plan.json").write_text(
+        json.dumps(
+            {
+                "tasks": [
+                    {
+                        "interactive_branch_generation": turn.branch_generation,
+                        "interactive_branch_start_turn": turn.branch_start_turn,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 def _two_provider_config(
@@ -165,6 +204,126 @@ def test_interactive_session_keeps_redacted_seed_for_semantic_continuity(tmp_pat
     assert second.context_fork["checkpoint_ref"] == checkpoint_ref
     assert second.context_fork["provider"] == "provider-a"
     assert second.context_fork["model"] == "model-a"
+
+
+def test_reconnect_promotes_durable_compaction_successor(tmp_path: Path) -> None:
+    root = tmp_path / "interactive"
+    session = InteractiveSession(OneShotConfig(repo=tmp_path, session_root=root))
+    first = session.prepare_turn("inspect")
+    old_ref = "interactive-main/epoch-3-" + "b" * 64 + ".json"
+    new_ref = "interactive-main/epoch-4-" + "c" * 64 + ".json"
+    checkpoint_root = first.session_dir / ".cambium" / "checkpoints"
+    (checkpoint_root / old_ref).parent.mkdir(parents=True)
+    (checkpoint_root / old_ref).write_text("{}", encoding="utf-8")
+    old_event = _checkpoint_event(old_ref)
+    store = EventStore(first.session_dir / ".cambium" / "events.db")
+    try:
+        store.append(old_event)
+    finally:
+        store.close()
+    session.observe_event(first, old_event)
+    session.complete_turn(first, succeeded=True)
+
+    (checkpoint_root / new_ref).write_text("{}", encoding="utf-8")
+    advanced = _checkpoint_event(new_ref)
+    advanced["kind"] = "context_epoch_advanced"
+    advanced_payload = advanced["payload"]
+    assert isinstance(advanced_payload, dict)
+    advanced_payload["epoch"] = 4
+    advanced_payload["folded_from_epoch"] = 3
+    store = EventStore(first.session_dir / ".cambium" / "events.db")
+    try:
+        store.append(advanced)
+    finally:
+        store.close()
+
+    reloaded = InteractiveSession(OneShotConfig(repo=tmp_path, session_root=root))
+
+    assert reloaded.seed is not None
+    assert reloaded.seed.checkpoint_ref == new_ref
+    assert reloaded.seed.epoch == 4
+    assert reloaded.last_checkpoint == new_ref
+
+
+def test_reconnect_adopts_canonical_successful_orphan_turn(tmp_path: Path) -> None:
+    root = tmp_path / "interactive"
+    session = InteractiveSession(OneShotConfig(repo=tmp_path, session_root=root))
+    orphan = session.prepare_turn("finish before frontend dies")
+    _write_branch_plan(orphan)
+    store = EventStore(orphan.session_dir / ".cambium" / "events.db")
+    try:
+        store.append({"kind": "session_started", "task_id": None, "payload": {}})
+    finally:
+        store.close()
+    _write_success_result(orphan.session_dir)
+
+    reloaded = InteractiveSession(OneShotConfig(repo=tmp_path, session_root=root))
+    reloaded.acquire()
+    try:
+        assert reloaded.reconnected is True
+        assert reloaded.turn == orphan.number
+    finally:
+        reloaded.release()
+
+
+def test_latest_continue_discovers_successful_first_turn_orphan(tmp_path: Path) -> None:
+    root = default_session_root(tmp_path) / "first-orphan"
+    session = InteractiveSession(OneShotConfig(repo=tmp_path, session_root=root))
+    orphan = session.prepare_turn("finish before frontend dies")
+    _write_branch_plan(orphan)
+    store = EventStore(orphan.session_dir / ".cambium" / "events.db")
+    try:
+        store.append({"kind": "session_started", "task_id": None, "payload": {}})
+    finally:
+        store.close()
+    _write_success_result(orphan.session_dir)
+
+    assert InteractiveSession.resolve_continue_session(tmp_path, None) == root.resolve()
+
+
+def test_reconnect_refuses_to_skip_incomplete_orphan_turn(tmp_path: Path) -> None:
+    root = tmp_path / "interactive"
+    session = InteractiveSession(OneShotConfig(repo=tmp_path, session_root=root))
+    orphan = session.prepare_turn("incomplete")
+    _write_branch_plan(orphan)
+    store = EventStore(orphan.session_dir / ".cambium" / "events.db")
+    try:
+        store.append({"kind": "session_started", "task_id": None, "payload": {}})
+    finally:
+        store.close()
+
+    reloaded = InteractiveSession(OneShotConfig(repo=tmp_path, session_root=root))
+    reloaded.acquire()
+    try:
+        assert reloaded.turn == 0
+        with pytest.raises(InteractiveSessionError, match="unreconciled durable turn directory"):
+            reloaded.prepare_turn("must not skip")
+    finally:
+        reloaded.release()
+
+
+def test_reconnect_rejects_successful_orphan_from_old_branch(tmp_path: Path) -> None:
+    root = tmp_path / "interactive"
+    session = InteractiveSession(OneShotConfig(repo=tmp_path, session_root=root))
+    orphan = session.prepare_turn("old branch")
+    _write_branch_plan(orphan)
+    store = EventStore(orphan.session_dir / ".cambium" / "events.db")
+    try:
+        store.append({"kind": "session_started", "task_id": None, "payload": {}})
+    finally:
+        store.close()
+    _write_success_result(orphan.session_dir)
+    session.reset()
+
+    reloaded = InteractiveSession(OneShotConfig(repo=tmp_path, session_root=root))
+    reloaded.acquire()
+    try:
+        assert reloaded.branch_generation == 2
+        assert reloaded.turn == 0
+        with pytest.raises(InteractiveSessionError, match="unreconciled durable turn directory"):
+            reloaded.prepare_turn("must not adopt old branch")
+    finally:
+        reloaded.release()
 
 
 def test_interactive_reset_starts_fresh_branch(tmp_path: Path) -> None:

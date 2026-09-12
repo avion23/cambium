@@ -39,7 +39,12 @@ incompatible exact prefix or claim the old provider's cache.
 
 An interactive root has one active frontend owner. Reconnect reconstructs
 accepted state from the manifest and durable turn artifacts, not widget memory.
-The event stream remains usable by monitoring and history inspection.
+The event stream remains usable by monitoring and history inspection. If the
+frontend dies after a supervisor turn has already written a canonical successful
+root result, reconnect may adopt that next contiguous turn only when its durable
+plan is bound to the current interactive branch. An incomplete, failed, or
+foreign orphan turn is not skipped. A durable manual-compaction successor also
+advances the in-memory seed when it extends the manifest seed's recorded lineage.
 
 During a running turn, Ctrl-C or `/cancel` requests cancellation. At idle,
 Ctrl-C exits cleanly. Queued prompts are distinct from cancellation and from

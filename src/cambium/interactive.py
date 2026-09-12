@@ -29,6 +29,7 @@ from typing import Any
 
 from . import oneshot, supervisor
 from .oneshot import OneShotConfig, SessionMode
+from .results import ROOT_RESULT_KEYS, Result
 from .store import EventStore, StoreError, read_events_file
 from .summary_trunk import (
     SummaryTrunkError,
@@ -50,6 +51,8 @@ _LOCK_NAME = "session.lock"
 _TURN_DIR_RE = re.compile(r"^turn-(\d+)$")
 _MANIFEST_TURN_MARGIN = 1
 _CONTEXT_KINDS = frozenset({"context_checkpoint", "context_epoch_advanced"})
+_BRANCH_GENERATION_FIELD = "interactive_branch_generation"
+_BRANCH_START_TURN_FIELD = "interactive_branch_start_turn"
 _FORK_FIELDS = (
     "provider",
     "model",
@@ -103,6 +106,8 @@ class InteractiveTurn:
     config: OneShotConfig
     context_fork: dict[str, Any] | None
     summary_trunk_ref: str | None
+    branch_generation: int
+    branch_start_turn: int
 
 
 def _payload(event: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -527,7 +532,7 @@ class InteractiveSession:
         )
         return (
             type(turn) is int
-            and 1 <= turn <= max_listed_turn + _MANIFEST_TURN_MARGIN
+            and 0 <= turn <= max_listed_turn + _MANIFEST_TURN_MARGIN
             and cls._has_durable_state(root)
         )
 
@@ -668,6 +673,7 @@ class InteractiveSession:
         self._serving_turn = None
         self._reconnected = self._manifest_path.is_file() and self._has_durable_state(self.root)
         self._load_manifest()
+        self._reconcile_successful_orphans()
         self._load_durable_head()
         self._reconcile_provider_preference()
 
@@ -769,12 +775,137 @@ class InteractiveSession:
             epoch=epoch,
         )
 
+    @staticmethod
+    def _context_seed_from_event(
+        source_session: Path, event: Mapping[str, Any]
+    ) -> ContextSeed | None:
+        """Build a reusable seed only from a complete durable context event."""
+        payload = _payload(event)
+        checkpoint_ref = payload.get("checkpoint_ref")
+        cache_key = payload.get("cache_key")
+        epoch = payload.get("epoch")
+        if (
+            not isinstance(checkpoint_ref, str)
+            or not checkpoint_ref
+            or not isinstance(cache_key, Mapping)
+            or type(epoch) is not int
+            or epoch < 0
+        ):
+            return None
+        try:
+            checkpoint = _checkpoint_path(source_session, checkpoint_ref)
+        except InteractiveSessionError:
+            return None
+        if not checkpoint.is_file() or checkpoint.is_symlink():
+            return None
+        descriptor = _fork_descriptor(checkpoint_ref, cache_key)
+        provider = cache_key.get("provider")
+        model = cache_key.get("model")
+        return ContextSeed(
+            source_session=source_session.resolve(),
+            checkpoint_ref=checkpoint_ref,
+            descriptor={} if descriptor is None else descriptor,
+            provider=provider if isinstance(provider, str) and provider else None,
+            model=model if isinstance(model, str) and model else None,
+            epoch=epoch,
+        )
+
+    @staticmethod
+    def _successful_orphan_seed(
+        turn_dir: Path,
+        *,
+        branch_generation: int,
+        branch_start_turn: int,
+    ) -> tuple[bool, ContextSeed | None]:
+        """Validate one crashed-after-success turn using existing durable facts."""
+        state_dir = turn_dir / ".cambium"
+        event_db = state_dir / "events.db"
+        result_path = state_dir / "result.json"
+        plan_path = turn_dir / "plan.json"
+        if any(path.is_symlink() for path in (state_dir, event_db, result_path, plan_path)):
+            return False, None
+        if not event_db.is_file() or not result_path.is_file() or not plan_path.is_file():
+            return False, None
+
+        plan = _read_manifest_document(plan_path)
+        tasks = plan.get("tasks") if isinstance(plan, Mapping) else None
+        if not isinstance(tasks, list) or not tasks:
+            return False, None
+        for task in tasks:
+            if not isinstance(task, Mapping):
+                return False, None
+            if (
+                task.get(_BRANCH_GENERATION_FIELD) != branch_generation
+                or task.get(_BRANCH_START_TURN_FIELD) != branch_start_turn
+            ):
+                return False, None
+
+        document = _read_manifest_document(result_path)
+        if document is None or set(document) != set(ROOT_RESULT_KEYS):
+            return False, None
+        try:
+            result = Result(**document)
+        except (TypeError, ValueError):
+            return False, None
+        expected_session = str(turn_dir.resolve())
+        expected_event_log = f"sqlite:{turn_dir.resolve() / '.cambium' / 'events.db'}"
+        if (
+            result.status != "done"
+            or result.exit_code != 0
+            or result.session_id != expected_session
+            or result.event_log_ref != expected_event_log
+            or result.parent_task_id is not None
+            or result.failure_reason is not None
+        ):
+            return False, None
+
+        try:
+            events = read_events_file(event_db)
+        except (OSError, StoreError, ValueError, sqlite3.Error):
+            return False, None
+        seed: ContextSeed | None = None
+        for event in events:
+            if event.get("kind") not in _CONTEXT_KINDS:
+                continue
+            candidate = InteractiveSession._context_seed_from_event(turn_dir, event)
+            if candidate is not None:
+                seed = candidate
+        return True, seed
+
+    def _reconcile_successful_orphans(self) -> None:
+        """Adopt only contiguous turns proven successful before frontend death."""
+        adopted = False
+        while True:
+            turn_dir = self._turn_dir(self._turn + 1)
+            if not turn_dir.exists():
+                break
+            successful, seed = self._successful_orphan_seed(
+                turn_dir,
+                branch_generation=self._branch_generation,
+                branch_start_turn=self._branch_start_turn,
+            )
+            if not successful:
+                break
+            self._turn += 1
+            if seed is not None:
+                self._seed = seed
+            adopted = True
+        if adopted:
+            self._pending_seed = None
+            self._reconnected = True
+            self._write_manifest()
+
     def _load_durable_head(self) -> None:
-        """Read the newest durable checkpoint for reconnect diagnostics."""
-        if self._seed is not None:
-            self._last_epoch = self._seed.epoch
-            self._last_checkpoint = self._seed.checkpoint_ref
-        for turn_dir in self.active_turn_dirs():
+        """Recover the durable context head and reconnect diagnostics."""
+        seed = self._seed
+        if seed is not None:
+            self._last_epoch = seed.epoch
+            self._last_checkpoint = seed.checkpoint_ref
+
+        turn_dirs = list(self.active_turn_dirs())
+        if seed is not None and seed.source_session not in turn_dirs:
+            turn_dirs.append(seed.source_session)
+        for turn_dir in turn_dirs:
             event_db = turn_dir / ".cambium" / "events.db"
             if not event_db.is_file():
                 continue
@@ -782,22 +913,31 @@ class InteractiveSession:
                 events = read_events_file(event_db)
             except (OSError, StoreError, ValueError, sqlite3.Error):
                 continue
+            anchor_seen = seed is None or turn_dir.resolve() != seed.source_session.resolve()
             for event in events:
                 if event.get("kind") not in _CONTEXT_KINDS:
                     continue
+                candidate = self._context_seed_from_event(turn_dir, event)
+                if candidate is None:
+                    continue
+                self._last_epoch = candidate.epoch
+                self._last_checkpoint = candidate.checkpoint_ref
+                if seed is None or turn_dir.resolve() != seed.source_session.resolve():
+                    continue
+                if not anchor_seen:
+                    anchor_seen = (
+                        candidate.checkpoint_ref == seed.checkpoint_ref
+                        and candidate.epoch == seed.epoch
+                    )
+                    continue
                 payload = _payload(event)
-                checkpoint_ref = payload.get("checkpoint_ref")
-                epoch = payload.get("epoch")
-                if not isinstance(checkpoint_ref, str) or type(epoch) is not int or epoch < 0:
-                    continue
-                try:
-                    checkpoint = _checkpoint_path(turn_dir, checkpoint_ref)
-                except InteractiveSessionError:
-                    continue
-                if not checkpoint.is_file() or epoch < self._last_epoch:
-                    continue
-                self._last_epoch = epoch
-                self._last_checkpoint = checkpoint_ref
+                if (
+                    event.get("kind") == "context_epoch_advanced"
+                    and payload.get("folded_from_epoch") == seed.epoch
+                    and candidate.epoch == seed.epoch + 1
+                ):
+                    seed = candidate
+                    self._seed = candidate
 
     def resume_summary(self) -> str:
         """Describe the durable state that will be attached on startup."""
@@ -1278,10 +1418,15 @@ class InteractiveSession:
         self._reconcile_provider_preference()
         number = self._turn + 1
         session_dir = self._turn_dir(number)
-        while session_dir.exists():
-            number += 1
-            session_dir = self._turn_dir(number)
+        if session_dir.exists():
+            raise InteractiveSessionError(
+                f"cannot prepare turn {number}: an unreconciled durable turn directory exists"
+            )
         session_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
+        # Publish the interactive type marker before supervisor work starts.
+        # The accepted-turn pointer remains unchanged until complete_turn or
+        # conservative reconnect reconciliation proves this leaf succeeded.
+        self._write_manifest()
         config = replace(
             self._base_config,
             session_root=session_dir,
@@ -1335,6 +1480,8 @@ class InteractiveSession:
                 ),
                 context_fork=copy.deepcopy(context_fork),
                 summary_trunk_ref=summary_trunk_ref,
+                branch_generation=self._branch_generation,
+                branch_start_turn=self._branch_start_turn,
             )
             for index, prompt in enumerate(prompts, start=1)
         )
@@ -1350,6 +1497,12 @@ class InteractiveSession:
             raise InteractiveSessionError("interactive batch turns must share a turn number")
         if any(turn.session_dir != normalized[0].session_dir for turn in normalized):
             raise InteractiveSessionError("interactive batch turns must share a session directory")
+        if any(
+            turn.branch_generation != normalized[0].branch_generation
+            or turn.branch_start_turn != normalized[0].branch_start_turn
+            for turn in normalized
+        ):
+            raise InteractiveSessionError("interactive batch turns must share a branch")
         return normalized
 
     async def run_turn(
@@ -1368,6 +1521,12 @@ class InteractiveSession:
         remain owned by the existing oneshot/supervisor path.
         """
         turns = self._normalize_turns(turn)
+        if any(
+            item.branch_generation != self._branch_generation
+            or item.branch_start_turn != self._branch_start_turn
+            for item in turns
+        ):
+            raise InteractiveSessionError("prepared turn belongs to another interactive branch")
         session_dir = turns[0].session_dir
         repo = self.repo
         for item in turns:
@@ -1380,6 +1539,8 @@ class InteractiveSession:
             resolved, environment = oneshot._resolve_provider(item.config, repo)
             provider_environment.update(environment)
             task = oneshot.build_plan(resolved, repo, session_dir)["tasks"][0]
+            task[_BRANCH_GENERATION_FIELD] = item.branch_generation
+            task[_BRANCH_START_TURN_FIELD] = item.branch_start_turn
             if item.context_fork is not None:
                 task["context_fork"] = copy.deepcopy(item.context_fork)
             if item.summary_trunk_ref is not None:
@@ -1425,41 +1586,19 @@ class InteractiveSession:
             return
         if kind not in _CONTEXT_KINDS:
             return
-        checkpoint_ref = payload.get("checkpoint_ref")
-        cache_key = payload.get("cache_key")
-        if not isinstance(checkpoint_ref, str) or not checkpoint_ref:
+        seed = self._context_seed_from_event(turn.session_dir, event)
+        if seed is None:
             return
-        if not isinstance(cache_key, Mapping):
-            return
-        try:
-            checkpoint = _checkpoint_path(turn.session_dir, checkpoint_ref)
-        except InteractiveSessionError:
-            return
-        if not checkpoint.is_file() or checkpoint.is_symlink():
-            return
-        descriptor = _fork_descriptor(checkpoint_ref, cache_key)
-        provider = cache_key.get("provider")
-        model = cache_key.get("model")
-        epoch = payload.get("epoch", 0)
-        self._pending_seed = ContextSeed(
-            source_session=turn.session_dir,
-            checkpoint_ref=checkpoint_ref,
-            descriptor={} if descriptor is None else descriptor,
-            provider=provider if isinstance(provider, str) and provider else None,
-            model=model if isinstance(model, str) and model else None,
-            epoch=epoch if type(epoch) is int and epoch >= 0 else 0,
-        )
+        self._pending_seed = seed
         if (
             self._serving_turn != turn.number
-            and isinstance(provider, str)
-            and provider
-            and isinstance(model, str)
-            and model
+            and seed.provider is not None
+            and seed.model is not None
         ):
-            self._set_serving_preference(provider, model)
-        if self._pending_seed.epoch >= self._last_epoch:
-            self._last_epoch = self._pending_seed.epoch
-            self._last_checkpoint = checkpoint_ref
+            self._set_serving_preference(seed.provider, seed.model)
+        if seed.epoch >= self._last_epoch:
+            self._last_epoch = seed.epoch
+            self._last_checkpoint = seed.checkpoint_ref
 
     def complete_turn(
         self, turn: InteractiveTurn | Sequence[InteractiveTurn], *, succeeded: bool
