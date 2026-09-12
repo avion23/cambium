@@ -305,6 +305,11 @@ FINAL_SYNTHESIS_DIRECTIVE = (
     "names, commands, hashes, routine paths, lint chatter, and task restatement. Set "
     "objective_met=false when the task is incomplete."
 )
+REPEATED_EVIDENCE_DIRECTIVE = (
+    "The last read exactly repeated an earlier evidence query and returned the same evidence. "
+    "If the visible evidence already satisfies the task, return finish now. Otherwise take one "
+    "action that can add new evidence; do not reopen an already-seen record again."
+)
 
 
 class TaskStatus(StrEnum):
@@ -7449,6 +7454,20 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                     tools=tools,
                     model_identity=model_identity,
                 )
+                if (
+                    read_action
+                    and no_progress_actions == 1
+                    and not _finalization_due(
+                        turn, finalized, budget_new_tokens, soft_cap, config
+                    )
+                ):
+                    context_continuation, transcript = _append_context_message(
+                        {"role": "user", "content": REPEATED_EVIDENCE_DIRECTIVE},
+                        base_messages,
+                        context_continuation,
+                        transcript,
+                        config,
+                    )
                 (
                     finalized,
                     forced_finalization,

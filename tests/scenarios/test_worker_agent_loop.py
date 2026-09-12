@@ -1447,6 +1447,36 @@ def test_cancellation_mid_batch_persists_remaining_calls_as_unexecuted(
     assert tool_events[0]["batch_index"] == 0
 
 
+def test_repeated_evidence_gets_one_finish_directive_before_stall(tmp_path: Path) -> None:
+    worktree = _make_worktree(tmp_path / "repo")
+    config = _agent_config(
+        worktree,
+        max_no_progress_actions=2,
+        progress_window=3,
+    )
+    action = json.dumps(
+        {
+            "type": "tool_call",
+            "calls": [{"name": "read_batch", "arguments": {"paths": ["alpha.txt"]}}],
+        }
+    )
+    router = _ScriptedRouter(
+        [action, action, '{"type":"finish","summary":"evidence complete","objective_met":true}']
+    )
+
+    outcome = asyncio.run(_drive_loop(config, worktree, router))
+
+    assert outcome["status"] == "succeeded"
+    assert outcome["summary"] == "evidence complete"
+    assert len(router.prompts) == 3
+    final_prompt_messages = router.prompts[-1]["messages"]
+    assert sum(
+        message.get("content") == worker.REPEATED_EVIDENCE_DIRECTIVE
+        for message in final_prompt_messages
+        if isinstance(message, dict)
+    ) == 1
+
+
 def test_repeated_read_failure_persists_causal_tool_event_and_checkpoint(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
