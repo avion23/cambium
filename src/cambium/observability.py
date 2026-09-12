@@ -43,6 +43,7 @@ _CONTEXT_EVENT_KINDS = frozenset(
         "context_fork",
     }
 )
+_ASSIGNMENT_EVENT_KINDS = frozenset({"task_assigned", "child_admitted", "task_queued"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +73,10 @@ class AgentSnapshot:
     lineage: str = ""
     last_provider_cache_hit: bool | None = None
     phase: str | None = None
+    assigned_provider: str | None = None
+    assigned_model: str | None = None
+    serving_provider: str | None = None
+    serving_model: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,6 +163,10 @@ class _Agent:
     raw_tail_bytes: int = 0
     last_provider_cache_hit: bool | None = None
     phase: str | None = None
+    assigned_provider: str | None = None
+    assigned_model: str | None = None
+    serving_provider: str | None = None
+    serving_model: str | None = None
 
 
 def _payload(event: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -256,6 +265,21 @@ def _event_time(event: Mapping[str, Any]) -> float | None:
 
 def _string(value: Any) -> str | None:
     return value if isinstance(value, str) and value else None
+
+
+def _assignment_values(kind: str, payload: Mapping[str, Any]) -> tuple[str | None, str | None]:
+    """Return coding-assignment evidence, never call-time serving evidence."""
+    if kind not in _ASSIGNMENT_EVENT_KINDS:
+        return None, None
+    provider = _string(payload.get("assigned_provider")) or _string(payload.get("provider"))
+    return provider, _string(payload.get("model"))
+
+
+def _serving_values(kind: str, payload: Mapping[str, Any]) -> tuple[str | None, str | None]:
+    """Return the provider/model that served a durable usage observation."""
+    if kind != "usage_event":
+        return None, None
+    return _string(payload.get("provider")), _string(payload.get("model"))
 
 
 def _event_detail(kind: str, payload: Mapping[str, Any]) -> str:
@@ -499,6 +523,8 @@ class ObservabilityState:
 
         parent_id = _string(payload.get("parent_task_id"))
         child_id = _string(payload.get("child_task_id"))
+        assignment_provider, assignment_model = _assignment_values(kind, payload)
+        serving_provider, serving_model = _serving_values(kind, payload)
         if child_id is not None:
             child = self._ensure_agent(child_id)
             if parent_id is not None:
@@ -512,6 +538,12 @@ class ObservabilityState:
                 child.epoch = max(child.epoch, child_epoch)
             if kind == "child_rejected":
                 _set_state(child, "rejected")
+            if assignment_provider is not None:
+                child.assigned_provider = assignment_provider
+                child.provider = assignment_provider
+            if assignment_model is not None:
+                child.assigned_model = assignment_model
+                child.model = assignment_model
         lineage = _context_lineage(kind, payload)
         if lineage is not None:
             lineage_task_id = child_id or task_id
@@ -572,12 +604,34 @@ class ObservabilityState:
             if type(epoch) is int and epoch >= 0:
                 agent.epoch = max(agent.epoch, epoch)
 
-            provider = _string(payload.get("provider")) or _string(payload.get("assigned_provider"))
-            model = _string(payload.get("model"))
-            if provider is not None:
-                agent.provider = provider
-            if model is not None:
-                agent.model = model
+            assignment_targets_task = child_id is None or child_id == task_id
+            if assignment_provider is not None and assignment_targets_task:
+                agent.assigned_provider = assignment_provider
+                agent.provider = assignment_provider
+            if assignment_model is not None and assignment_targets_task:
+                agent.assigned_model = assignment_model
+                agent.model = assignment_model
+            if serving_provider is not None:
+                agent.serving_provider = serving_provider
+            if serving_model is not None:
+                agent.serving_model = serving_model
+            if kind == "usage_event" and payload.get("call_kind") != "summary":
+                incumbent = agent.assigned_provider or agent.provider
+                genuine_fallback = bool(
+                    serving_provider
+                    and incumbent
+                    and serving_provider != incumbent
+                    and payload.get("call_kind") == "agent"
+                    and not _string(payload.get("failure_reason"))
+                    and _string(payload.get("fell_back_from")) == incumbent
+                )
+                if incumbent is None or serving_provider == incumbent or genuine_fallback:
+                    if serving_provider is not None:
+                        agent.assigned_provider = serving_provider
+                        agent.provider = serving_provider
+                    if serving_model is not None:
+                        agent.assigned_model = serving_model
+                        agent.model = serving_model
             if kind == "heartbeat":
                 phase = _string(payload.get("phase"))
                 agent.phase = phase.casefold().replace("_", "-") if phase is not None else None
@@ -728,6 +782,10 @@ class ObservabilityState:
                     last_kind=agent.last_kind,
                     last_provider_cache_hit=agent.last_provider_cache_hit,
                     phase=agent.phase,
+                    assigned_provider=agent.assigned_provider,
+                    assigned_model=agent.assigned_model,
+                    serving_provider=agent.serving_provider,
+                    serving_model=agent.serving_model,
                 )
             )
 

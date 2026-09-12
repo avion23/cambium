@@ -22,6 +22,21 @@ def _is_child_admission_for(event: Mapping[str, Any], task_id: str) -> bool:
     return isinstance(payload, Mapping) and payload.get("child_task_id") == task_id
 
 
+def _event_parent_id(event: Mapping[str, Any]) -> str | None:
+    """Return the durable parent identity carried by one child-owned event."""
+    payload = event.get("payload")
+    if isinstance(payload, Mapping):
+        for key in ("parent_task_id", "parent_branch_id"):
+            value = payload.get(key)
+            if isinstance(value, str) and value:
+                return value
+    for key in ("parent_task_id", "parent_branch_id"):
+        value = event.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
 def _project_child_admission(
     state: BranchState, event: Mapping[str, Any], task_id: str
 ) -> BranchState:
@@ -84,9 +99,21 @@ def load_state(session_dir: str | Path, task_id: str | None = None) -> BranchSta
                 if owner not in descendants:
                     continue
                 if owner == task_id:
+                    parent_id = _event_parent_id(event) or state.identity.parent_branch_id
                     payload.pop("parent_task_id", None)
-                    event = {**event, "parent_task_id": None, "payload": payload}
+                    payload.pop("parent_branch_id", None)
+                    event = {
+                        **event,
+                        "parent_task_id": None,
+                        "parent_branch_id": None,
+                        "payload": payload,
+                    }
                 state = reduce(state, event)
+                if owner == task_id and parent_id is not None:
+                    state = replace(
+                        state,
+                        identity=replace(state.identity, parent_branch_id=parent_id),
+                    )
         return replace(
             state,
             identity=replace(

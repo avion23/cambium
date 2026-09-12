@@ -195,6 +195,10 @@ class Resources:
     cash_pressure: str = "unknown"
     delegation_overhead: str = "unknown"
     alternative_lane_available: bool | None = None
+    assigned_provider: str | None = None
+    assigned_model: str | None = None
+    serving_provider: str | None = None
+    serving_model: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,6 +267,10 @@ class Child:
     result: ResultEnvelope | None = None
     usage: Usage = field(default_factory=Usage)
     tool_events: tuple[ToolObservation, ...] = ()
+    assigned_provider: str | None = None
+    assigned_model: str | None = None
+    serving_provider: str | None = None
+    serving_model: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -344,6 +352,22 @@ class BranchState:
     @property
     def model(self) -> str | None:
         return self.resources.model
+
+    @property
+    def assigned_provider(self) -> str | None:
+        return self.resources.assigned_provider
+
+    @property
+    def assigned_model(self) -> str | None:
+        return self.resources.assigned_model
+
+    @property
+    def serving_provider(self) -> str | None:
+        return self.resources.serving_provider
+
+    @property
+    def serving_model(self) -> str | None:
+        return self.resources.serving_model
 
     @property
     def calls(self) -> int:
@@ -434,6 +458,10 @@ class BranchState:
                 "uncached_token_pressure": self.resources.uncached_token_pressure,
                 "provider": self.resources.provider,
                 "model": self.resources.model,
+                "assigned_provider": self.resources.assigned_provider,
+                "assigned_model": self.resources.assigned_model,
+                "serving_provider": self.resources.serving_provider,
+                "serving_model": self.resources.serving_model,
                 "provider_lease": self.resources.provider_lease,
                 "cache_affinity": self.resources.cache_affinity,
                 "cache_warmth": self.resources.cache_warmth,
@@ -552,6 +580,10 @@ class BranchState:
                 ),
                 provider=_optional_string(resources_data.get("provider")),
                 model=_optional_string(resources_data.get("model")),
+                assigned_provider=_optional_string(resources_data.get("assigned_provider")),
+                assigned_model=_optional_string(resources_data.get("assigned_model")),
+                serving_provider=_optional_string(resources_data.get("serving_provider")),
+                serving_model=_optional_string(resources_data.get("serving_model")),
                 provider_lease=_optional_string(resources_data.get("provider_lease")),
                 cache_affinity=_known_or_unknown_string(
                     resources_data.get("cache_affinity"), "unknown"
@@ -924,6 +956,10 @@ def _child_to_dict(value: Child) -> dict[str, Any]:
         "critical": value.critical,
         "provider": value.provider,
         "model": value.model,
+        "assigned_provider": value.assigned_provider,
+        "assigned_model": value.assigned_model,
+        "serving_provider": value.serving_provider,
+        "serving_model": value.serving_model,
         "current_tool": value.current_tool,
         "artifact_status": value.artifact_status,
         "accepted_artifact_head": value.accepted_artifact_head,
@@ -953,6 +989,10 @@ def _child_from_dict(value: Any) -> Child:
         critical=_optional_bool(data.get("critical")),
         provider=_optional_string(data.get("provider")),
         model=_optional_string(data.get("model")),
+        assigned_provider=_optional_string(data.get("assigned_provider")),
+        assigned_model=_optional_string(data.get("assigned_model")),
+        serving_provider=_optional_string(data.get("serving_provider")),
+        serving_model=_optional_string(data.get("serving_model")),
         current_tool=_optional_string(data.get("current_tool")),
         artifact_status=_known_or_unknown_string(data.get("artifact_status"), "unknown"),
         accepted_artifact_head=_optional_string(data.get("accepted_artifact_head")),
@@ -1066,10 +1106,13 @@ def _prepare_identity(
     branch_id = identity.branch_id or candidate
     if branch_id is None and task_id is not None:
         branch_id = task_id
+    parent_branch_id = identity.parent_branch_id
+    if parent_id is not None and parent_id != task_id and branch_id == task_id:
+        parent_branch_id = parent_id
     if (
         identity.session_id == session_id
         and identity.branch_id == branch_id
-        and identity.parent_branch_id == identity.parent_branch_id
+        and identity.parent_branch_id == parent_branch_id
     ):
         return state
     return replace(
@@ -1078,6 +1121,7 @@ def _prepare_identity(
             identity,
             session_id=session_id,
             branch_id=branch_id,
+            parent_branch_id=parent_branch_id,
         ),
     )
 
@@ -1139,7 +1183,7 @@ def _root_event(state: BranchState, task_id: str | None) -> bool:
 def _provider_values(values: Mapping[str, Any]) -> tuple[str | None, str | None]:
     metadata = values.get("provider_metadata")
     metadata_map = metadata if isinstance(metadata, Mapping) else {}
-    provider = _optional_string(_value(values, "provider", "assigned_provider"))
+    provider = _optional_string(values.get("provider"))
     model = _optional_string(values.get("model"))
     if provider is None:
         provider = _optional_string(metadata_map.get("provider"))
@@ -1148,10 +1192,57 @@ def _provider_values(values: Mapping[str, Any]) -> tuple[str | None, str | None]
     return provider, model
 
 
+def _assignment_values(values: Mapping[str, Any]) -> tuple[str | None, str | None]:
+    """Return provider/model admitted as the coding assignment."""
+    provider = _optional_string(values.get("assigned_provider"))
+    if provider is None:
+        provider = _optional_string(values.get("provider"))
+    return provider, _optional_string(values.get("model"))
+
+
 def _provider_lease(provider: str | None, model: str | None) -> str | None:
     if provider is None:
         return None
     return f"{provider}/{model}" if model is not None else provider
+
+
+def _update_assignment_resources(
+    resources: Resources, provider: str | None, model: str | None
+) -> Resources:
+    assigned_provider = provider or resources.assigned_provider
+    assigned_model = model or resources.assigned_model
+    return replace(
+        resources,
+        provider=assigned_provider or resources.provider,
+        model=assigned_model or resources.model,
+        assigned_provider=assigned_provider,
+        assigned_model=assigned_model,
+        provider_lease=_provider_lease(assigned_provider, assigned_model),
+    )
+
+
+def _update_serving(
+    value: Resources | Child, provider: str | None, model: str | None
+) -> Resources | Child:
+    return replace(
+        value,
+        serving_provider=provider or value.serving_provider,
+        serving_model=model or value.serving_model,
+    )
+
+
+def _successful_fallback(
+    value: Resources | Child, values: Mapping[str, Any], provider: str | None
+) -> bool:
+    incumbent = value.assigned_provider or value.provider
+    return bool(
+        provider
+        and incumbent
+        and provider != incumbent
+        and values.get("call_kind") == "agent"
+        and not _optional_string(values.get("failure_reason"))
+        and _optional_string(values.get("fell_back_from")) == incumbent
+    )
 
 
 def _progress(
@@ -1168,7 +1259,9 @@ def _progress(
     child_index = _find_child_index(state, task_id)
     generation = _generation(values)
     turn = _turn(values)
-    provider, model = _provider_values(values)
+    provider, model = (
+        _provider_values(values) if values.get("kind") == "usage_event" else (None, None)
+    )
     if child_index is not None:
         child = state.children[child_index]
         if generation is not None:
@@ -1192,6 +1285,7 @@ def _progress(
         current_tool = child.current_tool
         if "tool" in values:
             current_tool = _optional_string(values.get("tool"))
+        child = _update_serving(child, provider, model)
         return _replace_child(
             state,
             task_id,
@@ -1200,8 +1294,6 @@ def _progress(
                 generation=generation,
                 turn=turn,
                 lifecycle=lifecycle,
-                provider=provider or child.provider,
-                model=model or child.model,
                 current_tool=current_tool,
             ),
         )
@@ -1231,14 +1323,7 @@ def _progress(
         current_tool = _optional_string(values.get("tool"))
     resources = state.resources
     if provider is not None or model is not None:
-        resources = replace(
-            resources,
-            provider=provider or resources.provider,
-            model=model or resources.model,
-            provider_lease=_provider_lease(
-                provider or resources.provider, model or resources.model
-            ),
-        )
+        resources = _update_serving(resources, provider, model)
     return replace(
         state,
         identity=replace(identity, generation=generation, turn=turn, lifecycle=lifecycle),
@@ -1307,6 +1392,7 @@ def _reduce_task_assigned(state: BranchState, values: Mapping[str, Any]) -> Bran
         state = _prepare_identity(state, values, prefer_parent=True)
         state = _ensure_child(state, task_id, parent_id, kind=_optional_string(values.get("kind")))
         child = next(child for child in state.children if child.branch_id == task_id)
+        assigned_provider, assigned_model = _assignment_values(values)
         return _replace_child(
             state,
             task_id,
@@ -1315,6 +1401,10 @@ def _reduce_task_assigned(state: BranchState, values: Mapping[str, Any]) -> Bran
                 parent_branch_id=parent_id,
                 lifecycle=_transition(child.lifecycle, Lifecycle.QUEUED),
                 kind=_optional_string(values.get("kind")) or child.kind,
+                provider=assigned_provider or child.provider,
+                model=assigned_model or child.model,
+                assigned_provider=assigned_provider or child.assigned_provider,
+                assigned_model=assigned_model or child.assigned_model,
             ),
         )
 
@@ -1369,7 +1459,7 @@ def _reduce_task_assigned(state: BranchState, values: Mapping[str, Any]) -> Bran
     if current_step is not None:
         control = replace(control, current_step=current_step)
 
-    provider, model = _provider_values(contract)
+    provider, model = _assignment_values(contract)
     resources = state.resources
     max_turns = _nonnegative_int(contract.get("max_turns"))
     max_wall = _finite_nonnegative(contract.get("max_wall_s"))
@@ -1378,14 +1468,7 @@ def _reduce_task_assigned(state: BranchState, values: Mapping[str, Any]) -> Bran
     if max_wall is not None:
         resources = replace(resources, remaining_wall_s=max_wall)
     if provider is not None or model is not None:
-        resources = replace(
-            resources,
-            provider=provider or resources.provider,
-            model=model or resources.model,
-            provider_lease=_provider_lease(
-                provider or resources.provider, model or resources.model
-            ),
-        )
+        resources = _update_assignment_resources(resources, provider, model)
 
     artifacts = state.artifacts
     base_head = _optional_string(_value(contract, "base_commit", "base_head"))
@@ -1422,6 +1505,7 @@ def _reduce_child_admitted(state: BranchState, values: Mapping[str, Any]) -> Bra
     placement = _optional_string(values.get("placement")) or child.placement
     critical = _optional_bool(values.get("critical"))
     result_ref = _optional_string(values.get("result_ref"))
+    assigned_provider, assigned_model = _assignment_values(values)
     state = _replace_child(
         state,
         child_id,
@@ -1433,6 +1517,10 @@ def _reduce_child_admitted(state: BranchState, values: Mapping[str, Any]) -> Bra
             context_mode=context_mode,
             placement=placement,
             critical=critical if critical is not None else child.critical,
+            provider=assigned_provider or child.provider,
+            model=assigned_model or child.model,
+            assigned_provider=assigned_provider or child.assigned_provider,
+            assigned_model=assigned_model or child.assigned_model,
             result=(
                 replace(child.result, status="admitted")
                 if child.result is not None and result_ref is not None
@@ -1578,12 +1666,14 @@ def _update_resources_from_usage(resources: Resources, values: Mapping[str, Any]
     if remaining_wall_s is not None:
         updated = replace(updated, remaining_wall_s=remaining_wall_s)
     if provider is not None or model is not None:
-        updated = replace(
-            updated,
-            provider=provider or updated.provider,
-            model=model or updated.model,
-            provider_lease=_provider_lease(provider or updated.provider, model or updated.model),
-        )
+        updated = _update_serving(updated, provider, model)
+        incumbent = updated.assigned_provider or updated.provider
+        if values.get("call_kind") != "summary" and (
+            incumbent is None
+            or provider == incumbent
+            or _successful_fallback(updated, values, provider)
+        ):
+            updated = _update_assignment_resources(updated, provider, model)
     for field_name in (
         "context_pressure",
         "uncached_token_pressure",
@@ -1632,13 +1722,25 @@ def _reduce_usage(state: BranchState, values: Mapping[str, Any]) -> BranchState:
         child = state.children[child_index]
         child_usage = _usage_update(child.usage, values)
         provider, model = _provider_values(values)
+        child = _update_serving(child, provider, model)
+        incumbent = child.assigned_provider or child.provider
+        if values.get("call_kind") != "summary" and (
+            incumbent is None
+            or provider == incumbent
+            or _successful_fallback(child, values, provider)
+        ):
+            child = replace(
+                child,
+                provider=provider or child.provider,
+                model=model or child.model,
+                assigned_provider=provider or child.assigned_provider,
+                assigned_model=model or child.assigned_model,
+            )
         child = replace(
             child,
             usage=child_usage,
             generation=max(child.generation or 0, _generation(values) or 0) or child.generation,
             turn=max(child.turn or 0, _turn(values) or 0) or child.turn,
-            provider=provider or child.provider,
-            model=model or child.model,
             lifecycle=_transition(child.lifecycle, Lifecycle.ACTIVE),
         )
         return _replace_child(state, task_id, child)
