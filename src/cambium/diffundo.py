@@ -2862,11 +2862,12 @@ class Diffundo:
         credential_source: CredentialSource | None = None,
         codex_profile: Mapping[str, object] | None = None,
         debt: Mapping[str, Any] | None = None,
-        task_id: str = "task",
+        task_id: str | None = None,
         requirements: Mapping[str, Any] | None = None,
     ) -> None:
         self._providers = tuple(providers)
-        self._task_id = task_id
+        # OpenCode Go requires a stable per-conversation x-opencode-session (missing header may error). Never share one id: callers pass their conversation id, else mint one.
+        self._task_id = task_id if task_id else f"task-{uuid.uuid4().hex[:12]}"
         # Per-router transport table (defaults to the shared registry) so
         # callers can observe or substitute one protocol's transport without
         # touching global state.

@@ -79,6 +79,7 @@ class _Handler(BaseHTTPRequestHandler):
             {
                 "User-Agent": self.headers.get("User-Agent"),
                 "Authorization": self.headers.get("Authorization"),
+                "X-Opencode-Session": self.headers.get("X-Opencode-Session"),
             },
         )
         status, payload, delay, extra_headers = server.behavior_at(index)

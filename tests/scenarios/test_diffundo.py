@@ -3179,3 +3179,65 @@ def test_chat_response_larger_than_provider_cap_is_rejected() -> None:
         assert "response exceeds" in error.message
     finally:
         server.close()
+# --------------------------------------------------------------------------- #
+# 12. opencode session header (opencode-go requires x-opencode-session;
+# requests missing it may error). One stable ID per conversation.
+# --------------------------------------------------------------------------- #
+
+
+def test_opencode_destination_sends_stable_session_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = FakeServer(
+        [
+            (200, _ok_payload("first"), 0.0),
+            (200, _ok_payload("second"), 0.0),
+        ]
+    )
+    router = Diffundo(
+        (_config("p_go", server, "K_GO", model="m-go"),),
+        task_id="conv-123",
+    )
+    monkeypatch.setattr(
+        diffundo_module, "_is_opencode_destination", lambda _url: True
+    )
+    try:
+        first = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        second = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert first.content == "first"
+        assert second.content == "second"
+        assert [h["X-Opencode-Session"] for h in server.request_headers] == [
+            "conv-123",
+            "conv-123",
+        ]
+    finally:
+        server.close()
+
+
+def test_non_opencode_destination_omits_session_header() -> None:
+    server = FakeServer([(200, _ok_payload("hi"), 0.0)])
+    router = Diffundo(
+        (_config("p_other", server, "K_OTHER"),),
+        task_id="conv-456",
+    )
+    try:
+        result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert result.content == "hi"
+        assert server.request_headers[0]["X-Opencode-Session"] is None
+    finally:
+        server.close()
+
+
+def test_default_task_id_is_unique_per_router() -> None:
+    servers = [FakeServer([(200, _ok_payload("x"), 0.0)]) for _ in range(2)]
+    try:
+        first = Diffundo((_config("p_a", servers[0], "K_A"),))
+        second = Diffundo((_config("p_b", servers[1], "K_B"),))
+        assert first._task_id.startswith("task-")
+        assert second._task_id.startswith("task-")
+        assert first._task_id != second._task_id
+        explicit = Diffundo((_config("p_c", servers[0], "K_C"),), task_id="")
+        assert explicit._task_id.startswith("task-")
+    finally:
+        for server in servers:
+            server.close()
