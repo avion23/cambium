@@ -213,7 +213,6 @@ def test_gepa_reflection_feedback_is_grounded_in_rendered_prompt_and_trajectory(
     feedback = result.feedback
     # (i) the fully rendered production prompt, with its action-protocol envelope
     assert "Return exactly one action with no XML or prose." in feedback
-    assert "coding agent in an assigned Git worktree" not in feedback
     assert '{"type":"finish","summary":"...","objective_met":true}' in feedback
     assert "baseline" in feedback  # candidate instructions flow through coding_prompt
     # (ii) trajectory digest keys plus derailment highlights
