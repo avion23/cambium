@@ -23,3 +23,6 @@ htmlcov/
 
 # Committed module baselines stay tracked. Runtime benchmark copies belong
 # under .cambium/ and are covered by the rule above.
+
+# Generated extraction outputs stay untracked.
+/artifacts/

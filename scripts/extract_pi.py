@@ -15,7 +15,7 @@ Run from the repository root, for example::
 
     PYTHONPATH=src python3 scripts/extract_pi.py \
         --sessions-dir /home/ubuntu/.pi/agent/sessions \
-        --output artifacts/optimization/first-real-extraction/candidates-pi.jsonl
+        --output artifacts/optimization/candidates-pi.jsonl
 """
 
 from __future__ import annotations
@@ -51,8 +51,8 @@ DATASET_VERSION = "1.2.0"
 SOURCE = "pi-session"
 ADDED_BY = "script:extract_pi"
 DEFAULT_SESSIONS_DIR = Path("/home/ubuntu/.pi/agent/sessions")
-DEFAULT_OUTPUT = ROOT / "artifacts/optimization/first-real-extraction/candidates-pi.jsonl"
-REVIEW_QUEUE = ROOT / "artifacts/optimization/first-real-extraction/review_queue.jsonl"
+DEFAULT_OUTPUT = ROOT / "artifacts/optimization/candidates-pi.jsonl"
+REVIEW_QUEUE = ROOT / "artifacts/optimization/review_queue.jsonl"
 
 MAX_TASK_LENGTH = 600
 MAX_CONTEXT_LENGTH = 600

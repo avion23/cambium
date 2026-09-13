@@ -14,8 +14,6 @@ from .summary_trunk import (
     SUMMARY_VERBATIM_FIELD,
 )
 
-PROMPTS_VERSION = 19
-
 CODING_POLICY = (
     "Work directly and minimally. Locate with repo_query, read exact regions with read_batch, "
     "reuse existing code and the standard library, and verify relevant behavior. Treat failures "
@@ -169,7 +167,6 @@ __all__ = [
     "CODING_AGENT",
     "CODING_POLICY",
     "SUMMARY_POLICY",
-    "PROMPTS_VERSION",
     "SEMANTIC_SUMMARIZER",
     "SUMMARY_PROTOCOL_LINES",
     "coding_prompt",
