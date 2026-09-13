@@ -212,7 +212,8 @@ def test_gepa_reflection_feedback_is_grounded_in_rendered_prompt_and_trajectory(
     assert result.score == 0.25
     feedback = result.feedback
     # (i) the fully rendered production prompt, with its action-protocol envelope
-    assert "You are Cambium's coding agent in an assigned Git worktree" in feedback
+    assert "Return exactly one action with no XML or prose." in feedback
+    assert "coding agent in an assigned Git worktree" not in feedback
     assert '{"type":"finish","summary":"...","objective_met":true}' in feedback
     assert "baseline" in feedback  # candidate instructions flow through coding_prompt
     # (ii) trajectory digest keys plus derailment highlights
@@ -272,7 +273,7 @@ def test_gepa_reflection_feedback_renders_summary_control_for_summary_component(
     assert "<cambium-summary-control>" in feedback
     assert "candidate findings contract" in feedback
     assert "finding_preservation_contract" in feedback
-    assert "You are Cambium's coding agent" not in feedback.split("<trajectory-digest>")[0]
+    assert "Return exactly one action" not in feedback.split("<trajectory-digest>")[0]
     assert len(feedback) <= prompt_optimize._FEEDBACK_CHARS
 
 
