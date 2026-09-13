@@ -203,6 +203,9 @@ _ACTIVITY_PHASE_GLYPHS = {"thinking": "◌", "streaming": "▸", "waiting": "◒
 _STALL_AFTER_S = 12.0
 _ACTIVITY_TAIL_MAX_CHARS = 120
 _STATUS_PHASE_RE = re.compile(r"^(\S+)(\s+)([a-z][a-z-]*)(.*)$", re.IGNORECASE)
+_CACHE_HIT_LABEL = "cache HIT"
+_CACHE_MISS_LABEL = "[CACHE MISS]"
+_CACHE_STATUS_RE = re.compile(r"( · )(\[CACHE MISS\]|cache HIT)$")
 _STATUS_PHASE_STYLES = {
     "idle": "dim",
     "thinking": "magenta",
@@ -222,6 +225,10 @@ _STATUS_PHASE_STYLES = {
     "waiting": "blue",
     "cooldown": "yellow",
     "suspended": "yellow",
+}
+_CACHE_STATUS_STYLES = {
+    _CACHE_HIT_LABEL: "dim",
+    _CACHE_MISS_LABEL: "yellow",
 }
 _FIRST_TOKEN_KINDS = frozenset(
     {
@@ -2088,9 +2095,9 @@ class ActivityState:
 
         provider = "/".join(part for part in (self._provider, self._model) if part)
         cache = (
-            " · cache HIT"
+            f" · {_CACHE_HIT_LABEL}"
             if self._cache_hit is True
-            else " · cache MISS"
+            else f" · {_CACHE_MISS_LABEL}"
             if self._cache_hit is False
             else ""
         )
@@ -2846,9 +2853,17 @@ def _status_activity(activity_line: str, color: bool) -> str:
     style = _STATUS_PHASE_STYLES.get(match.group(3).casefold())
     if style is None:
         return clean
+    tail = match.group(4)
+    cache_match = _CACHE_STATUS_RE.search(tail)
+    if cache_match is not None:
+        cache_label = cache_match.group(2)
+        tail = (
+            f"{tail[:cache_match.start(2)]}"
+            f"{_status_paint(cache_label, _CACHE_STATUS_STYLES[cache_label], color)}"
+        )
     return (
         f"{match.group(1)}{match.group(2)}"
-        f"{_status_paint(match.group(3), style, color)}{match.group(4)}"
+        f"{_status_paint(match.group(3), style, color)}{tail}"
     )
 
 

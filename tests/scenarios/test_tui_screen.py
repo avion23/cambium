@@ -588,7 +588,64 @@ def test_activity_names_provider_and_cache_state_before_turn_finishes() -> None:
         },
         now=13.0,
     )
-    assert activity.render(now=14.0) == "◌ THINKING · zai/glm-5.3 · 4s · cache MISS"
+    assert activity.render(now=14.0) == "◌ THINKING · zai/glm-5.3 · 4s · [CACHE MISS]"
+
+    activity.observe_event(
+        {
+            "kind": "usage_event",
+            "payload": {
+                "provider": "zai",
+                "model": "glm-5.3",
+                "provider_cache_hit": True,
+            },
+        },
+        now=14.0,
+    )
+    assert activity.render(now=15.0) == "◌ THINKING · zai/glm-5.3 · 5s · cache HIT"
+
+
+def test_activity_cache_labels_are_colored_without_changing_the_plain_row() -> None:
+    activity_line = "◌ THINKING · zai/glm-5.3 · 4s · [CACHE MISS]"
+    colored = tui_screen._status_activity(activity_line, True)
+
+    assert tui_screen._visible(colored) == activity_line
+    assert "\x1b[1;35mTHINKING\x1b[0m" in colored
+    assert "\x1b[1;33m[CACHE MISS]\x1b[0m" in colored
+
+    hit_line = "◌ THINKING · zai/glm-5.3 · 5s · cache HIT"
+    hit_colored = tui_screen._status_activity(hit_line, True)
+    assert tui_screen._visible(hit_colored) == hit_line
+    assert "\x1b[2mcache HIT\x1b[0m" in hit_colored
+
+
+def test_activity_cache_label_requires_an_explicit_boolean() -> None:
+    activity = ActivityState()
+    activity.start(now=10.0)
+    activity.observe_event(
+        {
+            "kind": "heartbeat",
+            "payload": {
+                "phase": "thinking",
+                "phase_revision": 1,
+                "provider": "zai",
+                "model": "glm-5.3",
+            },
+        },
+        now=11.0,
+    )
+    activity.observe_event(
+        {
+            "kind": "usage_event",
+            "payload": {
+                "provider": "zai",
+                "model": "glm-5.3",
+                "provider_cache_hit": "false",
+            },
+        },
+        now=12.0,
+    )
+
+    assert "cache" not in activity.render(now=13.0)
 
 
 def test_activity_distinguishes_active_thinking_from_stalled_provider_or_tool() -> None:
