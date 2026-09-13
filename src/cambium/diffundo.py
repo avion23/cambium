@@ -1103,21 +1103,33 @@ def _read_provider_sse(
     body = bytearray()
     pending = bytearray()
     events: list[dict[str, Any]] = []
+    saw_done = False
+    saw_invalid_event = False
+    saw_post_done_data = False
     reader = getattr(response, "read1", None)
     if not callable(reader):
         reader = response.read
 
     def observe(line: bytes) -> None:
+        nonlocal saw_done, saw_invalid_event, saw_post_done_data
         if not line.startswith(b"data:"):
             return
         data = line[len(b"data:") :].strip()
-        if not data or data == b"[DONE]":
+        if not data:
+            return
+        if data == b"[DONE]":
+            saw_done = True
+            return
+        if saw_done:
+            saw_post_done_data = True
             return
         try:
             value = json.loads(data)
         except (UnicodeDecodeError, json.JSONDecodeError):
+            saw_invalid_event = True
             return
         if not isinstance(value, dict):
+            saw_invalid_event = True
             return
         events.append(value)
         _notify_observer(on_event, value)
@@ -1150,6 +1162,18 @@ def _read_provider_sse(
             del pending[: index + 1]
     if pending:
         observe(bytes(pending).rstrip(b"\r"))
+    if saw_post_done_data:
+        raise ProviderError(
+            provider,
+            ProviderOutcome.ERROR,
+            "malformed response: chat SSE stream contains data after terminal [DONE] event",
+        )
+    if saw_invalid_event:
+        raise ProviderError(
+            provider,
+            ProviderOutcome.ERROR,
+            "malformed response: chat SSE stream contains invalid event data",
+        )
     return bytes(body), tuple(events)
 
 
@@ -2113,7 +2137,7 @@ def _chat_stream_error(provider: ProviderConfig, error: Mapping[str, Any]) -> Pr
 def _chat_stream_payload(
     provider: ProviderConfig, events: Sequence[Mapping[str, Any]]
 ) -> dict[str, Any]:
-    """Assemble OpenAI-compatible chat chunks into the ordinary response shape."""
+    """Assemble one explicitly completed chat choice into the response shape."""
     content: list[str] = []
     tool_calls: dict[int, dict[str, Any]] = {}
     usage: dict[str, Any] | None = None
@@ -2121,6 +2145,7 @@ def _chat_stream_payload(
     finish_reason: str | None = None
     refusal: str | None = None
     saw_choice = False
+    choice_index: int | None = None
 
     for event in events:
         error = event.get("error")
@@ -2130,32 +2155,137 @@ def _chat_stream_payload(
             model = cast(str, event["model"])
         if isinstance(event.get("usage"), dict):
             usage = dict(cast(dict[str, Any], event["usage"]))
-        choices = event.get("choices")
-        if not isinstance(choices, list):
+        if "choices" not in event:
             continue
-        for choice in choices:
-            if not isinstance(choice, Mapping):
-                continue
+        choices = event["choices"]
+        if not isinstance(choices, list):
+            raise ProviderError(
+                provider.name,
+                ProviderOutcome.ERROR,
+                "malformed response: chat stream has invalid choices",
+            )
+        if any(not isinstance(choice, Mapping) for choice in choices):
+            raise ProviderError(
+                provider.name,
+                ProviderOutcome.ERROR,
+                "malformed response: chat stream contains an invalid completion choice",
+            )
+        event_choices = [choice for choice in choices if isinstance(choice, Mapping)]
+        if len(event_choices) > 1:
+            raise ProviderError(
+                provider.name,
+                ProviderOutcome.ERROR,
+                "malformed response: chat stream contains multiple completion choices",
+            )
+        for choice in event_choices:
             saw_choice = True
-            if isinstance(choice.get("finish_reason"), str):
-                finish_reason = cast(str, choice["finish_reason"])
+            if "index" not in choice:
+                current_choice_index = 0
+            else:
+                raw_choice_index = choice["index"]
+                if type(raw_choice_index) is not int or raw_choice_index < 0:
+                    raise ProviderError(
+                        provider.name,
+                        ProviderOutcome.ERROR,
+                        "malformed response: chat stream has an invalid choice index",
+                    )
+                current_choice_index = raw_choice_index
+            if choice_index is None:
+                choice_index = current_choice_index
+            elif current_choice_index != choice_index:
+                raise ProviderError(
+                    provider.name,
+                    ProviderOutcome.ERROR,
+                    (
+                        "malformed response: chat stream contains multiple completion "
+                        "choice indexes"
+                    ),
+                )
+            raw_finish_reason = choice.get("finish_reason")
+            has_delta = "delta" in choice
             delta = choice.get("delta")
-            if not isinstance(delta, Mapping):
+            if has_delta and not isinstance(delta, Mapping):
+                raise ProviderError(
+                    provider.name,
+                    ProviderOutcome.ERROR,
+                    "malformed response: chat stream has an invalid choice delta",
+                )
+            if finish_reason is not None:
+                if raw_finish_reason is not None or (has_delta and delta):
+                    raise ProviderError(
+                        provider.name,
+                        ProviderOutcome.ERROR,
+                        (
+                            "malformed response: chat stream contains data after terminal "
+                            "finish_reason"
+                        ),
+                    )
+                continue
+            if raw_finish_reason is not None:
+                if not isinstance(raw_finish_reason, str) or not raw_finish_reason.strip():
+                    raise ProviderError(
+                        provider.name,
+                        ProviderOutcome.ERROR,
+                        "malformed response: chat stream has an invalid finish_reason",
+                    )
+                finish_reason = raw_finish_reason
+            if not has_delta:
                 continue
             piece = delta.get("content")
+            if "content" in delta and piece is not None and not isinstance(piece, str):
+                raise ProviderError(
+                    provider.name,
+                    ProviderOutcome.ERROR,
+                    "malformed response: chat stream has invalid content delta",
+                )
             if isinstance(piece, str):
                 content.append(piece)
             refusal_piece = delta.get("refusal")
+            if "refusal" in delta and refusal_piece is not None and not isinstance(
+                refusal_piece, str
+            ):
+                raise ProviderError(
+                    provider.name,
+                    ProviderOutcome.ERROR,
+                    "malformed response: chat stream has invalid refusal delta",
+                )
             if isinstance(refusal_piece, str) and refusal_piece:
                 refusal = (refusal or "") + refusal_piece
-            raw_calls = delta.get("tool_calls")
-            if not isinstance(raw_calls, list):
+            if "tool_calls" not in delta or delta["tool_calls"] is None:
                 continue
+            raw_calls = delta["tool_calls"]
+            if not isinstance(raw_calls, list):
+                raise ProviderError(
+                    provider.name,
+                    ProviderOutcome.ERROR,
+                    "malformed response: chat stream has invalid tool_calls",
+                )
+            seen_call_indexes: set[int] = set()
             for position, raw_call in enumerate(raw_calls):
                 if not isinstance(raw_call, Mapping):
-                    continue
-                index = raw_call.get("index")
-                index = index if type(index) is int and index >= 0 else position
+                    raise ProviderError(
+                        provider.name,
+                        ProviderOutcome.ERROR,
+                        "malformed response: chat stream has an invalid tool call",
+                    )
+                if "index" not in raw_call:
+                    index = position
+                else:
+                    raw_index = raw_call["index"]
+                    if type(raw_index) is not int or raw_index < 0:
+                        raise ProviderError(
+                            provider.name,
+                            ProviderOutcome.ERROR,
+                            "malformed response: chat stream has an invalid tool call index",
+                        )
+                    index = raw_index
+                if index in seen_call_indexes:
+                    raise ProviderError(
+                        provider.name,
+                        ProviderOutcome.ERROR,
+                        "malformed response: chat stream has duplicate tool call indexes",
+                    )
+                seen_call_indexes.add(index)
                 call = tool_calls.setdefault(
                     index,
                     {
@@ -2166,16 +2296,40 @@ def _chat_stream_payload(
                 )
                 if raw_call.get("id"):
                     call["id"] = raw_call["id"]
-                function = raw_call.get("function")
-                if not isinstance(function, Mapping):
+                if "function" not in raw_call:
                     continue
+                function = raw_call["function"]
+                if function is None:
+                    continue
+                if not isinstance(function, Mapping):
+                    raise ProviderError(
+                        provider.name,
+                        ProviderOutcome.ERROR,
+                        "malformed response: chat stream has an invalid tool call function",
+                    )
                 name = function.get("name")
+                if "name" in function and name is not None and not isinstance(name, str):
+                    raise ProviderError(
+                        provider.name,
+                        ProviderOutcome.ERROR,
+                        "malformed response: chat stream has an invalid tool call name",
+                    )
                 if isinstance(name, str) and name:
                     current = str(call["function"].get("name", ""))
                     call["function"]["name"] = (
                         name if not current or name.startswith(current) else current + name
                     )
                 arguments = function.get("arguments")
+                if (
+                    "arguments" in function
+                    and arguments is not None
+                    and not isinstance(arguments, str)
+                ):
+                    raise ProviderError(
+                        provider.name,
+                        ProviderOutcome.ERROR,
+                        "malformed response: chat stream has invalid tool call arguments",
+                    )
                 if isinstance(arguments, str):
                     call["function"]["arguments"] += arguments
 
@@ -2183,7 +2337,19 @@ def _chat_stream_payload(
         raise ProviderError(
             provider.name,
             ProviderOutcome.ERROR,
-            "malformed chat stream: no completion choices",
+            "malformed response: chat stream has no completion choices",
+        )
+    if finish_reason is None:
+        raise ProviderError(
+            provider.name,
+            ProviderOutcome.ERROR,
+            "malformed response: chat stream has no terminal finish_reason",
+        )
+    if finish_reason in {"tool_calls", "function_call"} and not tool_calls:
+        raise ProviderError(
+            provider.name,
+            ProviderOutcome.ERROR,
+            "malformed response: chat stream tool-call finish_reason has no tool calls",
         )
     message: dict[str, Any] = {
         "role": "assistant",
@@ -2199,7 +2365,7 @@ def _chat_stream_payload(
             {
                 "index": 0,
                 "message": message,
-                "finish_reason": finish_reason or ("tool_calls" if tool_calls else "stop"),
+                "finish_reason": finish_reason,
             }
         ],
     }

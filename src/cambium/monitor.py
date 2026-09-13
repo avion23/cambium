@@ -26,7 +26,7 @@ from .observability import (
     SessionSnapshot,
 )
 from .store import StoreError
-from .supervisor import EventCursor, read_events_with_cursor
+from .supervisor import EventCursor, read_events_with_cursor, snapshot_event_positions
 from .terminal import (
     clip_terminal_text,
     pad_terminal_text,
@@ -408,6 +408,23 @@ async def monitor_session_async(
     out = sys.stdout if output_stream is None else output_stream
     state = ObservabilityState()
     event_cursor = EventCursor()
+    try:
+        snapshot_positions = (
+            snapshot_event_positions(session) if once or json_output else None
+        )
+    except (OSError, StoreError, ValueError) as exc:
+        print(f"cambium monitor: {exc}", file=sys.stderr)
+        return 1
+
+    def read_page(cursor: EventCursor) -> tuple[list[dict[str, object]], EventCursor]:
+        if snapshot_positions is None:
+            return read_events_with_cursor(session, cursor)
+        return read_events_with_cursor(
+            session,
+            cursor,
+            max_positions=snapshot_positions,
+        )
+
     cache_stats: dict[str, CacheProviderStats] = {}
     dashboard = AnsiDashboard(session, stream=out, enabled=not once and not json_output)
     # Normal-buffer output keeps the initial view and each new event; it does
@@ -416,10 +433,20 @@ async def monitor_session_async(
     try:
         with dashboard:
             while True:
-                events, event_cursor = read_events_with_cursor(session, event_cursor)
+                events, event_cursor = read_page(event_cursor)
                 for event in events:
                     record_cache_event(cache_stats, event)
                 state.extend(events)
+                # Cursor replay is deliberately paged so a long turn never
+                # materializes in one call.  One-shot output must drain every
+                # page before rendering; live monitoring keeps one page per
+                # poll and only treats an empty poll as reaching the tail.
+                if once or json_output:
+                    while events:
+                        events, event_cursor = read_page(event_cursor)
+                        for event in events:
+                            record_cache_event(cache_stats, event)
+                        state.extend(events)
                 snapshot = state.snapshot(session_dir=session)
                 if json_output:
                     out.write(snapshot_json(snapshot) + "\n")
@@ -438,7 +465,7 @@ async def monitor_session_async(
                 if events or not rendered:
                     dashboard.draw(snapshot, cache_stats=cache_stats)
                     rendered = True
-                if (
+                if not events and (
                     snapshot.session_status in {"ended", "cancelled", "failed"}
                     and snapshot.active_agents == 0
                     and snapshot.queued_agents == 0

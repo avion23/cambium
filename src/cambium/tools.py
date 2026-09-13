@@ -8,9 +8,9 @@ linting and dependency wiring out of process-global state.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import shlex
-import shutil
 import signal
 import stat
 import subprocess
@@ -88,12 +88,15 @@ class ToolContext:
 
 @dataclass(frozen=True, slots=True)
 class ToolResult:
-    """The bounded, LLM-facing result of one tool invocation."""
+    """The bounded LLM projection plus any exact durable output artifact."""
 
     ok: bool
     output: str = ""
     error: str | None = None
     duration_ms: int = 0
+    output_ref: str | None = None
+    output_sha256: str | None = None
+    output_bytes: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +104,9 @@ class _Outcome:
     ok: bool
     output: str = ""
     error: str | None = None
+    output_ref: str | None = None
+    output_sha256: str | None = None
+    output_bytes: int | None = None
 
 
 class _ToolFailure(Exception):
@@ -509,7 +515,7 @@ def _write_spill(
     stderr: Any,
     separator: bytes,
     directory: Path,
-) -> Path | None:
+) -> tuple[Path, str] | None:
     try:
         directory.mkdir(parents=True, exist_ok=True)
     except OSError:
@@ -528,14 +534,21 @@ def _write_spill(
         except OSError:
             return None
         try:
+            digest = hashlib.sha256()
             with os.fdopen(descriptor, "wb") as handle:
                 descriptor = -1
-                stdout.seek(0)
-                shutil.copyfileobj(stdout, handle)
+                for source in (stdout,):
+                    source.seek(0)
+                    while chunk := source.read(64 * 1024):
+                        handle.write(chunk)
+                        digest.update(chunk)
                 if separator:
                     handle.write(separator)
+                    digest.update(separator)
                 stderr.seek(0)
-                shutil.copyfileobj(stderr, handle)
+                while chunk := stderr.read(64 * 1024):
+                    handle.write(chunk)
+                    digest.update(chunk)
                 handle.flush()
                 os.fsync(handle.fileno())
         except OSError:
@@ -546,10 +559,12 @@ def _write_spill(
             except FileNotFoundError:
                 pass
             return None
-        return path
+        return path, digest.hexdigest()
 
 
-def _shell_output(stdout: Any, stderr: Any, ctx: ToolContext) -> str:
+def _shell_output(
+    stdout: Any, stderr: Any, ctx: ToolContext
+) -> tuple[str, str | None, str | None, int | None]:
     stdout.seek(0, os.SEEK_END)
     stdout_size = stdout.tell()
     stderr.seek(0, os.SEEK_END)
@@ -561,12 +576,24 @@ def _shell_output(stdout: Any, stderr: Any, ctx: ToolContext) -> str:
         separator = b"" if stdout.read(1) == b"\n" else b"\n"
     total = stdout_size + len(separator) + stderr_size
     if total <= SHELL_OUTPUT_MAX_BYTES:
-        return _read_logical_slice(
-            stdout, stdout_size, separator, stderr, stderr_size, 0, total
-        ).decode("utf-8", errors="replace")
+        return (
+            _read_logical_slice(
+                stdout, stdout_size, separator, stderr, stderr_size, 0, total
+            ).decode("utf-8", errors="replace"),
+            None,
+            None,
+            None,
+        )
 
-    spill_path = _write_spill(stdout, stderr, separator, _spill_directory(ctx))
-    full_output = str(spill_path) if spill_path is not None else "unavailable"
+    directory = _spill_directory(ctx)
+    spilled = _write_spill(stdout, stderr, separator, directory)
+    spill_path, output_sha256 = spilled if spilled is not None else (None, None)
+    output_ref = (
+        spill_path.relative_to(directory.parent.parent).as_posix()
+        if spill_path is not None
+        else None
+    )
+    full_output = output_ref or "unavailable"
     head = _read_logical_slice(
         stdout,
         stdout_size,
@@ -587,7 +614,12 @@ def _shell_output(stdout: Any, stderr: Any, ctx: ToolContext) -> str:
         SHELL_OUTPUT_TAIL_BYTES,
     )
     marker = f"\n[... {total} bytes truncated, full output: {full_output} ...]\n"
-    return head.decode("utf-8", errors="replace") + marker + tail.decode("utf-8", errors="replace")
+    projection = (
+        head.decode("utf-8", errors="replace")
+        + marker
+        + tail.decode("utf-8", errors="replace")
+    )
+    return projection, output_ref, output_sha256, total if output_ref is not None else None
 
 
 async def _run_shell_process(
@@ -623,18 +655,30 @@ async def _run_shell_process(
             await _bounded_process_drain(completion)
             stdout.flush()
             stderr.flush()
-            output = _shell_output(stdout, stderr, ctx)
+            output, output_ref, output_sha256, output_bytes = _shell_output(stdout, stderr, ctx)
             if isinstance(exc, asyncio.CancelledError):
                 raise
-            raise subprocess.TimeoutExpired(command, timeout_s, output=output) from exc
+            timeout = subprocess.TimeoutExpired(command, timeout_s, output=output)
+            timeout.output_ref = output_ref
+            timeout.output_sha256 = output_sha256
+            timeout.output_bytes = output_bytes
+            raise timeout from exc
 
         stdout.flush()
         stderr.flush()
-        output = _shell_output(stdout, stderr, ctx)
+        output, output_ref, output_sha256, output_bytes = _shell_output(stdout, stderr, ctx)
         returncode = process.returncode
         if returncode is None:  # the process has exited; None would mean still running
-            raise subprocess.TimeoutExpired(command, timeout_s, output=output)
-        return subprocess.CompletedProcess(command, returncode, output, "")
+            timeout = subprocess.TimeoutExpired(command, timeout_s, output=output)
+            timeout.output_ref = output_ref
+            timeout.output_sha256 = output_sha256
+            timeout.output_bytes = output_bytes
+            raise timeout
+        completed = subprocess.CompletedProcess(command, returncode, output, "")
+        completed.output_ref = output_ref
+        completed.output_sha256 = output_sha256
+        completed.output_bytes = output_bytes
+        return completed
 
 
 async def _capture_process_stream(
@@ -784,16 +828,33 @@ async def _run_shell(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
         output = (
             exc.output if isinstance(exc.output, str) else _process_output(exc.stdout, exc.stderr)
         )
-        return _Outcome(False, output, f"run_shell timed out after {timeout_s}s")
+        return _Outcome(
+            False,
+            output,
+            f"run_shell timed out after {timeout_s}s",
+            output_ref=getattr(exc, "output_ref", None),
+            output_sha256=getattr(exc, "output_sha256", None),
+            output_bytes=getattr(exc, "output_bytes", None),
+        )
     except FileNotFoundError as exc:
         raise _ToolFailure(f"command not found: {command[0]!r}") from exc
     except OSError as exc:
         raise _ToolFailure(f"could not run command {command[0]!r}: {exc}") from exc
 
     output = result.stdout
+    artifact = {
+        "output_ref": getattr(result, "output_ref", None),
+        "output_sha256": getattr(result, "output_sha256", None),
+        "output_bytes": getattr(result, "output_bytes", None),
+    }
     if result.returncode != 0:
-        return _Outcome(False, output, f"run_shell exited with status {result.returncode}")
-    return _Outcome(True, output)
+        return _Outcome(
+            False,
+            output,
+            f"run_shell exited with status {result.returncode}",
+            **artifact,
+        )
+    return _Outcome(True, output, **artifact)
 
 
 async def _read_batch(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
@@ -1091,6 +1152,9 @@ async def run_tool(name: str, args: dict[str, Any], ctx: ToolContext) -> ToolRes
         output=outcome.output,
         error=outcome.error,
         duration_ms=_duration_ms(started_ns),
+        output_ref=outcome.output_ref,
+        output_sha256=outcome.output_sha256,
+        output_bytes=outcome.output_bytes,
     )
 
 

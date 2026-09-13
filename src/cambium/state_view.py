@@ -8,9 +8,44 @@ from pathlib import Path
 from typing import Any
 
 from .branch_history import _session_event_stores
-from .branch_state import BranchState, Identity, inspect_state, reduce
+from .branch_state import (
+    _GLOSSARY_KINDS,
+    BranchState,
+    Identity,
+    _advance_metadata,
+    _event_kind,
+    reduce,
+)
 from .situation import render_situation_frame
-from .store import read_events_file
+from .store import iter_event_pages
+
+_EVENT_PAGE_SIZE = 4096
+_UNKNOWN_EVENT_KIND_LIMIT = 256
+
+
+def _iter_store_events(store: Path):
+    """Yield one durable store's rows without materializing the turn."""
+
+    for page in iter_event_pages(store, page_size=_EVENT_PAGE_SIZE):
+        yield from page
+
+
+def _reduce_bounded(state: BranchState, event: Mapping[str, Any]) -> BranchState:
+    """Fold one event without retaining an unbounded unknown-kind tuple."""
+
+    kind = _event_kind(event)
+    if kind is not None and kind in _GLOSSARY_KINDS:
+        return reduce(state, event)
+    updated = _advance_metadata(state, event, kind)
+    unknown_kind = kind or "<missing>"
+    kinds = (*updated.unknown_event_kinds, unknown_kind)
+    if len(kinds) > _UNKNOWN_EVENT_KIND_LIMIT:
+        kinds = kinds[-_UNKNOWN_EVENT_KIND_LIMIT:]
+    return replace(
+        updated,
+        unknown_events=updated.unknown_events + 1,
+        unknown_event_kinds=kinds,
+    )
 
 
 def _is_child_admission_for(event: Mapping[str, Any], task_id: str) -> bool:
@@ -73,24 +108,24 @@ def _project_child_admission(
 def load_state(session_dir: str | Path, task_id: str | None = None) -> BranchState:
     """Replay the latest relevant turn, never interleave turn-local sequence IDs."""
     for store in reversed(_session_event_stores(Path(session_dir))):
-        events = read_events_file(store)
-        if not events:
-            continue
         if task_id is None:
-            state = inspect_state(events)
-        else:
-            if not any(
-                event.get("task_id") == task_id or _is_child_admission_for(event, task_id)
-                for event in events
-            ):
+            state = BranchState()
+            for event in _iter_store_events(store):
+                state = _reduce_bounded(state, event)
+            if state.source_watermark == 0:
                 continue
+        else:
             descendants = {task_id}
             state = BranchState(identity=Identity(branch_id=task_id))
-            for event in events:
+            found = False
+            for event in _iter_store_events(store):
                 payload = dict(event.get("payload") or {})
                 if _is_child_admission_for(event, task_id):
+                    found = True
                     state = _project_child_admission(state, event, task_id)
                     continue
+                if event.get("task_id") == task_id:
+                    found = True
                 if payload.get("parent_task_id") in descendants:
                     child = payload.get("child_task_id")
                     if isinstance(child, str):
@@ -108,12 +143,14 @@ def load_state(session_dir: str | Path, task_id: str | None = None) -> BranchSta
                         "parent_branch_id": None,
                         "payload": payload,
                     }
-                state = reduce(state, event)
+                state = _reduce_bounded(state, event)
                 if owner == task_id and parent_id is not None:
                     state = replace(
                         state,
                         identity=replace(state.identity, parent_branch_id=parent_id),
                     )
+            if not found:
+                continue
         return replace(
             state,
             identity=replace(

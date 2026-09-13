@@ -1122,6 +1122,74 @@ def test_live_resize_keeps_stream_suffix_arriving_with_new_width(
     assert rendered.count("CAMBIUM ▸ third") == 1
 
 
+def test_live_narrow_stream_preserves_words_through_resize_and_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sizes = iter(
+        (
+            tui_screen.os.terminal_size((8, 24)),
+            tui_screen.os.terminal_size((8, 24)),
+            tui_screen.os.terminal_size((12, 24)),
+            tui_screen.os.terminal_size((12, 24)),
+            tui_screen.os.terminal_size((12, 24)),
+        )
+    )
+    monkeypatch.setattr(tui_screen.shutil, "get_terminal_size", lambda _default: next(sizes))
+    stream = _Tty()
+    transcript = Transcript()
+    timeline = LinearTimeline(stream)
+    with timeline:
+        timeline.draw(
+            _snapshot(),
+            transcript,
+            session_description="",
+            branch_line="",
+            cumulative_line="",
+        )
+        transcript.observe_event(
+            {"kind": "assistant_delta", "payload": {"delta": "alpha beta gamma\n"}}
+        )
+        timeline.draw(
+            _snapshot(),
+            transcript,
+            session_description="",
+            branch_line="",
+            cumulative_line="",
+        )
+        # A resize must not replay or discard the already-emitted narrow row.
+        timeline.draw(
+            _snapshot(),
+            transcript,
+            session_description="",
+            branch_line="",
+            cumulative_line="",
+            force=True,
+        )
+        transcript.observe_event(
+            {"kind": "assistant_delta", "payload": {"delta": " delta epsilon\n"}}
+        )
+        timeline.draw(
+            _snapshot(),
+            transcript,
+            session_description="",
+            branch_line="",
+            cumulative_line="",
+        )
+        transcript.finish_stream("alpha beta gamma\n delta epsilon\n")
+        timeline.draw(
+            _snapshot(),
+            transcript,
+            session_description="",
+            branch_line="",
+            cumulative_line="",
+            force=True,
+        )
+
+    visible = _visible(stream.getvalue())
+    for word in ("alpha", "beta", "gamma", "delta", "epsilon"):
+        assert visible.count(word) == 1
+
+
 def test_live_completion_keeps_unbroken_stream_content_together(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1460,8 +1528,10 @@ def test_durable_response_chunks_preserve_answers_over_16k(tmp_path: Path) -> No
         invalid_replay,
     )
     assert [entry.text for entry in invalid_replay.entries if entry.role == "assistant"] == [
-        "unvalidated assistant tail",
-        "safe",
+        "unvalidated assistant tail"
+    ]
+    assert [entry.text for entry in invalid_replay.entries if entry.role == "error"] == [
+        "incomplete assistant response:\nsafe"
     ]
 
 
@@ -1495,9 +1565,9 @@ def test_replay_restores_safe_prefix_without_claiming_success(
     transcript = Transcript()
     _restore_turn_transcript(tmp_path, events, transcript)
 
-    assert [entry.text for entry in transcript.entries if entry.role == "assistant"] == [
-        "safe prefix"
-    ]
+    assert [entry.text for entry in transcript.entries if entry.role == "assistant"] == []
+    errors = [entry.text for entry in transcript.entries if entry.role == "error"]
+    assert "incomplete assistant response:\nsafe prefix" in errors
     assert not any("must not replace" in entry.text for entry in transcript.entries)
 
 
@@ -1517,7 +1587,10 @@ def test_replay_restores_safe_prefix_without_terminal_result(tmp_path: Path) -> 
         transcript,
     )
 
-    assert [entry.text for entry in transcript.entries if entry.role == "assistant"] == ["orphan"]
+    assert [entry.text for entry in transcript.entries if entry.role == "assistant"] == []
+    assert [entry.text for entry in transcript.entries if entry.role == "error"] == [
+        "incomplete assistant response:\norphan"
+    ]
 
 
 def test_replay_scopes_response_suppression_to_matching_identity(tmp_path: Path) -> None:
@@ -1563,7 +1636,10 @@ def test_replay_scopes_response_suppression_to_matching_identity(tmp_path: Path)
     _restore_turn_transcript(tmp_path, events, transcript)
     assistant = [entry.text for entry in transcript.entries if entry.role == "assistant"]
 
-    assert assistant == ["unrelated stream", "canonical prefix", "unrelated result"]
+    assert assistant == ["unrelated result"]
+    assert [entry.text for entry in transcript.entries if entry.role == "error"] == [
+        "incomplete assistant response:\ncanonical prefix"
+    ]
 
 
 def test_message_events_switch_roles_and_keep_streaming_text_bounded() -> None:

@@ -13,23 +13,25 @@ permissions.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import stat
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, unquote
 
-from .store import StoreError, read_events_file
+from .store import StoreError, iter_event_pages
 
-MAX_HISTORY_EVENTS = 100_000
 MAX_HISTORY_ROWS = 64
 MAX_HISTORY_OUTPUT_BYTES = 32 * 1024
 MAX_CHECKPOINT_BYTES = 4 * 1024 * 1024
 MAX_MESSAGE_BYTES = 8 * 1024
+MAX_ARTIFACT_PAGE_BYTES = 8 * 1024
+_EVENT_PAGE_SIZE = 4096
 
 _TERMINAL_EVENT_KINDS = frozenset(
     {
@@ -136,6 +138,16 @@ def _non_negative_offset(value: Any) -> int:
     return value
 
 
+def _artifact_limit(value: Any) -> int:
+    if value is None:
+        return MAX_MESSAGE_BYTES
+    if type(value) is not int or value < 1 or value > MAX_ARTIFACT_PAGE_BYTES:
+        raise BranchHistoryError(
+            f"output_limit must be between 1 and {MAX_ARTIFACT_PAGE_BYTES} bytes"
+        )
+    return value
+
+
 def _session_event_stores(session_dir: Path) -> tuple[Path, ...]:
     """Return the root/turn event stores that form one visible session."""
     selected = session_dir.expanduser().resolve()
@@ -149,7 +161,12 @@ def _session_event_stores(session_dir: Path) -> tuple[Path, ...]:
     add(root / ".cambium" / "events.db")
     try:
         children = sorted(
-            (child for child in root.iterdir() if re.fullmatch(r"turn-[0-9]+", child.name)),
+            (
+                child
+                for child in root.iterdir()
+                if re.fullmatch(r"turn-[0-9]+", child.name)
+                and child.name == f"turn-{int(child.name[5:]):04d}"
+            ),
             key=lambda path: int(path.name[5:]),
         )
     except OSError:
@@ -165,35 +182,43 @@ def _event_payload(event: Mapping[str, Any]) -> dict[str, Any]:
     return dict(payload) if isinstance(payload, Mapping) else {}
 
 
-def _events(session_dir: Path) -> list[_Event]:
+def _events(session_dir: Path) -> Iterable[_Event]:
+    """Yield normalized durable events page by page.
+
+    Queries only retain the projection needed for their response.  A large
+    turn therefore does not hit the capped materializing reader or require an
+    in-memory copy of the complete event log.
+    """
+
     stores = _session_event_stores(session_dir)
-    events: list[_Event] = []
     for store_index, path in enumerate(stores):
         try:
-            rows = read_events_file(path, max_rows=MAX_HISTORY_EVENTS)
+            pages = iter_event_pages(path, page_size=_EVENT_PAGE_SIZE)
+            row_index = 0
+            for rows in pages:
+                for row in rows:
+                    current_index = row_index
+                    row_index += 1
+                    if not isinstance(row, Mapping):
+                        continue
+                    payload = _event_payload(row)
+                    generation = row.get("generation")
+                    if type(generation) is int:
+                        payload["generation"] = generation
+                    kind = row.get("kind")
+                    if not isinstance(kind, str) or not kind:
+                        candidate = payload.get("type")
+                        kind = candidate if isinstance(candidate, str) else "unknown"
+                    task_id = payload.get("task_id", row.get("task_id"))
+                    if not isinstance(task_id, str) or not task_id:
+                        task_id = None
+                    seq = row.get("seq")
+                    sequence = seq if type(seq) is int and seq >= 0 else current_index
+                    name = path.parent.parent.name
+                    session = name if re.fullmatch(r"turn-[0-9]+", name) else ""
+                    yield _Event((store_index, sequence), kind, payload, task_id, session)
         except StoreError as exc:
             raise BranchHistoryError(f"cannot read branch event store {path}: {exc}") from exc
-        for row_index, row in enumerate(rows):
-            if not isinstance(row, Mapping):
-                continue
-            payload = _event_payload(row)
-            generation = row.get("generation")
-            if type(generation) is int:
-                payload["generation"] = generation
-            kind = row.get("kind")
-            if not isinstance(kind, str) or not kind:
-                candidate = payload.get("type")
-                kind = candidate if isinstance(candidate, str) else "unknown"
-            task_id = payload.get("task_id", row.get("task_id"))
-            if not isinstance(task_id, str) or not task_id:
-                task_id = None
-            seq = row.get("seq")
-            sequence = seq if type(seq) is int and seq >= 0 else row_index
-            name = path.parent.parent.name
-            session = name if re.fullmatch(r"turn-[0-9]+", name) else ""
-            events.append(_Event((store_index, sequence), kind, payload, task_id, session))
-    events.sort(key=lambda event: event.order)
-    return events
 
 
 def _int(payload: Mapping[str, Any], key: str, default: int = 0) -> int:
@@ -293,7 +318,7 @@ def _record_terminal_status(branches: dict[str, _Branch], get_branch: Any, event
         get_branch(task_id).status = _terminal_status(event)
 
 
-def _branches(events: Sequence[_Event]) -> list[_Branch]:
+def _branches(events: Iterable[_Event]) -> list[_Branch]:
     branches: dict[str, _Branch] = {}
 
     def get(task_id: str) -> _Branch:
@@ -343,10 +368,11 @@ def _page(lines: Sequence[str], offset: int, limit: int) -> str:
     return _bounded("\n".join((header, *selected)) + suffix)
 
 
-def _list_branches(events: Sequence[_Event], offset: int, limit: int) -> str:
+def _list_branches(events: Iterable[_Event], offset: int, limit: int) -> str:
     rows = _branches(events)
     lines = [f"branches={len(rows)}"]
-    for branch in rows:
+    selected = rows[offset : offset + limit]
+    for branch in selected:
         lines.append(
             " ".join(
                 (
@@ -361,17 +387,18 @@ def _list_branches(events: Sequence[_Event], offset: int, limit: int) -> str:
                 )
             )
         )
-    return _page(lines, offset, limit)
+    suffix = f"\nnext_offset={offset + len(selected)}" if offset + len(selected) < len(rows) else ""
+    return _bounded("\n".join(lines) + suffix)
 
 
-def _tool_events(events: Sequence[_Event], task_id: str | None) -> list[_Event]:
-    return [
-        event
-        for event in events
-        if event.kind == "tool_event"
-        and event.task_id is not None
-        and (task_id is None or event.task_id == task_id)
-    ]
+def _tool_events(events: Iterable[_Event], task_id: str | None) -> Iterable[_Event]:
+    for event in events:
+        if (
+            event.kind == "tool_event"
+            and event.task_id is not None
+            and (task_id is None or event.task_id == task_id)
+        ):
+            yield event
 
 
 def _tool_identity(event: _Event) -> tuple[str, int, int, int]:
@@ -385,24 +412,27 @@ def _tool_identity(event: _Event) -> tuple[str, int, int, int]:
     )
 
 
-def _list_tools(events: Sequence[_Event], task_id: str | None, offset: int, limit: int) -> str:
-    rows = _tool_events(events, task_id)
-    lines = [f"tool_calls={len(rows)}"]
-    for event in rows:
-        branch, generation, turn, batch_index = _tool_identity(event)
-        lines.append(
-            " ".join(
-                (
-                    tool_ref(branch, generation, turn, batch_index, session=event.session),
-                    f"branch={branch_ref(branch)}",
-                    f"tool={event.payload.get('tool', '-')}",
-                    f"ok={str(bool(event.payload.get('ok'))).lower()}",
-                    f"duration_ms={_int(event.payload, 'duration_ms')}",
-                    f"cmd={event.payload.get('cmd', '-')}",
+def _list_tools(events: Iterable[_Event], task_id: str | None, offset: int, limit: int) -> str:
+    lines: list[str] = []
+    total = 0
+    for event in _tool_events(events, task_id):
+        if offset <= total < offset + limit:
+            branch, generation, turn, batch_index = _tool_identity(event)
+            lines.append(
+                " ".join(
+                    (
+                        tool_ref(branch, generation, turn, batch_index, session=event.session),
+                        f"branch={branch_ref(branch)}",
+                        f"tool={event.payload.get('tool', '-')}",
+                        f"ok={str(bool(event.payload.get('ok'))).lower()}",
+                        f"duration_ms={_int(event.payload, 'duration_ms')}",
+                        f"cmd={event.payload.get('cmd', '-')}",
+                    )
                 )
             )
-        )
-    return _page(lines, offset, limit)
+        total += 1
+    suffix = f"\nnext_offset={offset + len(lines)}" if offset + len(lines) < total else ""
+    return _bounded("\n".join((f"tool_calls={total}", *lines)) + suffix)
 
 
 def _regular_json(path: Path) -> dict[str, Any]:
@@ -469,14 +499,14 @@ def _checkpoint_messages(
 
 
 def _checkpoint_event(
-    events: Sequence[_Event],
+    events: Iterable[_Event],
     task_id: str,
     generation: int | None,
     turn: int | None,
     *,
     session: str | None = None,
 ) -> _Event | None:
-    matches: list[_Event] = []
+    latest: _Event | None = None
     for event in events:
         if event.kind != "checkpoint" or event.task_id != task_id:
             continue
@@ -487,8 +517,8 @@ def _checkpoint_event(
         if turn is not None and _int(event.payload, "turn") != turn:
             continue
         if isinstance(event.payload.get("state_ref"), str):
-            matches.append(event)
-    return matches[-1] if matches else None
+            latest = event
+    return latest
 
 
 def _extract_tool_exchange(
@@ -555,21 +585,114 @@ def _validate_tool_observation(observation: str, tool: str, expected_ok: bool) -
         raise BranchHistoryError("recorded tool observation disagrees with the tool event")
 
 
-def _read_tool(events: Sequence[_Event], ref: Any) -> str:
+def _artifact_page(
+    root: Path,
+    event: _Event,
+    *,
+    offset: int,
+    limit: int,
+) -> tuple[str, int | None]:
+    """Read one hash-verified page from a durable tool-output spill artifact."""
+    output_ref = event.payload.get("output_ref")
+    output_sha256 = event.payload.get("output_sha256")
+    output_bytes = event.payload.get("output_bytes")
+    if (
+        not isinstance(output_ref, str)
+        or not output_ref
+        or not isinstance(output_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", output_sha256) is None
+        or type(output_bytes) is not int
+        or output_bytes < 0
+    ):
+        raise BranchHistoryError("tool output artifact metadata is invalid")
+
+    relative = Path(output_ref)
+    if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+        raise BranchHistoryError("tool output artifact ref is invalid")
+    session_root = root / event.session if event.session else root
+    session_root = session_root.resolve()
+    candidate = session_root / relative
+    current = session_root
+    for component in relative.parts:
+        current /= component
+        try:
+            info = current.lstat()
+        except FileNotFoundError as exc:
+            raise BranchHistoryError("tool output artifact is missing") from exc
+        if stat.S_ISLNK(info.st_mode):
+            raise BranchHistoryError("tool output artifact must not traverse symlinks")
+    try:
+        candidate = candidate.resolve()
+        candidate.relative_to(session_root)
+    except (OSError, ValueError) as exc:
+        raise BranchHistoryError("tool output artifact escapes its session") from exc
+    if not candidate.is_file() or candidate.is_symlink():
+        raise BranchHistoryError("tool output artifact is unavailable")
+    if candidate.stat().st_size != output_bytes:
+        raise BranchHistoryError("tool output artifact byte count does not match durable evidence")
+
+    digest = hashlib.sha256()
+    try:
+        with candidate.open("rb") as handle:
+            while chunk := handle.read(64 * 1024):
+                digest.update(chunk)
+            if digest.hexdigest() != output_sha256:
+                raise BranchHistoryError(
+                    "tool output artifact digest does not match durable evidence"
+                )
+            page_start = min(offset, output_bytes)
+            handle.seek(page_start)
+            raw = handle.read(limit)
+    except OSError as exc:
+        raise BranchHistoryError("tool output artifact cannot be read") from exc
+    next_offset = page_start + len(raw)
+    return (
+        raw.decode("utf-8", errors="replace"),
+        next_offset if next_offset < output_bytes else None,
+    )
+
+
+def _read_tool(
+    events: Iterable[_Event],
+    ref: Any,
+    *,
+    root: Path,
+    output_offset: int = 0,
+    output_limit: int = MAX_MESSAGE_BYTES,
+) -> str:
     task_id, generation, turn, batch_index, session = _parse_tool_ref(ref)
-    matches = [
-        event
-        for event in _tool_events(events, task_id)
-        if _tool_identity(event) == (task_id, generation, turn, batch_index)
-        and (session is None or event.session == session)
-    ]
-    if not matches:
+    latest_tool: _Event | None = None
+    latest_artifact: _Event | None = None
+    sessions: set[str] = set()
+    checkpoints: dict[str, _Event] = {}
+    for event in events:
+        matching_identity = (
+            event.task_id == task_id
+            and _tool_identity(event) == (task_id, generation, turn, batch_index)
+            and (session is None or event.session == session)
+        )
+        if event.kind == "tool_event" and matching_identity:
+            latest_tool = event
+            sessions.add(event.session)
+        elif event.kind == "tool_output_artifact" and matching_identity:
+            latest_artifact = event
+            sessions.add(event.session)
+        if (
+            event.kind == "checkpoint"
+            and event.task_id == task_id
+            and (session is None or event.session == session)
+            and _int(event.payload, "generation") == generation
+            and _int(event.payload, "turn") == turn
+            and isinstance(event.payload.get("state_ref"), str)
+        ):
+            checkpoints[event.session] = event
+    if latest_tool is None:
         raise BranchHistoryError(f"tool call not found: {ref}")
-    if len({event.session for event in matches}) > 1:
+    if len(sessions) > 1:
         raise BranchHistoryError(
             "ambiguous tool ref across interactive turns; list tools for scoped refs"
         )
-    event = matches[-1]
+    event = latest_tool
     tool_name, tool_ok = _validate_tool_event(event)
     lines = [
         str(ref),
@@ -578,7 +701,7 @@ def _read_tool(events: Sequence[_Event], ref: Any) -> str:
         f"tool={tool_name} ok={str(tool_ok).lower()} ",
         f"cmd={event.payload.get('cmd', '-')}",
     ]
-    checkpoint = _checkpoint_event(events, task_id, generation, turn, session=event.session)
+    checkpoint = checkpoints.get(event.session)
     if checkpoint is None:
         raise BranchHistoryError(f"tool call has no matching checkpoint evidence: {ref}")
     state_ref = checkpoint.payload.get("state_ref")
@@ -598,10 +721,30 @@ def _read_tool(events: Sequence[_Event], ref: Any) -> str:
     _validate_tool_observation(observation, tool_name, tool_ok)
     lines.extend(("assistant_action:", _bounded(action, MAX_MESSAGE_BYTES)))
     lines.extend(("tool_observation:", _bounded(observation, MAX_MESSAGE_BYTES)))
+    if latest_artifact is not None:
+        page, next_output_offset = _artifact_page(
+            root,
+            latest_artifact,
+            offset=output_offset,
+            limit=output_limit,
+        )
+        lines.extend(
+            (
+                "tool_output_artifact:",
+                (
+                    f"ref={latest_artifact.payload['output_ref']} "
+                    f"sha256={latest_artifact.payload['output_sha256']} "
+                    f"bytes={latest_artifact.payload['output_bytes']} offset={output_offset}"
+                ),
+                page,
+            )
+        )
+        if next_output_offset is not None:
+            lines.append(f"next_output_offset={next_output_offset}")
     return _bounded("\n".join(lines))
 
 
-def _latest_transcript(events: Sequence[_Event], task_id: str, offset: int, limit: int) -> str:
+def _latest_transcript(events: Iterable[_Event], task_id: str, offset: int, limit: int) -> str:
     checkpoint = _checkpoint_event(events, task_id, None, None)
     if checkpoint is None:
         raise BranchHistoryError(f"branch has no retrievable checkpoint: {task_id}")
@@ -640,7 +783,15 @@ def query_branch_history(session_dir: Path | str, arguments: Mapping[str, Any]) 
     if action is HistoryAction.TOOLS:
         return _list_tools(events, task_id, offset, limit)
     if action is HistoryAction.TOOL:
-        return _read_tool(events, arguments.get("ref"))
+        output_offset = _non_negative_offset(arguments.get("output_offset"))
+        output_limit = _artifact_limit(arguments.get("output_limit"))
+        return _read_tool(
+            events,
+            arguments.get("ref"),
+            root=root,
+            output_offset=output_offset,
+            output_limit=output_limit,
+        )
     if task_id is None:
         raise BranchHistoryError("branch_history action=transcript requires task_id")
     return _latest_transcript(events, task_id, offset, limit)

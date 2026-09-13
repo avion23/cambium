@@ -44,6 +44,50 @@ def test_inspection_can_focus_a_queued_admitted_child(tmp_path):
         store.close()
 
 
+def test_inspection_focus_child_projects_a_late_failure(tmp_path):
+    path = tmp_path / ".cambium" / "events.db"
+    path.parent.mkdir()
+    store = EventStore(path)
+    try:
+        store.append(
+            {
+                "kind": "child_admitted",
+                "task_id": "root",
+                "payload": {
+                    "parent_task_id": "root",
+                    "child_task_id": "child",
+                },
+            }
+        )
+        store.append(
+            {
+                "kind": "result",
+                "task_id": "child",
+                "payload": {"status": "succeeded"},
+            }
+        )
+        store.append(
+            {
+                "kind": "child_failed",
+                "task_id": "child",
+                "payload": {
+                    "parent_task_id": "root",
+                    "child_task_id": "child",
+                    "reason": "late failure",
+                },
+            }
+        )
+        state = load_state(tmp_path, "child")
+    finally:
+        store.close()
+
+    assert state.identity.branch_id == "child"
+    assert state.children == ()
+    assert state.lifecycle.value == "failed"
+    assert state.result is not None
+    assert state.result.status == "failed"
+
+
 def test_inspection_does_not_interleave_turns_and_can_focus_a_child(tmp_path, monkeypatch):
     root = tmp_path / "session"
     for turn, objective in ((1, "obsolete task"), (2, "current task")):

@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import collections
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -68,7 +69,7 @@ import stat
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 from typing import Any, cast
 
@@ -109,6 +110,9 @@ CRITICAL_KINDS = frozenset(
         # Provider usage carries the authoritative success/failure evidence
         # used by retries, fallback, quota accounting, and replay.
         "usage_event",
+        # Large shell output is stored once as a private exact artifact; this
+        # critical row is the durable content-addressed pointer to those bytes.
+        "tool_output_artifact",
         # Child outcomes are the durable state consumed by parent joins and
         # resume, so queue pressure must not silently erase them.
         "child_result",
@@ -178,6 +182,10 @@ The cap is deliberately high enough for a large real session, while keeping a
 single untrusted store from forcing an unbounded replay allocation.  Readers
 fail closed when the cap is exceeded instead of silently dropping events.
 """
+# A page is deliberately much smaller than the materialization cap.  Callers
+# that need to inspect a complete store should consume ``iter_event_pages``
+# instead of increasing ``MAX_EVENT_ROWS_PER_READ``.
+_DEFAULT_EVENT_PAGE_SIZE = 4096
 _SELECT_AFTER = (
     "SELECT seq, kind, payload, ts, monotonic_ms, task_id, worker_id, "
     "generation, request_id FROM events WHERE seq > ? ORDER BY seq LIMIT ?"
@@ -221,6 +229,47 @@ def read_events_file(
     return [event for event in events if event["seq"] > after_seq]
 
 
+def iter_event_pages(
+    db_path: Path | str,
+    after_seq: int = 0,
+    *,
+    page_size: int = _DEFAULT_EVENT_PAGE_SIZE,
+    busy_timeout_ms: int = _READER_BUSY_TIMEOUT_MS,
+) -> Iterator[list[dict[str, Any]]]:
+    """Yield durable events in bounded pages without applying the read cap.
+
+    ``read_events_file`` remains the fail-closed, capped API for callers that
+    explicitly materialize a list.  Replay and inspection code that must scan
+    a complete store should consume these pages incrementally.  Each yielded
+    list contains at most ``page_size`` validated events; SQLite connections
+    are opened and closed for each page so a long scan does not hold a reader
+    transaction or WAL lock.
+    """
+    if type(page_size) is not int or page_size < 1:
+        raise ValueError("page_size must be a positive integer")
+
+    path = Path(db_path)
+    try:
+        path_stat = path.lstat()
+    except FileNotFoundError:
+        return iter(())
+    except OSError as exc:
+        raise StoreError(f"cannot inspect event store {path}: {exc}") from exc
+    if stat.S_ISLNK(path_stat.st_mode):
+        raise StoreError(f"event store path must not be a symlink: {path}")
+    if not stat.S_ISREG(path_stat.st_mode):
+        return iter(())
+    try:
+        with path.open("rb") as handle:
+            header = handle.read(len(_SQLITE_HEADER))
+    except OSError as exc:
+        raise StoreError(f"cannot read event store {path}: {exc}") from exc
+
+    if header == _SQLITE_HEADER:
+        return _iter_sqlite_event_pages(path, busy_timeout_ms, after_seq, page_size)
+    return _iter_jsonl_event_pages(path, after_seq, page_size)
+
+
 def count_events_file(
     db_path: Path | str,
     *,
@@ -248,6 +297,43 @@ def count_events_file(
             return int(conn.execute("SELECT COUNT(*) FROM events").fetchone()[0])
         finally:
             conn.close()
+    except (OSError, sqlite3.Error) as exc:
+        raise _event_store_error(path, str(exc)) from exc
+
+
+def max_event_seq_file(
+    db_path: Path | str,
+    *,
+    busy_timeout_ms: int = _READER_BUSY_TIMEOUT_MS,
+) -> int:
+    """Return the durable tail sequence without materializing event rows."""
+    path = Path(db_path)
+    try:
+        path_stat = path.lstat()
+    except FileNotFoundError:
+        return 0
+    except OSError as exc:
+        raise StoreError(f"cannot inspect event store {path}: {exc}") from exc
+    if stat.S_ISLNK(path_stat.st_mode):
+        raise StoreError(f"event store path must not be a symlink: {path}")
+    if not stat.S_ISREG(path_stat.st_mode):
+        return 0
+    try:
+        with path.open("rb") as handle:
+            header = handle.read(len(_SQLITE_HEADER))
+        if header == _SQLITE_HEADER:
+            conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+            try:
+                conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
+                row = conn.execute("SELECT COALESCE(MAX(seq), 0) FROM events").fetchone()
+                return int(row[0]) if row is not None else 0
+            finally:
+                conn.close()
+        maximum = 0
+        for page in _iter_jsonl_event_pages(path, 0, _DEFAULT_EVENT_PAGE_SIZE):
+            if page:
+                maximum = page[-1]["seq"]
+        return maximum
     except (OSError, sqlite3.Error) as exc:
         raise _event_store_error(path, str(exc)) from exc
 
@@ -388,6 +474,175 @@ def _event_row_limit(max_rows: int | None) -> int:
     if type(limit) is not int or limit < 1:
         raise ValueError("max_rows must be a positive integer")
     return limit
+
+
+class _EventIdFilter:
+    """Bounded duplicate detector for unbounded streaming reads.
+
+    Bloom hits are confirmed against the JSONL prefix before they are
+    reported as duplicates, so a false-positive bit pattern cannot reject a
+    valid stream.  The capped materializer retains its exact event-ID set and
+    therefore keeps its existing contract.
+    """
+
+    _BITS = 1 << 25
+    _HASHES = 4
+
+    def __init__(self) -> None:
+        self._bits = bytearray(self._BITS // 8)
+
+    def _positions(self, event_id: str) -> tuple[int, ...]:
+        digest = hashlib.sha256(event_id.encode("utf-8")).digest()
+        return tuple(
+            int.from_bytes(digest[offset : offset + 8], "big") % self._BITS
+            for offset in range(0, self._HASHES * 8, 8)
+        )
+
+    def seen_or_add(self, event_id: str) -> bool:
+        positions = self._positions(event_id)
+        duplicate = all(self._bits[position >> 3] & (1 << (position & 7)) for position in positions)
+        for position in positions:
+            self._bits[position >> 3] |= 1 << (position & 7)
+        return duplicate
+
+
+def _jsonl_seen_event_id(path: Path, event_id: str, before_line: int) -> bool:
+    """Confirm a Bloom-filter hit against the already-read JSONL prefix."""
+    try:
+        with path.open("rb") as handle:
+            for line_no, raw_line in enumerate(handle, start=1):
+                if line_no >= before_line:
+                    return False
+                if not raw_line.strip():
+                    continue
+                try:
+                    value = json.loads(raw_line.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if isinstance(value, dict) and value.get("event_id") == event_id:
+                    return True
+    except OSError as exc:
+        raise StoreError(f"cannot read event store {path}: {exc}") from exc
+    return False
+
+
+def _iter_jsonl_event_pages(
+    path: Path, after_seq: int, page_size: int
+) -> Iterator[list[dict[str, Any]]]:
+    """Stream validated JSONL events while retaining read_events_file semantics."""
+    page: list[dict[str, Any]] = []
+    previous_seq = 0
+    event_ids: _EventIdFilter | None = None
+    try:
+        with path.open("rb") as handle:
+            for line_no, raw_line in enumerate(handle, start=1):
+                if not raw_line.strip():
+                    continue
+                complete_line = raw_line.endswith(b"\n")
+                try:
+                    line = raw_line.decode("utf-8")
+                    value = json.loads(line)
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    if not complete_line:
+                        continue
+                    raise _event_store_error(path, "invalid JSON", line_no) from exc
+                try:
+                    event = _validate_event_record(value)
+                except (TypeError, ValueError) as exc:
+                    raise _event_store_error(path, str(exc), line_no) from exc
+
+                seq = event["seq"]
+                if seq <= previous_seq:
+                    raise _event_store_error(
+                        path, f"event sequence is not increasing at seq {seq}"
+                    )
+                previous_seq = seq
+                event_id = event.get("event_id")
+                if event_id is not None:
+                    if event_ids is None:
+                        event_ids = _EventIdFilter()
+                    if event_ids.seen_or_add(event_id) and _jsonl_seen_event_id(
+                        path, event_id, line_no
+                    ):
+                        raise _event_store_error(path, f"duplicate event_id {event_id!r}")
+
+                if seq <= after_seq:
+                    continue
+                page.append(event)
+                if len(page) == page_size:
+                    yield page
+                    page = []
+    except OSError as exc:
+        raise StoreError(f"cannot read event store {path}: {exc}") from exc
+    if page:
+        yield page
+
+
+def _iter_sqlite_event_pages(
+    path: Path, busy_timeout_ms: int, after_seq: int, page_size: int
+) -> Iterator[list[dict[str, Any]]]:
+    """Stream SQLite rows in bounded queries, closing each reader promptly."""
+    cursor_seq = after_seq
+    previous_seq = 0
+    event_ids: _EventIdFilter | None = None
+    while True:
+        conn = None
+        rows: list[tuple] = []
+        page: list[dict[str, Any]] = []
+        done = False
+        try:
+            conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+            conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
+            rows = conn.execute(_SELECT_AFTER, (cursor_seq, page_size)).fetchall()
+            if not rows:
+                return
+
+            trailing_corruption = False
+            for index, row in enumerate(rows):
+                try:
+                    event = EventStore._row_to_event(row)
+                except json.JSONDecodeError as exc:
+                    # Match _events_from_rows/read_events_file: only an
+                    # undecodable final SQLite payload may be treated as a
+                    # torn tail.  A later durable row makes it mid-file
+                    # corruption and must fail closed.
+                    if index < len(rows) - 1:
+                        raise _event_store_error(path, "invalid JSON payload") from exc
+                    later = conn.execute(
+                        "SELECT 1 FROM events WHERE seq > ? LIMIT 1", (row[0],)
+                    ).fetchone()
+                    if later is not None:
+                        raise _event_store_error(path, "invalid JSON payload") from exc
+                    trailing_corruption = True
+                    break
+                except (IndexError, TypeError, ValueError) as exc:
+                    raise _event_store_error(path, str(exc)) from exc
+
+                seq = event["seq"]
+                if seq <= previous_seq:
+                    raise _event_store_error(
+                        path, f"event sequence is not increasing at seq {seq}"
+                    )
+                previous_seq = seq
+                event_id = event.get("event_id")
+                if event_id is not None:
+                    if event_ids is None:
+                        event_ids = _EventIdFilter()
+                    if event_ids.seen_or_add(event_id):
+                        raise _event_store_error(path, f"duplicate event_id {event_id!r}")
+                page.append(event)
+
+            cursor_seq = rows[-1][0]
+            done = trailing_corruption or len(rows) < page_size
+        except (OSError, sqlite3.Error) as exc:
+            raise _event_store_error(path, str(exc)) from exc
+        finally:
+            if conn is not None:
+                conn.close()
+        if page:
+            yield page
+        if done:
+            return
 
 
 def _read_jsonl_events(path: Path, max_rows: int) -> list[dict[str, Any]]:

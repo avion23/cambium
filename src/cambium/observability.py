@@ -22,6 +22,7 @@ from .provider_scheduler import QuotaWindowSnapshot
 from .summary_trunk import SUMMARY_ENTRY_OPEN
 
 _TERMINAL_STATES = frozenset({"succeeded", "failed", "cancelled", "exited", "rejected"})
+_FAILURE_STATES = frozenset({"failed", "cancelled", "rejected"})
 _ACTIVE_STATES = frozenset({"starting", "active", "merging"})
 _STATE_PRIORITY = {
     "queued": 0,
@@ -44,6 +45,19 @@ _CONTEXT_EVENT_KINDS = frozenset(
     }
 )
 _ASSIGNMENT_EVENT_KINDS = frozenset({"task_assigned", "child_admitted", "task_queued"})
+_CHILD_TERMINAL_EVENT_KINDS = frozenset({"child_result", "child_failed", "child_rejected"})
+_FAILURE_EVENT_KINDS = frozenset(
+    {
+        "worker_failed",
+        "worker_terminated",
+        "task_failed",
+        "context_resume_failed",
+        "fatal_error",
+        "merge_failed",
+        "join_invariant_failed",
+    }
+)
+_RECOVERY_EVENT_KINDS = frozenset({"merge_committed", "resolver_succeeded"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,6 +181,10 @@ class _Agent:
     assigned_model: str | None = None
     serving_provider: str | None = None
     serving_model: str | None = None
+    merge_failure_pending: bool = False
+    merge_failure_generation: int | None = None
+    nonrecoverable_failure: bool = False
+    restart_pending: bool = False
 
 
 def _payload(event: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -304,7 +322,26 @@ def _event_detail(kind: str, payload: Mapping[str, Any]) -> str:
     return ""
 
 
-def _set_state(agent: _Agent, state: str) -> None:
+def _terminal_state(status: Any) -> str | None:
+    value = _string(status)
+    if value in {"timeout", "unresolvable"}:
+        return "failed"
+    if value == "suspended":
+        return value
+    return value if value in _TERMINAL_STATES else None
+
+
+def _set_state(agent: _Agent, state: str, *, reset_failure: bool = False) -> None:
+    # Durable failure evidence is authoritative even when a provisional
+    # terminal success arrived first.  A later non-recoverable failure must
+    # not leave the operator view claiming success.
+    if state in _FAILURE_STATES:
+        agent.state = state
+        agent.merge_failure_pending = False
+        agent.merge_failure_generation = None
+        agent.nonrecoverable_failure = True
+        agent.restart_pending = False
+        return
     if agent.state == "suspended" and state in {"starting", "active", "merging"}:
         agent.state = state
         return
@@ -313,14 +350,52 @@ def _set_state(agent: _Agent, state: str) -> None:
         agent.tool = None
         return
     if agent.state in _TERMINAL_STATES:
-        if agent.state == "failed" and state == "starting":
+        if agent.state == "failed" and state == "starting" and reset_failure:
             agent.state = state
+            agent.merge_failure_pending = False
+            agent.merge_failure_generation = None
+            agent.nonrecoverable_failure = False
+            agent.restart_pending = False
         return
     if state in _TERMINAL_STATES:
         agent.state = state
         return
     if _STATE_PRIORITY.get(state, 0) >= _STATE_PRIORITY.get(agent.state, 0):
         agent.state = state
+
+
+def _mark_merge_failure(agent: _Agent, payload: Mapping[str, Any], generation: Any) -> None:
+    """Record merge failure while allowing a later durable recovery event.
+
+    Merge conflicts and private observer diagnostics can both be followed by
+    a committed merge or resolver success.  Keep the pending marker separate
+    from worker/join failures so recovery cannot erase those failures.
+    """
+    if agent.nonrecoverable_failure:
+        return
+    agent.merge_failure_pending = True
+    failure_generation = generation
+    if type(failure_generation) is not int:
+        failure_generation = payload.get("generation")
+    agent.merge_failure_generation = failure_generation if type(failure_generation) is int else None
+    recoverable_diagnostic = payload.get("internal") is True and payload.get("recoverable") is True
+    if not recoverable_diagnostic:
+        agent.state = "failed"
+
+
+def _clear_merge_failure(agent: _Agent, generation: Any) -> bool:
+    """Clear a pending merge failure and publish the recovered success."""
+    generation_matches = (
+        type(generation) is int
+        and agent.merge_failure_generation == generation
+        and generation == agent.generation
+    ) or (generation is None and agent.merge_failure_generation is None and agent.generation == 0)
+    if not agent.merge_failure_pending or agent.nonrecoverable_failure or not generation_matches:
+        return False
+    agent.merge_failure_pending = False
+    agent.merge_failure_generation = None
+    agent.state = "succeeded"
+    return True
 
 
 def _context_lineage(kind: str, payload: Mapping[str, Any]) -> str | None:
@@ -527,8 +602,11 @@ class ObservabilityState:
         serving_provider, serving_model = _serving_values(kind, payload)
         if child_id is not None:
             child = self._ensure_agent(child_id)
-            if parent_id is not None:
-                child.parent_task_id = parent_id
+            relation_parent_id = parent_id
+            if relation_parent_id is None and task_id is not None and task_id != child_id:
+                relation_parent_id = task_id
+            if relation_parent_id is not None:
+                child.parent_task_id = relation_parent_id
             child_epoch = payload.get("epoch")
             if (
                 (kind in _CONTEXT_EVENT_KINDS or kind == "context_fork_skipped")
@@ -536,8 +614,22 @@ class ObservabilityState:
                 and child_epoch >= 0
             ):
                 child.epoch = max(child.epoch, child_epoch)
-            if kind == "child_rejected":
-                _set_state(child, "rejected")
+            if kind in _CHILD_TERMINAL_EVENT_KINDS:
+                child.last_seq = seq
+                child.last_kind = kind
+                if type(generation) is int and generation >= 0:
+                    child.generation = max(child.generation, generation)
+                turn = payload.get("turn")
+                if type(turn) is int and turn >= 0:
+                    child.turn = max(child.turn, turn)
+                if kind == "child_failed":
+                    _set_state(child, "failed")
+                elif kind == "child_rejected":
+                    _set_state(child, "rejected")
+                else:
+                    status = _terminal_state(payload.get("status"))
+                    if status is not None:
+                        _set_state(child, status)
             if assignment_provider is not None:
                 child.assigned_provider = assignment_provider
                 child.provider = assignment_provider
@@ -551,6 +643,7 @@ class ObservabilityState:
                 self._ensure_agent(lineage_task_id).lineage = lineage
         if task_id is not None:
             agent = self._ensure_agent(task_id)
+            previous_generation = agent.generation
             if parent_id is not None and task_id != parent_id:
                 agent.parent_task_id = parent_id
             if type(generation) is int and generation >= 0:
@@ -561,7 +654,13 @@ class ObservabilityState:
             if kind in {"task_assigned", "child_admitted", "task_queued"}:
                 _set_state(agent, "queued")
             elif kind == "spawned":
-                _set_state(agent, "starting")
+                reset_failure = agent.restart_pending or (
+                    type(generation) is int and generation > previous_generation
+                )
+                _set_state(agent, "starting", reset_failure=reset_failure)
+                agent.restart_pending = False
+            elif kind in {"restart_scheduled", "recover"}:
+                agent.restart_pending = True
             elif kind in {
                 "ready",
                 "run_task",
@@ -579,17 +678,36 @@ class ObservabilityState:
                     _set_state(agent, "active")
             elif kind in {"merge_progress", "merge_started"}:
                 _set_state(agent, "merging")
-            elif kind in {
-                "worker_failed",
-                "worker_terminated",
-                "task_failed",
-                "context_resume_failed",
-            }:
-                _set_state(agent, "failed")
+            elif kind in _FAILURE_EVENT_KINDS:
+                if kind == "merge_failed":
+                    _mark_merge_failure(agent, payload, generation)
+                else:
+                    _set_state(agent, "failed")
+            elif kind in {"child_result", "child_failed"} and (
+                child_id is None or child_id == task_id
+            ):
+                if kind == "child_failed":
+                    _set_state(agent, "failed")
+                else:
+                    status = _terminal_state(payload.get("status"))
+                    if status is not None:
+                        _set_state(agent, status)
             elif kind == "result":
-                status = _string(payload.get("status"))
-                if status in {"succeeded", "failed", "cancelled", "suspended"}:
+                status = _terminal_state(payload.get("status")) or _string(payload.get("status"))
+                if status in {"succeeded", "failed", "cancelled", "rejected", "suspended"}:
                     _set_state(agent, status)
+            elif kind in _RECOVERY_EVENT_KINDS:
+                # A durable publication/resolver success can complete an
+                # active task, but it cannot erase a prior non-recoverable
+                # failure.  It also clears a pending merge failure, whether
+                # that was a conflict or an internal recoverable diagnostic.
+                if not _clear_merge_failure(agent, generation) and not agent.merge_failure_pending:
+                    _set_state(agent, "succeeded")
+            elif kind == "merge_reconciled" and not agent.merge_failure_pending:
+                # Reconciliation is a success observation only when no
+                # unresolved merge episode is still pending.  It is not a
+                # recovery proof for a prior merge diagnostic.
+                _set_state(agent, "succeeded")
             elif kind == "exit" and agent.state != "suspended":
                 _set_state(agent, "exited")
             elif kind == "reuse_ready" and agent.state not in _TERMINAL_STATES:
@@ -656,8 +774,7 @@ class ObservabilityState:
                 if payload.get("call_kind") == "summary":
                     agent.summary_calls += 1
                 cache_hit = payload.get("provider_cache_hit")
-                if type(cache_hit) is bool:
-                    agent.last_provider_cache_hit = cache_hit
+                agent.last_provider_cache_hit = cache_hit if type(cache_hit) is bool else None
                 agent.input_tokens += input_tokens
                 agent.output_tokens += output_tokens
                 agent.cached_tokens += cached_tokens

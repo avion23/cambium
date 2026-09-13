@@ -4248,20 +4248,28 @@ async def _emit_tool_event(
     tool_result: ToolResult,
     batch_index: int = 0,
 ) -> None:
-    await send(
-        writer,
-        {
-            "type": "tool_event",
-            "task_id": config.task_id,
-            "generation": config.generation,
-            "tool": name,
-            "cmd": _safe_cmd(name, args),
-            "turn": turn,
-            "batch_index": batch_index,
-            "ok": bool(tool_result.ok),
-            "duration_ms": int(tool_result.duration_ms),
-        },
-    )
+    message: dict[str, Any] = {
+        "type": "tool_event",
+        "task_id": config.task_id,
+        "generation": config.generation,
+        "tool": name,
+        "cmd": _safe_cmd(name, args),
+        "turn": turn,
+        "batch_index": batch_index,
+        "ok": bool(tool_result.ok),
+        "duration_ms": int(tool_result.duration_ms),
+    }
+    if (
+        tool_result.output_ref is not None
+        and tool_result.output_sha256 is not None
+        and tool_result.output_bytes is not None
+    ):
+        message.update(
+            output_ref=tool_result.output_ref,
+            output_sha256=tool_result.output_sha256,
+            output_bytes=tool_result.output_bytes,
+        )
+    await send(writer, message)
 
 
 def _emit_tool_output_delta(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from pathlib import Path
 
@@ -102,6 +103,54 @@ def _write_session(
         encoding="utf-8",
     )
     return session
+
+
+def test_tool_history_reopens_hash_verified_large_output_artifact(tmp_path: Path) -> None:
+    session = _write_session(tmp_path)
+    exact = ("0123456789abcdef" * 4096).encode()
+    spill = session / ".cambium" / "spill" / "exact.txt"
+    spill.parent.mkdir(parents=True)
+    spill.write_bytes(exact)
+    events_path = session / ".cambium" / "events.db"
+    events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+    events.append(
+        {
+            "seq": 6,
+            "kind": "tool_output_artifact",
+            "payload": {
+                "tool": "read_batch",
+                "turn": 2,
+                "batch_index": 0,
+                "output_ref": ".cambium/spill/exact.txt",
+                "output_sha256": hashlib.sha256(exact).hexdigest(),
+                "output_bytes": len(exact),
+            },
+            "task_id": "child",
+            "generation": 1,
+        }
+    )
+    events_path.write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+
+    page = query_branch_history(
+        session,
+        {
+            "action": "tool",
+            "ref": "tool:child:1:2:0",
+            "output_offset": 100,
+            "output_limit": 64,
+        },
+    )
+
+    assert f"sha256={hashlib.sha256(exact).hexdigest()}" in page
+    assert exact[100:164].decode() in page
+    assert "next_output_offset=164" in page
+
+    spill.write_bytes(b"tampered")
+    with pytest.raises(BranchHistoryError, match="byte count|digest"):
+        query_branch_history(session, {"action": "tool", "ref": "tool:child:1:2:0"})
 
 
 @pytest.mark.parametrize("scopes", [("turn-0001", "turn-0002"), ("turn-9999", "turn-10000")])

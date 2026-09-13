@@ -285,6 +285,39 @@ def test_terminal_input_grapheme_editing_and_cell_vertical_navigation(tmp_path: 
             editor._key("\x1b[A")
             assert editor.cursor == 0
 
+            editor.text, editor.cursor = "🇺🇸a\nx", len("🇺🇸a\nx")
+            editor._key("\x1b[A")
+            assert editor.cursor == 0
+
+    _run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("grapheme", "end"),
+    [
+        ("🇺🇸", 2),
+        ("👩\u200d💻", 3),
+        ("e\u0301", 2),
+        ("\ud800", 1),
+    ],
+)
+def test_terminal_input_keeps_graphemes_atomic(
+    tmp_path: Path, grapheme: str, end: int
+) -> None:
+    async def scenario() -> None:
+        with _editor(tmp_path) as (editor, _master, _timeline, _focused):
+            editor.text = f"a{grapheme}b"
+            editor.cursor = 1
+            editor._key("\x1b[C")
+            assert editor.cursor == 1 + end
+            editor._key("\x7f")
+            assert (editor.text, editor.cursor) == ("ab", 1)
+
+            editor.text = grapheme
+            editor.cursor = 0
+            editor._key("\x1b[3~")
+            assert editor.text == ""
+
     _run(scenario())
 
 

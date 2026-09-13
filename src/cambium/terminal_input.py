@@ -14,16 +14,13 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from rich.cells import split_graphemes
-
-from .terminal import supports_cursor_controls
+from .terminal import supports_cursor_controls, terminal_grapheme_spans_raw
 
 
 def _grapheme_boundaries(text: str) -> list[int]:
     """Return code-point indexes delimiting grapheme clusters."""
 
-    spans, _ = split_graphemes(text)
-    return [0, *(end for _, end, _ in spans)]
+    return [0, *(end for _, end, _ in terminal_grapheme_spans_raw(text))]
 
 
 def _previous_boundary(text: str, cursor: int) -> int:
@@ -47,7 +44,7 @@ def _next_boundary(text: str, cursor: int) -> int:
 
 
 def _line_cell_width(text: str) -> int:
-    return split_graphemes(text)[1]
+    return sum(width for _, _, width in terminal_grapheme_spans_raw(text))
 
 
 def _index_at_cell(text: str, cells: int) -> int:
@@ -57,8 +54,7 @@ def _index_at_cell(text: str, cells: int) -> int:
         return 0
     used = 0
     index = 0
-    spans, _ = split_graphemes(text)
-    for _boundary, next_boundary, width in spans:
+    for _boundary, next_boundary, width in terminal_grapheme_spans_raw(text):
         if used + width > cells:
             break
         used += width

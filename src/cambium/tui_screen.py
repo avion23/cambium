@@ -2441,13 +2441,23 @@ def _entry_lines(
     if entry.role == "tool" and owner and entry.tool_name is None:
         label = f"{label}[{owner}]"
     label_prefix = f"{label} ▸ "
+    # At very narrow widths the semantic label competes with the body.  A
+    # clipped body would still be marked emitted by stream bookkeeping, so
+    # drop the label below the normal 20-cell layout (or when it fills a row).
+    # The terminal then receives every body grapheme instead of an ellipsis.
+    if width < 20 or _display_width(label_prefix) >= width:
+        label_prefix = ""
+    continuation_prefix = "    " if label_prefix else ""
     body_width = max(1, width - _display_width(label_prefix))
     if entry.tool_name is not None:
         summary_lines = _dense_rendered_lines(_wrap_markdown(_tool_line(entry), body_width))
         rendered = [
             (entry.role, _clip(label_prefix + (summary_lines[0] if summary_lines else ""), width))
         ]
-        rendered.extend((entry.role, _clip("    " + line, width)) for line in summary_lines[1:])
+        rendered.extend(
+            (entry.role, _clip(continuation_prefix + line, width))
+            for line in summary_lines[1:]
+        )
         summary = f"{entry.tool_name}: "
         detail = entry.text
         if detail.startswith(summary):
@@ -2459,7 +2469,7 @@ def _entry_lines(
                 else render_markdown_lines(detail, body_width, color=color)
             )
             rendered.extend(
-                (entry.role, _clip("    " + line, width))
+                (entry.role, _clip(continuation_prefix + line, width))
                 for line in _dense_rendered_lines(detail_lines)
             )
     else:
@@ -2482,7 +2492,7 @@ def _entry_lines(
                 if entry.role == "error" and line.lstrip().startswith(_FAILURE_CONTEXT_PREFIX)
                 else entry.role
             )
-            rendered.append((role, _clip("    " + line, width)))
+            rendered.append((role, _clip(continuation_prefix + line, width)))
     return rendered
 
 

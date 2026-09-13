@@ -10,7 +10,7 @@ import pytest
 
 from cambium import repl
 from cambium.oneshot import OneShotConfig
-from cambium.render_markdown import render_markdown, render_markdown_if_tty
+from cambium.render_markdown import render_markdown, render_markdown_if_tty, render_markdown_lines
 from cambium.supervisor import PlanResult, TaskResult
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -66,15 +66,42 @@ def test_unicode_line_separators_are_normalized() -> None:
     assert "\u0085" not in visible and "\u2028" not in visible and "\u2029" not in visible
 
 
-@pytest.mark.parametrize(("name", "value"), [("NO_COLOR", "1"), ("TERM", "dumb")])
-def test_disabled_color_returns_sanitized_plain_markdown(
-    monkeypatch, name: str, value: str
+@pytest.mark.parametrize("term", [None, "", "   ", "dumb", " DUMB ", "pipe"])
+def test_disabled_color_returns_plain_markdown_for_normalized_terms(
+    monkeypatch, term: str | None
 ) -> None:
     monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.delenv("TERM", raising=False)
-    monkeypatch.setenv(name, value)
+    monkeypatch.delenv("COLORTERM", raising=False)
+    if term is not None:
+        monkeypatch.setenv("TERM", term)
     text = "safe\x1b[31m\n# Title\n"
     assert render_markdown_if_tty(text, _Tty()) == "safe\n# Title\n"
+
+
+@pytest.mark.parametrize("no_color", ["1", ""])
+def test_no_color_presence_returns_plain_markdown(monkeypatch, no_color: str) -> None:
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setenv("NO_COLOR", no_color)
+    text = "safe\x1b[31m\n# Title\n"
+    assert render_markdown_if_tty(text, _Tty()) == "safe\n# Title\n"
+
+
+def test_empty_term_disables_rich_even_with_colorterm(monkeypatch) -> None:
+    monkeypatch.delenv("TERM", raising=False)
+    monkeypatch.setenv("COLORTERM", "truecolor")
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    text = "# Title\n- item\n"
+    assert render_markdown_if_tty(text, _Tty()) == text
+
+
+@pytest.mark.parametrize("width", [8, 19])
+def test_markdown_lines_honor_narrow_width_without_dropping_words(width: int) -> None:
+    text = "one two three four five six seven eight nine ten"
+    lines = render_markdown_lines(text, width=width, color_depth=0)
+    rendered = "".join(lines)
+
+    assert all(word in rendered for word in text.split())
 
 
 def test_renderer_uses_extended_palette_without_backgrounds(monkeypatch) -> None:

@@ -170,7 +170,7 @@ def _terminal_color_depth(
     colorterm: str,
     no_color: bool,
 ) -> int:
-    if not tty or no_color or term == "dumb":
+    if not tty or not term or no_color or term == "dumb":
         return 0
     if colorterm in {"24bit", "truecolor"} or term.endswith(("-direct", "-truecolor")):
         return 24
@@ -370,6 +370,17 @@ def terminal_grapheme_spans(value: Any) -> list[tuple[int, int, int]]:
     return _grapheme_spans(sanitize_terminal_text(value, single_line=True))
 
 
+def terminal_grapheme_spans_raw(text: str) -> list[tuple[int, int, int]]:
+    """Return grapheme spans for ``text`` without sanitizing its contents.
+
+    Spans use code-point offsets into the original value.  This is intended
+    for the editable input buffer, where sanitizing first would invalidate
+    cursor indexes (for example when lone surrogates are escaped).
+    """
+
+    return _grapheme_spans(text)
+
+
 def _cell_width(char: str) -> int:
     return _cell_len(char)
 
@@ -430,4 +441,5 @@ __all__ = [
     "terminal_color_depth",
     "terminal_display_width",
     "terminal_grapheme_spans",
+    "terminal_grapheme_spans_raw",
 ]

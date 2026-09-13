@@ -7,11 +7,12 @@ import io
 import json
 import sqlite3
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
 
-from cambium import tui
+from cambium import oneshot, tui, worker
 from cambium.interactive import InteractiveSession, InteractiveSessionError
 from cambium.monitor import monitor_session
 from cambium.oneshot import OneShotConfig, default_session_root
@@ -32,43 +33,24 @@ class _Tty(io.StringIO):
         return True
 
 
-def _cache_key(
-    provider: str = "provider-a", model: str = "model-a", *, redacted: bool = False
-) -> dict[str, object]:
-    digest = "a" * 64
-    return {
-        "provider": provider,
-        "model": model,
-        "protocol": "chat_completions",
-        "reasoning_effort": None,
-        "system_sha256": digest,
-        "tools_sha256": digest,
-        "prefix_sha256": digest,
-        "suffix_sha256": digest,
-        "full_sha256": digest,
-        "prefix_bytes": 1024,
-        "message_count": 3,
-        "redacted": redacted,
-        "provider_boundary": {},
-    }
-
-
-def _checkpoint_event(
-    ref: str,
-    provider: str = "provider-a",
-    model: str = "model-a",
+def _checkpoint_event_from_checkpoint(
+    checkpoint: worker.ContextCheckpoint,
     *,
-    redacted: bool = False,
+    kind: str = "context_checkpoint",
+    folded_from_epoch: int | None = None,
 ) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "checkpoint_ref": checkpoint.checkpoint_ref,
+        "epoch": checkpoint.epoch,
+        "cache_key": asdict(checkpoint.cache_key),
+    }
+    if folded_from_epoch is not None:
+        payload["folded_from_epoch"] = folded_from_epoch
     return {
-        "seq": 1,
-        "kind": "context_checkpoint",
+        "kind": kind,
         "task_id": "interactive-main",
-        "payload": {
-            "checkpoint_ref": ref,
-            "epoch": 3,
-            "cache_key": _cache_key(provider, model, redacted=redacted),
-        },
+        "generation": checkpoint.generation,
+        "payload": payload,
     }
 
 
@@ -95,19 +77,132 @@ def _write_success_result(turn_dir: Path) -> None:
 
 
 def _write_branch_plan(turn) -> None:
+    identity = {
+        "repo": str(Path(turn.config.repo).resolve()),
+        "worktree_path": str((turn.session_dir / "wt").resolve()),
+        "branch": oneshot._default_branch(turn.session_dir),
+        "task": turn.config.task,
+    }
     (turn.session_dir / "plan.json").write_text(
         json.dumps(
             {
                 "tasks": [
                     {
+                        "task_id": "interactive-main",
+                        **identity,
                         "interactive_branch_generation": turn.branch_generation,
                         "interactive_branch_start_turn": turn.branch_start_turn,
+                        "context_reuse": True,
                     }
                 ]
             }
         ),
         encoding="utf-8",
     )
+
+
+def _write_orphan_lifecycle(
+    turn, *, late_failure: bool = False
+) -> worker.ContextCheckpoint:
+    identity = {
+        "repo": str(Path(turn.config.repo).resolve()),
+        "worktree_path": str((turn.session_dir / "wt").resolve()),
+        "branch": oneshot._default_branch(turn.session_dir),
+        "task": turn.config.task,
+    }
+    checkpoint = _write_valid_context_checkpoint(turn.session_dir, generation=1, epoch=1)
+    store = EventStore(turn.session_dir / ".cambium" / "events.db")
+    events = [
+        {"kind": "session_started", "task_id": None, "payload": {}},
+        {"kind": "task_assigned", "task_id": "interactive-main", "payload": identity},
+        {
+            "kind": "context_checkpoint",
+            "task_id": "interactive-main",
+            "generation": 1,
+            "payload": {
+                "checkpoint_ref": checkpoint.checkpoint_ref,
+                "epoch": checkpoint.epoch,
+                "cache_key": asdict(checkpoint.cache_key),
+            },
+        },
+        {
+            "kind": "result",
+            "task_id": "interactive-main",
+            "generation": 1,
+            "payload": {"status": "succeeded"},
+        },
+        {
+            "kind": "exit",
+            "task_id": "interactive-main",
+            "generation": 1,
+            "payload": {"reason": "done"},
+        },
+    ]
+    if late_failure:
+        events.append(
+            {
+                "kind": "worker_failed",
+                "task_id": "interactive-main",
+                "generation": 1,
+                "payload": {"reason": "late failure"},
+            }
+        )
+    events.append(
+        {
+            "kind": "session_ended",
+            "task_id": None,
+            "payload": {
+                "session_status": "ended",
+                "results": {"interactive-main": "succeeded"},
+            },
+        }
+    )
+    try:
+        for event in events:
+            store.append(event)
+    finally:
+        store.close()
+    return checkpoint
+
+
+def _write_valid_context_checkpoint(
+    turn_dir: Path,
+    *,
+    generation: int,
+    epoch: int,
+    provider: str = "provider-a",
+    model: str = "model-a",
+) -> worker.ContextCheckpoint:
+    config = worker.AgentConfig(
+        task_id="interactive-main",
+        generation=generation,
+        task="interactive checkpoint",
+        worktree=None,
+        base_commit=None,
+        fanout_config=None,
+        max_turns=1,
+        max_tokens=100,
+        shell_permission=False,
+        network_permission=False,
+        heartbeat_interval_s=1.0,
+        max_wall_s=60.0,
+        checkpoint_root=turn_dir / ".cambium" / "checkpoints",
+    )
+    checkpoint = worker._write_epoch_checkpoint(
+        config,
+        turn=1,
+        epoch=epoch,
+        messages=[
+            {"role": "system", "content": "interactive checkpoint"},
+            {"role": "user", "content": "branch history"},
+        ],
+        provider=provider,
+        model=model,
+        tools_sha256="a" * 64,
+        provider_compat={"provider-a": ("chat_completions", None)},
+    )
+    assert checkpoint is not None
+    return checkpoint
 
 
 def _two_provider_config(
@@ -161,17 +256,23 @@ def test_interactive_session_carries_exact_and_semantic_seed(tmp_path: Path) -> 
     root = tmp_path / "interactive"
     session = InteractiveSession(OneShotConfig(repo=tmp_path, session_root=root))
     first = session.prepare_turn("inspect")
-    checkpoint_ref = "interactive-main/epoch-3-" + "b" * 64 + ".json"
-    checkpoint = first.session_dir / ".cambium" / "checkpoints" / checkpoint_ref
-    checkpoint.parent.mkdir(parents=True)
-    checkpoint.write_text("{}", encoding="utf-8")
+    checkpoint = _write_valid_context_checkpoint(first.session_dir, generation=1, epoch=3)
+    checkpoint_ref = checkpoint.checkpoint_ref
 
-    session.observe_event(first, _checkpoint_event(checkpoint_ref))
+    checkpoint_event = _checkpoint_event_from_checkpoint(checkpoint)
+    store = EventStore(first.session_dir / ".cambium" / "events.db")
+    try:
+        store.append(checkpoint_event)
+    finally:
+        store.close()
+    session.observe_event(first, checkpoint_event)
     session.complete_turn(first, succeeded=True)
     second = session.prepare_turn("continue")
 
     copied = second.session_dir / ".cambium" / "checkpoints" / checkpoint_ref
-    assert copied.read_text(encoding="utf-8") == "{}"
+    assert copied.read_text(encoding="utf-8") == (
+        first.session_dir / ".cambium" / "checkpoints" / checkpoint_ref
+    ).read_text(encoding="utf-8")
     assert second.summary_trunk_ref == checkpoint_ref
     assert second.context_fork is not None
     assert second.context_fork["provider"] == "provider-a"
@@ -186,22 +287,19 @@ def test_interactive_session_carries_exact_and_semantic_seed(tmp_path: Path) -> 
     assert reloaded.seed.checkpoint_ref == checkpoint_ref
 
 
-def test_interactive_session_keeps_redacted_seed_for_semantic_continuity(tmp_path: Path) -> None:
+def test_interactive_session_keeps_seed_for_semantic_continuity(tmp_path: Path) -> None:
     root = tmp_path / "interactive"
     session = InteractiveSession(OneShotConfig(repo=tmp_path, session_root=root))
     first = session.prepare_turn("inspect")
-    checkpoint_ref = "interactive-main/epoch-3-" + "b" * 64 + ".json"
-    checkpoint = first.session_dir / ".cambium" / "checkpoints" / checkpoint_ref
-    checkpoint.parent.mkdir(parents=True)
-    checkpoint.write_text("{}", encoding="utf-8")
+    checkpoint = _write_valid_context_checkpoint(first.session_dir, generation=1, epoch=3)
 
-    session.observe_event(first, _checkpoint_event(checkpoint_ref, redacted=True))
+    session.observe_event(first, _checkpoint_event_from_checkpoint(checkpoint))
     session.complete_turn(first, succeeded=True)
     second = session.prepare_turn("continue")
 
-    assert second.summary_trunk_ref == checkpoint_ref
+    assert second.summary_trunk_ref == checkpoint.checkpoint_ref
     assert second.context_fork is not None
-    assert second.context_fork["checkpoint_ref"] == checkpoint_ref
+    assert second.context_fork["checkpoint_ref"] == checkpoint.checkpoint_ref
     assert second.context_fork["provider"] == "provider-a"
     assert second.context_fork["model"] == "model-a"
 
@@ -210,12 +308,8 @@ def test_reconnect_promotes_durable_compaction_successor(tmp_path: Path) -> None
     root = tmp_path / "interactive"
     session = InteractiveSession(OneShotConfig(repo=tmp_path, session_root=root))
     first = session.prepare_turn("inspect")
-    old_ref = "interactive-main/epoch-3-" + "b" * 64 + ".json"
-    new_ref = "interactive-main/epoch-4-" + "c" * 64 + ".json"
-    checkpoint_root = first.session_dir / ".cambium" / "checkpoints"
-    (checkpoint_root / old_ref).parent.mkdir(parents=True)
-    (checkpoint_root / old_ref).write_text("{}", encoding="utf-8")
-    old_event = _checkpoint_event(old_ref)
+    old_checkpoint = _write_valid_context_checkpoint(first.session_dir, generation=1, epoch=3)
+    old_event = _checkpoint_event_from_checkpoint(old_checkpoint)
     store = EventStore(first.session_dir / ".cambium" / "events.db")
     try:
         store.append(old_event)
@@ -224,13 +318,12 @@ def test_reconnect_promotes_durable_compaction_successor(tmp_path: Path) -> None
     session.observe_event(first, old_event)
     session.complete_turn(first, succeeded=True)
 
-    (checkpoint_root / new_ref).write_text("{}", encoding="utf-8")
-    advanced = _checkpoint_event(new_ref)
-    advanced["kind"] = "context_epoch_advanced"
-    advanced_payload = advanced["payload"]
-    assert isinstance(advanced_payload, dict)
-    advanced_payload["epoch"] = 4
-    advanced_payload["folded_from_epoch"] = 3
+    new_checkpoint = _write_valid_context_checkpoint(first.session_dir, generation=1, epoch=4)
+    advanced = _checkpoint_event_from_checkpoint(
+        new_checkpoint,
+        kind="context_epoch_advanced",
+        folded_from_epoch=old_checkpoint.epoch,
+    )
     store = EventStore(first.session_dir / ".cambium" / "events.db")
     try:
         store.append(advanced)
@@ -240,9 +333,9 @@ def test_reconnect_promotes_durable_compaction_successor(tmp_path: Path) -> None
     reloaded = InteractiveSession(OneShotConfig(repo=tmp_path, session_root=root))
 
     assert reloaded.seed is not None
-    assert reloaded.seed.checkpoint_ref == new_ref
+    assert reloaded.seed.checkpoint_ref == new_checkpoint.checkpoint_ref
     assert reloaded.seed.epoch == 4
-    assert reloaded.last_checkpoint == new_ref
+    assert reloaded.last_checkpoint == new_checkpoint.checkpoint_ref
 
 
 def test_reconnect_adopts_canonical_successful_orphan_turn(tmp_path: Path) -> None:
@@ -250,11 +343,7 @@ def test_reconnect_adopts_canonical_successful_orphan_turn(tmp_path: Path) -> No
     session = InteractiveSession(OneShotConfig(repo=tmp_path, session_root=root))
     orphan = session.prepare_turn("finish before frontend dies")
     _write_branch_plan(orphan)
-    store = EventStore(orphan.session_dir / ".cambium" / "events.db")
-    try:
-        store.append({"kind": "session_started", "task_id": None, "payload": {}})
-    finally:
-        store.close()
+    _write_orphan_lifecycle(orphan)
     _write_success_result(orphan.session_dir)
 
     reloaded = InteractiveSession(OneShotConfig(repo=tmp_path, session_root=root))
@@ -266,16 +355,70 @@ def test_reconnect_adopts_canonical_successful_orphan_turn(tmp_path: Path) -> No
         reloaded.release()
 
 
+def test_reconnect_adopts_orphan_without_context_when_plan_disables_reuse(tmp_path: Path) -> None:
+    root = tmp_path / "interactive"
+    session = InteractiveSession(
+        OneShotConfig(repo=tmp_path, session_root=root, context_reuse=False)
+    )
+    orphan = session.prepare_turn("no context needed")
+    _write_branch_plan(orphan)
+    plan_path = orphan.session_dir / "plan.json"
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    plan["tasks"][0]["context_reuse"] = False
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+    identity = {
+        "repo": str(tmp_path.resolve()),
+        "worktree_path": str((orphan.session_dir / "wt").resolve()),
+        "branch": oneshot._default_branch(orphan.session_dir),
+        "task": orphan.config.task,
+    }
+    store = EventStore(orphan.session_dir / ".cambium" / "events.db")
+    try:
+        for event in (
+            {"kind": "session_started", "task_id": None, "payload": {}},
+            {"kind": "task_assigned", "task_id": "interactive-main", "payload": identity},
+            {
+                "kind": "result",
+                "task_id": "interactive-main",
+                "generation": 1,
+                "payload": {"status": "succeeded"},
+            },
+            {
+                "kind": "exit",
+                "task_id": "interactive-main",
+                "generation": 1,
+                "payload": {"reason": "done"},
+            },
+            {
+                "kind": "session_ended",
+                "task_id": None,
+                "payload": {
+                    "session_status": "ended",
+                    "results": {"interactive-main": "succeeded"},
+                },
+            },
+        ):
+            store.append(event)
+    finally:
+        store.close()
+
+    reloaded = InteractiveSession(
+        OneShotConfig(repo=tmp_path, session_root=root, context_reuse=False)
+    )
+    reloaded.acquire()
+    try:
+        assert reloaded.turn == orphan.number
+        assert reloaded.seed is None
+    finally:
+        reloaded.release()
+
+
 def test_latest_continue_discovers_successful_first_turn_orphan(tmp_path: Path) -> None:
     root = default_session_root(tmp_path) / "first-orphan"
     session = InteractiveSession(OneShotConfig(repo=tmp_path, session_root=root))
     orphan = session.prepare_turn("finish before frontend dies")
     _write_branch_plan(orphan)
-    store = EventStore(orphan.session_dir / ".cambium" / "events.db")
-    try:
-        store.append({"kind": "session_started", "task_id": None, "payload": {}})
-    finally:
-        store.close()
+    _write_orphan_lifecycle(orphan)
     _write_success_result(orphan.session_dir)
 
     assert InteractiveSession.resolve_continue_session(tmp_path, None) == root.resolve()
@@ -339,47 +482,37 @@ def test_interactive_fork_reuses_current_checkpoint(tmp_path: Path) -> None:
     root = tmp_path / "interactive"
     session = InteractiveSession(OneShotConfig(repo=tmp_path, session_root=root))
     first = session.prepare_turn("inspect")
-    checkpoint_ref = "interactive-main/epoch-3-" + "b" * 64 + ".json"
-    checkpoint = first.session_dir / ".cambium" / "checkpoints" / checkpoint_ref
-    checkpoint.parent.mkdir(parents=True)
-    checkpoint.write_text("{}", encoding="utf-8")
-    session.observe_event(first, _checkpoint_event(checkpoint_ref))
+    checkpoint = _write_valid_context_checkpoint(first.session_dir, generation=1, epoch=3)
+    session.observe_event(first, _checkpoint_event_from_checkpoint(checkpoint))
     session.complete_turn(first, succeeded=True)
 
     message = session.fork()
 
     assert "generation=2" in message
     assert session.seed is not None
-    assert session.seed.checkpoint_ref == checkpoint_ref
+    assert session.seed.checkpoint_ref == checkpoint.checkpoint_ref
     assert session.active_turn_dirs() == ()
 
 
 def test_interactive_branches_replay_event_store_heads(tmp_path: Path) -> None:
     root = tmp_path / "interactive"
     session = InteractiveSession(OneShotConfig(repo=tmp_path, session_root=root))
-    event_db = root / "turn-0001" / ".cambium" / "events.db"
-    event_db.parent.mkdir(parents=True)
+    turn = session.prepare_turn("branch history")
+    _write_branch_plan(turn)
+    _write_orphan_lifecycle(turn)
+    second_checkpoint = _write_valid_context_checkpoint(turn.session_dir, generation=1, epoch=2)
+    event_db = turn.session_dir / ".cambium" / "events.db"
     store = EventStore(event_db)
     try:
-        store.append(
-            {
-                "kind": "context_checkpoint",
-                "task_id": "interactive-main",
-                "generation": 1,
-                "payload": {
-                    "checkpoint_ref": "interactive-main/epoch-001-ref.json",
-                    "epoch": 1,
-                },
-            }
-        )
         store.append(
             {
                 "kind": "context_epoch_advanced",
                 "task_id": "interactive-main",
                 "generation": 1,
                 "payload": {
-                    "checkpoint_ref": "interactive-main/epoch-002-ref.json",
+                    "checkpoint_ref": second_checkpoint.checkpoint_ref,
                     "epoch": 2,
+                    "cache_key": asdict(second_checkpoint.cache_key),
                 },
             }
         )
@@ -390,7 +523,7 @@ def test_interactive_branches_replay_event_store_heads(tmp_path: Path) -> None:
 
     assert len(heads) == 1
     assert heads[0].epoch == 2
-    assert heads[0].checkpoint_ref.endswith("epoch-002-ref.json")
+    assert heads[0].checkpoint_ref == second_checkpoint.checkpoint_ref
 
 
 def test_interactive_read_events_merges_turn_stores(tmp_path: Path) -> None:
@@ -456,6 +589,290 @@ def test_interactive_cursor_delivers_late_events_from_each_store(tmp_path: Path)
     assert [event["seq"] for event in late] == [4, 5]
     assert cursor.watermark == 5
     assert read_events(root, after_seq=cursor) == []
+
+
+def test_interactive_cursor_pages_a_long_turn_without_read_cap_failure(tmp_path: Path) -> None:
+    root = tmp_path / "interactive"
+    event_db = root / "turn-0001" / ".cambium" / "events.db"
+    event_db.parent.mkdir(parents=True)
+    connection = sqlite3.connect(event_db)
+    try:
+        connection.execute(
+            """
+            CREATE TABLE events (
+                seq INTEGER PRIMARY KEY,
+                kind TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                ts TEXT,
+                monotonic_ms INTEGER,
+                task_id TEXT,
+                worker_id TEXT,
+                generation INTEGER,
+                request_id TEXT
+            )
+            """
+        )
+        connection.executemany(
+            "INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                (seq, "heartbeat", "{}", None, None, "interactive-main", None, 1, None)
+                for seq in range(1, 100_002)
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    later_db = root / "turn-0002" / ".cambium" / "events.db"
+    later_db.parent.mkdir(parents=True)
+    later_store = EventStore(later_db, fsync_interval_s=60.0)
+    try:
+        later_store.append({"kind": "later-turn", "payload": {}})
+    finally:
+        later_store.close()
+
+    cursor = EventCursor()
+    total = 0
+    batches: list[int] = []
+    kinds: list[str] = []
+    last_kind: str | None = None
+    while True:
+        events, cursor = read_events_with_cursor(root, cursor)
+        if not events:
+            break
+        batches.append(len(events))
+        total += len(events)
+        kinds.extend(event["kind"] for event in events)
+        last_kind = events[-1]["kind"]
+
+    assert total == 100_002
+    assert max(batches) <= 4_096
+    assert last_kind == "later-turn"
+    assert kinds.index("later-turn") == 100_001
+
+
+def test_interactive_cursor_orders_early_parent_event_before_full_turn_page(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "interactive"
+    root_store = EventStore(root / ".cambium" / "events.db", fsync_interval_s=60.0)
+    try:
+        root_store.append({"kind": "root-low", "payload": {"turn": 0}})
+    finally:
+        root_store.close()
+    turn_store = EventStore(
+        root / "turn-0001" / ".cambium" / "events.db", fsync_interval_s=60.0
+    )
+    try:
+        for _ in range(4_096):
+            turn_store.append({"kind": "turn-one", "payload": {}})
+    finally:
+        turn_store.close()
+
+    events, cursor = read_events_with_cursor(root)
+
+    assert events[0]["kind"] == "root-low"
+    assert events[1]["kind"] == "turn-one"
+    assert cursor.position("root") == 1
+
+
+def test_reconnect_refuses_result_json_without_durable_lifecycle(tmp_path: Path) -> None:
+    root = tmp_path / "interactive"
+    session = InteractiveSession(OneShotConfig(repo=tmp_path, session_root=root))
+    orphan = session.prepare_turn("result only")
+    _write_branch_plan(orphan)
+    store = EventStore(orphan.session_dir / ".cambium" / "events.db")
+    try:
+        store.append({"kind": "session_started", "task_id": None, "payload": {}})
+    finally:
+        store.close()
+    _write_success_result(orphan.session_dir)
+
+    reloaded = InteractiveSession(OneShotConfig(repo=tmp_path, session_root=root))
+    reloaded.acquire()
+    try:
+        assert reloaded.turn == 0
+        with pytest.raises(InteractiveSessionError, match="unreconciled durable turn directory"):
+            reloaded.prepare_turn("must not skip")
+    finally:
+        reloaded.release()
+
+
+def test_reconnect_rejects_late_durable_failure_after_success(tmp_path: Path) -> None:
+    root = tmp_path / "interactive"
+    session = InteractiveSession(OneShotConfig(repo=tmp_path, session_root=root))
+    orphan = session.prepare_turn("late failure")
+    _write_branch_plan(orphan)
+    _write_orphan_lifecycle(orphan, late_failure=True)
+    _write_success_result(orphan.session_dir)
+
+    reloaded = InteractiveSession(OneShotConfig(repo=tmp_path, session_root=root))
+    reloaded.acquire()
+    try:
+        assert reloaded.turn == 0
+    finally:
+        reloaded.release()
+
+
+def test_orphan_rejects_protocol_failure_after_success(tmp_path: Path) -> None:
+    root = tmp_path / "interactive"
+    session = InteractiveSession(OneShotConfig(repo=tmp_path, session_root=root))
+    orphan = session.prepare_turn("protocol failure")
+    _write_branch_plan(orphan)
+    _write_orphan_lifecycle(orphan)
+    store = EventStore(orphan.session_dir / ".cambium" / "events.db")
+    try:
+        store.append(
+            {
+                "kind": "protocol",
+                "task_id": "interactive-main",
+                "generation": 1,
+                "payload": {"note": "worker sent an unexpected envelope"},
+            }
+        )
+    finally:
+        store.close()
+
+    valid, seed = InteractiveSession._durable_turn_evidence(
+        orphan.session_dir,
+        branch_generation=orphan.branch_generation,
+        branch_start_turn=orphan.branch_start_turn,
+        require_context=True,
+        expected_repo=tmp_path,
+    )
+
+    assert valid is False
+    assert seed is None
+
+
+def test_observe_event_rejects_child_and_malformed_context(tmp_path: Path) -> None:
+    session = InteractiveSession(
+        OneShotConfig(repo=tmp_path, session_root=tmp_path / "interactive")
+    )
+    turn = session.prepare_turn("context authority")
+    checkpoint = _write_valid_context_checkpoint(turn.session_dir, generation=1, epoch=1)
+
+    child_event = _checkpoint_event_from_checkpoint(checkpoint)
+    child_event["task_id"] = "child-task"
+    session.observe_event(turn, child_event)
+    assert session._pending_seed is None
+
+    checkpoint_path = turn.session_dir / ".cambium" / "checkpoints" / checkpoint.checkpoint_ref
+    checkpoint_path.write_text("{}", encoding="utf-8")
+    session.observe_event(turn, _checkpoint_event_from_checkpoint(checkpoint))
+    assert session._pending_seed is None
+
+
+def test_reconnect_drops_manifest_seed_without_matching_durable_event(tmp_path: Path) -> None:
+    root = tmp_path / "interactive"
+    session = InteractiveSession(OneShotConfig(repo=tmp_path, session_root=root))
+    turn = session.prepare_turn("stale seed")
+    checkpoint = _write_valid_context_checkpoint(turn.session_dir, generation=1, epoch=1)
+    event = _checkpoint_event_from_checkpoint(checkpoint)
+    seed = InteractiveSession._context_seed_from_event(
+        turn.session_dir,
+        event,
+        strict=True,
+    )
+    assert seed is not None
+
+    session.complete_turn(turn, succeeded=False)
+    EventStore(turn.session_dir / ".cambium" / "events.db").close()
+    manifest_path = root / ".cambium" / "interactive.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["turn"] = turn.number
+    manifest["seed"] = {
+        "source_session": str(seed.source_session),
+        "checkpoint_ref": seed.checkpoint_ref,
+        "descriptor": seed.descriptor,
+        "provider": seed.provider,
+        "model": seed.model,
+        "epoch": seed.epoch,
+    }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    reloaded = InteractiveSession(OneShotConfig(repo=tmp_path, session_root=root))
+
+    assert reloaded.seed is None
+    assert reloaded.last_checkpoint is None
+
+
+def test_orphan_rejects_checkpoint_from_failed_generation(tmp_path: Path) -> None:
+    root = tmp_path / "interactive"
+    session = InteractiveSession(OneShotConfig(repo=tmp_path, session_root=root))
+    orphan = session.prepare_turn("retry after checkpoint failure")
+    _write_branch_plan(orphan)
+    identity = {
+        "repo": str(tmp_path.resolve()),
+        "worktree_path": str((orphan.session_dir / "wt").resolve()),
+        "branch": oneshot._default_branch(orphan.session_dir),
+        "task": orphan.config.task,
+    }
+    checkpoint = _write_valid_context_checkpoint(orphan.session_dir, generation=1, epoch=1)
+    store = EventStore(orphan.session_dir / ".cambium" / "events.db")
+    try:
+        store.append(
+            {"kind": "task_assigned", "task_id": "interactive-main", "payload": identity}
+        )
+        store.append(
+            {
+                "kind": "context_checkpoint",
+                "task_id": "interactive-main",
+                "generation": 1,
+                "payload": {
+                    "checkpoint_ref": checkpoint.checkpoint_ref,
+                    "epoch": checkpoint.epoch,
+                    "cache_key": asdict(checkpoint.cache_key),
+                },
+            }
+        )
+        store.append(
+            {
+                "kind": "worker_failed",
+                "task_id": "interactive-main",
+                "generation": 1,
+                "payload": {"reason": "worker crashed after checkpoint"},
+            }
+        )
+        store.append(
+            {
+                "kind": "result",
+                "task_id": "interactive-main",
+                "generation": 2,
+                "payload": {"status": "succeeded"},
+            }
+        )
+        store.append(
+            {
+                "kind": "exit",
+                "task_id": "interactive-main",
+                "generation": 2,
+                "payload": {"reason": "done"},
+            }
+        )
+        store.append(
+            {
+                "kind": "session_ended",
+                "task_id": None,
+                "payload": {
+                    "session_status": "ended",
+                    "results": {"interactive-main": "succeeded"},
+                },
+            }
+        )
+    finally:
+        store.close()
+
+    valid, seed = InteractiveSession._durable_turn_evidence(
+        orphan.session_dir,
+        branch_generation=orphan.branch_generation,
+        branch_start_turn=orphan.branch_start_turn,
+        require_context=True,
+        expected_repo=tmp_path,
+    )
+
+    assert valid is False
+    assert seed is None
 
 
 def test_interactive_read_events_skips_symlinked_turn_store(tmp_path: Path) -> None:
@@ -631,11 +1048,14 @@ def test_resume_reselects_healthy_provider_and_reconciles_model(
     )
     session = InteractiveSession(config)
     first = session.prepare_turn("first")
-    checkpoint_ref = "interactive-main/epoch-1-" + "d" * 64 + ".json"
-    checkpoint = first.session_dir / ".cambium" / "checkpoints" / checkpoint_ref
-    checkpoint.parent.mkdir(parents=True)
-    checkpoint.write_text("{}", encoding="utf-8")
-    session.observe_event(first, _checkpoint_event(checkpoint_ref, "dead-zen", "zen-model"))
+    checkpoint = _write_valid_context_checkpoint(
+        first.session_dir,
+        generation=1,
+        epoch=1,
+        provider="dead-zen",
+        model="zen-model",
+    )
+    session.observe_event(first, _checkpoint_event_from_checkpoint(checkpoint))
     session.complete_turn(first, succeeded=True)
 
     provider_config = _two_provider_config(provider_config, first_enabled=False)
@@ -729,7 +1149,7 @@ def test_serving_reconciliation_preserves_per_provider_model_choices(
     assert session.model == "codex-model"
 
 
-def test_explicit_model_preference_survives_fallback_result_and_next_turn(
+def test_genuine_coding_fallback_replaces_explicit_incumbent_for_next_turn(
     tmp_path: Path,
 ) -> None:
     provider_config = _two_provider_config(tmp_path / "providers.json")
@@ -760,17 +1180,17 @@ def test_explicit_model_preference_survives_fallback_result_and_next_turn(
         ),
     )
 
-    assert session.provider == "dead-zen"
-    assert session.model == "zen-model"
+    assert session.provider == "healthy-codex"
+    assert session.model == "codex-model"
     session.complete_turn(first, succeeded=False)
     second = session.prepare_turn("continue")
-    assert second.config.provider == "dead-zen"
-    assert second.config.model == "zen-model"
+    assert second.config.provider == "healthy-codex"
+    assert second.config.model == "codex-model"
     manifest = json.loads(
         (tmp_path / "interactive" / ".cambium" / "interactive.json").read_text(encoding="utf-8")
     )
-    assert manifest["provider_preference"] == "dead-zen"
-    assert manifest["model_preference"] == "zen-model"
+    assert manifest["provider_preference"] == "healthy-codex"
+    assert manifest["model_preference"] == "codex-model"
 
     reloaded = InteractiveSession(
         OneShotConfig(
@@ -793,8 +1213,8 @@ def test_explicit_model_preference_survives_fallback_result_and_next_turn(
             )
         ),
     )
-    assert reloaded.provider == "dead-zen"
-    assert reloaded.model == "zen-model"
+    assert reloaded.provider == "healthy-codex"
+    assert reloaded.model == "codex-model"
 
 
 def test_summary_serving_observations_do_not_set_interactive_preference(
@@ -846,12 +1266,13 @@ def test_tty_tui_reuses_checkpoint_on_second_prompt(monkeypatch, tmp_path: Path)
 
     async def fake_run(self, turn, *, on_event=None):
         seen_context_forks.append(turn.context_fork)
-        checkpoint_ref = f"interactive-main/epoch-{turn.number}-" + f"{turn.number:064x}" + ".json"
-        checkpoint = turn.session_dir / ".cambium" / "checkpoints" / checkpoint_ref
-        checkpoint.parent.mkdir(parents=True, exist_ok=True)
-        checkpoint.write_text("{}", encoding="utf-8")
+        checkpoint = _write_valid_context_checkpoint(
+            turn.session_dir,
+            generation=1,
+            epoch=turn.number,
+        )
         if on_event is not None:
-            on_event(_checkpoint_event(checkpoint_ref))
+            on_event(_checkpoint_event_from_checkpoint(checkpoint))
             on_event(
                 {
                     "seq": 2,
@@ -924,30 +1345,71 @@ def test_restore_history_folds_completed_current_branch(monkeypatch, tmp_path: P
 
     monkeypatch.setattr(
         tui,
-        "read_events_file",
-        lambda _path: [
-            {
-                "seq": 1,
-                "kind": "usage_event",
-                "task_id": "interactive-main",
-                "payload": {
-                    "provider": "provider-a",
-                    "model": "model-a",
-                    "latency_s": 1.0,
-                    "usage": {
-                        "input_tokens": 10,
-                        "output_tokens": 5,
-                        "total_tokens": 15,
-                    },
-                },
-            }
-        ],
+        "iter_event_pages",
+        lambda _path, **_kwargs: iter(
+            [
+                [
+                    {
+                        "seq": 1,
+                        "kind": "usage_event",
+                        "task_id": "interactive-main",
+                        "payload": {
+                            "provider": "provider-a",
+                            "model": "model-a",
+                            "latency_s": 1.0,
+                            "usage": {
+                                "input_tokens": 10,
+                                "output_tokens": 5,
+                                "total_tokens": 15,
+                            },
+                        },
+                    }
+                ]
+            ]
+        ),
     )
 
     cumulative, _snapshot = tui._restore_history(session)
 
     assert cumulative.calls == 1
     assert cumulative.total_tokens == 15
+
+
+def test_tui_restore_retains_sparse_tool_event_after_heartbeats(tmp_path: Path) -> None:
+    turn_dir = tmp_path / "turn-0001"
+    transcript = Transcript(max_entries=8)
+    events = [
+        {
+            "seq": 1,
+            "kind": "task_assigned",
+            "task_id": "interactive-main",
+            "payload": {"task": "sparse prompt"},
+        },
+        {
+            "seq": 2,
+            "kind": "tool_event",
+            "task_id": "interactive-main",
+            "generation": 1,
+            "payload": {"tool": "run_shell", "ok": True, "duration_ms": 7},
+        },
+        *(
+            {
+                "seq": sequence,
+                "kind": "heartbeat",
+                "task_id": "interactive-main",
+                "generation": 1,
+                "payload": {},
+            }
+            for sequence in range(3, 1_000)
+        ),
+    ]
+
+    tui._restore_turn_transcript(turn_dir, iter(events), transcript)
+
+    assert any(
+        entry.role == "tool" and "run_shell: ok" in entry.text
+        for entry in transcript.entries
+    )
 
 
 @pytest.mark.parametrize("columns", [80, 60])
@@ -960,15 +1422,9 @@ def test_tui_reconnects_to_explicit_durable_interactive_session(
     root = default_session_root(tmp_path) / "prior"
     session = InteractiveSession(OneShotConfig(repo=tmp_path, session_root=root))
     first = session.prepare_turn("durable prompt")
-    checkpoint_ref = "interactive-main/epoch-7-" + "c" * 64 + ".json"
-    checkpoint = first.session_dir / ".cambium" / "checkpoints" / checkpoint_ref
-    checkpoint.parent.mkdir(parents=True)
-    checkpoint.write_text("{}", encoding="utf-8")
-    checkpoint_event = _checkpoint_event(checkpoint_ref)
-    checkpoint_event.pop("seq")
-    checkpoint_payload = checkpoint_event["payload"]
-    assert isinstance(checkpoint_payload, dict)
-    checkpoint_payload["epoch"] = 7
+    checkpoint = _write_valid_context_checkpoint(first.session_dir, generation=1, epoch=7)
+    checkpoint_ref = checkpoint.checkpoint_ref
+    checkpoint_event = _checkpoint_event_from_checkpoint(checkpoint)
 
     event_db = first.session_dir / ".cambium" / "events.db"
     store = EventStore(event_db)
@@ -1039,7 +1495,6 @@ def test_tui_reconnects_to_explicit_durable_interactive_session(
     assert error.getvalue() == ""
     assert "Detected prior interactive session" in rendered
     assert "last_epoch=7" in rendered
-    assert "last_checkpoint=interactive-main/epoch-7-" in rendered
     assert "durable prompt" in rendered
     assert "durable answer" in rendered
     assert "125 tok" in rendered

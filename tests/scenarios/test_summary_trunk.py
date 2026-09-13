@@ -85,6 +85,15 @@ def _append(trunk, tail, turn, label, *, verbatim_evidence=()):
     return append_summary_entry(trunk, entry), entry
 
 
+def _append_payload(trunk, tail, turn, label, **updates):
+    """Append one test entry with explicit semantic deltas."""
+    _request, expectation = build_summary_request(trunk, tail, through_turn=turn)
+    payload = json.loads(_response(expectation, label=label))
+    payload.update(updates)
+    entry = parse_summary_response(json.dumps(payload), expectation)
+    return append_summary_entry(trunk, entry), entry
+
+
 def test_consecutive_entries_never_resummarize_prior_entries() -> None:
     trunk_1, entry_1 = _append(HEAD, TAIL_1, 2, "one")
     first_summary_bytes = trunk_1[-1]["content"].encode("utf-8")
@@ -150,6 +159,121 @@ def test_corrections_and_closed_work_survive_folds_and_k0() -> None:
     assert [m["content"] for m in trunk[2:]] == history
     assert len(sources) == 3
     assert summary_trunk.compile_k0_projection(summary_entries(rolled)) == state
+
+
+def test_k0_bounds_aggregate_semantic_fields_and_preserves_latest_values() -> None:
+    trunk = list(HEAD)
+    first_tail = [{"role": "user", "content": "first semantic range"}]
+    second_tail = [{"role": "user", "content": "second semantic range"}]
+    first_facts = [f"F{index}: fact {index}" for index in range(SUMMARY_MAX_ITEMS)]
+    second_facts = [
+        f"F{index}: fact {index}" for index in range(SUMMARY_MAX_ITEMS, SUMMARY_MAX_ITEMS * 2)
+    ]
+    first_files = [f"src/first_{index}.py: symbol_{index}" for index in range(SUMMARY_MAX_ITEMS)]
+    second_files = [
+        f"src/second_{index}.py: symbol_{index}"
+        for index in range(SUMMARY_MAX_ITEMS, SUMMARY_MAX_ITEMS * 2)
+    ]
+
+    trunk, _ = _append_payload(
+        trunk,
+        first_tail,
+        1,
+        "first",
+        facts_added=first_facts,
+        files_and_symbols_changed=first_files,
+    )
+    trunk, _ = _append_payload(
+        trunk,
+        second_tail,
+        2,
+        "second",
+        facts_added=second_facts,
+        files_and_symbols_changed=second_files,
+    )
+
+    rolled, projection, _sources = summary_trunk.rollover_summary_trunk(trunk)
+    k0 = summary_entries(rolled)[0]
+
+    assert projection.facts == tuple(second_facts)
+    assert projection.files_and_symbols_changed == tuple(second_files)
+    assert k0.facts_added == projection.facts
+    assert k0.files_and_symbols_changed == projection.files_and_symbols_changed
+    assert summary_trunk.compile_k0_projection(summary_entries(rolled)) == projection
+    assert SUMMARY_TRUNCATION_MARKER in k0.outcome
+    assert "facts: omitted 32" in k0.outcome
+    assert "files_and_symbols_changed: omitted 32" in k0.outcome
+    for field in SUMMARY_LIST_FIELDS:
+        assert len(getattr(k0, field)) <= SUMMARY_MAX_ITEMS
+
+
+def test_successive_k0_rollovers_advance_corrections_and_recent_verbatim_history() -> None:
+    trunk = list(HEAD)
+    trunk, _ = _append_payload(
+        trunk,
+        [{"role": "user", "content": "evidence e1 e2 e3 e4"}],
+        1,
+        "first",
+        decisions_added=["D1: old design"],
+        facts_added=["F1: old conclusion"],
+        files_and_symbols_changed=["src/old.py:old_symbol"],
+        open_items=["O1: recheck implementation"],
+        verification_results=["V1: old check"],
+        verbatim_evidence=["e1", "e2", "e3", "e4"],
+    )
+    first_rolled, first_projection, _ = summary_trunk.rollover_summary_trunk(trunk)
+    assert first_projection.verbatim_evidence == ("e1", "e2", "e3", "e4")
+
+    trunk, _ = _append_payload(
+        first_rolled,
+        [{"role": "user", "content": "evidence e5 correction"}],
+        2,
+        "second",
+        decisions_added=["D1: direct design"],
+        decisions_superseded=["D1"],
+        facts_added=["F1: corrected conclusion"],
+        facts_invalidated=["F1"],
+        files_and_symbols_changed=["src/new.py:new_symbol"],
+        open_items_resolved=["O1"],
+        verification_invalidated=["V1"],
+        verification_results=["V2: corrected check"],
+        verbatim_evidence=["e5"],
+    )
+    second_rolled, second_projection, _ = summary_trunk.rollover_summary_trunk(trunk)
+    second_k0 = summary_entries(second_rolled)[0]
+    assert second_projection.decisions == ("D1: direct design",)
+    assert second_projection.facts == ("F1: corrected conclusion",)
+    assert second_projection.open_work == ()
+    assert second_projection.verification_state == ("V2: corrected check",)
+    assert second_projection.files_and_symbols_changed == (
+        "src/old.py:old_symbol",
+        "src/new.py:new_symbol",
+    )
+    assert second_projection.verbatim_evidence == ("e2", "e3", "e4", "e5")
+    assert SUMMARY_TRUNCATION_MARKER in second_k0.outcome
+    assert "verbatim_evidence" in second_k0.outcome
+
+    trunk, _ = _append_payload(
+        second_rolled,
+        [{"role": "user", "content": "evidence e6 invalidation"}],
+        3,
+        "third",
+        decisions_added=[],
+        facts_invalidated=["F1"],
+        facts_added=[],
+        files_and_symbols_changed=[],
+        verification_invalidated=["V2"],
+        verification_results=[],
+        verbatim_evidence=["e6"],
+    )
+    third_rolled, third_projection, _ = summary_trunk.rollover_summary_trunk(trunk)
+    third_k0 = summary_entries(third_rolled)[0]
+    assert third_projection.facts == ()
+    assert third_projection.verification_state == ()
+    assert third_projection.files_and_symbols_changed == second_projection.files_and_symbols_changed
+    assert third_projection.verbatim_evidence == ("e3", "e4", "e5", "e6")
+    assert SUMMARY_TRUNCATION_MARKER in third_k0.outcome
+    assert summary_trunk.compile_k0_projection(summary_entries(third_rolled)) == third_projection
 
 
 def test_summary_request_keeps_existing_trunk_as_exact_prefix() -> None:

@@ -342,7 +342,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "description": (
             "Read this session's recorded branches, tools, or transcript without rerunning "
             "them. Start with branches or tools; reopen one tool by its returned ref. "
-            "transcript requires task_id. offset is zero-based; limit is at most 64 rows."
+            "For a tool with a durable large-output artifact, output_offset/output_limit page "
+            "the exact hash-verified bytes. transcript requires task_id. offset is zero-based; "
+            "limit is at most 64 rows."
         ),
         "parameters": _parameters(
             {
@@ -351,6 +353,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "ref": {"type": "string", "minLength": 1},
                 "offset": {"type": "integer", "minimum": 0},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 64},
+                "output_offset": {"type": "integer", "minimum": 0},
+                "output_limit": {"type": "integer", "minimum": 1, "maximum": 8192},
             },
             ["action"],
         ),

@@ -29,6 +29,11 @@ class _RunningTaskGroup:
         self.tasks.append(asyncio.create_task(coroutine))
 
 
+class _FailingTaskGroup:
+    def create_task(self, _coroutine: Any) -> None:
+        raise RuntimeError("spawn unavailable")
+
+
 def _provider_config(path: Path, providers: list[dict[str, Any]]) -> Path:
     path.write_text(json.dumps({"providers": providers}), encoding="utf-8")
     return path
@@ -187,6 +192,40 @@ def test_same_task_generation_deduplicates_while_child_is_running(tmp_path: Path
     assert len(created_specs) == 1
     assert created_specs[0]["worktree_path"] == str(session_dir / "child-wt")
     assert runtime._lanes[provider_name].in_flight == 0
+
+
+def test_spawn_failure_after_durable_admission_has_durable_terminal_child_outcome(
+    tmp_path: Path,
+) -> None:
+    session_dir = tmp_path / "session"
+    repo, base = init_repo(tmp_path, "admission-test", "admission@test")
+    parent = _parent(session_dir, repo, base)
+    runtime = _Runtime(session_dir, None)
+    runtime.set_session_tasks([parent])
+    runtime._task_group = _FailingTaskGroup()  # type: ignore[assignment]
+    events: list[dict[str, Any]] = []
+
+    async def emit(kind: str, **payload: Any) -> None:
+        events.append({"kind": kind, **payload})
+
+    runtime.emit = emit  # type: ignore[method-assign]
+
+    result = asyncio.run(
+        runtime._admit_child(
+            parent,
+            _proposal(session_dir, repo, base, "child"),
+            _parent_envelope(),
+        )
+    )
+
+    assert result == []
+    lifecycle = [event for event in events if event["kind"] in {"child_admitted", "child_failed"}]
+    assert [event["kind"] for event in lifecycle] == ["child_admitted", "child_failed"]
+    assert lifecycle[1]["task_id"] == "child"
+    assert lifecycle[1]["parent_task_id"] == "parent"
+    assert lifecycle[1]["reason"] == "ChildSpawnFailed"
+    assert not [event for event in events if event["kind"] == "child_rejected"]
+    assert all(task.get("task_id") != "child" for task in runtime._session_tasks)
 
 
 def test_different_child_tasks_are_admitted_with_distinct_request_ids(

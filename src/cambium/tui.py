@@ -11,8 +11,8 @@ import signal
 import sqlite3
 import sys
 import threading
-from collections import deque
-from collections.abc import Callable, Iterator, Mapping
+from collections import OrderedDict, deque
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -28,10 +28,23 @@ from .interactive import (
 from .monitor import render_agent_lines
 from .observability import ObservabilityState, SessionSnapshot
 from .provider_scheduler import QuotaLedgerError, read_quota_snapshots
-from .store import StoreError, read_events_file
+from .store import StoreError, iter_event_pages
 from .supervisor import reconstruct_response
 from .terminal import SynchronizedOutput, sanitize_terminal_text, terminal_capabilities
-from .tui_screen import ActivityState, LinearTimeline, Transcript, render_quota_rows
+from .tui_screen import (
+    _ASSISTANT_STREAM_KINDS,
+    _CHILD_RESULT_KINDS,
+    _CHILD_START_KINDS,
+    _FAILURE_EVENT_KINDS,
+    _PARENT_RESUME_KINDS,
+    _PARENT_WAIT_KINDS,
+    _TOOL_STREAM_KINDS,
+    ActivityState,
+    LinearTimeline,
+    Transcript,
+    render_quota_rows,
+)
+from .worker import MAX_RESPONSE_DURABLE_CHUNKS
 
 _readline: Any
 try:
@@ -709,12 +722,195 @@ def _reconstruct_response_batch(
     return replayed
 
 
+class _BoundedRestoreEvents:
+    """Retain only the event evidence needed to restore a bounded transcript.
+
+    Usage/state replay consumes every durable row directly.  Transcript
+    restoration needs a second, ordered view because response validation waits
+    for the terminal result.  Keep the presentation tail, prompts, and a
+    bounded response prefix per identity; never turn a whole event store into
+    one in-memory list.
+    """
+
+    _TAIL_MULTIPLIER = 4
+    _RESULT_EVENT_LIMIT = 32
+    _LIFECYCLE_EVENT_LIMIT = 64
+    _TIMELINE_EVENT_KINDS = (
+        _ASSISTANT_STREAM_KINDS
+        | _TOOL_STREAM_KINDS
+        | _CHILD_START_KINDS
+        | _CHILD_RESULT_KINDS
+        | _PARENT_WAIT_KINDS
+        | _PARENT_RESUME_KINDS
+        | _FAILURE_EVENT_KINDS
+        | frozenset(
+            {
+                "child_admitted",
+                "child_rejected",
+                "context_epoch_advanced",
+                "context_checkpoint",
+                "merge_committed",
+                "merge_published",
+                "resolver_failed",
+                "resolver_succeeded",
+                "result",
+                "exit",
+                "session_ended",
+            }
+        )
+    )
+
+    def __init__(self, transcript: Transcript) -> None:
+        entries = getattr(transcript, "_entries", None)
+        capacity = getattr(entries, "maxlen", None)
+        if type(capacity) is not int or capacity < 1:
+            capacity = 160
+        self._identity_limit = capacity
+        self._tail: deque[tuple[int, dict[str, Any]]] = deque(
+            maxlen=max(32, capacity * self._TAIL_MULTIPLIER)
+        )
+        self._prompts: deque[tuple[int, dict[str, Any]]] = deque(maxlen=capacity)
+        self._tool_events: deque[tuple[int, dict[str, Any]]] = deque(maxlen=capacity)
+        # Keep sparse semantic events independently from the raw tail.  A
+        # long heartbeat-only gap must not evict a child/context/checkpoint
+        # fact that the transcript renderer knows how to show.
+        self._timeline_events: deque[tuple[int, dict[str, Any]]] = deque(maxlen=capacity)
+        self._lifecycle_events: deque[tuple[int, dict[str, Any]]] = deque(
+            maxlen=self._LIFECYCLE_EVENT_LIMIT
+        )
+        self._responses: OrderedDict[
+            tuple[str, int, str], list[tuple[int, dict[str, Any]]]
+        ] = OrderedDict()
+        self._response_overflow: set[tuple[str, int, str]] = set()
+        self._chunk_counts: dict[tuple[str, int, str], int] = {}
+        self._result_counts: dict[tuple[str, int, str], int] = {}
+        self._lifecycle_counts: dict[tuple[str, int, str], int] = {}
+        self._sequence = 0
+
+    def _response_bucket(
+        self, identity: tuple[str, int, str]
+    ) -> list[tuple[int, dict[str, Any]]]:
+        bucket = self._responses.get(identity)
+        if bucket is not None:
+            self._responses.move_to_end(identity)
+            return bucket
+        if len(self._responses) >= self._identity_limit:
+            evicted, _ = self._responses.popitem(last=False)
+            self._response_overflow.discard(evicted)
+            self._chunk_counts.pop(evicted, None)
+            self._result_counts.pop(evicted, None)
+            self._lifecycle_counts.pop(evicted, None)
+        bucket = []
+        self._responses[identity] = bucket
+        return bucket
+
+    def add(self, event: dict[str, Any]) -> None:
+        sequence = self._sequence
+        self._sequence += 1
+        kind = event.get("kind")
+        self._tail.append((sequence, event))
+
+        if kind in {"task_assigned", "user_prompt", "user_message", "prompt"}:
+            self._prompts.append((sequence, event))
+        if kind == "tool_event":
+            self._tool_events.append((sequence, event))
+        if kind in self._TIMELINE_EVENT_KINDS:
+            self._timeline_events.append((sequence, event))
+        if kind in {
+            "worker_failed",
+            "task_failed",
+            "worker_terminated",
+            "join_invariant_failed",
+            "merge_failed",
+            "merge_committed",
+            "resolver_succeeded",
+            "exit",
+            "session_ended",
+        }:
+            self._lifecycle_events.append((sequence, event))
+
+        identity = _response_identity(event)
+        if identity is None or kind not in {
+            "response_chunk",
+            "result",
+            "worker_failed",
+            "task_failed",
+            "worker_terminated",
+            "join_invariant_failed",
+            "merge_failed",
+            "merge_committed",
+            "resolver_succeeded",
+            "exit",
+        }:
+            return
+
+        bucket = self._response_bucket(identity)
+        if kind == "response_chunk":
+            count = self._chunk_counts.get(identity, 0) + 1
+            self._chunk_counts[identity] = count
+            if count > MAX_RESPONSE_DURABLE_CHUNKS:
+                self._response_overflow.add(identity)
+                return
+            bucket.append((sequence, event))
+            return
+
+        if kind == "result":
+            count = self._result_counts.get(identity, 0) + 1
+            self._result_counts[identity] = count
+            if count <= self._RESULT_EVENT_LIMIT:
+                bucket.append((sequence, event))
+            else:
+                self._response_overflow.add(identity)
+            return
+
+        count = self._lifecycle_counts.get(identity, 0) + 1
+        self._lifecycle_counts[identity] = count
+        if count <= self._LIFECYCLE_EVENT_LIMIT:
+            bucket.append((sequence, event))
+        else:
+            self._response_overflow.add(identity)
+
+    def events(self) -> list[dict[str, Any]]:
+        selected: dict[int, dict[str, Any]] = {
+            sequence: event for sequence, event in self._tail
+        }
+        for sequence, event in self._prompts:
+            selected[sequence] = event
+        for sequence, event in self._tool_events:
+            selected[sequence] = event
+        for sequence, event in self._timeline_events:
+            selected[sequence] = event
+        for sequence, event in self._lifecycle_events:
+            selected[sequence] = event
+        for identity, bucket in self._responses.items():
+            for sequence, event in bucket:
+                selected[sequence] = event
+            if identity in self._response_overflow:
+                task_id, generation, request_id = identity
+                selected[self._sequence] = {
+                    "kind": "response_chunk",
+                    "task_id": task_id,
+                    "generation": generation,
+                    "request_id": request_id,
+                    "payload": {"chunk_index": 0, "text": "", "final": False},
+                }
+                self._sequence += 1
+        return [selected[sequence] for sequence in sorted(selected)]
+
+
 def _restore_turn_transcript(
     turn_dir: Path,
-    events: list[dict[str, Any]],
+    events: Iterable[dict[str, Any]] | _BoundedRestoreEvents,
     transcript: Transcript,
 ) -> None:
     """Replay validated durable prompt/output events into the timeline tail."""
+    if isinstance(events, _BoundedRestoreEvents):
+        events = events.events()
+    else:
+        bounded = _BoundedRestoreEvents(transcript)
+        for event in events:
+            bounded.add(event)
+        events = bounded.events()
     response_identities = {
         identity
         for event in events
@@ -757,8 +953,11 @@ def _restore_turn_transcript(
             # once per correlated identity. Raw chunks are never replayed.
             identity = _response_identity(event)
             if identity is not None and identity not in emitted_responses:
-                prefix, _complete = reconstructed_responses[identity]
-                transcript._append_validated_response(prefix, stream_key=repr(identity))
+                prefix, complete = reconstructed_responses[identity]
+                if complete:
+                    transcript._append_validated_response(prefix, stream_key=repr(identity))
+                elif prefix:
+                    transcript.error(f"incomplete assistant response:\n{prefix}")
                 emitted_responses.add(identity)
             continue
         identity = _response_identity(event)
@@ -808,14 +1007,21 @@ def _restore_history(
         if not event_db.is_file():
             continue
         state = ObservabilityState(recent_limit=16)
+        replay_events = _BoundedRestoreEvents(transcript) if transcript is not None else None
         try:
-            events = read_events_file(event_db)
-            for event in events:
-                state.apply(event)
+            for page in iter_event_pages(event_db):
+                for event in page:
+                    state.apply(event)
+                    if replay_events is not None:
+                        replay_events.add(event)
         except (OSError, ValueError, StoreError, sqlite3.Error):
             continue
         if transcript is not None:
-            _restore_turn_transcript(turn_dir, events, transcript)
+            _restore_turn_transcript(
+                turn_dir,
+                replay_events if replay_events is not None else (),
+                transcript,
+            )
         latest = state.snapshot(session_dir=turn_dir)
         cumulative.add(latest)
     return cumulative, latest

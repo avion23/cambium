@@ -30,7 +30,7 @@ from typing import Any
 from . import oneshot, supervisor
 from .oneshot import OneShotConfig, SessionMode
 from .results import ROOT_RESULT_KEYS, Result
-from .store import EventStore, StoreError, read_events_file
+from .store import EventStore, StoreError, iter_event_pages
 from .summary_trunk import (
     SummaryTrunkError,
     is_k0_entry,
@@ -53,6 +53,23 @@ _MANIFEST_TURN_MARGIN = 1
 _CONTEXT_KINDS = frozenset({"context_checkpoint", "context_epoch_advanced"})
 _BRANCH_GENERATION_FIELD = "interactive_branch_generation"
 _BRANCH_START_TURN_FIELD = "interactive_branch_start_turn"
+_INTERACTIVE_TASK_ID = "interactive-main"
+_SUCCESS_EXIT_REASONS = frozenset({"done"})
+_FAILURE_EVENT_KINDS = frozenset(
+    {
+        "error",
+        "fatal_error",
+        "protocol",
+        "worker_failed",
+        "task_failed",
+        "worker_terminated",
+        "join_invariant_failed",
+        "merge_failed",
+        "resolver_failed",
+        "context_resume_failed",
+        "timeout",
+    }
+)
 _FORK_FIELDS = (
     "provider",
     "model",
@@ -130,7 +147,13 @@ def _checkpoint_path(session_dir: Path, checkpoint_ref: str) -> Path:
         root.relative_to(session_root)
     except ValueError as exc:
         raise InteractiveSessionError("checkpoint root escapes the session") from exc
-    candidate = (root / relative).resolve()
+    candidate = root / relative
+    current = root
+    for component in relative.parts:
+        current /= component
+        if current.is_symlink():
+            raise InteractiveSessionError("checkpoint path is a symlink")
+    candidate = candidate.resolve()
     try:
         candidate.relative_to(root)
     except ValueError as exc:
@@ -184,7 +207,7 @@ def _lock_document(path: Path) -> dict[str, Any] | None:
         if not raw or len(raw) > 4096:
             return None
         document = json.loads(raw)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError):
         return None
     return dict(document) if isinstance(document, Mapping) else None
 
@@ -352,7 +375,7 @@ def _read_manifest_document(path: Path) -> dict[str, Any] | None:
         if len(raw) > 1024 * 1024:
             return None
         document = json.loads(raw)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError):
         return None
     return dict(document) if isinstance(document, Mapping) else None
 
@@ -777,7 +800,10 @@ class InteractiveSession:
 
     @staticmethod
     def _context_seed_from_event(
-        source_session: Path, event: Mapping[str, Any]
+        source_session: Path,
+        event: Mapping[str, Any],
+        *,
+        strict: bool = False,
     ) -> ContextSeed | None:
         """Build a reusable seed only from a complete durable context event."""
         payload = _payload(event)
@@ -798,7 +824,47 @@ class InteractiveSession:
             return None
         if not checkpoint.is_file() or checkpoint.is_symlink():
             return None
-        descriptor = _fork_descriptor(checkpoint_ref, cache_key)
+        descriptor_cache_key = cache_key
+        if strict:
+            try:
+                from .ipc import MAX_LINE_BYTES
+                from .worker import (
+                    _reject_duplicate_pairs,
+                    _reject_json_constant,
+                    _validate_epoch_checkpoint_data,
+                )
+
+                if checkpoint.stat().st_size > MAX_LINE_BYTES * 4:
+                    return None
+                checkpoint_data = json.loads(
+                    checkpoint.read_text(encoding="utf-8"),
+                    object_pairs_hook=_reject_duplicate_pairs,
+                    parse_constant=_reject_json_constant,
+                )
+                validated = _validate_epoch_checkpoint_data(
+                    checkpoint_data,
+                    checkpoint_ref,
+                    expected_task_id=_INTERACTIVE_TASK_ID,
+                    expected_generation=event.get("generation"),
+                )
+                if payload.get("epoch") != validated.epoch:
+                    return None
+                for field in _FORK_FIELDS:
+                    if cache_key.get(field) != getattr(validated.cache_key, field):
+                        return None
+                descriptor_cache_key = {
+                    field: getattr(validated.cache_key, field) for field in _FORK_FIELDS
+                }
+            except (
+                OSError,
+                UnicodeDecodeError,
+                ValueError,
+                TypeError,
+                KeyError,
+                RecursionError,
+            ):
+                return None
+        descriptor = _fork_descriptor(checkpoint_ref, descriptor_cache_key)
         provider = cache_key.get("provider")
         model = cache_key.get("model")
         return ContextSeed(
@@ -811,66 +877,377 @@ class InteractiveSession:
         )
 
     @staticmethod
-    def _successful_orphan_seed(
+    def _interactive_plan_task(
+        plan_path: Path,
+        *,
+        branch_generation: int | None = None,
+        branch_start_turn: int | None = None,
+        turn: int | None = None,
+    ) -> tuple[dict[str, Any], bool] | None:
+        """Return the one interactive task and whether it needs context."""
+        plan = _read_manifest_document(plan_path)
+        tasks = plan.get("tasks") if isinstance(plan, Mapping) else None
+        if not isinstance(tasks, list) or len(tasks) != 1:
+            return None
+        task = tasks[0]
+        if not isinstance(task, Mapping) or task.get("task_id") != _INTERACTIVE_TASK_ID:
+            return None
+        generation = task.get(_BRANCH_GENERATION_FIELD)
+        start_turn = task.get(_BRANCH_START_TURN_FIELD)
+        if type(generation) is not int or generation < 1:
+            return None
+        if type(start_turn) is not int or start_turn < 0:
+            return None
+        if branch_generation is not None and generation != branch_generation:
+            return None
+        if branch_start_turn is not None and start_turn != branch_start_turn:
+            return None
+        if turn is not None and start_turn > turn:
+            return None
+        for field in ("repo", "worktree_path", "branch", "task"):
+            value = task.get(field)
+            if not isinstance(value, str) or not value.strip():
+                return None
+        context_fork = task.get("context_fork")
+        summary_ref = task.get("summary_trunk_ref")
+        if context_fork is not None and not isinstance(context_fork, Mapping):
+            return None
+        if summary_ref is not None and (
+            not isinstance(summary_ref, str) or not summary_ref
+        ):
+            return None
+        context_reuse = task.get("context_reuse")
+        if type(context_reuse) is not bool:
+            return None
+        return dict(task), context_reuse
+
+    @staticmethod
+    def _assignment_matches_plan(task: Mapping[str, Any], event: Mapping[str, Any]) -> bool:
+        """Check the durable assignment against the persisted interactive task."""
+        envelope_task_id = event.get("task_id")
+        if envelope_task_id is not None and envelope_task_id != _INTERACTIVE_TASK_ID:
+            return False
+        payload = _payload(event)
+        payload_task_id = payload.get("task_id")
+        if payload_task_id is not None and payload_task_id != _INTERACTIVE_TASK_ID:
+            return False
+        if envelope_task_id is None and payload_task_id is None:
+            return False
+        for field in ("repo", "worktree_path", "branch", "task"):
+            expected = task.get(field)
+            actual = payload.get(field)
+            if expected is not None and actual != expected:
+                return False
+            if expected is None and actual is not None:
+                return False
+        parent_task_id = payload.get("parent_task_id")
+        return parent_task_id is None
+
+    @staticmethod
+    def _durable_turn_evidence(
         turn_dir: Path,
         *,
-        branch_generation: int,
-        branch_start_turn: int,
+        branch_generation: int | None = None,
+        branch_start_turn: int | None = None,
+        turn: int | None = None,
+        require_context: bool = False,
+        expected_repo: Path | None = None,
+        allow_post_terminal_context: bool = False,
     ) -> tuple[bool, ContextSeed | None]:
-        """Validate one crashed-after-success turn using existing durable facts."""
+        """Validate one turn from its durable plan, events, and checkpoints.
+
+        A result file is only a corroborating record.  Adoption requires the
+        event stream to prove assignment, a successful terminal result, a
+        clean exit, and a successful session end.  A later target failure
+        clears a provisional success, while a new generation may subsequently
+        prove success again.  A context checkpoint is usable only when it was
+        emitted by that successful generation; a failed generation's
+        checkpoint must never seed a continuation.
+        """
         state_dir = turn_dir / ".cambium"
         event_db = state_dir / "events.db"
         result_path = state_dir / "result.json"
         plan_path = turn_dir / "plan.json"
         if any(path.is_symlink() for path in (state_dir, event_db, result_path, plan_path)):
             return False, None
-        if not event_db.is_file() or not result_path.is_file() or not plan_path.is_file():
+        if not event_db.is_file() or not plan_path.is_file():
             return False, None
 
-        plan = _read_manifest_document(plan_path)
-        tasks = plan.get("tasks") if isinstance(plan, Mapping) else None
-        if not isinstance(tasks, list) or not tasks:
+        parsed_plan = InteractiveSession._interactive_plan_task(
+            plan_path,
+            branch_generation=branch_generation,
+            branch_start_turn=branch_start_turn,
+            turn=turn,
+        )
+        if parsed_plan is None:
             return False, None
-        for task in tasks:
-            if not isinstance(task, Mapping):
+        task, plan_requires_context = parsed_plan
+        context_required = require_context or plan_requires_context
+        if expected_repo is not None:
+            try:
+                if Path(task["repo"]).resolve() != expected_repo.resolve():
+                    return False, None
+                if Path(task["worktree_path"]).resolve() != (turn_dir / "wt").resolve():
+                    return False, None
+                if task["branch"] != oneshot._default_branch(turn_dir):
+                    return False, None
+            except (OSError, TypeError, ValueError):
                 return False, None
+
+        # ``result.json`` is useful corroboration, but events remain the
+        # authority.  If a result exists, reject malformed or contradictory
+        # data instead of allowing it to override the event stream.
+        if result_path.exists():
+            document = _read_manifest_document(result_path)
+            if document is None or set(document) != set(ROOT_RESULT_KEYS):
+                return False, None
+            try:
+                result = Result(**document)
+            except (TypeError, ValueError):
+                return False, None
+            expected_session = str(turn_dir.resolve())
+            expected_event_log = f"sqlite:{turn_dir.resolve() / '.cambium' / 'events.db'}"
             if (
-                task.get(_BRANCH_GENERATION_FIELD) != branch_generation
-                or task.get(_BRANCH_START_TURN_FIELD) != branch_start_turn
+                result.status != "done"
+                or result.exit_code != 0
+                or result.session_id != expected_session
+                or result.event_log_ref != expected_event_log
+                or result.parent_task_id is not None
+                or result.failure_reason is not None
             ):
                 return False, None
 
-        document = _read_manifest_document(result_path)
-        if document is None or set(document) != set(ROOT_RESULT_KEYS):
-            return False, None
-        try:
-            result = Result(**document)
-        except (TypeError, ValueError):
-            return False, None
-        expected_session = str(turn_dir.resolve())
-        expected_event_log = f"sqlite:{turn_dir.resolve() / '.cambium' / 'events.db'}"
-        if (
-            result.status != "done"
-            or result.exit_code != 0
-            or result.session_id != expected_session
-            or result.event_log_ref != expected_event_log
-            or result.parent_task_id is not None
-            or result.failure_reason is not None
-        ):
-            return False, None
+        assigned_seq: int | None = None
+        successful_result: tuple[int, int] | None = None
+        clean_exit: tuple[int, int] | None = None
+        session_success_seq: int | None = None
+        session_ended_seen = False
+        latest_context: ContextSeed | None = None
+        latest_context_generation: int | None = None
+        latest_context_seq: int | None = None
+        failed_generations: set[int] = set()
+        result_generations: set[int] = set()
+        exit_generations: set[int] = set()
+        context_tainted = False
+
+        def clear_provisional(failed_generation: int | None = None) -> None:
+            nonlocal successful_result, clean_exit, session_success_seq
+            nonlocal latest_context, latest_context_generation, latest_context_seq, context_tainted
+            successful_result = None
+            clean_exit = None
+            session_success_seq = None
+            if failed_generation is None:
+                latest_context = None
+                latest_context_generation = None
+                latest_context_seq = None
+                context_tainted = True
+                return
+            failed_generations.add(failed_generation)
+            if latest_context_generation == failed_generation:
+                latest_context = None
+                latest_context_generation = None
+                latest_context_seq = None
 
         try:
-            events = read_events_file(event_db)
-        except (OSError, StoreError, ValueError, sqlite3.Error):
+            pages = iter_event_pages(event_db)
+            for page in pages:
+                if not isinstance(page, list):
+                    return False, None
+                for event in page:
+                    if not isinstance(event, Mapping):
+                        return False, None
+                    seq = event.get("seq")
+                    if type(seq) is not int or seq <= 0:
+                        return False, None
+                    kind = event.get("kind")
+                    if not isinstance(kind, str) or not kind:
+                        return False, None
+
+                    if kind in _CONTEXT_KINDS and event.get("task_id") == _INTERACTIVE_TASK_ID:
+                        if session_ended_seen and not allow_post_terminal_context:
+                            context_tainted = True
+                            latest_context = None
+                            latest_context_generation = None
+                            latest_context_seq = None
+                            continue
+                        generation = event.get("generation")
+                        if type(generation) is not int or generation <= 0:
+                            context_tainted = True
+                            latest_context = None
+                            latest_context_generation = None
+                            latest_context_seq = None
+                            continue
+                        payload_task_id = _payload(event).get("task_id")
+                        if payload_task_id is not None and payload_task_id != _INTERACTIVE_TASK_ID:
+                            context_tainted = True
+                            latest_context = None
+                            latest_context_generation = None
+                            latest_context_seq = None
+                            continue
+                        if generation in failed_generations:
+                            continue
+                        candidate = InteractiveSession._context_seed_from_event(
+                            turn_dir,
+                            event,
+                            strict=True,
+                        )
+                        latest_context = candidate
+                        latest_context_generation = generation if candidate is not None else None
+                        latest_context_seq = seq if candidate is not None else None
+                        context_tainted = candidate is None
+                        continue
+
+                    if kind == "task_assigned":
+                        if not InteractiveSession._assignment_matches_plan(task, event):
+                            if event.get("task_id") == _INTERACTIVE_TASK_ID:
+                                return False, None
+                            continue
+                        if assigned_seq is not None:
+                            return False, None
+                        assigned_seq = seq
+                        continue
+
+                    target = event.get("task_id") == _INTERACTIVE_TASK_ID
+                    if kind == "result" and target:
+                        payload = _payload(event)
+                        payload_task_id = payload.get("task_id")
+                        payload_generation = payload.get("generation")
+                        if payload_task_id is not None and payload_task_id != _INTERACTIVE_TASK_ID:
+                            return False, None
+                        status = payload.get("status", event.get("status"))
+                        generation = event.get("generation")
+                        if type(generation) is not int or generation <= 0:
+                            return False, None
+                        if payload_generation is not None and payload_generation != generation:
+                            return False, None
+                        if generation in result_generations:
+                            return False, None
+                        result_generations.add(generation)
+                        if session_ended_seen:
+                            return False, None
+                        response_valid = payload.get("response_valid", event.get("response_valid"))
+                        if status == "succeeded" and (
+                            response_valid is None or response_valid is True
+                        ):
+                            successful_result = (seq, generation)
+                            clean_exit = None
+                            session_success_seq = None
+                        else:
+                            clear_provisional(generation)
+                        continue
+
+                    if kind == "exit" and target:
+                        payload = _payload(event)
+                        payload_task_id = payload.get("task_id")
+                        payload_generation = payload.get("generation")
+                        if payload_task_id is not None and payload_task_id != _INTERACTIVE_TASK_ID:
+                            return False, None
+                        reason = payload.get("reason", event.get("reason"))
+                        generation = event.get("generation")
+                        if type(generation) is not int or generation <= 0:
+                            return False, None
+                        if payload_generation is not None and payload_generation != generation:
+                            return False, None
+                        if generation in exit_generations:
+                            return False, None
+                        exit_generations.add(generation)
+                        if (
+                            reason in _SUCCESS_EXIT_REASONS
+                            and successful_result is not None
+                            and generation == successful_result[1]
+                            and seq > successful_result[0]
+                        ):
+                            clean_exit = (seq, generation)
+                        else:
+                            clear_provisional(generation)
+                        continue
+
+                    if kind in _FAILURE_EVENT_KINDS and target:
+                        # A recoverable merge diagnostic is followed by an
+                        # explicit resolver success and is not a terminal
+                        # failure for the root turn.
+                        payload = _payload(event)
+                        payload_task_id = payload.get("task_id")
+                        if payload_task_id is not None and payload_task_id != _INTERACTIVE_TASK_ID:
+                            return False, None
+                        recoverable_merge = (
+                            kind == "merge_failed"
+                            and payload.get("internal") is True
+                            and payload.get("recoverable") is True
+                        )
+                        if not recoverable_merge:
+                            generation = event.get("generation")
+                            clear_provisional(generation if type(generation) is int else None)
+                        continue
+
+                    if kind != "session_ended":
+                        continue
+                    if event.get("task_id") is not None:
+                        return False, None
+                    if session_ended_seen:
+                        return False, None
+                    session_ended_seen = True
+                    payload = _payload(event)
+                    statuses = payload.get("results")
+                    successful_session = (
+                        payload.get("session_status") == "ended"
+                        and isinstance(statuses, Mapping)
+                        and statuses.get(_INTERACTIVE_TASK_ID) == "succeeded"
+                    )
+                    if successful_session:
+                        if (
+                            successful_result is None
+                            or clean_exit is None
+                            or not (
+                                assigned_seq is not None
+                                and assigned_seq < successful_result[0] < clean_exit[0] < seq
+                            )
+                        ):
+                            clear_provisional()
+                            continue
+                        session_success_seq = seq
+                    else:
+                        clear_provisional()
+        except (OSError, StoreError, ValueError, sqlite3.Error, TypeError, RecursionError):
             return False, None
-        seed: ContextSeed | None = None
-        for event in events:
-            if event.get("kind") not in _CONTEXT_KINDS:
-                continue
-            candidate = InteractiveSession._context_seed_from_event(turn_dir, event)
-            if candidate is not None:
-                seed = candidate
-        return True, seed
+
+        if (
+            assigned_seq is None
+            or successful_result is None
+            or clean_exit is None
+            or session_success_seq is None
+            or context_tainted
+            or (
+                latest_context is not None
+                and latest_context_generation != successful_result[1]
+            )
+            or (
+                latest_context is not None
+                and assigned_seq is not None
+                and (latest_context_seq is None or latest_context_seq <= assigned_seq)
+            )
+            or (context_required and latest_context is None)
+        ):
+            return False, None
+        return True, latest_context
+
+    @staticmethod
+    def _successful_orphan_seed(
+        turn_dir: Path,
+        *,
+        branch_generation: int,
+        branch_start_turn: int,
+        require_context: bool = False,
+        expected_repo: Path | None = None,
+    ) -> tuple[bool, ContextSeed | None]:
+        """Validate one crashed-after-success turn using existing durable facts."""
+        return InteractiveSession._durable_turn_evidence(
+            turn_dir,
+            branch_generation=branch_generation,
+            branch_start_turn=branch_start_turn,
+            require_context=require_context,
+            expected_repo=expected_repo,
+        )
 
     def _reconcile_successful_orphans(self) -> None:
         """Adopt only contiguous turns proven successful before frontend death."""
@@ -883,12 +1260,13 @@ class InteractiveSession:
                 turn_dir,
                 branch_generation=self._branch_generation,
                 branch_start_turn=self._branch_start_turn,
+                require_context=False,
+                expected_repo=self.repo,
             )
             if not successful:
                 break
             self._turn += 1
-            if seed is not None:
-                self._seed = seed
+            self._seed = seed
             adopted = True
         if adopted:
             self._pending_seed = None
@@ -896,48 +1274,98 @@ class InteractiveSession:
             self._write_manifest()
 
     def _load_durable_head(self) -> None:
-        """Recover the durable context head and reconnect diagnostics."""
-        seed = self._seed
-        if seed is not None:
-            self._last_epoch = seed.epoch
-            self._last_checkpoint = seed.checkpoint_ref
+        """Recover a continuation head only from corroborated durable context events."""
+        manifest_seed = self._seed
+        self._seed = None
+        self._last_epoch = 0
+        self._last_checkpoint = None
 
         turn_dirs = list(self.active_turn_dirs())
-        if seed is not None and seed.source_session not in turn_dirs:
-            turn_dirs.append(seed.source_session)
+        listed_sources = {
+            turn_dir.resolve() for _number, turn_dir in self._listed_turn_dirs(self.root)
+        }
+        source_resolved = manifest_seed.source_session.resolve() if manifest_seed else None
+        if manifest_seed is not None and source_resolved not in listed_sources:
+            return
+        if manifest_seed is not None and all(
+            turn_dir.resolve() != source_resolved for turn_dir in turn_dirs
+        ):
+            turn_dirs.append(manifest_seed.source_session)
+
+        latest: tuple[tuple[int, int], ContextSeed] | None = None
+        manifest_anchor: ContextSeed | None = None
+        manifest_anchor_seen = manifest_seed is None
         for turn_dir in turn_dirs:
             event_db = turn_dir / ".cambium" / "events.db"
-            if not event_db.is_file():
+            if not event_db.is_file() or event_db.is_symlink():
                 continue
             try:
-                events = read_events_file(event_db)
+                pages = iter_event_pages(event_db)
             except (OSError, StoreError, ValueError, sqlite3.Error):
                 continue
-            anchor_seen = seed is None or turn_dir.resolve() != seed.source_session.resolve()
-            for event in events:
-                if event.get("kind") not in _CONTEXT_KINDS:
-                    continue
-                candidate = self._context_seed_from_event(turn_dir, event)
-                if candidate is None:
-                    continue
-                self._last_epoch = candidate.epoch
-                self._last_checkpoint = candidate.checkpoint_ref
-                if seed is None or turn_dir.resolve() != seed.source_session.resolve():
-                    continue
-                if not anchor_seen:
-                    anchor_seen = (
-                        candidate.checkpoint_ref == seed.checkpoint_ref
-                        and candidate.epoch == seed.epoch
-                    )
-                    continue
-                payload = _payload(event)
-                if (
-                    event.get("kind") == "context_epoch_advanced"
-                    and payload.get("folded_from_epoch") == seed.epoch
-                    and candidate.epoch == seed.epoch + 1
-                ):
-                    seed = candidate
-                    self._seed = candidate
+            source_matches_manifest = (
+                manifest_seed is not None and turn_dir.resolve() == source_resolved
+            )
+            try:
+                for page in pages:
+                    for event in page:
+                        if (
+                            event.get("kind") not in _CONTEXT_KINDS
+                            or event.get("task_id") != _INTERACTIVE_TASK_ID
+                        ):
+                            continue
+                        payload = _payload(event)
+                        payload_task_id = payload.get("task_id")
+                        if payload_task_id is not None and payload_task_id != _INTERACTIVE_TASK_ID:
+                            continue
+                        generation = event.get("generation")
+                        if (
+                            isinstance(generation, bool)
+                            or not isinstance(generation, int)
+                            or generation <= 0
+                        ):
+                            continue
+                        candidate = self._context_seed_from_event(turn_dir, event, strict=True)
+                        if candidate is None:
+                            continue
+                        match = _TURN_DIR_RE.fullmatch(turn_dir.name)
+                        turn_number = int(match.group(1)) if match is not None else -1
+                        order = (turn_number, int(event["seq"]))
+                        if latest is None or order > latest[0]:
+                            latest = (order, candidate)
+                        if not source_matches_manifest or manifest_seed is None:
+                            continue
+                        if not manifest_anchor_seen:
+                            if (
+                                candidate.checkpoint_ref == manifest_seed.checkpoint_ref
+                                and candidate.epoch == manifest_seed.epoch
+                                and candidate.descriptor == manifest_seed.descriptor
+                                and candidate.provider == manifest_seed.provider
+                                and candidate.model == manifest_seed.model
+                            ):
+                                manifest_anchor = candidate
+                                manifest_anchor_seen = True
+                            continue
+                        if (
+                            event.get("kind") == "context_epoch_advanced"
+                            and manifest_anchor is not None
+                            and payload.get("folded_from_epoch") == manifest_anchor.epoch
+                            and candidate.epoch == manifest_anchor.epoch + 1
+                        ):
+                            manifest_anchor = candidate
+            except (OSError, StoreError, ValueError, sqlite3.Error, TypeError, RecursionError):
+                continue
+
+        if manifest_seed is not None:
+            self._seed = manifest_anchor
+        if self._seed is not None:
+            self._last_epoch = self._seed.epoch
+            self._last_checkpoint = self._seed.checkpoint_ref
+        elif latest is not None:
+            # Keep diagnostics useful without promoting an unreferenced event
+            # into a continuation seed.
+            self._last_epoch = latest[1].epoch
+            self._last_checkpoint = latest[1].checkpoint_ref
 
     def resume_summary(self) -> str:
         """Describe the durable state that will be attached on startup."""
@@ -975,46 +1403,41 @@ class InteractiveSession:
         )
 
     def branch_heads(self) -> tuple[BranchHead, ...]:
-        """Replay turn event stores and return their latest checkpoint heads."""
+        """Return durable checkpoint heads for every completed branch turn."""
         heads: list[BranchHead] = []
         for turn, turn_dir in self._listed_turn_dirs(self.root):
-            event_db = turn_dir / ".cambium" / "events.db"
-            if not event_db.is_file():
+            plan_path = turn_dir / "plan.json"
+            parsed_plan = InteractiveSession._interactive_plan_task(
+                plan_path,
+                turn=turn,
+            )
+            if parsed_plan is None:
                 continue
-            latest: tuple[int, str] | None = None
-            try:
-                events = read_events_file(event_db)
-            except (OSError, ValueError, StoreError):
-                continue
-            for event in events:
-                if event.get("kind") not in {"context_checkpoint", "context_epoch_advanced"}:
-                    continue
-                payload = event.get("payload")
-                if not isinstance(payload, Mapping):
-                    continue
-                checkpoint_ref = payload.get("checkpoint_ref")
-                epoch = payload.get("epoch")
-                if (
-                    not isinstance(checkpoint_ref, str)
-                    or not checkpoint_ref
-                    or type(epoch) is not int
-                    or epoch < 0
-                ):
-                    continue
-                latest = (epoch, checkpoint_ref)
-            if latest is None:
+            task, _requires_context = parsed_plan
+            generation = task[_BRANCH_GENERATION_FIELD]
+            branch_start = task[_BRANCH_START_TURN_FIELD]
+            valid, seed = InteractiveSession._durable_turn_evidence(
+                turn_dir,
+                branch_generation=generation,
+                branch_start_turn=branch_start,
+                turn=turn,
+                require_context=True,
+                expected_repo=self.repo,
+                allow_post_terminal_context=True,
+            )
+            if not valid or seed is None:
                 continue
             current = (
                 self._seed is not None
                 and turn == self._turn
                 and self._seed.source_session == turn_dir.resolve()
-                and self._seed.checkpoint_ref == latest[1]
+                and self._seed.checkpoint_ref == seed.checkpoint_ref
             )
             heads.append(
                 BranchHead(
                     turn=turn,
-                    epoch=latest[0],
-                    checkpoint_ref=latest[1],
+                    epoch=seed.epoch,
+                    checkpoint_ref=seed.checkpoint_ref,
                     source_session=turn_dir,
                     current=current,
                 )
@@ -1125,7 +1548,12 @@ class InteractiveSession:
             self._set_serving_preference(*selected, force=True)
 
     def _record_serving_preference(
-        self, turn: InteractiveTurn, provider: str, model: str | None
+        self,
+        turn: InteractiveTurn,
+        provider: str,
+        model: str | None,
+        *,
+        force: bool = False,
     ) -> None:
         """Record a provider/model that actually served this turn."""
         self._serving_turn = turn.number
@@ -1134,20 +1562,52 @@ class InteractiveSession:
             model = declared_model
         elif not isinstance(model, str) or not model:
             model = None
-        self._set_serving_preference(provider, model)
+        self._set_serving_preference(provider, model, force=force)
+
+    def _serving_observation_allowed(
+        self,
+        provider: str,
+        *,
+        call_kind: Any = None,
+        failure_reason: Any = None,
+        fell_back_from: Any = None,
+    ) -> tuple[bool, bool]:
+        """Return whether serving evidence may move coding ownership and whether to force it."""
+        if failure_reason is not None or call_kind == "summary":
+            return False, False
+        incumbent = self.provider
+        if incumbent is None or provider == incumbent:
+            return True, False
+        genuine_fallback = (
+            call_kind == "agent"
+            and isinstance(fell_back_from, str)
+            and fell_back_from == incumbent
+        )
+        return genuine_fallback, genuine_fallback
 
     def observe_result(self, turn: InteractiveTurn, result: Any) -> None:
-        """Record the terminal serving pair, including router fallback provenance."""
+        """Record only successful root coding service, including genuine fallback."""
         if not isinstance(turn, InteractiveTurn):
             raise InteractiveSessionError("interactive result requires a prepared turn")
         results = getattr(result, "results", None)
         item = results[0] if isinstance(results, tuple | list) and results else result
+        if getattr(item, "task_id", None) != turn.config.task_id:
+            return
+        if getattr(item, "status", None) != "succeeded":
+            return
         provider = getattr(item, "provider", None)
         if not isinstance(provider, str) or not provider:
             return
         model = getattr(item, "model", None)
-        if provider != self.provider or (isinstance(model, str) and model != self.model):
-            self._record_serving_preference(turn, provider, model)
+        allowed, force = self._serving_observation_allowed(
+            provider,
+            call_kind="agent",
+            fell_back_from=getattr(item, "fell_back_from", None),
+        )
+        if allowed and (
+            provider != self.provider or (isinstance(model, str) and model != self.model)
+        ):
+            self._record_serving_preference(turn, provider, model, force=force)
 
     def set_model_preference(self, value: str) -> str:
         """Validate and persist a provider/model preference for later turns."""
@@ -1383,6 +1843,8 @@ class InteractiveSession:
                 number = int(match.group(1))
             except ValueError:
                 continue
+            if path.name != f"turn-{number:04d}":
+                continue
             listed.append((number, path))
         listed.sort(key=lambda item: (item[0], item[1].name))
         return tuple(listed)
@@ -1497,6 +1959,7 @@ class InteractiveSession:
         task = oneshot.build_plan(resolved, repo, session_dir)["tasks"][0]
         task[_BRANCH_GENERATION_FIELD] = turn.branch_generation
         task[_BRANCH_START_TURN_FIELD] = turn.branch_start_turn
+        task["context_reuse"] = resolved.context_reuse
         if turn.context_fork is not None:
             task["context_fork"] = copy.deepcopy(turn.context_fork)
         if turn.summary_trunk_ref is not None:
@@ -1521,27 +1984,48 @@ class InteractiveSession:
         return result
 
     def observe_event(self, turn: InteractiveTurn, event: Mapping[str, Any]) -> None:
-        """Capture serving provenance and the newest durable checkpoint."""
+        """Capture root coding provenance and the newest durable checkpoint."""
+        if not isinstance(turn, InteractiveTurn) or event.get("task_id") != _INTERACTIVE_TASK_ID:
+            return
         kind = event.get("kind")
         payload = _payload(event)
         if kind in {"usage_event", "result"}:
             serving = payload.get("provider_metadata") if kind == "result" else payload
             if not isinstance(serving, Mapping):
                 serving = payload
-            if payload.get("call_kind") == "summary" or serving.get("call_kind") == "summary":
+            if kind == "result" and payload.get("status") != "succeeded":
                 return
             provider = serving.get("provider")
             model = serving.get("model")
             if isinstance(provider, str) and provider:
-                self._record_serving_preference(
-                    turn,
-                    provider,
-                    model if isinstance(model, str) and model else None,
+                call_kind = payload.get("call_kind", serving.get("call_kind"))
+                failure_reason = serving.get(
+                    "failure_reason", payload.get("failure_reason")
                 )
+                allowed, force = self._serving_observation_allowed(
+                    provider,
+                    call_kind=call_kind,
+                    failure_reason=failure_reason,
+                    fell_back_from=serving.get("fell_back_from"),
+                )
+                model_value = model if isinstance(model, str) and model else None
+                if allowed and (provider != self.provider or model_value != self.model):
+                    self._record_serving_preference(
+                        turn,
+                        provider,
+                        model_value,
+                        force=force,
+                    )
             return
         if kind not in _CONTEXT_KINDS:
             return
-        seed = self._context_seed_from_event(turn.session_dir, event)
+        payload_task_id = payload.get("task_id")
+        if payload_task_id is not None and payload_task_id != _INTERACTIVE_TASK_ID:
+            return
+        generation = event.get("generation")
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation <= 0:
+            return
+        seed = self._context_seed_from_event(turn.session_dir, event, strict=True)
         if seed is None:
             return
         self._pending_seed = seed
@@ -1563,7 +2047,7 @@ class InteractiveSession:
         if number <= self._turn:
             raise InteractiveSessionError("interactive turns must complete in order")
         self._turn = number
-        if succeeded and self._pending_seed is not None:
+        if succeeded:
             self._seed = self._pending_seed
         self._pending_seed = None
         self._write_manifest()

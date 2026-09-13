@@ -53,7 +53,7 @@ An entry may include an optional `verbatim_evidence` list for compact source
 artifacts, such as one log line or a small JSON value. Each item must occur
 byte-for-byte in one message of that fold's raw range. The parser rejects an
 absent, invented, or over-sized claim. The limits are four items, 512 UTF-8
-bytes per item, and 2,048 bytes in total. This evidence is semantic payload;
+bytes per item, and 1,536 bytes in total. This evidence is semantic payload;
 it does not change the raw-range digest or grant exact/cache identity.
 
 An epoch number identifies a published checkpoint snapshot. Ordinary folds
@@ -148,8 +148,10 @@ and still-applicable checks. Invalidations apply before additions in the same
 delta, so a replacement is not accidentally deleted. Repeated closure of an
 already absent label is harmless; it must not block compaction.
 
-K0 also carries the first unique `verbatim_evidence` items that fit the same
-limits. It does not create, relabel, or revalidate evidence after the fold.
+K0 carries a bounded recent history of unique `verbatim_evidence` items in
+source order. Newer snippets evict older ones when the four-item or 1,536-byte
+limits are reached; any loss is named in K0's outcome. It does not create,
+relabel, or revalidate evidence after the fold.
 
 Original entries remain unchanged and accessible through history. The model
 must identify a correction or completion from actual evidence. K0 does not infer

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import sys
 import time
@@ -233,6 +234,9 @@ def test_run_shell_returns_bounded_output_and_complete_spill(
     spill_files = sorted((session / ".cambium" / "spill").glob("run-*.txt"))
     assert len(spill_files) == 1
     assert spill_files[0].read_text(encoding="utf-8") == expected
+    assert result.output_ref == f".cambium/spill/{spill_files[0].name}"
+    assert result.output_sha256 == hashlib.sha256(expected.encode()).hexdigest()
+    assert result.output_bytes == len(expected.encode())
     assert len(result.output.encode()) <= MAX_OUTPUT_BYTES
 
 

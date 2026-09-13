@@ -36,6 +36,26 @@ class Lifecycle(StrEnum):
     REJECTED = "rejected"
 
 
+class FailureSource(StrEnum):
+    """Durable source of a terminal failure verdict."""
+
+    NONE = "none"
+    UNKNOWN = "unknown"
+    RESULT = "result"
+    CHILD_RESULT = "child_result"
+    CHILD_FAILED = "child_failed"
+    CHILD_REJECTED = "child_rejected"
+    WORKER_FAILED = "worker_failed"
+    WORKER_TERMINATED = "worker_terminated"
+    TASK_FAILED = "task_failed"
+    CONTEXT_RESUME_FAILED = "context_resume_failed"
+    FATAL_ERROR = "fatal_error"
+    MERGE_FAILED = "merge_failed"
+    JOIN_INVARIANT_FAILED = "join_invariant_failed"
+    CANCELLED = "cancelled"
+    TASK_CANCELLED = "task_cancelled"
+
+
 _LIFECYCLE_RANK = {
     Lifecycle.UNKNOWN: 0,
     Lifecycle.QUEUED: 1,
@@ -56,6 +76,28 @@ _TERMINAL_LIFECYCLES = frozenset(
         Lifecycle.FAILED,
         Lifecycle.CANCELLED,
         Lifecycle.REJECTED,
+    }
+)
+_TERMINAL_RESULT_STATUSES = frozenset(
+    {
+        Lifecycle.FAILED.value,
+        Lifecycle.CANCELLED.value,
+        Lifecycle.REJECTED.value,
+        "timeout",
+        "unresolvable",
+    }
+)
+_AUTHORITATIVE_FAILURE_KINDS = frozenset(
+    {
+        "worker_failed",
+        "worker_terminated",
+        "task_failed",
+        "context_resume_failed",
+        "fatal_error",
+        "join_invariant_failed",
+        "merge_failed",
+        "cancelled",
+        "task_cancelled",
     }
 )
 
@@ -226,6 +268,7 @@ class ResultEnvelope:
     epoch: int | None = None
     terminal_action: TerminalAction | None = None
     provider_metadata: tuple[tuple[str, Any], ...] = ()
+    failure_source: FailureSource = FailureSource.NONE
 
 
 @dataclass(frozen=True, slots=True)
@@ -880,6 +923,9 @@ def _result_to_dict(value: ResultEnvelope) -> dict[str, Any]:
         "status": value.status,
         "summary": value.summary,
         "failure_reason": value.failure_reason,
+        "failure_source": (
+            value.failure_source.value if isinstance(value.failure_source, FailureSource) else None
+        ),
         "commits": list(value.commits),
         "files_changed": list(value.files_changed),
         "diff_truncated": value.diff_truncated,
@@ -895,12 +941,25 @@ def _result_to_dict(value: ResultEnvelope) -> dict[str, Any]:
     }
 
 
+def _parse_failure_source(value: Any) -> FailureSource:
+    if value is None:
+        return FailureSource.NONE
+    raw = _optional_string(value)
+    if raw is None:
+        return FailureSource.UNKNOWN
+    try:
+        return FailureSource(raw)
+    except ValueError:
+        return FailureSource.UNKNOWN
+
+
 def _result_from_dict(value: Mapping[str, Any]) -> ResultEnvelope:
     terminal_action = value.get("terminal_action")
     return ResultEnvelope(
         status=_optional_string(value.get("status")),
         summary=_optional_string(value.get("summary")),
         failure_reason=_optional_string(value.get("failure_reason")),
+        failure_source=_parse_failure_source(value.get("failure_source")),
         commits=_required_string_tuple(value.get("commits", ())),
         files_changed=_required_string_tuple(value.get("files_changed", ())),
         diff_truncated=_optional_bool(value.get("diff_truncated")),
@@ -1168,7 +1227,12 @@ def _transition(
     *,
     allow_regression: bool = False,
     restart: bool = False,
+    terminal_authoritative: bool = False,
 ) -> Lifecycle:
+    if restart and desired is not None:
+        return desired
+    if terminal_authoritative and desired in _TERMINAL_LIFECYCLES:
+        return desired
     if current in _TERMINAL_LIFECYCLES and not restart:
         return current
     if allow_regression or _LIFECYCLE_RANK[desired] >= _LIFECYCLE_RANK[current]:
@@ -1252,6 +1316,7 @@ def _progress(
     *,
     allow_regression: bool = False,
     restart: bool = False,
+    terminal_authoritative: bool = False,
 ) -> BranchState:
     task_id = _task_id(values)
     if task_id is None:
@@ -1278,6 +1343,7 @@ def _progress(
                 desired,
                 allow_regression=allow_regression,
                 restart=restart,
+                terminal_authoritative=terminal_authoritative,
             )
             if desired is not None
             else child.lifecycle
@@ -1314,6 +1380,7 @@ def _progress(
             desired,
             allow_regression=allow_regression,
             restart=restart,
+            terminal_authoritative=terminal_authoritative,
         )
         if desired is not None
         else identity.lifecycle
@@ -1373,6 +1440,113 @@ def _add_blocker(state: BranchState, blocker: str | None) -> BranchState:
     return replace(
         state,
         control=replace(state.control, blockers=(*state.control.blockers, blocker[:512])),
+    )
+
+
+def _remove_blockers(state: BranchState, predicate: Callable[[str], bool]) -> BranchState:
+    """Remove only blockers owned by one reducer concern."""
+
+    blockers = tuple(blocker for blocker in state.control.blockers if not predicate(blocker))
+    if blockers == state.control.blockers:
+        return state
+    return replace(state, control=replace(state.control, blockers=blockers))
+
+
+def _failure_reason(values: Mapping[str, Any], default: str) -> str:
+    return (
+        _optional_string(_value(values, "failure_reason", "reason", "message", "error_type"))
+        or default
+    )
+
+
+def _failure_result(
+    result: ResultEnvelope | None,
+    *,
+    source: str,
+    reason: str,
+    summary: str | None = None,
+    status: str = Lifecycle.FAILED.value,
+) -> ResultEnvelope:
+    """Override only terminal status/failure fields on a prior result.
+
+    A late supervisor verdict must not discard result evidence that was already
+    durable (summary, commits, files and provider metadata). Preserve the
+    provenance of an earlier non-merge failure so a later merge acceptance
+    cannot incorrectly revive it.
+    """
+
+    if result is None:
+        return ResultEnvelope(
+            status=status,
+            summary=summary,
+            failure_reason=reason,
+            failure_source=_parse_failure_source(source),
+        )
+    incoming_source = _parse_failure_source(source)
+    failure_source = incoming_source
+    failure_reason = reason or result.failure_reason
+    prior_terminal = result.status in _TERMINAL_RESULT_STATUSES
+    if prior_terminal and incoming_source is FailureSource.MERGE_FAILED:
+        # A merge diagnostic after another terminal failure must not hide the
+        # earlier non-recoverable verdict from a later merge acceptance.
+        failure_source = (
+            FailureSource.UNKNOWN
+            if result.failure_source is FailureSource.NONE
+            else result.failure_source
+        )
+        failure_reason = result.failure_reason or reason
+    return replace(
+        result,
+        status=status,
+        failure_reason=failure_reason,
+        failure_source=failure_source,
+        summary=result.summary if result.summary is not None else summary,
+    )
+
+
+def _inherit_failure_evidence(
+    result: ResultEnvelope, prior: ResultEnvelope | None
+) -> ResultEnvelope:
+    """Keep explicit failure evidence when a later envelope omits it."""
+
+    if prior is None or result.status not in _TERMINAL_RESULT_STATUSES:
+        return result
+    failure_reason = result.failure_reason or prior.failure_reason
+    failure_source = result.failure_source
+    if prior.failure_source not in {FailureSource.MERGE_FAILED} and failure_source in {
+        FailureSource.RESULT,
+        FailureSource.CHILD_RESULT,
+    }:
+        if prior.failure_source is FailureSource.NONE:
+            failure_source = FailureSource.UNKNOWN
+        else:
+            failure_source = prior.failure_source
+        failure_reason = prior.failure_reason or failure_reason
+    return replace(
+        result,
+        failure_reason=failure_reason,
+        failure_source=failure_source,
+    )
+
+
+def _merge_failure_marker(task_id: str | None, reason: str, generation: int | None) -> str:
+    target = task_id or "<root>"
+    generation_label = str(generation) if generation is not None else "unknown"
+    prefix = f"merge_failed[{target}]: generation={generation_label}: "
+    return prefix + reason[: max(0, 512 - len(prefix))]
+
+
+def _is_merge_failure_marker(blocker: str, task_id: str | None, generation: int | None) -> bool:
+    target = task_id or "<root>"
+    generation_label = str(generation) if generation is not None else "unknown"
+    return blocker.startswith(f"merge_failed[{target}]: generation={generation_label}: ")
+
+
+def _has_merge_failure_marker(state: BranchState, task_id: str | None) -> bool:
+    target = task_id or "<root>"
+    return any(
+        blocker.startswith(f"merge_failed[{target}]: generation=")
+        for blocker in state.control.blockers
     )
 
 
@@ -1536,9 +1710,11 @@ def _result_status_lifecycle(status: str | None) -> Lifecycle | None:
         return Lifecycle.SUCCEEDED
     if status == Lifecycle.CANCELLED.value:
         return Lifecycle.CANCELLED
+    if status == Lifecycle.REJECTED.value:
+        return Lifecycle.REJECTED
     if status == Lifecycle.SUSPENDED.value:
         return Lifecycle.SUSPENDED
-    if status in {Lifecycle.FAILED.value, "unresolvable"}:
+    if status in {Lifecycle.FAILED.value, "timeout", "unresolvable"}:
         return Lifecycle.FAILED
     return None
 
@@ -1549,6 +1725,10 @@ def _result_from_values(values: Mapping[str, Any]) -> ResultEnvelope:
         status=_optional_string(values.get("status")),
         summary=_optional_string(values.get("summary")),
         failure_reason=_optional_string(_value(values, "failure_reason", "reason")),
+        # Failure provenance comes from the durable event kind below.  Do not
+        # let an untrusted envelope relabel a result as recoverable merge
+        # evidence and then bypass a later terminal failure.
+        failure_source=FailureSource.NONE,
         commits=_strings_value(values, "commits") or (),
         files_changed=_strings_value(values, "files_changed", "files") or (),
         diff_truncated=_optional_bool(values.get("diff_truncated")),
@@ -1561,31 +1741,86 @@ def _result_from_values(values: Mapping[str, Any]) -> ResultEnvelope:
 
 
 def _reduce_result(state: BranchState, values: Mapping[str, Any]) -> BranchState:
-    task_id = _task_id(values)
-    if task_id is None:
+    owner_task_id = _task_id(values)
+    if owner_task_id is None:
         return state
     state = _prepare_identity(state, values)
+    task_id = owner_task_id
+    child_task_id = _optional_string(values.get("child_task_id"))
+    if values.get("kind") == "child_result" and child_task_id is not None:
+        task_id = child_task_id
+        if task_id != state.identity.branch_id:
+            state = _ensure_child(state, task_id, _parent_id(values) or owner_task_id)
+        values = {**values, "task_id": task_id}
     result = _result_from_values(values)
     lifecycle = _result_status_lifecycle(result.status)
+    if lifecycle in {Lifecycle.FAILED, Lifecycle.CANCELLED, Lifecycle.REJECTED}:
+        event_source = result.failure_source
+        if event_source in {FailureSource.NONE, FailureSource.UNKNOWN}:
+            event_source = (
+                FailureSource.CHILD_RESULT
+                if values.get("kind") == "child_result"
+                else FailureSource.RESULT
+            )
+        result = replace(
+            result,
+            failure_source=event_source,
+        )
     child_index = _find_child_index(state, task_id)
     if child_index is not None:
         child = state.children[child_index]
+        result = _inherit_failure_evidence(result, child.result)
+        next_lifecycle = (
+            _transition(
+                child.lifecycle,
+                lifecycle,
+                terminal_authoritative=lifecycle
+                in {Lifecycle.FAILED, Lifecycle.CANCELLED, Lifecycle.REJECTED},
+            )
+            if lifecycle is not None
+            else child.lifecycle
+        )
+        if (
+            lifecycle is not None
+            and next_lifecycle is not lifecycle
+            and (child.lifecycle in _TERMINAL_LIFECYCLES)
+        ):
+            return _replace_child(state, task_id, child)
         child = replace(
             child,
             result=result,
-            lifecycle=(
-                _transition(child.lifecycle, lifecycle)
-                if lifecycle is not None
-                else child.lifecycle
-            ),
+            lifecycle=next_lifecycle,
             checkpoint_ref=result.checkpoint_ref or child.checkpoint_ref,
             epoch=result.epoch if result.epoch is not None else child.epoch,
         )
         return _replace_child(state, task_id, child)
     if not _root_event(state, task_id):
         return state
+    next_lifecycle = (
+        _transition(
+            state.lifecycle,
+            lifecycle,
+            terminal_authoritative=lifecycle
+            in {Lifecycle.FAILED, Lifecycle.CANCELLED, Lifecycle.REJECTED},
+        )
+        if lifecycle is not None
+        else state.lifecycle
+    )
+    if (
+        lifecycle is not None
+        and next_lifecycle is not lifecycle
+        and (state.lifecycle in _TERMINAL_LIFECYCLES)
+    ):
+        return state
+    result = _inherit_failure_evidence(result, state.result)
     state = replace(state, result=result)
-    state = _progress(state, values, lifecycle)
+    state = _progress(
+        state,
+        values,
+        next_lifecycle,
+        terminal_authoritative=lifecycle
+        in {Lifecycle.FAILED, Lifecycle.CANCELLED, Lifecycle.REJECTED},
+    )
     if result.status == Lifecycle.SUSPENDED.value:
         state = replace(
             state,
@@ -1878,8 +2113,20 @@ def _reduce_context(state: BranchState, values: Mapping[str, Any]) -> BranchStat
             },
         )
     if kind == "context_resume_failed":
-        state = _progress(state, values, Lifecycle.FAILED)
-        return _add_blocker(state, _optional_string(_value(values, "reason", "message")))
+        reason = _failure_reason(values, kind)
+        state = _progress(
+            state,
+            values,
+            Lifecycle.FAILED,
+            terminal_authoritative=True,
+        )
+        state = _record_terminal_failure(
+            state,
+            values,
+            source="context_resume_failed",
+            reason=reason,
+        )
+        return _add_blocker(state, reason)
     child_index = _find_child_index(state, task_id)
     epoch = _nonnegative_int(values.get("epoch"))
     checkpoint_ref = _optional_string(values.get("checkpoint_ref"))
@@ -1927,24 +2174,138 @@ def _reduce_context(state: BranchState, values: Mapping[str, Any]) -> BranchStat
     return _set_delta(state, f"context {kind}")
 
 
-def _reduce_artifact(state: BranchState, values: Mapping[str, Any]) -> BranchState:
+def _merge_recovery_matches(state: BranchState, task_id: str, generation: int | None) -> bool:
+    child_index = _find_child_index(state, task_id)
+    if child_index is not None:
+        child = state.children[child_index]
+        if generation is not None and child.generation != generation:
+            return False
+        if generation is None and child.generation is not None:
+            return False
+    elif not _root_event(state, task_id):
+        return False
+    else:
+        if generation is not None and state.identity.generation != generation:
+            return False
+        if generation is None and state.identity.generation is not None:
+            return False
+    return any(
+        _is_merge_failure_marker(blocker, task_id, generation) for blocker in state.control.blockers
+    )
+
+
+def _recover_merge_failure(state: BranchState, task_id: str, generation: int | None) -> BranchState:
+    """Clear a merge episode only when it owns the current failure result."""
+
+    if not _merge_recovery_matches(state, task_id, generation):
+        return state
+    child_index = _find_child_index(state, task_id)
+    if child_index is not None:
+        state = _remove_blockers(
+            state, lambda blocker: _is_merge_failure_marker(blocker, task_id, generation)
+        )
+        child = state.children[child_index]
+        result = child.result
+        if result is None or result.failure_source is not FailureSource.MERGE_FAILED:
+            return state
+        return _replace_child(
+            state,
+            task_id,
+            replace(
+                child,
+                lifecycle=Lifecycle.SUCCEEDED,
+                result=replace(
+                    result,
+                    status=Lifecycle.SUCCEEDED.value,
+                    failure_reason=None,
+                    failure_source=FailureSource.NONE,
+                ),
+            ),
+        )
+    state = _remove_blockers(
+        state, lambda blocker: _is_merge_failure_marker(blocker, task_id, generation)
+    )
+    if state.result is None:
+        return state
+    if state.result.failure_source is not FailureSource.MERGE_FAILED:
+        return state
+    return replace(
+        state,
+        identity=replace(state.identity, lifecycle=Lifecycle.SUCCEEDED),
+        result=replace(
+            state.result,
+            status=Lifecycle.SUCCEEDED.value,
+            failure_reason=None,
+            failure_source=FailureSource.NONE,
+        ),
+    )
+
+
+def _reduce_artifact(state: BranchState, values: Mapping[str, Any]) -> BranchState:  # noqa: C901
     kind = values.get("kind")
     task_id = _task_id(values)
     if task_id is None:
         return state
     state = _prepare_identity(state, values)
+    recoverable_merge_diagnostic = (
+        kind == "merge_failed"
+        and values.get("internal") is True
+        and values.get("recoverable") is True
+    )
+    merge_failure = kind == "merge_failed"
+    merge_recovery = kind in {"merge_committed", "resolver_succeeded"}
+    merge_reconciled = kind == "merge_reconciled"
+    recovery_generation = _generation(values)
     desired = {
         "merge_started": Lifecycle.PUBLISHING,
         "child_integration_prepared": Lifecycle.JOINING,
         "child_integrated": Lifecycle.JOINING,
         "merge_committed": Lifecycle.SUCCEEDED,
         "merge_reconciled": Lifecycle.SUCCEEDED,
+        "resolver_succeeded": Lifecycle.SUCCEEDED,
         "merge_failed": Lifecycle.FAILED,
         "join_invariant_failed": Lifecycle.FAILED,
     }.get(kind)
-    state = _progress(state, values, desired)
+    recovery_marker_pending = (merge_recovery or merge_reconciled) and _has_merge_failure_marker(
+        state, task_id
+    )
+    recovery_matches = not recovery_marker_pending or (
+        merge_recovery and _merge_recovery_matches(state, task_id, recovery_generation)
+    )
+    state = _progress(
+        state,
+        values,
+        None
+        if recoverable_merge_diagnostic
+        or ((merge_recovery or merge_reconciled) and not recovery_matches)
+        else desired,
+        terminal_authoritative=(
+            (merge_failure and not recoverable_merge_diagnostic) or kind == "join_invariant_failed"
+        ),
+    )
+    reason = _failure_reason(values, kind or "artifact failure")
+    if merge_failure and not recoverable_merge_diagnostic:
+        state = _record_terminal_failure(state, values, source="merge_failed", reason=reason)
+    elif kind == "join_invariant_failed":
+        state = _record_terminal_failure(
+            state,
+            values,
+            source="join_invariant_failed",
+            reason=reason,
+        )
+    if merge_failure:
+        state = _add_blocker(state, _merge_failure_marker(task_id, reason, recovery_generation))
+    elif merge_recovery:
+        state = _recover_merge_failure(state, task_id, recovery_generation)
     new_head = _optional_string(
-        _value(values, "accepted_integration_head", "artifact_head", "new", "head")
+        _value(
+            values,
+            "accepted_integration_head",
+            "artifact_head",
+            "new",
+            "head",
+            "merge_sha",
+        )
     )
     explicit_worktree_head = _optional_string(
         _value(values, "worktree_head", "parent_head", "current_head")
@@ -1960,7 +2321,7 @@ def _reduce_artifact(state: BranchState, values: Mapping[str, Any]) -> BranchSta
         status = child.artifact_status
         if kind == "child_integrated":
             status = "integrated"
-        elif kind in {"merge_committed", "merge_reconciled"}:
+        elif kind in {"merge_committed", "merge_reconciled", "resolver_succeeded"}:
             status = "published"
         child_result = child.result
         if kind == "main_worktree_stale" and child_result is not None:
@@ -1987,9 +2348,7 @@ def _reduce_artifact(state: BranchState, values: Mapping[str, Any]) -> BranchSta
             )
         return _add_blocker(
             state,
-            _optional_string(_value(values, "reason", "message"))
-            if kind in {"merge_failed", "join_invariant_failed"}
-            else None,
+            reason if kind == "join_invariant_failed" else None,
         )
 
     if not _root_event(state, task_id):
@@ -2002,7 +2361,12 @@ def _reduce_artifact(state: BranchState, values: Mapping[str, Any]) -> BranchSta
             worktree_head=new_head or artifacts.worktree_head,
             dirty=False if dirty is None else dirty,
         )
-    elif kind in {"child_integrated", "merge_committed", "merge_reconciled"}:
+    elif kind in {
+        "child_integrated",
+        "merge_committed",
+        "merge_reconciled",
+        "resolver_succeeded",
+    }:
         artifacts = replace(
             artifacts,
             accepted_integration_head=new_head or artifacts.accepted_integration_head,
@@ -2033,37 +2397,126 @@ def _reduce_artifact(state: BranchState, values: Mapping[str, Any]) -> BranchSta
         )
     state = _add_blocker(
         state,
-        _optional_string(_value(values, "reason", "message"))
-        if kind in {"merge_failed", "join_invariant_failed"}
-        else None,
+        reason if kind == "join_invariant_failed" else None,
     )
     return _set_delta(state, f"artifact event: {kind}")
 
 
 def _reduce_child_failure(state: BranchState, values: Mapping[str, Any]) -> BranchState:
     task_id = _task_id(values)
-    child_id = _optional_string(values.get("child_task_id")) or task_id
+    child_id = _optional_string(values.get("child_task_id"))
+    if child_id is None and values.get("kind") == "child_failed":
+        child_id = task_id
     parent_id = _parent_id(values)
     if child_id is None:
         return state
     state = _prepare_identity(state, values, prefer_parent=parent_id is not None)
-    state = _ensure_child(state, child_id, parent_id)
-    child = next(child for child in state.children if child.branch_id == child_id)
     lifecycle = Lifecycle.REJECTED if values.get("kind") == "child_rejected" else Lifecycle.FAILED
     result_status = "rejected" if lifecycle is Lifecycle.REJECTED else "failed"
-    child = replace(
-        child,
-        parent_branch_id=parent_id or child.parent_branch_id,
-        lifecycle=_transition(child.lifecycle, lifecycle),
-        result=ResultEnvelope(
-            status=result_status,
-            failure_reason=_optional_string(_value(values, "reason", "message")),
+    reason = _failure_reason(values, lifecycle.value)
+    child_index = _find_child_index(state, child_id)
+    prior_result = (
+        state.children[child_index].result
+        if child_index is not None
+        else state.result
+        if child_id == state.identity.branch_id
+        else None
+    )
+    if lifecycle is Lifecycle.REJECTED:
+        result = (
+            replace(
+                prior_result,
+                status=result_status,
+                failure_reason=reason,
+                failure_source=FailureSource.CHILD_REJECTED,
+                summary=prior_result.summary
+                if prior_result is not None and prior_result.summary is not None
+                else _optional_string(values.get("message")),
+            )
+            if prior_result is not None
+            else ResultEnvelope(
+                status=result_status,
+                failure_reason=reason,
+                failure_source=FailureSource.CHILD_REJECTED,
+                summary=_optional_string(values.get("message")),
+            )
+        )
+    else:
+        result = _failure_result(
+            prior_result,
+            source="child_failed",
+            reason=reason,
             summary=_optional_string(values.get("message")),
+        )
+    if child_id == state.identity.branch_id:
+        state = replace(
+            state,
+            identity=replace(
+                state.identity,
+                lifecycle=_transition(
+                    state.identity.lifecycle,
+                    lifecycle,
+                    terminal_authoritative=True,
+                ),
+            ),
+            result=result,
+        )
+    else:
+        state = _ensure_child(state, child_id, parent_id)
+        child = next(child for child in state.children if child.branch_id == child_id)
+        child = replace(
+            child,
+            parent_branch_id=parent_id or child.parent_branch_id,
+            lifecycle=_transition(child.lifecycle, lifecycle, terminal_authoritative=True),
+            result=result,
+        )
+        state = _replace_child(state, child_id, child)
+    return _add_blocker(state, f"child {child_id}: {reason}")
+
+
+def _record_terminal_failure(
+    state: BranchState,
+    values: Mapping[str, Any],
+    *,
+    source: str,
+    status: str = Lifecycle.FAILED.value,
+    reason: str | None = None,
+) -> BranchState:
+    """Project a supervisor-owned terminal failure onto its branch result."""
+
+    task_id = _task_id(values)
+    if task_id is None:
+        return state
+    reason = reason or _failure_reason(values, source)
+    child_index = _find_child_index(state, task_id)
+    if child_index is not None:
+        child = state.children[child_index]
+        return _replace_child(
+            state,
+            task_id,
+            replace(
+                child,
+                result=_failure_result(
+                    child.result,
+                    source=source,
+                    reason=reason,
+                    summary=_optional_string(values.get("message")),
+                    status=status,
+                ),
+            ),
+        )
+    if not _root_event(state, task_id):
+        return state
+    return replace(
+        state,
+        result=_failure_result(
+            state.result,
+            source=source,
+            reason=reason,
+            summary=_optional_string(values.get("message")),
+            status=status,
         ),
     )
-    state = _replace_child(state, child_id, child)
-    reason = _optional_string(_value(values, "reason", "message")) or lifecycle.value
-    return _add_blocker(state, f"child {child_id}: {reason}")
 
 
 def _reduce_generic_lifecycle(state: BranchState, values: Mapping[str, Any]) -> BranchState:
@@ -2099,12 +2552,21 @@ def _reduce_generic_lifecycle(state: BranchState, values: Mapping[str, Any]) -> 
         "task_cancelled": Lifecycle.CANCELLED,
     }.get(kind)
     state = _prepare_identity(state, values)
+    terminal_failure = kind in _AUTHORITATIVE_FAILURE_KINDS
     state = _progress(
         state,
         values,
         desired,
         restart=kind in {"restart_scheduled", "recover"},
+        terminal_authoritative=terminal_failure,
     )
+    if terminal_failure is True:
+        state = _record_terminal_failure(
+            state,
+            values,
+            source=kind or desired.value,
+            status=desired.value,
+        )
     if kind in {
         "timeout",
         "fatal_error",
@@ -2251,6 +2713,7 @@ def _handler_for(kind: str) -> Callable[[BranchState, Mapping[str, Any]], Branch
         "merge_committed",
         "merge_failed",
         "merge_reconciled",
+        "resolver_succeeded",
         "worktree_salvaged",
         "worktree_pruned",
         "worktree_cleanup_deferred",
@@ -2334,6 +2797,7 @@ def from_json(document: str | bytes | bytearray | Mapping[str, Any]) -> BranchSt
 __all__ = [
     "SCHEMA_VERSION",
     "Lifecycle",
+    "FailureSource",
     "Identity",
     "Mission",
     "Authority",

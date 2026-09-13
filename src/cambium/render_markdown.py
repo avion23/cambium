@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import shutil
 from functools import lru_cache
 from io import StringIO
@@ -19,7 +18,7 @@ from rich.style import Style
 from rich.syntax import Syntax
 from rich.theme import Theme
 
-from .terminal import sanitize_terminal_text, terminal_color_depth
+from .terminal import sanitize_terminal_text, terminal_capabilities
 
 
 class _CambiumHeading(Heading):
@@ -151,7 +150,7 @@ def render_markdown_lines(text: str, *, width: int, color_depth: int = 16) -> li
         markup=False,
         no_color=color_system is None,
         theme=markdown_theme(),
-        width=max(20, width),
+        width=max(1, width),
     )
     lines: list[str] = []
     for line in console.render_lines(markdown_document(text), pad=False):
@@ -176,9 +175,10 @@ def render_markdown_lines(text: str, *, width: int, color_depth: int = 16) -> li
 
 def render_markdown(text: str, *, width: int | None = None, color_depth: int = 256) -> str:
     """Render Markdown to ANSI using Cambium's in-process Rich renderer."""
+    requested_width = shutil.get_terminal_size((100, 40)).columns if width is None else width
     lines = render_markdown_lines(
         text,
-        width=max(20, width or shutil.get_terminal_size((100, 40)).columns),
+        width=max(1, requested_width),
         color_depth=color_depth,
     )
     return "\n".join(lines) + ("\n" if lines else "")
@@ -187,16 +187,13 @@ def render_markdown(text: str, *, width: int | None = None, color_depth: int = 2
 def render_markdown_if_tty(text: str, stream: TextIO) -> str:
     """Render on an interactive color terminal; otherwise return sanitized plain text."""
     clean = sanitize_terminal_text(text)
-    try:
-        is_tty = bool(stream.isatty())
-    except (AttributeError, OSError, ValueError):
-        return clean
-    if not is_tty or os.environ.get("NO_COLOR") or os.environ.get("TERM", "") == "dumb":
+    capabilities = terminal_capabilities(stream)
+    if capabilities.color_depth == 0:
         return clean
     return render_markdown(
         clean,
         width=shutil.get_terminal_size((100, 40)).columns,
-        color_depth=terminal_color_depth(stream),
+        color_depth=capabilities.color_depth,
     )
 
 

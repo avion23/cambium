@@ -64,6 +64,10 @@ def _sse(*events: dict[str, Any]) -> bytes:
     )
 
 
+def _sse_without_done(*events: dict[str, Any]) -> bytes:
+    return b"".join(b"data: " + json.dumps(event).encode("utf-8") + b"\n\n" for event in events)
+
+
 class _MemorySocket:
     def __init__(self, data: bytes) -> None:
         self._file = io.BytesIO(data)
@@ -269,6 +273,324 @@ def test_chat_completions_stream_reasoning_output_and_usage_live() -> None:
         ]
         assert server.calls[0]["stream"] is True
         assert server.calls[0]["stream_options"] == {"include_usage": True}
+    finally:
+        server.close()
+
+
+def test_chat_completions_stream_eof_before_terminal_is_rejected() -> None:
+    stream = _sse_without_done(
+        {
+            "model": "m-partial",
+            "choices": [{"index": 0, "delta": {"content": "partial"}}],
+        }
+    )
+    server = FakeServer([(200, stream, 0.0, {"Content-Type": "text/event-stream"})])
+    router = Diffundo((_config("p_partial", server, "K_PARTIAL", model="m-partial"),))
+    statuses: list[dict[str, Any]] = []
+    try:
+        with pytest.raises(AllProvidersFailed) as raised:
+            asyncio.run(
+                router.call(
+                    ProviderTier.FAST,
+                    PROMPT,
+                    on_status=lambda event: statuses.append(dict(event)),
+                )
+            )
+        error = cast(ProviderError, raised.value.last_error)
+        assert error.outcome is ProviderOutcome.ERROR
+        assert "malformed" in error.message.casefold()
+        assert "stream" in error.message.casefold()
+        assert router.health("p_partial") is HealthState.COOLDOWN
+        assert len(server.calls) == 1
+        assert [event["kind"] for event in statuses] == [
+            "provider_attempt",
+            "provider_failed",
+        ]
+        assert statuses[-1]["outcome"] == ProviderOutcome.ERROR.value
+    finally:
+        server.close()
+
+
+def test_chat_completions_stream_terminal_reason_without_done_succeeds() -> None:
+    stream = _sse_without_done(
+        {
+            "model": "m-terminal-no-done",
+            "choices": [
+                {"index": 0, "delta": {"content": "complete"}, "finish_reason": "stop"}
+            ],
+        }
+    )
+    server = FakeServer([(200, stream, 0.0, {"Content-Type": "text/event-stream"})])
+    router = Diffundo(
+        (_config("p_terminal_no_done", server, "K_TERMINAL_NO_DONE", model="m-terminal-no-done"),)
+    )
+    try:
+        result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert result.content == "complete"
+        assert result.provider == "p_terminal_no_done"
+    finally:
+        server.close()
+
+
+def test_chat_completions_stream_done_without_terminal_reason_is_rejected() -> None:
+    stream = _sse(
+        {
+            "model": "m-no-reason",
+            "choices": [{"index": 0, "delta": {"content": "partial"}}],
+        }
+    )
+    server = FakeServer([(200, stream, 0.0, {"Content-Type": "text/event-stream"})])
+    router = Diffundo((_config("p_no_reason", server, "K_NO_REASON", model="m-no-reason"),))
+    try:
+        with pytest.raises(AllProvidersFailed) as raised:
+            asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        error = cast(ProviderError, raised.value.last_error)
+        assert error.outcome is ProviderOutcome.ERROR
+        assert "finish_reason" in error.message
+        assert router.health("p_no_reason") is HealthState.COOLDOWN
+    finally:
+        server.close()
+
+
+def test_chat_completions_stream_rejects_data_after_done() -> None:
+    stream = _sse(
+        {
+            "model": "m_late_terminal",
+            "choices": [{"index": 0, "delta": {"content": "partial"}}],
+        }
+    ) + (
+        b'data: {"model":"m_late_terminal","choices":[{"index":0,"delta":{},'
+        b'"finish_reason":"stop"}]}'
+        b"\n\n"
+    )
+    server = FakeServer([(200, stream, 0.0, {"Content-Type": "text/event-stream"})])
+    router = Diffundo(
+        (_config("p_late_terminal", server, "K_LATE_TERMINAL", model="m_late_terminal"),)
+    )
+    try:
+        with pytest.raises(AllProvidersFailed) as raised:
+            asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        error = cast(ProviderError, raised.value.last_error)
+        assert error.outcome is ProviderOutcome.ERROR
+        assert "after terminal" in error.message
+        assert router.health("p_late_terminal") is HealthState.COOLDOWN
+    finally:
+        server.close()
+
+
+def test_chat_completions_stream_rejects_data_after_finish_reason() -> None:
+    stream = _sse(
+        {
+            "model": "m_late_delta",
+            "choices": [
+                {"index": 0, "delta": {"content": "first"}, "finish_reason": "stop"}
+            ],
+        },
+        {
+            "model": "m_late_delta",
+            "choices": [{"index": 0, "delta": {"content": "late"}}],
+        },
+    )
+    server = FakeServer([(200, stream, 0.0, {"Content-Type": "text/event-stream"})])
+    router = Diffundo(
+        (_config("p_late_delta", server, "K_LATE_DELTA", model="m_late_delta"),)
+    )
+    try:
+        with pytest.raises(AllProvidersFailed) as raised:
+            asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        error = cast(ProviderError, raised.value.last_error)
+        assert error.outcome is ProviderOutcome.ERROR
+        assert "after terminal" in error.message
+        assert router.health("p_late_delta") is HealthState.COOLDOWN
+    finally:
+        server.close()
+
+
+def test_chat_completions_stream_invalid_event_data_is_rejected() -> None:
+    stream = (
+        b'data: {"model":"m_invalid_event","choices":[{"index":0,"delta":'
+        b'{"content":"partial"}}]}\n\n'
+        b"data: {not-json}\n\n"
+        b'data: {"model":"m_invalid_event","choices":[{"index":0,"delta":{},'
+        b'"finish_reason":"stop"}]}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    server = FakeServer([(200, stream, 0.0, {"Content-Type": "text/event-stream"})])
+    router = Diffundo(
+        (_config("p_invalid_event", server, "K_INVALID_EVENT", model="m_invalid_event"),)
+    )
+    try:
+        with pytest.raises(AllProvidersFailed) as raised:
+            asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        error = cast(ProviderError, raised.value.last_error)
+        assert error.outcome is ProviderOutcome.ERROR
+        assert "invalid event data" in error.message
+        assert router.health("p_invalid_event") is HealthState.COOLDOWN
+    finally:
+        server.close()
+
+
+def test_chat_completions_stream_rejects_malformed_tool_call_delta() -> None:
+    stream = _sse(
+        {
+            "model": "m_bad_tool_stream",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"tool_calls": ["not-a-tool-call"]},
+                    "finish_reason": "tool_calls",
+                }
+            ],
+        }
+    )
+    server = FakeServer([(200, stream, 0.0, {"Content-Type": "text/event-stream"})])
+    router = Diffundo(
+        (_config("p_bad_tool_stream", server, "K_BAD_TOOL_STREAM", model="m_bad_tool_stream"),)
+    )
+    try:
+        with pytest.raises(AllProvidersFailed) as raised:
+            asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        error = cast(ProviderError, raised.value.last_error)
+        assert error.outcome is ProviderOutcome.ERROR
+        assert "invalid tool call" in error.message
+        assert router.health("p_bad_tool_stream") is HealthState.COOLDOWN
+    finally:
+        server.close()
+
+
+def test_chat_completions_stream_with_terminal_reason_succeeds() -> None:
+    stream = _sse(
+        {
+            "model": "m-complete",
+            "choices": [{"index": 0, "delta": {"content": "complete"}}],
+        },
+        {
+            "model": "m-complete",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        },
+    )
+    server = FakeServer([(200, stream, 0.0, {"Content-Type": "text/event-stream"})])
+    router = Diffundo((_config("p_complete", server, "K_COMPLETE", model="m-complete"),))
+    try:
+        result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert result.provider == "p_complete"
+        assert result.model == "m-complete"
+        assert result.content == "complete"
+        assert result.tool_calls is None
+        assert router.health("p_complete") is HealthState.HEALTHY
+    finally:
+        server.close()
+
+
+def test_chat_completions_stream_tool_call_terminal_reason_succeeds() -> None:
+    stream = _sse(
+        {
+            "model": "m-tool-stream",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_stream",
+                                "type": "function",
+                                "function": {
+                                    "name": "search",
+                                    "arguments": '{"query":',
+                                },
+                            }
+                        ]
+                    },
+                }
+            ],
+        },
+        {
+            "model": "m-tool-stream",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "function": {"arguments": ' "x"}'},
+                            }
+                        ]
+                    },
+                }
+            ],
+        },
+        {
+            "model": "m-tool-stream",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+        },
+    )
+    server = FakeServer([(200, stream, 0.0, {"Content-Type": "text/event-stream"})])
+    router = Diffundo((_config("p_tool_stream", server, "K_TOOL_STREAM", model="m-tool-stream"),))
+    try:
+        result = asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        assert result.provider == "p_tool_stream"
+        assert result.content == ""
+        assert result.tool_calls is not None
+        assert len(result.tool_calls) == 1
+        tool_call = result.tool_calls[0]
+        assert tool_call["id"] == "call_stream"
+        assert tool_call["function"]["name"] == "search"
+        assert tool_call["function"]["arguments"] == '{"query": "x"}'
+        assert router.health("p_tool_stream") is HealthState.HEALTHY
+    finally:
+        server.close()
+
+
+def test_chat_completions_stream_multiple_choice_indexes_are_rejected() -> None:
+    stream = _sse(
+        {
+            "model": "m-multiple",
+            "choices": [{"index": 0, "delta": {"content": "first"}}],
+        },
+        {
+            "model": "m-multiple",
+            "choices": [{"index": 1, "delta": {"content": "second"}}],
+        },
+        {
+            "model": "m-multiple",
+            "choices": [{"index": 1, "delta": {}, "finish_reason": "stop"}],
+        }
+    )
+    server = FakeServer([(200, stream, 0.0, {"Content-Type": "text/event-stream"})])
+    router = Diffundo((_config("p_multiple", server, "K_MULTIPLE", model="m-multiple"),))
+    try:
+        with pytest.raises(AllProvidersFailed) as raised:
+            asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        error = cast(ProviderError, raised.value.last_error)
+        assert error.outcome is ProviderOutcome.ERROR
+        assert "choice" in error.message.casefold()
+        assert router.health("p_multiple") is HealthState.COOLDOWN
+        assert len(server.calls) == 1
+    finally:
+        server.close()
+
+
+def test_chat_completions_stream_multiple_indexless_choices_are_rejected() -> None:
+    stream = _sse(
+        {
+            "model": "m-indexless",
+            "choices": [
+                {"delta": {"content": "first"}},
+                {"delta": {"content": "second"}},
+            ],
+        }
+    )
+    server = FakeServer([(200, stream, 0.0, {"Content-Type": "text/event-stream"})])
+    router = Diffundo((_config("p_indexless", server, "K_INDEXLESS", model="m-indexless"),))
+    try:
+        with pytest.raises(AllProvidersFailed) as raised:
+            asyncio.run(router.call(ProviderTier.FAST, PROMPT))
+        error = cast(ProviderError, raised.value.last_error)
+        assert error.outcome is ProviderOutcome.ERROR
+        assert "choice" in error.message.casefold()
+        assert router.health("p_indexless") is HealthState.COOLDOWN
     finally:
         server.close()
 

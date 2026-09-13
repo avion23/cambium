@@ -38,6 +38,34 @@ def _event(
     return record
 
 
+def test_unknown_cache_evidence_clears_previous_hit_miss_state() -> None:
+    state = ObservabilityState()
+    state.apply(
+        _event(
+            1,
+            "usage_event",
+            task_id="root",
+            provider="codex",
+            model="gpt",
+            call_kind="agent",
+            provider_cache_hit=True,
+        )
+    )
+    assert state.snapshot().agents[0].last_provider_cache_hit is True
+
+    state.apply(
+        _event(
+            2,
+            "usage_event",
+            task_id="root",
+            provider="codex",
+            model="gpt",
+            call_kind="agent",
+        )
+    )
+    assert state.snapshot().agents[0].last_provider_cache_hit is None
+
+
 def test_reducer_exposes_main_and_subagent_usage_and_models() -> None:
     events = [
         _event(1, "session_started"),
@@ -145,6 +173,264 @@ def test_first_terminal_state_wins_over_late_events(
     assert snapshot.agents[0].turn == expected_turn
     assert snapshot.succeeded_agents == succeeded
     assert snapshot.failed_agents == failed
+
+
+@pytest.mark.parametrize(
+    ("kind", "payload", "expected_state"),
+    (
+        ("child_result", {"status": "succeeded"}, "succeeded"),
+        ("child_result", {"status": "timeout"}, "failed"),
+        ("child_failed", {"reason": "provider timeout"}, "failed"),
+    ),
+)
+def test_child_terminal_events_transition_the_admitted_child(
+    kind: str, payload: dict, expected_state: str
+) -> None:
+    events = [
+        _event(
+            1,
+            "child_admitted",
+            task_id="parent",
+            parent_task_id="parent",
+            child_task_id="child",
+        ),
+        _event(2, kind, task_id="child", parent_task_id="parent", **payload),
+    ]
+
+    snapshot = snapshot_from_events(events)
+
+    parent = next(agent for agent in snapshot.agents if agent.task_id == "parent")
+    child = next(agent for agent in snapshot.agents if agent.task_id == "child")
+    assert parent.state == "queued"
+    assert child.parent_task_id == "parent"
+    assert child.state == expected_state
+
+
+def test_child_terminal_event_payload_identity_does_not_fail_the_parent() -> None:
+    snapshot = snapshot_from_events(
+        [
+            _event(
+                1,
+                "child_admitted",
+                task_id="parent",
+                parent_task_id="parent",
+                child_task_id="child",
+            ),
+            _event(
+                2,
+                "child_result",
+                task_id="parent",
+                child_task_id="child",
+                status="succeeded",
+            ),
+        ]
+    )
+
+    parent = next(agent for agent in snapshot.agents if agent.task_id == "parent")
+    child = next(agent for agent in snapshot.agents if agent.task_id == "child")
+    assert parent.state == "queued"
+    assert child.state == "succeeded"
+
+
+def test_unattributed_child_rejection_does_not_reject_the_parent() -> None:
+    snapshot = snapshot_from_events(
+        [
+            _event(1, "task_queued", task_id="parent"),
+            _event(
+                2,
+                "child_rejected",
+                task_id="parent",
+                parent_task_id="parent",
+                child_task_id=None,
+                reason="MalformedProposal",
+            ),
+        ]
+    )
+
+    assert snapshot.agents[0].state == "queued"
+
+
+def test_unresolvable_child_result_projects_as_failure() -> None:
+    snapshot = snapshot_from_events(
+        [
+            _event(
+                1,
+                "child_admitted",
+                task_id="parent",
+                parent_task_id="parent",
+                child_task_id="child",
+            ),
+            _event(2, "child_result", task_id="child", status="unresolvable"),
+        ]
+    )
+
+    child = next(agent for agent in snapshot.agents if agent.task_id == "child")
+    assert child.state == "failed"
+
+
+@pytest.mark.parametrize("kind", ("worker_failed", "merge_failed", "join_invariant_failed"))
+def test_late_durable_failure_invalidates_provisional_success(kind: str) -> None:
+    snapshot = snapshot_from_events(
+        [
+            _event(1, "result", task_id="root", status="succeeded"),
+            _event(2, kind, task_id="root", reason=f"{kind} after result"),
+        ]
+    )
+
+    assert snapshot.agents[0].state == "failed"
+    assert snapshot.succeeded_agents == 0
+    assert snapshot.failed_agents == 1
+
+
+def test_recoverable_merge_diagnostic_does_not_invalidate_success() -> None:
+    snapshot = snapshot_from_events(
+        [
+            _event(1, "result", task_id="root", status="succeeded"),
+            _event(
+                2,
+                "merge_failed",
+                task_id="root",
+                internal=True,
+                recoverable=True,
+                message="observer failed after private integration",
+            ),
+            _event(3, "resolver_succeeded", task_id="root", status="succeeded"),
+        ]
+    )
+
+    assert snapshot.agents[0].state == "succeeded"
+    assert snapshot.succeeded_agents == 1
+    assert snapshot.failed_agents == 0
+
+
+def test_stale_merge_recovery_cannot_claim_success_for_a_pending_diagnostic() -> None:
+    snapshot = snapshot_from_events(
+        [
+            _event(1, "spawned", task_id="root", generation=1),
+            _event(
+                2,
+                "merge_failed",
+                task_id="root",
+                generation=1,
+                internal=True,
+                recoverable=True,
+                reason="observer failed after integration",
+            ),
+            _event(
+                3,
+                "merge_committed",
+                task_id="root",
+                generation=0,
+                status="succeeded",
+            ),
+        ]
+    )
+
+    assert snapshot.agents[0].state == "starting"
+    assert snapshot.succeeded_agents == 0
+    assert snapshot.failed_agents == 0
+
+
+def test_merge_conflict_recovery_restores_provisional_success() -> None:
+    snapshot = snapshot_from_events(
+        [
+            _event(1, "result", task_id="root", status="succeeded"),
+            _event(2, "merge_failed", task_id="root", status="merge_conflict"),
+            _event(3, "resolver_succeeded", task_id="root", status="succeeded"),
+        ]
+    )
+
+    assert snapshot.agents[0].state == "succeeded"
+    assert snapshot.succeeded_agents == 1
+    assert snapshot.failed_agents == 0
+
+
+def test_recovery_does_not_clear_worker_failure_after_merge_diagnostic() -> None:
+    snapshot = snapshot_from_events(
+        [
+            _event(1, "result", task_id="root", status="succeeded"),
+            _event(2, "merge_failed", task_id="root", reason="merge conflict"),
+            _event(3, "worker_failed", task_id="root", reason="worker integrity"),
+            _event(4, "merge_committed", task_id="root", status="succeeded"),
+        ]
+    )
+
+    assert snapshot.agents[0].state == "failed"
+    assert snapshot.succeeded_agents == 0
+    assert snapshot.failed_agents == 1
+
+
+@pytest.mark.parametrize("generation", (None, 0, 2))
+def test_stale_or_unqualified_merge_recovery_does_not_clear_failure(generation) -> None:
+    snapshot = snapshot_from_events(
+        [
+            _event(1, "result", task_id="root", generation=1, status="succeeded"),
+            _event(2, "merge_failed", task_id="root", generation=1, reason="conflict"),
+            _event(
+                3,
+                "merge_committed",
+                task_id="root",
+                generation=generation,
+                status="succeeded",
+            ),
+        ]
+    )
+
+    assert snapshot.agents[0].state == "failed"
+    assert snapshot.succeeded_agents == 0
+    assert snapshot.failed_agents == 1
+
+
+def test_merge_reconciled_does_not_clear_a_merge_failure() -> None:
+    snapshot = snapshot_from_events(
+        [
+            _event(1, "result", task_id="root", generation=1, status="succeeded"),
+            _event(2, "merge_failed", task_id="root", generation=1, reason="conflict"),
+            _event(3, "merge_reconciled", task_id="root", generation=1, status="succeeded"),
+        ]
+    )
+
+    assert snapshot.agents[0].state == "failed"
+    assert snapshot.succeeded_agents == 0
+    assert snapshot.failed_agents == 1
+
+    diagnostic = snapshot_from_events(
+        [
+            _event(1, "spawned", task_id="root", generation=1),
+            _event(
+                2,
+                "merge_failed",
+                task_id="root",
+                generation=1,
+                internal=True,
+                recoverable=True,
+                reason="observer diagnostic",
+            ),
+            _event(
+                3,
+                "merge_reconciled",
+                task_id="root",
+                generation=1,
+                status="succeeded",
+            ),
+        ]
+    )
+    assert diagnostic.agents[0].state == "starting"
+
+
+def test_timeout_restart_can_publish_a_new_generation_success() -> None:
+    snapshot = snapshot_from_events(
+        [
+            _event(1, "timeout", task_id="root", generation=1),
+            _event(2, "restart_scheduled", task_id="root", generation=1),
+            _event(3, "spawned", task_id="root", generation=2),
+            _event(4, "result", task_id="root", generation=2, status="succeeded"),
+        ]
+    )
+
+    assert snapshot.agents[0].state == "succeeded"
+    assert snapshot.succeeded_agents == 1
+    assert snapshot.failed_agents == 0
 
 
 def test_checkpoint_inspection_rejects_symlink_outside_session(tmp_path: Path) -> None:

@@ -139,7 +139,8 @@ from .store import (
     EventStore,
     StoreError,
     _PreRedactedEvent,
-    count_events_file,
+    iter_event_pages,
+    max_event_seq_file,
     read_events_file,
 )
 from .summary_trunk import semantic_summary_messages
@@ -1226,8 +1227,11 @@ def _terminal_action_for_event(value: Any) -> dict[str, Any] | None:
     }
 
 
-_TOOL_EVENT_INT_FIELDS = ("batch_index", "batch_size", "turn")
+_TOOL_EVENT_INT_FIELDS = ("batch_index", "batch_size", "turn", "output_bytes")
 _TOOL_EVENT_DURATION_FIELDS = ("duration_ms",)
+_TOOL_OUTPUT_ARTIFACT_FIELDS = ("output_ref", "output_sha256", "output_bytes")
+_TOOL_OUTPUT_REF_RE = re.compile(r"\.cambium/spill/run-[0-9]+-[0-9]+\.txt\Z")
+_TOOL_OUTPUT_SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _TOOL_OUTPUT_DELTA_MAX_BYTES = 2048
 _TOOL_OUTPUT_STREAMS = frozenset({"stdout", "stderr"})
 _USAGE_EVENT_FORWARD_FIELDS = frozenset(
@@ -1284,7 +1288,28 @@ def _invalid_tool_event_fields(msg: dict[str, Any]) -> list[str]:
             and math.isfinite(cast(int | float, value))
         ):
             invalid.append(field)
-    return invalid
+    artifact_present = [field in msg for field in _TOOL_OUTPUT_ARTIFACT_FIELDS]
+    if any(artifact_present) and not all(artifact_present):
+        invalid.extend(
+            field
+            for field, present in zip(
+                _TOOL_OUTPUT_ARTIFACT_FIELDS,
+                artifact_present,
+                strict=True,
+            )
+            if not present
+        )
+    if "output_ref" in msg and (
+        not isinstance(msg["output_ref"], str)
+        or _TOOL_OUTPUT_REF_RE.fullmatch(msg["output_ref"]) is None
+    ):
+        invalid.append("output_ref")
+    if "output_sha256" in msg and (
+        not isinstance(msg["output_sha256"], str)
+        or _TOOL_OUTPUT_SHA256_RE.fullmatch(msg["output_sha256"]) is None
+    ):
+        invalid.append("output_sha256")
+    return sorted(set(invalid))
 
 
 def _invalid_tool_output_delta_fields(msg: dict[str, Any]) -> list[str]:
@@ -2181,9 +2206,12 @@ def _interactive_turn_event_stores(session_dir: Path) -> list[tuple[int, Path]]:
         match = re.fullmatch(r"turn-(\d+)", child.name)
         if match is None or child.is_symlink() or not child.is_dir():
             continue
+        number = int(match.group(1))
+        if child.name != f"turn-{number:04d}":
+            continue
         event_db = child / ".cambium" / "events.db"
         if not event_db.is_symlink() and event_db.is_file():
-            stores.append((int(match.group(1)), event_db))
+            stores.append((number, event_db))
     stores.sort(key=lambda item: item[0])
     return stores
 
@@ -2199,7 +2227,14 @@ def _interactive_event_timestamp(event: Mapping[str, Any]) -> float | None:
     return timestamp if math.isfinite(timestamp) else None
 
 
+def _interactive_event_turn(event: Mapping[str, Any], fallback_turn: int) -> int:
+    payload = event.get("payload")
+    event_turn = payload.get("turn") if isinstance(payload, Mapping) else None
+    return event_turn if type(event_turn) is int and event_turn >= 0 else fallback_turn
+
+
 _INTERACTIVE_READ_BUSY_TIMEOUT_MS = 200
+_INTERACTIVE_READ_PAGE_SIZE = 4096
 
 
 @dataclass(frozen=True, slots=True)
@@ -2238,6 +2273,23 @@ def _cursor_positions(cursor: EventCursor) -> dict[str, int]:
     return positions
 
 
+def _cursor_position_limits(
+    limits: Mapping[str, int] | Iterable[tuple[str, int]] | None,
+) -> dict[str, int] | None:
+    """Validate fixed per-store endpoints used by finite replay drains."""
+    if limits is None:
+        return None
+    entries = limits.items() if isinstance(limits, Mapping) else limits
+    validated: dict[str, int] = {}
+    for key, sequence in entries:
+        if not isinstance(key, str) or not key:
+            raise ValueError("event cursor limit store key must be a non-empty string")
+        if type(sequence) is not int or sequence < 0:
+            raise ValueError("event cursor limit must be a non-negative integer")
+        validated[key] = sequence
+    return validated
+
+
 def _interactive_store_key(turn: int) -> str:
     return f"turn:{turn}"
 
@@ -2250,65 +2302,203 @@ def _transient_event_store_lock(exc: StoreError) -> bool:
 
 
 def _read_interactive_events_with_cursor(
-    session_dir: Path, cursor: EventCursor
+    session_dir: Path,
+    cursor: EventCursor,
+    *,
+    max_positions: Mapping[str, int] | Iterable[tuple[str, int]] | None = None,
 ) -> tuple[list[dict[str, Any]], EventCursor]:
-    """Read only rows beyond each source's cursor and append a new watermark."""
+    """Read one globally bounded, turn-ordered page beyond each store cursor.
+
+    A full page from an earlier turn stops the scan before any later turn.  A
+    short page proves that store has reached its durable tail, so the
+    remaining capacity can be filled from subsequent stores.  ``max_positions``
+    is an optional fixed endpoint captured before a finite monitor drain;
+    rows appended after that endpoint are left for a later live poll.
+    """
     positions = _cursor_positions(cursor)
+    limits = _cursor_position_limits(max_positions)
     next_positions = dict(positions)
     turn_stores = _interactive_turn_event_stores(session_dir)
     records: list[tuple[int, int, float | None, int, dict[str, Any]]] = []
+    fallback_turn = turn_stores[-1][0] + 1 if turn_stores else 0
+    prefetched_turn: int | None = None
+    prefetched_page: list[dict[str, Any]] = []
+
+    # Find the first turn store that can actually contribute beyond this
+    # cursor.  Empty or already-drained early directories must not hide a
+    # parent record whose logical turn precedes the next non-empty turn.
     for turn, event_db in turn_stores:
         store_key = _interactive_store_key(turn)
+        if limits is not None and store_key not in limits:
+            continue
+        source_after = positions.get(store_key, 0)
+        source_limit = limits.get(store_key) if limits is not None else None
+        if source_limit is not None and source_after >= source_limit:
+            continue
         try:
-            events = read_events_file(
-                event_db,
-                positions.get(store_key, 0),
-                busy_timeout_ms=_INTERACTIVE_READ_BUSY_TIMEOUT_MS,
+            candidate_page = next(
+                iter_event_pages(
+                    event_db,
+                    after_seq=source_after,
+                    page_size=1,
+                    busy_timeout_ms=_INTERACTIVE_READ_BUSY_TIMEOUT_MS,
+                ),
+                [],
             )
         except StoreError as exc:
             if _transient_event_store_lock(exc):
                 continue
             raise
-        if events:
-            next_positions[store_key] = max(event["seq"] for event in events)
-        for event in events:
-            records.append(
+        if source_limit is not None:
+            candidate_page = [event for event in candidate_page if event["seq"] <= source_limit]
+        if candidate_page:
+            prefetched_turn = turn
+            prefetched_page = candidate_page
+            break
+
+    # Parent-store compaction records normally follow the turn stores, but a
+    # legacy record can carry an earlier or equal logical turn.  Probe its
+    # ordered prefix before filling the page from turn stores so such a record
+    # cannot be stranded behind a full earlier-turn page.  Only the consumed prefix
+    # advances the parent cursor; the remainder is read below after turns.
+    root_event_db = session_dir / ".cambium" / "events.db"
+    root_after = positions.get("root", 0)
+    root_limit = limits.get("root") if limits is not None else None
+    if (
+        prefetched_turn is not None
+        and (limits is None or "root" in limits)
+        and (root_limit is None or root_after < root_limit)
+    ):
+        try:
+            root_probe = next(
+                iter_event_pages(
+                    root_event_db,
+                    after_seq=root_after,
+                    page_size=_INTERACTIVE_READ_PAGE_SIZE,
+                    busy_timeout_ms=_INTERACTIVE_READ_BUSY_TIMEOUT_MS,
+                ),
+                [],
+            )
+        except StoreError as exc:
+            if _transient_event_store_lock(exc):
+                root_probe = []
+            else:
+                raise
+        if root_limit is not None:
+            root_probe = [event for event in root_probe if event["seq"] <= root_limit]
+        early_root: list[dict[str, Any]] = []
+        first_turn = prefetched_turn
+        for event in root_probe:
+            if _interactive_event_turn(event, fallback_turn) > first_turn:
+                break
+            early_root.append(event)
+        if early_root:
+            root_after = early_root[-1]["seq"]
+            next_positions["root"] = root_after
+            records.extend(
                 (
-                    turn,
+                    _interactive_event_turn(event, fallback_turn),
                     event["seq"],
                     _interactive_event_timestamp(event),
-                    0,
+                    1,
+                    event,
+                )
+                for event in early_root
+            )
+
+    for turn, event_db in turn_stores:
+        if limits is not None and _interactive_store_key(turn) not in limits:
+            continue
+        store_key = _interactive_store_key(turn)
+        source_after = positions.get(store_key, 0)
+        source_limit = limits.get(store_key) if limits is not None else None
+        first_page = prefetched_page if turn == prefetched_turn else None
+        while len(records) < _INTERACTIVE_READ_PAGE_SIZE:
+            page_size = _INTERACTIVE_READ_PAGE_SIZE - len(records)
+            if source_limit is not None and source_after >= source_limit:
+                break
+            prefetched = first_page is not None
+            if prefetched:
+                page = first_page
+                first_page = None
+                prefetched_page = []
+            else:
+                try:
+                    pages = iter_event_pages(
+                        event_db,
+                        after_seq=source_after,
+                        page_size=page_size,
+                        busy_timeout_ms=_INTERACTIVE_READ_BUSY_TIMEOUT_MS,
+                    )
+                    page = next(pages, [])
+                except StoreError as exc:
+                    if _transient_event_store_lock(exc):
+                        break
+                    raise
+            if not page:
+                break
+            if source_limit is not None:
+                page = [event for event in page if event["seq"] <= source_limit]
+            if page:
+                source_after = max(event["seq"] for event in page)
+                for event in page:
+                    records.append(
+                        (
+                            turn,
+                            event["seq"],
+                            _interactive_event_timestamp(event),
+                            0,
+                            event,
+                        )
+                    )
+            # The page size is the remaining global capacity.  A short page,
+            # or a page reaching a fixed endpoint, proves this source cannot
+            # contribute another row before the next source.
+            if prefetched:
+                continue
+            if len(page) < page_size or (
+                source_limit is not None and page[-1]["seq"] >= source_limit
+            ):
+                break
+        if source_after > positions.get(store_key, 0):
+            next_positions[store_key] = source_after
+        if len(records) >= _INTERACTIVE_READ_PAGE_SIZE:
+            break
+
+    # Read the legacy parent store only after turn-local rows have claimed
+    # this bounded page.  This prevents a large parent log with high logical
+    # turns from advancing its cursor past older turn-local rows.  Compact
+    # events still sort into their payload turn whenever capacity remains.
+    if len(records) < _INTERACTIVE_READ_PAGE_SIZE and (limits is None or "root" in limits):
+        root_limit = limits.get("root") if limits is not None else None
+        root_events: list[dict[str, Any]] = []
+        if root_limit is None or root_after < root_limit:
+            try:
+                root_pages = iter_event_pages(
+                    root_event_db,
+                    after_seq=root_after,
+                    page_size=_INTERACTIVE_READ_PAGE_SIZE - len(records),
+                    busy_timeout_ms=_INTERACTIVE_READ_BUSY_TIMEOUT_MS,
+                )
+                root_events = next(root_pages, [])
+            except StoreError as exc:
+                if not _transient_event_store_lock(exc):
+                    raise
+        if root_limit is not None:
+            root_events = [event for event in root_events if event["seq"] <= root_limit]
+        if root_events:
+            next_positions["root"] = max(event["seq"] for event in root_events)
+        for event in root_events:
+            logical_turn = _interactive_event_turn(event, fallback_turn)
+            records.append(
+                (
+                    logical_turn,
+                    event["seq"],
+                    _interactive_event_timestamp(event),
+                    1,
                     event,
                 )
             )
-
-    root_event_db = session_dir / ".cambium" / "events.db"
-    try:
-        root_events = read_events_file(
-            root_event_db,
-            positions.get("root", 0),
-            busy_timeout_ms=_INTERACTIVE_READ_BUSY_TIMEOUT_MS,
-        )
-    except StoreError as exc:
-        if not _transient_event_store_lock(exc):
-            raise
-        root_events = []
-    if root_events:
-        next_positions["root"] = max(event["seq"] for event in root_events)
-    fallback_turn = turn_stores[-1][0] + 1 if turn_stores else 0
-    for event in root_events:
-        payload = event.get("payload")
-        event_turn = payload.get("turn") if isinstance(payload, Mapping) else None
-        turn = event_turn if type(event_turn) is int and event_turn >= 0 else fallback_turn
-        records.append(
-            (
-                turn,
-                event["seq"],
-                _interactive_event_timestamp(event),
-                1,
-                event,
-            )
-        )
 
     records.sort(
         key=lambda item: (
@@ -2332,31 +2522,96 @@ def _read_interactive_events_with_cursor(
 
 
 def read_events_with_cursor(
-    session_dir: Path | str, cursor: EventCursor | None = None
+    session_dir: Path | str,
+    cursor: EventCursor | None = None,
+    *,
+    max_positions: Mapping[str, int] | Iterable[tuple[str, int]] | None = None,
 ) -> tuple[list[dict[str, Any]], EventCursor]:
-    """Replay an interactive session with a per-store monotonic cursor."""
+    """Replay one bounded page with a per-store monotonic cursor.
+
+    ``max_positions`` fences replay at fixed store endpoints.  It is intended
+    for finite snapshots such as monitor ``--once``; ordinary live polling
+    must leave it unset so late durable rows remain visible.
+    """
     if cursor is None:
         cursor = EventCursor()
     if not isinstance(cursor, EventCursor):
         raise TypeError("cursor must be an EventCursor")
-    return _read_interactive_events_with_cursor(Path(session_dir), cursor)
+    return _read_interactive_events_with_cursor(
+        Path(session_dir), cursor, max_positions=max_positions
+    )
+
+
+def snapshot_event_positions(
+    session_dir: Path | str,
+    cursor: EventCursor | None = None,
+) -> tuple[tuple[str, int], ...]:
+    """Capture sequence endpoints for a finite replay snapshot.
+
+    The endpoints are sampled before draining.  A store that is temporarily
+    locked is fenced at its current cursor, preserving the existing fail-soft
+    lock handling instead of allowing a later append to make a one-shot drain
+    unbounded.
+    """
+    if cursor is None:
+        cursor = EventCursor()
+    if not isinstance(cursor, EventCursor):
+        raise TypeError("cursor must be an EventCursor")
+    positions = _cursor_positions(cursor)
+    session = Path(session_dir)
+
+    endpoints: dict[str, int] = {}
+    for turn, event_db in _interactive_turn_event_stores(session):
+        key = _interactive_store_key(turn)
+        try:
+            tail = max_event_seq_file(
+                event_db,
+                busy_timeout_ms=_INTERACTIVE_READ_BUSY_TIMEOUT_MS,
+            )
+            endpoints[key] = max(positions.get(key, 0), tail)
+        except StoreError as exc:
+            if not _transient_event_store_lock(exc):
+                raise
+            endpoints[key] = positions.get(key, 0)
+
+    root_key = "root"
+    root_event_db = session / ".cambium" / "events.db"
+    try:
+        tail = max_event_seq_file(
+            root_event_db,
+            busy_timeout_ms=_INTERACTIVE_READ_BUSY_TIMEOUT_MS,
+        )
+        endpoints[root_key] = max(positions.get(root_key, 0), tail)
+    except StoreError as exc:
+        if not _transient_event_store_lock(exc):
+            raise
+        endpoints[root_key] = positions.get(root_key, 0)
+    return tuple(sorted(endpoints.items()))
 
 
 def _read_interactive_events(session_dir: Path, after_seq: int) -> list[dict[str, Any]]:
     """Replay the legacy integer-watermark view of interactive turn stores.
 
     New monitor polling uses :func:`read_events_with_cursor`.  For this
-    compatibility API, turn stores without parent records can still push the
-    integer watermark into SQL by subtracting each earlier store's row count;
-    late inserts require the explicit cursor because an integer has no room for
-    one local position per store.
+    compatibility API, turn stores without parent records translate the
+    integer watermark from a global event ordinal to each store's local
+    sequence.  Late inserts require the explicit cursor because an integer has
+    no room for one local position per store.
     """
     turn_stores = _interactive_turn_event_stores(session_dir)
     if not turn_stores:
         return read_events_file(session_dir / ".cambium" / "events.db", after_seq)
 
     root_event_db = session_dir / ".cambium" / "events.db"
-    root_events = read_events_file(root_event_db)
+    root_events: list[dict[str, Any]] = []
+    try:
+        root_events = read_events_file(
+            root_event_db,
+            busy_timeout_ms=_INTERACTIVE_READ_BUSY_TIMEOUT_MS,
+        )
+    except StoreError as exc:
+        if not _transient_event_store_lock(exc):
+            raise
     if root_events:
         # ``/compact`` is the one legacy path that can write the parent store;
         # retain its historical ordering and filtering semantics.
@@ -2393,21 +2648,30 @@ def _read_interactive_events(session_dir: Path, after_seq: int) -> list[dict[str
         remaining = max(after_seq, 0)
         for turn, event_db in turn_stores:
             try:
-                store_count = count_events_file(
-                    event_db,
-                    busy_timeout_ms=_INTERACTIVE_READ_BUSY_TIMEOUT_MS,
-                )
-                local_after = min(remaining, store_count)
+                local_after = 0
+                consumed = 0
+                if remaining:
+                    for page in iter_event_pages(
+                        event_db,
+                        page_size=_INTERACTIVE_READ_PAGE_SIZE,
+                        busy_timeout_ms=_INTERACTIVE_READ_BUSY_TIMEOUT_MS,
+                    ):
+                        take = min(remaining - consumed, len(page))
+                        if take:
+                            consumed += take
+                            local_after = page[take - 1]["seq"]
+                        if consumed == remaining:
+                            break
                 events = read_events_file(
                     event_db,
-                    local_after,
+                    after_seq=local_after,
                     busy_timeout_ms=_INTERACTIVE_READ_BUSY_TIMEOUT_MS,
                 )
             except StoreError as exc:
                 if not _transient_event_store_lock(exc):
                     raise
                 continue
-            remaining = max(remaining - store_count, 0)
+            remaining = max(remaining - consumed, 0)
             records.extend(
                 (turn, event["seq"], _interactive_event_timestamp(event), 0, event)
                 for event in events
@@ -4498,22 +4762,25 @@ class _Runtime:
             self._child_runners[child_task_id] = self._task_group.create_task(child_coroutine)
         except BaseException as create_error:
             child_coroutine.close()
-            self._rollback_child_admission(parent_task_id, child_task_id, child_spec)
+            reason = str(create_error)[:512]
             if rejections is not None:
                 rejections.append(("ChildSpawnFailed", str(create_error)))
             try:
+                # Admission is already durable. Close it with a durability-critical
+                # child terminal event before removing in-memory state so replay
+                # never leaves a failed spawn looking queued.
                 await self.emit(
-                    "child_rejected",
-                    task_id=parent_task_id,
+                    "child_failed",
+                    task_id=child_task_id,
                     request_id=request_id,
                     parent_task_id=parent_task_id,
                     child_task_id=child_task_id,
                     child_kind=kind,
                     reason="ChildSpawnFailed",
-                    message=str(create_error)[:512],
+                    message=reason,
                 )
                 await self._record_revision_conversation(
-                    outcome="rejected",
+                    outcome="failed",
                     parent_task_id=parent_task_id,
                     child_task_id=child_task_id,
                     child_kind=kind,
@@ -4521,8 +4788,8 @@ class _Runtime:
                     reason="ChildSpawnFailed",
                     proposal=proposal,
                 )
-            except BaseException:
-                pass
+            finally:
+                self._rollback_child_admission(parent_task_id, child_task_id, child_spec)
             return []
         self._admitted_children.setdefault(parent_task_id, []).append(child_task_id)
         return [child_task_id]
@@ -7741,6 +8008,18 @@ class _Runtime:
             for field in ("batch_index", "batch_size", "ok", "duration_ms", "turn"):
                 if field in msg:
                     forwarded[field] = msg[field]
+            if all(field in msg for field in _TOOL_OUTPUT_ARTIFACT_FIELDS):
+                await self.emit(
+                    "tool_output_artifact",
+                    task_id=state.task_id,
+                    generation=state.generation,
+                    tool=msg.get("tool"),
+                    turn=event_turn,
+                    batch_index=msg.get("batch_index", 0),
+                    output_ref=msg["output_ref"],
+                    output_sha256=msg["output_sha256"],
+                    output_bytes=msg["output_bytes"],
+                )
             await self.emit(
                 "tool_event",
                 task_id=state.task_id,

@@ -147,6 +147,9 @@ class K0Projection:
     verification_state: tuple[str, ...]
     open_work: tuple[str, ...]
     verbatim_evidence: tuple[str, ...]
+    # Keep this field last with a default so callers that construct a
+    # projection positionally retain the previous six-value shape.
+    files_and_symbols_changed: tuple[str, ...] = ()
 
     @property
     def verification_results(self) -> tuple[str, ...]:
@@ -167,6 +170,7 @@ class K0Projection:
             "verification_state": list(self.verification_state),
             "open_work": list(self.open_work),
             "verbatim_evidence": list(self.verbatim_evidence),
+            "files_and_symbols_changed": list(self.files_and_symbols_changed),
         }
 
 
@@ -743,12 +747,17 @@ def _semantic_item_key(item: str) -> str:
     return match.group(1) if match is not None else item
 
 
-def _active_semantic_items(
+def _active_semantic_items_full(
     entries: Sequence[SummaryEntry],
     added_fields: tuple[str, ...],
     invalidated_fields: tuple[str, ...],
 ) -> tuple[str, ...]:
-    """Invalidate old values, then apply replacements from the same delta."""
+    """Invalidate old values, then apply replacements from the same delta.
+
+    Values are kept in insertion order.  Replacing an existing semantic ID
+    removes its old position first, so the replacement is treated as the
+    newest active value when the bounded K0 suffix is selected.
+    """
     active: dict[str, str] = {}
     for entry in entries:
         for field in invalidated_fields:
@@ -756,12 +765,32 @@ def _active_semantic_items(
                 active.pop(_semantic_item_key(item), None)
         for field in added_fields:
             for item in getattr(entry, field):
-                active[_semantic_item_key(item)] = item
+                key = _semantic_item_key(item)
+                active.pop(key, None)
+                active[key] = item
     return tuple(active.values())
 
 
-def _unique_semantic_items(entries: Sequence[SummaryEntry], field: str) -> tuple[str, ...]:
-    """Fold an append-only semantic field while retaining source order."""
+def _latest_semantic_items(items: Sequence[str]) -> tuple[str, ...]:
+    """Keep the newest bounded semantic values in source order."""
+    if len(items) <= SUMMARY_MAX_ITEMS:
+        return tuple(items)
+    return tuple(items[-SUMMARY_MAX_ITEMS:])
+
+
+def _active_semantic_items(
+    entries: Sequence[SummaryEntry],
+    added_fields: tuple[str, ...],
+    invalidated_fields: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Fold active semantic values and retain only the newest bounded suffix."""
+    return _latest_semantic_items(
+        _active_semantic_items_full(entries, added_fields, invalidated_fields)
+    )
+
+
+def _unique_semantic_items_full(entries: Sequence[SummaryEntry], field: str) -> tuple[str, ...]:
+    """Fold one append-only semantic field while retaining source order."""
     values: dict[str, str] = {}
     for entry in entries:
         for item in getattr(entry, field):
@@ -769,24 +798,57 @@ def _unique_semantic_items(entries: Sequence[SummaryEntry], field: str) -> tuple
     return tuple(values.values())
 
 
-def _unique_verbatim_items(entries: Sequence[SummaryEntry]) -> tuple[str, ...]:
-    """Retain bounded exact snippets in source order for a K0 projection."""
+def _unique_semantic_items(entries: Sequence[SummaryEntry], field: str) -> tuple[str, ...]:
+    """Fold and bound one append-only semantic field."""
+    return _latest_semantic_items(_unique_semantic_items_full(entries, field))
+
+
+def _unique_verbatim_items_full(entries: Sequence[SummaryEntry]) -> tuple[str, ...]:
+    """Return all unique excerpts in their first-seen source order."""
     values: list[str] = []
     seen: set[str] = set()
-    total_bytes = 0
     for entry in entries:
         for item in entry.verbatim_evidence:
             if item in seen:
                 continue
-            item_bytes = len(item.encode("utf-8"))
-            if len(values) >= SUMMARY_MAX_VERBATIM_ITEMS:
-                return tuple(values)
-            if total_bytes + item_bytes > SUMMARY_MAX_VERBATIM_BYTES:
-                continue
             seen.add(item)
             values.append(item)
-            total_bytes += item_bytes
     return tuple(values)
+
+
+def _unique_verbatim_items(entries: Sequence[SummaryEntry]) -> tuple[str, ...]:
+    """Retain a bounded recent exact-evidence history in source order.
+
+    Keep first-seen order for duplicate excerpts, but select from the newest
+    unique values first.  Skipping an item that would exceed the byte bound
+    lets a smaller older artifact remain useful without starving new evidence.
+    Reverse the selected values before returning them so retained snippets stay
+    chronological.
+    """
+    values = _unique_verbatim_items_full(entries)
+    selected: list[str] = []
+    selected_bytes = 0
+    for item in reversed(values):
+        if len(selected) >= SUMMARY_MAX_VERBATIM_ITEMS:
+            break
+        item_bytes = len(item.encode("utf-8"))
+        if selected_bytes + item_bytes > SUMMARY_MAX_VERBATIM_BYTES:
+            continue
+        selected.append(item)
+        selected_bytes += item_bytes
+    return tuple(reversed(selected))
+
+
+def _k0_outcome(segment_count: int, loss_notes: Sequence[str]) -> str:
+    """Describe the K0 boundary and any bounded projection loss."""
+    outcome = (
+        f"compacted {segment_count} immutable semantic segment(s); "
+        "state covers these summaries only. Later raw observations may supersede "
+        "facts, complete open work, or invalidate checks listed here."
+    )
+    if loss_notes:
+        outcome += f" {SUMMARY_TRUNCATION_MARKER} " + "; ".join(loss_notes) + "."
+    return outcome
 
 
 def compile_k0_projection(entries: Sequence[SummaryEntry]) -> K0Projection:
@@ -815,6 +877,9 @@ def compile_k0_projection(entries: Sequence[SummaryEntry]) -> K0Projection:
             ("facts_invalidated",),
         ),
         constraints=_unique_semantic_items(normalized, "relevant_failed_approaches"),
+        files_and_symbols_changed=_unique_semantic_items(
+            normalized, "files_and_symbols_changed"
+        ),
         verification_state=_active_semantic_items(
             normalized,
             ("verification_results",),
@@ -848,6 +913,79 @@ def k0_entry(
     if not normalized:
         raise SummaryTrunkError("cannot encode K0 from an empty summary trunk")
     active = projection if projection is not None else compile_k0_projection(normalized)
+    loss_notes: list[str] = []
+    semantic_fields = (
+        (
+            "decisions",
+            _active_semantic_items_full(
+                normalized,
+                ("decisions_added",),
+                ("decisions_superseded",),
+            ),
+            active.decisions,
+        ),
+        (
+            "facts",
+            _active_semantic_items_full(
+                normalized,
+                ("facts_added",),
+                ("facts_invalidated",),
+            ),
+            active.facts,
+        ),
+        (
+            "constraints",
+            _unique_semantic_items_full(normalized, "relevant_failed_approaches"),
+            active.constraints,
+        ),
+        (
+            "files_and_symbols_changed",
+            _unique_semantic_items_full(normalized, "files_and_symbols_changed"),
+            active.files_and_symbols_changed,
+        ),
+        (
+            "verification_state",
+            _active_semantic_items_full(
+                normalized,
+                ("verification_results",),
+                ("verification_invalidated",),
+            ),
+            active.verification_state,
+        ),
+        (
+            "open_work",
+            _active_semantic_items_full(
+                normalized,
+                ("open_items",),
+                ("open_items_resolved",),
+            ),
+            active.open_work,
+        ),
+    )
+    for field, full_values, retained_values in semantic_fields:
+        omitted = len(full_values) - len(retained_values)
+        if omitted > 0:
+            loss_notes.append(f"{field}: omitted {omitted} older active item(s)")
+
+    full_verbatim = _unique_verbatim_items_full(normalized)
+    omitted_verbatim = len(full_verbatim) - len(active.verbatim_evidence)
+    if omitted_verbatim > 0:
+        loss_notes.append(
+            f"verbatim_evidence: omitted {omitted_verbatim} older or over-budget item(s)"
+        )
+
+    # A K0 entry can itself be rolled over later.  Preserve the fact that an
+    # earlier projection was bounded without copying an ever-growing outcome
+    # transcript into each successor.
+    prior_loss = any(
+        item.objective == "CAST K0 active semantic projection"
+        and SUMMARY_TRUNCATION_MARKER in item.outcome
+        for item in normalized
+    )
+    if prior_loss and not loss_notes:
+        loss_notes.append("prior K0 projection retained bounded semantic history")
+
+    outcome = _k0_outcome(len(normalized), loss_notes)
     entry = SummaryEntry(
         type="summary_entry",
         sequence=1,
@@ -855,22 +993,44 @@ def k0_entry(
         source_message_count=len(normalized),
         through_turn=max(item.through_turn for item in normalized),
         objective="CAST K0 active semantic projection",
-        outcome=(
-            f"compacted {len(normalized)} immutable semantic segment(s); "
-            "state covers these summaries only. Later raw observations may supersede "
-            "facts, complete open work, or invalidate checks listed here."
-        ),
+        outcome=outcome,
         decisions_added=active.decisions,
         decisions_superseded=(),
         facts_added=active.facts,
         facts_invalidated=(),
-        files_and_symbols_changed=(),
+        files_and_symbols_changed=active.files_and_symbols_changed,
         verification_results=active.verification_state,
         relevant_failed_approaches=active.constraints,
         open_items=active.open_work,
         verbatim_evidence=active.verbatim_evidence,
     )
-    return _entry_from_mapping(entry_mapping(entry))
+    fitted = _entry_from_mapping(entry_mapping(entry))
+    fit_loss_notes: list[str] = []
+    for field in SUMMARY_LIST_FIELDS:
+        before = getattr(entry, field)
+        after = getattr(fitted, field)
+        if before == after:
+            continue
+        if len(after) < len(before):
+            fit_loss_notes.append(
+                f"{field}: entry byte cap omitted {len(before) - len(after)} item(s)"
+            )
+        else:
+            fit_loss_notes.append(f"{field}: entry byte cap shortened values")
+    if entry.objective != fitted.objective:
+        fit_loss_notes.append("objective: entry byte cap shortened text")
+    if fit_loss_notes:
+        fitted = _entry_from_mapping(
+            entry_mapping(
+                replace(
+                    entry,
+                    outcome=_k0_outcome(
+                        len(normalized), [*loss_notes, *fit_loss_notes]
+                    ),
+                )
+            )
+        )
+    return fitted
 
 
 def is_k0_entry(entry: SummaryEntry) -> bool:
@@ -897,9 +1057,13 @@ def rollover_summary_trunk(
         raise SummaryTrunkError("cannot roll over a trunk with no summary entries")
     compacted = entries
     replacement = k0_entry(compacted)
+    # ``k0_entry`` revalidates and may fit a dense projection to the wire
+    # byte bound.  Return the state represented by that materialized entry,
+    # not an unfit pre-wire projection.
+    materialized_projection = compile_k0_projection((replacement,))
     return (
         [*trunk[:stable_head_messages], render_summary_message(replacement)],
-        compile_k0_projection(compacted),
+        materialized_projection,
         compacted,
     )
 
