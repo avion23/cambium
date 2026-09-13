@@ -14,7 +14,7 @@ from .summary_trunk import (
     SUMMARY_VERBATIM_FIELD,
 )
 
-PROMPTS_VERSION = 20
+PROMPTS_VERSION = 19
 
 CODING_POLICY = (
     "Work directly and minimally. Locate with repo_query, read exact regions with read_batch, "
@@ -35,6 +35,7 @@ SUMMARY_POLICY = (
 
 # Protocol is code-owned. Optimization replaces policies, not actions or tool schemas.
 _ACTION_PROTOCOL = (
+    "You are Cambium's coding agent in an assigned Git worktree.\n"
     "Return exactly one action with no XML or prose. When native control functions named plan "
     "and finish are present, return every action through the native function-call channel and "
     "never serialize an action into assistant text. When only native operational tools are "
