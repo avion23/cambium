@@ -18,6 +18,7 @@ from cambium.tui_screen import (
     ActivityState,
     LinearTimeline,
     Transcript,
+    TranscriptEntry,
     _clip,
     _display_width,
     _take_display_width,
@@ -1418,6 +1419,73 @@ def test_assistant_deltas_render_in_the_active_tail_before_turn_completion() -> 
     transcript.finish_stream("# Findings\nThe stream is live.\n")
     assert transcript.streaming_text == ""
     assert transcript.entries[-1].text == "# Findings\nThe stream is live."
+
+
+@pytest.mark.parametrize(
+    ("depth", "stream_heading", "committed_heading"),
+    [
+        (24, "\x1b[1;38;2;95;215;255m", "\x1b[1;38;2;135;175;255m"),
+        (256, "\x1b[1;38;5;81m", "\x1b[1;38;5;111m"),
+    ],
+)
+def test_live_timeline_preserves_markdown_color_depth_through_stream_and_commit(
+    monkeypatch: pytest.MonkeyPatch,
+    depth: int,
+    stream_heading: str,
+    committed_heading: str,
+) -> None:
+    monkeypatch.setattr(
+        tui_screen.shutil,
+        "get_terminal_size",
+        lambda _default: tui_screen.os.terminal_size((80, 24)),
+    )
+    stream = _Tty()
+    transcript = Transcript()
+    timeline = LinearTimeline(stream)
+    timeline.color = depth
+
+    with timeline:
+        transcript.observe_event(
+            {"kind": "assistant_delta", "payload": {"delta": "# Streamed\n"}}
+        )
+        timeline.draw(
+            _snapshot(),
+            transcript,
+            session_description="",
+            branch_line="",
+            cumulative_line="",
+        )
+        streamed = stream.getvalue()
+
+        transcript.finish_stream("# Streamed\n\n## Committed\n")
+        timeline.draw(
+            _snapshot(),
+            transcript,
+            session_description="",
+            branch_line="",
+            cumulative_line="",
+            force=True,
+        )
+        committed = stream.getvalue()[len(streamed) :]
+
+    assert stream_heading in streamed
+    assert committed_heading in committed
+
+
+def test_timeline_monochrome_stream_and_committed_rows_remain_plain() -> None:
+    streamed = Transcript()
+    streamed.observe_event({"kind": "assistant_delta", "payload": {"delta": "# Heading\n"}})
+    timeline = LinearTimeline(io.StringIO(), enabled=False)
+
+    stream_rows, _ = timeline._stream_delta_rows(streamed, 80, "", None, None, 0)
+    history_rows = timeline._entry_rows(
+        (TranscriptEntry(role="assistant", text="# Heading"),),
+        80,
+        0,
+    )
+
+    assert stream_rows == (("assistant", "CAMBIUM ▸ Heading"),)
+    assert history_rows == (("assistant", "CAMBIUM ▸ Heading"),)
 
 
 def test_accepted_response_chunks_append_one_assistant_timeline_entry_per_chunk() -> None:

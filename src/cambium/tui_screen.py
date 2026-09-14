@@ -2219,7 +2219,7 @@ def _markdown_table_cells(line: str) -> tuple[str, ...] | None:
     return tuple(cell.strip() for cell in stripped.split("|"))
 
 
-def _render_narrow_table_lines(text: str, width: int, color: bool) -> list[str]:
+def _render_narrow_table_lines(text: str, width: int, color: bool | int) -> list[str]:
     """Flatten only tables that Rich cannot fit; preserve every cell."""
     output: list[str] = []
     for row_index, line in enumerate(text.splitlines()):
@@ -2408,7 +2408,7 @@ def _bounded_markdown_lines(
     width: int,
     limit: int,
     *,
-    color: bool,
+    color: bool | int,
 ) -> list[str]:
     """Bound source detail and then wrapped rows without changing entry state."""
     limit = max(1, limit)
@@ -2438,7 +2438,7 @@ def _entry_lines(
     width: int,
     *,
     detail_limit: int | None = None,
-    color: bool = False,
+    color: bool | int = False,
 ) -> list[tuple[str, str]]:
     width = max(1, width)
     if _is_private_runtime_text(entry.text):
@@ -2520,7 +2520,7 @@ def _transcript_blocks(
     width: int,
     *,
     expanded: bool = False,
-    color: bool = False,
+    color: bool | int = False,
 ) -> list[list[tuple[str, str]]]:
     blocks: list[list[tuple[str, str]]] = []
     index = 0
@@ -2845,7 +2845,7 @@ def _activity_status(snapshot: Any, activity_line: str) -> str:
     return "⠋ orchestrating" if getattr(snapshot, "active_agents", 0) else "⠋ idle"
 
 
-def _status_activity(activity_line: str, color: bool) -> str:
+def _status_activity(activity_line: str, color: bool | int) -> str:
     clean = _safe_rendered(activity_line)
     match = _STATUS_PHASE_RE.match(clean)
     if match is None:
@@ -2890,7 +2890,7 @@ def _status_line(
     width: int,
     activity_line: str = "",
     show_detail: bool = False,
-    color: bool = False,
+    color: bool | int = False,
     prefix: bool = False,
 ) -> str:
     fields = _status_fields(
@@ -3137,7 +3137,7 @@ class LinearTimeline:
                     owner_task_id=transcript._stream_owner_task_id,
                 ),
                 width,
-                color=bool(color),
+                color=color,
             )
         )
         return rows, emitted + complete
@@ -3148,7 +3148,7 @@ class LinearTimeline:
     ) -> tuple[tuple[str, str], ...]:
         rows: list[tuple[str, str]] = []
         previous_kind = ""
-        for block in _transcript_blocks(entries, width, expanded=False, color=bool(color)):
+        for block in _transcript_blocks(entries, width, expanded=False, color=color):
             kind = _transcript_block_kind(block)
             if rows and kind == "tool" and previous_kind != "tool":
                 rows.append(("system", ""))
@@ -3414,7 +3414,7 @@ class LinearTimeline:
                 )
                 if streamed_entry is not None:
                     rendered_stream = tuple(
-                        _entry_lines(streamed_entry, width, color=bool(self.color))
+                        _entry_lines(streamed_entry, width, color=self.color)
                     )
                     block_size = len(rendered_stream)
                     for index in range(len(history_new) - block_size + 1):
@@ -3433,7 +3433,7 @@ class LinearTimeline:
                                             owner_task_id=streamed_entry.owner_task_id,
                                         ),
                                         width,
-                                        color=bool(self.color),
+                                        color=self.color,
                                     )
                                 )
                                 if suffix
