@@ -2866,7 +2866,9 @@ class Diffundo:
         requirements: Mapping[str, Any] | None = None,
     ) -> None:
         self._providers = tuple(providers)
-        # OpenCode Go requires a stable per-conversation x-opencode-session (missing header may error). Never share one id: callers pass their conversation id, else mint one.
+        # OpenCode Go requires a stable per-conversation x-opencode-session;
+        # a missing header may fail. Never share one id across conversations.
+        # Callers pass their conversation id, otherwise this router mints one.
         self._task_id = task_id if task_id else f"task-{uuid.uuid4().hex[:12]}"
         # Per-router transport table (defaults to the shared registry) so
         # callers can observe or substitute one protocol's transport without

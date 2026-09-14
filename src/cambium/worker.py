@@ -6897,7 +6897,11 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
 
     wall_deadline = time.monotonic() + max(0.0, absolute_wall_deadline - time.time())
     try:
-        for turn in range(first_turn, config.max_turns + 3):
+        # ``max_turns`` is a hard provider-call limit.  The loop used to
+        # reserve two extra iterations for finalization retries, which let a
+        # task issue calls after its declared budget.  Finalization must fit
+        # within the same bounded turns.
+        for turn in range(first_turn, config.max_turns + 1):
             progress.turn = turn
             progress.status = "working"
             final_synthesis_call = finalized

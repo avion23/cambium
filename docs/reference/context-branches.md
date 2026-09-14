@@ -23,17 +23,21 @@
 ```
 
 Policy fields are optional. One delegate defaults to `trunk + inherit`; several
-in one action batch default to `semantic + spread`; read-only delegates
-(`kind=investigation`) default to `fresh + inherit`. Explicit semantic/fresh
-context defaults to spread; explicit spread defaults to semantic context.
-The worker records the resolved policy before admission. The supervisor derives
-repo, worktree, branch and inherited execution settings. See
+writable delegates in one action batch default to `semantic + spread`. A single
+read-only delegate (`kind=investigation`) defaults to `fresh + inherit`; several
+read-only siblings in one action default to `fresh + spread`. Parallel batches
+also receive bounded defaults when the model omits budgets: read-only children
+use 8 turns / 300 seconds and writable children use 12 turns / 600 seconds.
+Explicit context, placement, and budget values win. The worker records the
+resolved policy before admission. The supervisor derives repo, worktree, branch
+and inherited execution settings. See
 [automatic delegation](../architecture/context-branches.md).
 
 The proven-good read-only fan-out is one batch of `kind=investigation` delegates
-with disjoint read scope and omitted policy fields: completion resolves them to
-`fresh + inherit`, the only context mode with no checkpoint precondition, so the
-first delegation of a fresh session admits. Do not blind-retry a rejected
+with disjoint read scope and omitted policy fields: completion resolves siblings
+to `fresh + spread`, the context mode with no checkpoint precondition plus
+provider-lane spreading. A single read-only probe stays `fresh + inherit`. The
+first delegation of a fresh session therefore admits without a checkpoint. Do not blind-retry a rejected
 semantic batch; the rejection is structural, not transient. Two preconditions
 govern the other modes: `trunk` requires an exact compatible **unredacted**
 parent checkpoint, while `semantic` requires a persisted parent checkpoint with

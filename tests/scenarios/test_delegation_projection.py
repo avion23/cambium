@@ -23,6 +23,8 @@ def test_delegate_defaults_depend_on_independent_batch() -> None:
     assert args["kind"] == "feature"
     assert args["spec"]["context_mode"] == "trunk"
     assert args["spec"]["placement"] == "inherit"
+    assert "max_turns" not in args["spec"]
+    assert "max_wall_s" not in args["spec"]
     batch = _parse_agent_action(
         json.dumps(
             {
@@ -33,6 +35,8 @@ def test_delegate_defaults_depend_on_independent_batch() -> None:
     )
     assert all(c["arguments"]["spec"]["context_mode"] == "semantic" for c in batch["calls"])
     assert all(c["arguments"]["spec"]["placement"] == "spread" for c in batch["calls"])
+    assert all(c["arguments"]["spec"]["max_turns"] == 12 for c in batch["calls"])
+    assert all(c["arguments"]["spec"]["max_wall_s"] == 600 for c in batch["calls"])
 
 
 def test_read_only_investigation_delegates_spread_when_batched() -> None:
@@ -56,6 +60,8 @@ def test_read_only_investigation_delegates_spread_when_batched() -> None:
     batch = _parse_agent_action(json.dumps({"type": "tool_call", "calls": [call("a"), call("b")]}))
     assert all(c["arguments"]["spec"]["context_mode"] == "fresh" for c in batch["calls"])
     assert all(c["arguments"]["spec"]["placement"] == "spread" for c in batch["calls"])
+    assert all(c["arguments"]["spec"]["max_turns"] == 8 for c in batch["calls"])
+    assert all(c["arguments"]["spec"]["max_wall_s"] == 300 for c in batch["calls"])
 
 
 def test_investigation_delegates_keep_explicit_policy() -> None:

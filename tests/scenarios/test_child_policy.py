@@ -61,10 +61,14 @@ def test_read_only_delegates_use_fresh_context_and_spread_batches() -> None:
     single = complete_child_policy({}, siblings=1, read_only=True)
     assert single["context_mode"] == "fresh"
     assert single["placement"] == "inherit"
+    assert "max_turns" not in single
+    assert "max_wall_s" not in single
 
     batch = complete_child_policy({}, siblings=4, read_only=True)
     assert batch["context_mode"] == "fresh"
     assert batch["placement"] == "spread"
+    assert batch["max_turns"] == 8
+    assert batch["max_wall_s"] == 300
 
 
 def test_read_only_completion_respects_explicit_declarations() -> None:
@@ -78,12 +82,22 @@ def test_read_only_completion_respects_explicit_declarations() -> None:
     assert spread_only["context_mode"] == "fresh"
     assert spread_only["placement"] == "spread"
 
+    explicit_budget = complete_child_policy(
+        {"max_turns": 3, "max_wall_s": 90}, siblings=2, read_only=True
+    )
+    assert explicit_budget["max_turns"] == 3
+    assert explicit_budget["max_wall_s"] == 90
+
 
 def test_writable_delegates_keep_the_existing_defaults() -> None:
     single = complete_child_policy({})
     assert single["context_mode"] == "trunk"
     assert single["placement"] == "inherit"
+    assert "max_turns" not in single
+    assert "max_wall_s" not in single
 
     batch = complete_child_policy({}, siblings=3)
     assert batch["context_mode"] == "semantic"
     assert batch["placement"] == "spread"
+    assert batch["max_turns"] == 12
+    assert batch["max_wall_s"] == 600

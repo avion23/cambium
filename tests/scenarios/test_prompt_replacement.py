@@ -30,6 +30,15 @@ def test_atomic_replacement_changes_new_prompts_not_existing_snapshot(
         in after["messages"][0]["content"]
     )
     assert "Mention checks by outcome" in after["messages"][0]["content"]
+    for guidance in (
+        "Keep trivial lookups and one-turn read-only probes local",
+        "Batch known independent reads in one action",
+        "Delegate substantial independent reasoning, editing, or long verification together",
+        "max_turns=8/max_wall_s=300",
+        "max_turns=12/max_wall_s=600",
+        "explicit values always win",
+    ):
+        assert guidance in after["messages"][0]["content"]
     assert "summary_entry" not in second["coding"]
 
 

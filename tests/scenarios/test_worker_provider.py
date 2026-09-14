@@ -1259,7 +1259,7 @@ def test_worker_endless_tool_calls_stop_at_max_turns(tmp_path) -> None:
     server = _FakeOpenAIServer()
     try:
         config_path = _provider_config(tmp_path / "providers.json", server.base_url)
-        for _ in range(4):
+        for _ in range(2):
             _enqueue(
                 '{"type":"tool_call","name":"read_batch","arguments":{"paths":["target.txt"]}}'
             )
@@ -1280,7 +1280,7 @@ def test_worker_endless_tool_calls_stop_at_max_turns(tmp_path) -> None:
         assert not any("graceful stop" in message.get("failure_reason", "") for message in messages)
         assert rc == 0  # Transport completed; the task verdict is in its envelope.
         with REQUEST_LOCK:
-            assert len(REQUESTS) == 4  # Two regular turns plus the existing completion reserve.
+            assert len(REQUESTS) == 2  # max_turns is a hard provider-call cap.
     finally:
         server.close()
 

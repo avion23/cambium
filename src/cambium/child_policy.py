@@ -15,7 +15,9 @@ represented by ``None``. Model calls use :func:`complete_child_policy`: one
 blocking child defaults to trunk/inherit; independent batches to semantic/spread;
 read-only (``kind=investigation``) delegates use fresh context, with one child
 inheriting provider affinity and independent sibling batches spreading across
-provider lanes.
+provider lanes. Parallel batches also receive bounded child budgets when the
+model omits them: eight turns/300 seconds for read-only investigations and
+twelve turns/600 seconds for writable work.
 """
 
 from __future__ import annotations
@@ -51,6 +53,10 @@ class ChildPolicy:
 
 class ChildPolicyError(ValueError):
     """A delegated child did not declare a coherent branch policy."""
+
+
+_PARALLEL_READ_ONLY_BUDGET = {"max_turns": 8, "max_wall_s": 300}
+_PARALLEL_WRITABLE_BUDGET = {"max_turns": 12, "max_wall_s": 600}
 
 
 def _enum_value[T: StrEnum](spec: Mapping[str, Any], key: str, enum: type[T]) -> T:
@@ -99,8 +105,11 @@ def complete_child_policy(
     Such children use ``fresh`` context because they do not need a parent
     checkpoint. A single probe inherits provider affinity; independent sibling
     probes spread across provider lanes so read-only fanout can increase total
-    throughput. Explicit declarations always win; an explicit semantic child
-    may reuse a persisted summary-only checkpoint, including redacted summaries.
+    throughput. Parallel batches receive an eight-turn/300-second read-only
+    budget or a twelve-turn/600-second writable budget when omitted. Explicit
+    declarations always win; an explicit semantic child may reuse a persisted
+    summary-only checkpoint, including redacted summaries. Single-child calls
+    keep the supervisor's existing inherited execution defaults.
     """
     if not isinstance(spec, Mapping):
         raise ChildPolicyError("child spec must be an object")
@@ -114,6 +123,10 @@ def complete_child_policy(
         resolved.setdefault(
             "placement", "inherit" if resolved["context_mode"] == "trunk" else "spread"
         )
+    if siblings > 1:
+        defaults = _PARALLEL_READ_ONLY_BUDGET if read_only else _PARALLEL_WRITABLE_BUDGET
+        for field, value in defaults.items():
+            resolved.setdefault(field, value)
     require_child_policy(resolved)
     return resolved
 

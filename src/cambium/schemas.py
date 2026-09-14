@@ -362,13 +362,17 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "delegate",
         "description": (
-            "Propose one scoped child workload for work you should not do yourself. The child "
-            "is a full Cambium worker in an isolated git worktree. This call only proposes; "
+            "Propose one scoped child workload for substantial independent reasoning, editing, "
+            "or long verification that you should not do yourself. Keep trivial lookups and "
+            "one-turn read-only probes local; batch known independent reads in one action. The "
+            "child is a full Cambium worker in an isolated git worktree. This call only proposes; "
             "the supervisor validates and durably admits or rejects the child. With context "
             "reuse, a successful proposal may suspend this task until the child result is "
-            "joined. Make spec.task self-contained. Prefer one batched child per independent "
-            "target when several branches can run concurrently. One child defaults to "
-            "trunk+inherit; several writable children default to semantic+spread; read-only "
+            "joined. Make spec.task self-contained. For a parallel batch, set scope-appropriate "
+            "max_turns and max_wall_s; omitted budgets default to 8 turns/300 seconds for "
+            "read-only investigations and 12 turns/600 seconds for writable children. Explicit "
+            "values win. Single-child calls keep inherited execution budgets. One child defaults "
+            "to trunk+inherit; several writable children default to semantic+spread; read-only "
             "investigation siblings default to fresh+spread (one probe uses fresh+inherit). "
             "Explicit pairs include "
             "trunk+inherit, semantic+inherit, semantic+spread, "
@@ -457,16 +461,20 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                             "type": "integer",
                             "minimum": 1,
                             "description": (
-                                "Optional child turn budget; supervisor caps it at the "
-                                "parent's remaining turns."
+                                "Optional child turn budget. For omitted budgets in a parallel "
+                                "batch, read-only investigations use 8 turns and writable "
+                                "children use 12; supervisor caps every value at the parent's "
+                                "remaining turns."
                             ),
                         },
                         "max_wall_s": {
                             "type": "integer",
                             "minimum": 30,
                             "description": (
-                                "Optional child wall budget in seconds; supervisor caps "
-                                "it at the parent's remaining time."
+                                "Optional child wall budget in seconds. For omitted budgets in "
+                                "a parallel batch, read-only investigations use 300 seconds and "
+                                "writable children use 600; supervisor caps every value at the "
+                                "parent's remaining time."
                             ),
                         },
                     },

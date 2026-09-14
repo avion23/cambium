@@ -2953,7 +2953,10 @@ def test_valid_action_resets_consecutive_invalid_action_bound(tmp_path: Path) ->
 
 def test_parse_repair_near_budget_can_still_use_tools(tmp_path: Path) -> None:
     worktree = _make_worktree(tmp_path / "repo")
-    config = _agent_config(worktree, max_turns=3)
+    # Four provider responses are required: plan, malformed probe, repaired
+    # read, then the terminal finish.  Keep the declared budget equal to the
+    # number of calls now that max_turns is a hard provider-call cap.
+    config = _agent_config(worktree, max_turns=4)
     router = _ScriptedRouter(
         [
             '{"type":"plan","steps":["read alpha"]}',
