@@ -54,8 +54,10 @@ writable ledger retry.
 
 ## Observation
 
-`ObservabilityState` reduces the current turn's events. The TUI combines that
-snapshot with completed-turn cumulative usage without double counting.
+`ObservabilityState` reduces the current turn's events. Session history status
+projects the newest interactive root lifecycle while retaining completed-turn
+child states and cumulative root usage. The TUI combines its snapshot with
+completed-turn cumulative usage without double counting.
 `branch_history` can reopen recorded evidence across the interactive root's
 turn directories. Its reads do not rerun tools or reconstruct hidden reasoning.
 

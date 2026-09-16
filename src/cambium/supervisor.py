@@ -2235,6 +2235,11 @@ def _interactive_event_turn(event: Mapping[str, Any], fallback_turn: int) -> int
 
 _INTERACTIVE_READ_BUSY_TIMEOUT_MS = 200
 _INTERACTIVE_READ_PAGE_SIZE = 4096
+_INTERACTIVE_ROOT_TASK_ID = "interactive-main"
+_STATUS_HISTORICAL_MARKER = "_status_historical"
+_STATUS_SESSION_BOUNDARY_KINDS = frozenset(
+    {"session_started", "session_resumed", "session_ended", "session_cancelled", "shutdown"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2705,6 +2710,212 @@ def read_events(session_dir: Path | str, after_seq: int | EventCursor = 0) -> li
     if isinstance(after_seq, EventCursor):
         return read_events_with_cursor(session_dir, after_seq)[0]
     return _read_interactive_events(Path(session_dir), after_seq)
+
+
+def read_status_events(session_dir: Path | str) -> list[dict[str, Any]]:
+    """Replay events for the session-status projection.
+
+    Interactive roots reuse ``interactive-main`` for every turn. The normal
+    replay stream keeps every turn because history consumers need that record;
+    status instead uses the newest root lifecycle while retaining child task
+    events and cumulative root usage from earlier turns. This projection
+    leaves :func:`read_events` unchanged for replay and monitoring callers;
+    retained historical usage rows carry an internal reducer marker so they
+    do not reopen the current lifecycle.
+    """
+    session = Path(session_dir)
+    turn_stores = _interactive_turn_event_stores(session)
+    if not turn_stores:
+        return read_events(session)
+
+    latest_turn = turn_stores[-1][0]
+    records: list[tuple[int, int, float | None, int, dict[str, Any]]] = []
+
+    def read_turn_store(event_db: Path) -> list[dict[str, Any]]:
+        try:
+            return read_events_file(
+                event_db,
+                busy_timeout_ms=_INTERACTIVE_READ_BUSY_TIMEOUT_MS,
+            )
+        except StoreError as exc:
+            if _transient_event_store_lock(exc):
+                return []
+            raise
+
+    # Child task ids are model-provided and a later interactive run may reuse
+    # one.  Exclude older lifecycle events for ids present in the latest turn
+    # so a terminal failure from an earlier run cannot make the new child
+    # sticky; retain their usage rows as cumulative evidence.
+    latest_events = read_turn_store(turn_stores[-1][1])
+    root_event_db = session / ".cambium" / "events.db"
+    try:
+        root_events = read_events_file(
+            root_event_db,
+            busy_timeout_ms=_INTERACTIVE_READ_BUSY_TIMEOUT_MS,
+        )
+    except StoreError as exc:
+        if _transient_event_store_lock(exc):
+            root_events = []
+        else:
+            raise
+    latest_child_ids: set[str] = set()
+
+    def add_latest_child_id(value: Any) -> None:
+        if isinstance(value, str) and value and value != _INTERACTIVE_ROOT_TASK_ID:
+            latest_child_ids.add(value)
+
+    for latest_event in latest_events:
+        add_latest_child_id(latest_event.get("task_id"))
+        latest_payload = latest_event.get("payload")
+        if not isinstance(latest_payload, Mapping):
+            continue
+        add_latest_child_id(latest_payload.get("child_task_id"))
+        latest_statuses = latest_payload.get("results")
+        if isinstance(latest_statuses, Mapping):
+            for raw_task_id in latest_statuses:
+                add_latest_child_id(raw_task_id)
+
+    for latest_event in root_events:
+        latest_payload = latest_event.get("payload")
+        latest_turn_value = (
+            latest_payload.get("turn") if isinstance(latest_payload, Mapping) else None
+        )
+        if type(latest_turn_value) is int and latest_turn_value < latest_turn:
+            continue
+        add_latest_child_id(latest_event.get("task_id"))
+        if not isinstance(latest_payload, Mapping):
+            continue
+        add_latest_child_id(latest_payload.get("child_task_id"))
+        latest_statuses = latest_payload.get("results")
+        if isinstance(latest_statuses, Mapping):
+            for raw_task_id in latest_statuses:
+                add_latest_child_id(raw_task_id)
+
+    def append_summary_children(event: Mapping[str, Any], *, turn: int, source: int) -> None:
+        payload = event.get("payload")
+        statuses = payload.get("results") if isinstance(payload, Mapping) else None
+        if not isinstance(statuses, Mapping):
+            return
+        for raw_task_id, raw_status in statuses.items():
+            if not isinstance(raw_task_id, str) or not raw_task_id:
+                continue
+            if raw_task_id == _INTERACTIVE_ROOT_TASK_ID or raw_task_id in latest_child_ids:
+                continue
+            if not isinstance(raw_status, str) or not raw_status:
+                continue
+            records.append(
+                (
+                    turn,
+                    event["seq"],
+                    _interactive_event_timestamp(event),
+                    source,
+                    {
+                        "kind": "result",
+                        "task_id": raw_task_id,
+                        "payload": {
+                            "parent_task_id": _INTERACTIVE_ROOT_TASK_ID,
+                            "status": raw_status,
+                        },
+                    },
+                )
+            )
+
+    def normalize_child_parent(event: Mapping[str, Any]) -> Mapping[str, Any]:
+        task_id = event.get("task_id")
+        if not isinstance(task_id, str) or not task_id or task_id == _INTERACTIVE_ROOT_TASK_ID:
+            return event
+        payload = event.get("payload")
+        if not isinstance(payload, Mapping):
+            return event
+        parent_task_id = payload.get("parent_task_id")
+        if isinstance(parent_task_id, str) and parent_task_id:
+            return event
+        normalized = dict(event)
+        normalized_payload = dict(payload)
+        normalized_payload["parent_task_id"] = _INTERACTIVE_ROOT_TASK_ID
+        normalized["payload"] = normalized_payload
+        return normalized
+
+    for turn, event_db in turn_stores:
+        events = latest_events if turn == latest_turn else read_turn_store(event_db)
+        for event in events:
+            if turn != latest_turn:
+                task_id = event.get("task_id")
+                kind = event.get("kind")
+                if kind in _STATUS_SESSION_BOUNDARY_KINDS:
+                    append_summary_children(event, turn=turn, source=0)
+                    continue
+                if task_id != _INTERACTIVE_ROOT_TASK_ID and task_id in latest_child_ids:
+                    if kind != "usage_event":
+                        continue
+                    event = dict(event)
+                    event[_STATUS_HISTORICAL_MARKER] = True
+                elif task_id == _INTERACTIVE_ROOT_TASK_ID and kind != "usage_event":
+                    continue
+                elif task_id == _INTERACTIVE_ROOT_TASK_ID:
+                    event = dict(event)
+                    event[_STATUS_HISTORICAL_MARKER] = True
+            event = normalize_child_parent(event)
+            records.append(
+                (
+                    turn,
+                    event["seq"],
+                    _interactive_event_timestamp(event),
+                    0,
+                    event,
+                )
+            )
+
+    # Manual context compaction can append records to the parent store. Apply
+    # the same projection when a row carries an explicit older turn; rows
+    # without a turn remain current parent history.
+    for event in root_events:
+        payload = event.get("payload")
+        event_turn = payload.get("turn") if isinstance(payload, Mapping) else None
+        if type(event_turn) is int and event_turn < latest_turn:
+            kind = event.get("kind")
+            task_id = event.get("task_id")
+            if kind in _STATUS_SESSION_BOUNDARY_KINDS:
+                append_summary_children(event, turn=event_turn, source=1)
+                continue
+            if task_id != _INTERACTIVE_ROOT_TASK_ID and task_id in latest_child_ids:
+                if kind != "usage_event":
+                    continue
+                event = dict(event)
+                event[_STATUS_HISTORICAL_MARKER] = True
+            elif task_id == _INTERACTIVE_ROOT_TASK_ID and kind != "usage_event":
+                continue
+            elif task_id == _INTERACTIVE_ROOT_TASK_ID:
+                event = dict(event)
+                event[_STATUS_HISTORICAL_MARKER] = True
+        event = normalize_child_parent(event)
+        has_event_turn = type(event_turn) is int and event_turn >= 0
+        logical_turn = event_turn if has_event_turn else latest_turn + 1
+        records.append(
+            (
+                logical_turn,
+                event["seq"],
+                _interactive_event_timestamp(event),
+                1,
+                event,
+            )
+        )
+
+    records.sort(
+        key=lambda item: (
+            item[0],
+            item[1],
+            item[2] is None,
+            item[2] if item[2] is not None else 0.0,
+            item[3],
+        )
+    )
+    merged: list[dict[str, Any]] = []
+    for sequence, (_turn, _local_seq, _timestamp, _source, event) in enumerate(records, 1):
+        normalized = dict(event)
+        normalized["seq"] = sequence
+        merged.append(normalized)
+    return merged
 
 
 @dataclass(frozen=True, slots=True)

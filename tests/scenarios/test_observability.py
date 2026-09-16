@@ -175,6 +175,44 @@ def test_first_terminal_state_wins_over_late_events(
     assert snapshot.failed_agents == failed
 
 
+def test_session_ended_summary_projects_terminal_states() -> None:
+    snapshot = snapshot_from_events(
+        [
+            _event(
+                1,
+                "session_ended",
+                session_status="cancelled",
+                results={"interactive-main": "cancelled", "child": "cancelled"},
+            )
+        ]
+    )
+
+    assert snapshot.session_status == "cancelled"
+    assert [(agent.task_id, agent.state) for agent in snapshot.agents] == [
+        ("interactive-main", "cancelled"),
+        ("child", "cancelled"),
+    ]
+    assert snapshot.recent_events[-1].task_id is None
+
+
+def test_post_terminal_context_does_not_reopen_agent() -> None:
+    snapshot = snapshot_from_events(
+        [
+            _event(1, "result", task_id="root", status="succeeded"),
+            _event(
+                2,
+                "session_ended",
+                session_status="ended",
+                results={"root": "succeeded"},
+            ),
+            _event(3, "context_checkpoint", task_id="root", turn=2),
+        ]
+    )
+
+    assert snapshot.agents[0].state == "succeeded"
+    assert snapshot.agents[0].turn == 2
+
+
 @pytest.mark.parametrize(
     ("kind", "payload", "expected_state"),
     (

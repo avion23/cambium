@@ -4,7 +4,9 @@ A session is one caller-owned directory whose artifacts live in its
 ``.cambium/`` state directory: the canonical root result at
 ``.cambium/result.json`` (written by :func:`cambium.results.write_result`) and
 the durable event log at ``.cambium/events.db`` (written by
-:class:`cambium.store.EventStore`).
+:class:`cambium.store.EventStore`). Interactive roots keep those artifacts in
+``turn-NNNN/`` children; readers expose the newest completed turn as the root
+session view.
 
 Sessions for one repository live in ``<repo>/.cambium/sessions/``
 (:func:`session_root`).  :func:`list_sessions` returns the completed sessions
@@ -20,6 +22,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -50,11 +53,12 @@ class SessionEntry:
     """One session-directory listing record.
 
     ``valid`` is True for a completed session whose ``.cambium/result.json``
-    parses to a JSON object (``record`` then holds it). A directory that
-    looks like a session (its ``.cambium/result.json`` exists) but cannot be
-    read or parsed is ``valid=False`` with a ``reason``; such entries are
-    surfaced, never silently dropped. A directory without a result file is
-    not a session at all and produces no entry.
+    parses to a JSON object (``record`` then holds it), or for an interactive
+    root whose newest completed ``turn-NNNN/.cambium/result.json`` parses to a
+    JSON object. A directory that looks like a session but cannot be read or
+    parsed is ``valid=False`` with a ``reason``; such entries are surfaced,
+    never silently dropped. A directory without a result file (root or turn)
+    is not a session at all and produces no entry.
     """
 
     path: Path
@@ -63,15 +67,17 @@ class SessionEntry:
     reason: str | None = None
 
 
+_TURN_DIR_RE = re.compile(r"turn-(\d+)")
+
+
 def list_session_entries(root: Path) -> list[SessionEntry]:
     """Return typed listing records for every session under ``root``.
 
-    A child directory without ``.cambium/result.json`` is not a session and
-    contributes no entry. A child whose result file exists but cannot be
-    read or parsed becomes an invalid entry with a ``reason``; invalid
-    sessions are surfaced rather than hidden. Valid entries are ordered by
-    ascending ``(ended_at, started_at, name)``; invalid entries follow,
-    ordered by name.
+    A child directory without a root result or a completed interactive turn
+    result contributes no entry. A result file that exists but cannot be read
+    or parsed becomes an invalid entry with a ``reason``; invalid sessions are
+    surfaced rather than hidden. Valid entries are ordered by ascending
+    ``(ended_at, started_at, name)``; invalid entries follow, ordered by name.
     """
     sessions_root = Path(root).resolve()
     if not sessions_root.is_dir():
@@ -94,9 +100,10 @@ def list_session_entries(root: Path) -> list[SessionEntry]:
 def list_sessions(root: Path) -> list[Path]:
     """Return completed sessions under ``root``, oldest first.
 
-    A directory is a completed session when its ``.cambium/result.json``
-    parses to a JSON object.  Ordering is deterministic: ascending
-    ``(ended_at, started_at, name)`` read from each result record.
+    A directory is a completed session when its root result, or the newest
+    completed interactive turn result, parses to a JSON object. Ordering is
+    deterministic: ascending ``(ended_at, started_at, name)`` read from each
+    selected result record.
 
     Strict: a session directory whose result file exists but cannot be read
     or parsed raises :class:`InvalidSessionError` instead of being hidden;
@@ -118,19 +125,28 @@ def latest_session(root: Path) -> Path | None:
 def show_session(path: Path) -> SessionView:
     """Read one session's current result record into a view.
 
-    The session result (``.cambium/result.json``) is the only artifact this
-    view surfaces. The durable event log is not part of the result view;
-    readers that need the durable log stream it through
-    ``cambium.supervisor.read_events``. For interactive roots that function
-    merges the immutable ``turn-NNNN`` stores without changing the result's
-    session-root event-log reference.
+    The session result (``.cambium/result.json``), or the newest completed
+    interactive turn result, is the only artifact this view surfaces. The
+    durable event log is not part of the result view; readers that need the
+    durable log stream it through ``cambium.supervisor.read_events``. For
+    interactive roots that function merges the immutable ``turn-NNNN`` stores
+    without changing the result's session-root event-log reference.
     """
     session_path = Path(path)
-    result_path = session_path / ".cambium" / "result.json"
-    with open(result_path, encoding="utf-8") as stream:
-        record = json.load(stream)
-    if not isinstance(record, dict):
-        raise ValueError(f"session result is not a JSON object: {result_path}")
+    result_path = _result_path(session_path)
+    if result_path.is_file():
+        record = _read_result_record(result_path)
+    else:
+        interactive = _interactive_result_record(session_path)
+        if interactive is None:
+            # Preserve the ordinary missing-root-result error and avoid
+            # treating an incomplete interactive allocation as a session.
+            with open(result_path, encoding="utf-8") as stream:
+                record = json.load(stream)
+            if not isinstance(record, dict):
+                raise ValueError(f"session result is not a JSON object: {result_path}")
+        else:
+            _turn_path, record = interactive
     return SessionView(path=session_path.resolve(), result=record)
 
 
@@ -138,9 +154,10 @@ def show_session(path: Path) -> SessionView:
 class SessionView:
     """Renderer-friendly snapshot of one completed session's result record.
 
-    ``result`` is the parsed ``.cambium/result.json`` record. The durable
-    event log is intentionally not materialized here; readers that need
-    events stream them through ``cambium.supervisor.read_events``.
+    ``result`` is the parsed root ``.cambium/result.json`` record, or the
+    newest completed turn result for an interactive root. The durable event
+    log is intentionally not materialized here; readers that need events
+    stream them through ``cambium.supervisor.read_events``.
     """
 
     path: Path
@@ -149,6 +166,52 @@ class SessionView:
 
 def _result_path(path: Path) -> Path:
     return path / ".cambium" / "result.json"
+
+
+def _read_result_record(result_path: Path) -> dict[str, Any]:
+    """Read one canonical result record, preserving its path in errors."""
+    with open(result_path, encoding="utf-8") as stream:
+        record = json.load(stream)
+    if not isinstance(record, dict):
+        raise ValueError(f"session result is not a JSON object: {result_path}")
+    return record
+
+
+def _interactive_turn_result_paths(path: Path) -> list[tuple[int, Path]]:
+    """Return canonical turn result files under an interactive root."""
+    try:
+        children = tuple(path.iterdir())
+    except OSError:
+        return []
+    turns: list[tuple[int, Path]] = []
+    for child in children:
+        if child.is_symlink() or not child.is_dir():
+            continue
+        match = _TURN_DIR_RE.fullmatch(child.name)
+        if match is None:
+            continue
+        number = int(match.group(1))
+        if child.name != f"turn-{number:04d}":
+            continue
+        result_path = _result_path(child)
+        if result_path.is_file():
+            turns.append((number, result_path))
+    turns.sort(key=lambda item: item[0])
+    return turns
+
+
+def _interactive_result_record(path: Path) -> tuple[Path, dict[str, Any]] | None:
+    """Read the newest completed turn result for an interactive root.
+
+    The newest turn is authoritative.  If an older turn is corrupt, listing
+    still surfaces that corruption through :func:`_session_entry`; ``show``
+    reads only the turn it is asked to display.
+    """
+    turns = _interactive_turn_result_paths(path)
+    if not turns:
+        return None
+    _number, result_path = turns[-1]
+    return result_path, _read_result_record(result_path)
 
 
 def _session_entry(path: Path) -> SessionEntry | None:
@@ -161,7 +224,7 @@ def _session_entry(path: Path) -> SessionEntry | None:
     if not is_dir:
         return None
     if not result_path.is_file():
-        return None
+        return _interactive_session_entry(path)
     try:
         with open(result_path, encoding="utf-8") as stream:
             record = json.load(stream)
@@ -173,6 +236,32 @@ def _session_entry(path: Path) -> SessionEntry | None:
         return SessionEntry(
             path=path, valid=False, reason=f"not a JSON object: {type(record).__name__}"
         )
+    return SessionEntry(path=path, valid=True, record=record)
+
+
+def _interactive_session_entry(path: Path) -> SessionEntry | None:
+    """Return one listing record for a root whose results live in turns."""
+    turns = _interactive_turn_result_paths(path)
+    if not turns:
+        return None
+    invalid: list[str] = []
+    valid: list[tuple[int, dict[str, Any]]] = []
+    for number, result_path in turns:
+        try:
+            valid.append((number, _read_result_record(result_path)))
+        except OSError as exc:
+            invalid.append(f"turn-{number:04d} unreadable: {exc}")
+        except ValueError as exc:
+            invalid.append(f"turn-{number:04d} invalid: {exc}")
+    if invalid:
+        return SessionEntry(
+            path=path,
+            valid=False,
+            reason="; ".join(invalid),
+        )
+    if not valid:
+        return None
+    _number, record = valid[-1]
     return SessionEntry(path=path, valid=True, record=record)
 
 

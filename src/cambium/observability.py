@@ -58,6 +58,7 @@ _FAILURE_EVENT_KINDS = frozenset(
     }
 )
 _RECOVERY_EVENT_KINDS = frozenset({"merge_committed", "resolver_succeeded"})
+_STATUS_HISTORICAL_MARKER = "_status_historical"
 
 
 @dataclass(frozen=True, slots=True)
@@ -570,6 +571,9 @@ class ObservabilityState:
         kind = _string(event.get("kind")) or "event"
         payload = _payload(event)
         task_id = _string(event.get("task_id"))
+        # ``read_status_events`` marks usage from older interactive turns so
+        # it remains cumulative without reopening the current root lifecycle.
+        historical_usage = kind == "usage_event" and event.get(_STATUS_HISTORICAL_MARKER) is True
         generation = event.get("generation")
         timestamp = _event_time(event)
         if timestamp is not None:
@@ -646,10 +650,11 @@ class ObservabilityState:
             previous_generation = agent.generation
             if parent_id is not None and task_id != parent_id:
                 agent.parent_task_id = parent_id
-            if type(generation) is int and generation >= 0:
+            if not historical_usage and type(generation) is int and generation >= 0:
                 agent.generation = max(agent.generation, generation)
-            agent.last_seq = seq
-            agent.last_kind = kind
+            if not historical_usage:
+                agent.last_seq = seq
+                agent.last_kind = kind
 
             if kind in {"task_assigned", "child_admitted", "task_queued"}:
                 _set_state(agent, "queued")
@@ -674,7 +679,7 @@ class ObservabilityState:
                 "context_resume",
                 "context_fork",
             }:
-                if kind != "context_fork" or child_id in {None, task_id}:
+                if not historical_usage and (kind != "context_fork" or child_id in {None, task_id}):
                     _set_state(agent, "active")
             elif kind in {"merge_progress", "merge_started"}:
                 _set_state(agent, "merging")
@@ -715,12 +720,13 @@ class ObservabilityState:
             elif kind in {"cancelled", "task_cancelled"}:
                 _set_state(agent, "cancelled")
 
-            turn = payload.get("turn")
-            if type(turn) is int and turn >= 0:
-                agent.turn = max(agent.turn, turn)
-            epoch = payload.get("epoch")
-            if type(epoch) is int and epoch >= 0:
-                agent.epoch = max(agent.epoch, epoch)
+            if not historical_usage:
+                turn = payload.get("turn")
+                if type(turn) is int and turn >= 0:
+                    agent.turn = max(agent.turn, turn)
+                epoch = payload.get("epoch")
+                if type(epoch) is int and epoch >= 0:
+                    agent.epoch = max(agent.epoch, epoch)
 
             assignment_targets_task = child_id is None or child_id == task_id
             if assignment_provider is not None and assignment_targets_task:
@@ -729,11 +735,15 @@ class ObservabilityState:
             if assignment_model is not None and assignment_targets_task:
                 agent.assigned_model = assignment_model
                 agent.model = assignment_model
-            if serving_provider is not None:
+            if not historical_usage and serving_provider is not None:
                 agent.serving_provider = serving_provider
-            if serving_model is not None:
+            if not historical_usage and serving_model is not None:
                 agent.serving_model = serving_model
-            if kind == "usage_event" and payload.get("call_kind") != "summary":
+            if (
+                kind == "usage_event"
+                and not historical_usage
+                and payload.get("call_kind") != "summary"
+            ):
                 incumbent = agent.assigned_provider or agent.provider
                 genuine_fallback = bool(
                     serving_provider
@@ -750,15 +760,15 @@ class ObservabilityState:
                     if serving_model is not None:
                         agent.assigned_model = serving_model
                         agent.model = serving_model
-            if kind == "heartbeat":
+            if kind == "heartbeat" and not historical_usage:
                 phase = _string(payload.get("phase"))
                 agent.phase = phase.casefold().replace("_", "-") if phase is not None else None
-            if "tool" in payload and payload.get("tool") is None:
+            if not historical_usage and "tool" in payload and payload.get("tool") is None:
                 # A heartbeat with tool=None is an explicit "no tool running"
                 # signal (the worker clears the field after each tool); keep
                 # the transient status row from showing a completed tool forever.
                 agent.tool = None
-            else:
+            elif not historical_usage:
                 tool = _string(payload.get("tool"))
                 if tool is not None:
                     agent.tool = tool
@@ -794,20 +804,21 @@ class ObservabilityState:
                 cost = _finite_non_negative(payload.get("estimated_cost_usd"))
                 if cost is not None:
                     agent.estimated_cost_usd += cost
-                if input_tokens > 0:
+                if not historical_usage and input_tokens > 0:
                     agent.exact_prompt_tokens = input_tokens
-                for field in (
-                    "active_context_bytes",
-                    "active_context_messages",
-                    "summary_trunk_bytes",
-                    "summary_segments",
-                    "raw_tail_bytes",
-                ):
-                    value = payload.get(field)
-                    if type(value) is int and value >= 0:
-                        setattr(agent, field, value)
+                if not historical_usage:
+                    for field in (
+                        "active_context_bytes",
+                        "active_context_messages",
+                        "summary_trunk_bytes",
+                        "summary_segments",
+                        "raw_tail_bytes",
+                    ):
+                        value = payload.get(field)
+                        if type(value) is int and value >= 0:
+                            setattr(agent, field, value)
 
-            if kind in _CONTEXT_EVENT_KINDS:
+            if kind in _CONTEXT_EVENT_KINDS and not historical_usage:
                 checkpoint_ref = _string(payload.get("checkpoint_ref"))
                 if checkpoint_ref is None:
                     checkpoint_ref = _string(payload.get("state_ref"))
@@ -827,10 +838,21 @@ class ObservabilityState:
         if kind in {"session_started", "session_resumed"}:
             self._session_status = "running"
         elif kind == "session_ended":
+            # A cancelled supervisor may have no root ``result`` row.  Its
+            # terminal status is still durable in the session summary, so use
+            # that evidence for the interactive root lifecycle.
             self._session_status = _string(payload.get("session_status")) or "ended"
+            statuses = payload.get("results")
+            if isinstance(statuses, Mapping):
+                for raw_task_id, raw_status in statuses.items():
+                    status_task_id = _string(raw_task_id)
+                    status = _terminal_state(raw_status)
+                    if status_task_id is None or status is None:
+                        continue
+                    _set_state(self._ensure_agent(status_task_id), status)
         elif kind in {"session_cancelled", "shutdown"}:
             self._session_status = "cancelled"
-        elif self._session_status == "idle" and task_id is not None:
+        elif self._session_status == "idle" and task_id is not None and not historical_usage:
             self._session_status = "running"
 
         self._recent.append(

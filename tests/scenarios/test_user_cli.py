@@ -17,10 +17,11 @@ from cambium import cli, oneshot, repl, session, tui
 from cambium.auth import AuthStore, derived_env_name
 from cambium.interactive import InteractiveSession
 from cambium.ipc import MAX_LINE_BYTES
-from cambium.render import render_json_result
+from cambium.observability import snapshot_from_events
+from cambium.render import render_json_result, render_subagent_status
 from cambium.results import Result, write_result
 from cambium.store import EventStore
-from cambium.supervisor import PlanResult, TaskResult
+from cambium.supervisor import PlanResult, TaskResult, read_status_events
 
 
 def _repo(path: Path) -> Path:
@@ -31,6 +32,12 @@ def _repo(path: Path) -> Path:
         filename="file.txt",
         content="file\n",
     )[0]
+
+
+def _run_session_command(argv: list[str]) -> int:
+    """Run one parsed session command."""
+    args = cli._build_parser().parse_args(argv)
+    return cli._run_session(args)
 
 
 def _plan_result() -> PlanResult:
@@ -489,6 +496,38 @@ def test_session_readers_and_cli_expose_paths_and_result_data(capsys, tmp_path: 
     assert json.loads(capsys.readouterr().out)["summary"] == "new"
 
 
+def test_interactive_root_list_latest_and_show_use_latest_turn_result(
+    capsys, tmp_path: Path
+) -> None:
+    root = tmp_path / "sessions"
+    interactive_root = root / "interactive"
+    _write_result(interactive_root / "turn-0001", 1.0)
+    _write_events_db(interactive_root / "turn-0001")
+    _write_result(interactive_root / "turn-0002", 2.0)
+    _write_events_db(interactive_root / "turn-0002")
+    _write_events_db(interactive_root / "turn-0003")
+
+    # Interactive sessions persist one result per turn and intentionally do
+    # not write a duplicate result at the root.
+    assert not (interactive_root / ".cambium" / "result.json").exists()
+    expected = interactive_root.resolve()
+    assert session.list_sessions(root) == [expected]
+    assert session.latest_session(root) == expected
+    view = session.show_session(interactive_root)
+    assert view.path == expected
+    assert view.result["summary"] == "turn-0002"
+    assert view.result["ended_at"] == 2.0
+
+    assert _run_session_command(["session", "list", "--session-dir", str(root)]) == 0
+    assert capsys.readouterr().out.splitlines() == [str(expected)]
+    assert _run_session_command(["session", "latest", "--session-dir", str(root)]) == 0
+    assert capsys.readouterr().out.strip() == str(expected)
+    assert _run_session_command(["session", "show", "--session-dir", str(root), "interactive"]) == 0
+    shown = json.loads(capsys.readouterr().out)
+    assert shown["summary"] == "turn-0002"
+    assert shown["session_id"] == str((interactive_root / "turn-0002").resolve())
+
+
 def test_session_show_rejects_unrenderable_result_without_leaking_payload(
     capsys, tmp_path: Path
 ) -> None:
@@ -593,6 +632,190 @@ def test_session_status_renders_per_subagent_lifecycle(capsys, tmp_path: Path) -
     assert "tokens=0" in totals
     assert "calls=1" in totals
     assert "cost=$0.000000" in totals
+
+
+@pytest.mark.parametrize("prior_terminal", ("failed", "cancelled"))
+def test_session_status_uses_latest_interactive_turn_after_prior_terminal(
+    prior_terminal: str, capsys, tmp_path: Path
+) -> None:
+    root = tmp_path / "sessions"
+    session_dir = root / "interactive"
+    _write_lifecycle_events(
+        session_dir / "turn-0001",
+        [
+            {"kind": "spawned", "task_id": "interactive-main", "generation": 1},
+            {
+                "kind": "usage_event",
+                "task_id": "interactive-main",
+                "generation": 1,
+                "payload": {"turn": 1, "usage": {"total_tokens": 100}},
+            },
+            {
+                "kind": "result",
+                "task_id": "interactive-main",
+                "generation": 1,
+                "payload": {"status": prior_terminal},
+            },
+            {
+                "kind": "task_assigned",
+                "task_id": "child-task",
+                "generation": 1,
+                "payload": {"parent_task_id": "interactive-main", "turn": 1},
+            },
+            {
+                "kind": "spawned",
+                "task_id": "child-task",
+                "generation": 1,
+                "payload": {"turn": 1},
+            },
+            {
+                "kind": "result",
+                "task_id": "child-task",
+                "generation": 1,
+                "payload": {"status": "failed", "turn": 1},
+            },
+        ],
+    )
+    _write_lifecycle_events(
+        session_dir / "turn-0002",
+        [
+            {"kind": "spawned", "task_id": "interactive-main", "generation": 1},
+            {
+                "kind": "usage_event",
+                "task_id": "interactive-main",
+                "generation": 1,
+                "payload": {"turn": 2, "usage": {"total_tokens": 10}},
+            },
+            {
+                "kind": "result",
+                "task_id": "interactive-main",
+                "generation": 1,
+                "payload": {"status": "succeeded"},
+            },
+        ],
+    )
+
+    assert (
+        _run_session_command(["session", "status", "--session-dir", str(root), "interactive"]) == 0
+    )
+    lines = capsys.readouterr().out.splitlines()
+    main = next(line for line in lines if line.startswith("interactive-main"))
+    assert "done" in main
+    child = next(line for line in lines if line.startswith("child-task"))
+    assert "failed" in child
+    assert "turn=1" in child
+    totals = next(line for line in lines if line.startswith("totals:"))
+    assert "tokens=110" in totals
+    assert "calls=2" in totals
+
+
+def test_session_status_prefers_latest_reused_child_lifecycle(tmp_path: Path) -> None:
+    root = tmp_path / "sessions"
+    session_dir = root / "interactive"
+    _write_lifecycle_events(
+        session_dir / "turn-0001",
+        [
+            {"kind": "spawned", "task_id": "interactive-main"},
+            {
+                "kind": "spawned",
+                "task_id": "reused-child",
+                "payload": {"parent_task_id": "interactive-main"},
+            },
+            {
+                "kind": "result",
+                "task_id": "reused-child",
+                "payload": {"status": "failed"},
+            },
+        ],
+    )
+    _write_lifecycle_events(
+        session_dir / "turn-0002",
+        [
+            {"kind": "spawned", "task_id": "interactive-main"},
+            {
+                "kind": "spawned",
+                "task_id": "reused-child",
+                "payload": {"parent_task_id": "interactive-main"},
+            },
+            {
+                "kind": "result",
+                "task_id": "reused-child",
+                "payload": {"status": "succeeded"},
+            },
+        ],
+    )
+
+    snapshot = snapshot_from_events(read_status_events(session_dir))
+    child = next(agent for agent in snapshot.agents if agent.task_id == "reused-child")
+    assert child.state == "succeeded"
+
+
+def test_session_status_keeps_latest_running_root_lifecycle(tmp_path: Path) -> None:
+    root = tmp_path / "sessions"
+    session_dir = root / "interactive"
+    _write_lifecycle_events(
+        session_dir / "turn-0001",
+        [
+            {
+                "kind": "usage_event",
+                "task_id": "interactive-main",
+                "generation": 1,
+                "payload": {"turn": 1, "usage": {"total_tokens": 100}},
+            },
+            {
+                "kind": "result",
+                "task_id": "interactive-main",
+                "generation": 1,
+                "payload": {"status": "succeeded"},
+            },
+        ],
+    )
+    _write_lifecycle_events(
+        session_dir / "turn-0002",
+        [
+            {"kind": "task_assigned", "task_id": "interactive-main", "generation": 1},
+            {"kind": "spawned", "task_id": "interactive-main", "generation": 1},
+        ],
+    )
+
+    text = render_subagent_status(read_status_events(session_dir))
+    main = next(line for line in text.splitlines() if line.startswith("interactive-main"))
+    assert "starting" in main
+    assert "running" not in main
+    assert "turn=1" not in main
+    assert "calls=1" in main
+    assert "tokens=100" in main
+
+
+def test_session_status_projects_summary_only_interactive_cancellation(
+    capsys, tmp_path: Path
+) -> None:
+    root = tmp_path / "sessions"
+    session_dir = root / "interactive"
+    _write_lifecycle_events(
+        session_dir / "turn-0001",
+        [
+            {
+                "kind": "session_ended",
+                "payload": {
+                    "session_status": "cancelled",
+                    "results": {
+                        "interactive-main": "cancelled",
+                        "child-task": "cancelled",
+                    },
+                },
+            }
+        ],
+    )
+
+    assert (
+        _run_session_command(["session", "status", "--session-dir", str(root), "interactive"]) == 0
+    )
+    lines = capsys.readouterr().out.splitlines()
+    main = next(line for line in lines if line.startswith("interactive-main"))
+    assert "cancelled" in main
+    child = next(line for line in lines if line.startswith("child-task"))
+    assert "cancelled" in child
 
 
 def test_session_status_and_usage_read_turn_store_only_session(capsys, tmp_path: Path) -> None:

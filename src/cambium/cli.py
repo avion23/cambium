@@ -1394,7 +1394,7 @@ def _run_session(args: argparse.Namespace) -> int:
         candidate = Path(args.session_id).expanduser()
         path = candidate if candidate.is_absolute() else root / candidate
         try:
-            events = supervisor.read_events(path)
+            events = supervisor.read_status_events(path)
         except (OSError, StoreError, ValueError, sqlite3.Error) as exc:
             print(f"cambium session: {exc}", file=sys.stderr)
             return 1
