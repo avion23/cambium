@@ -68,6 +68,7 @@ def test_experiment_budget_accepts_partial_codex_usage(usage, tokens) -> None:
         provider, {}
     )
     budget = ExperimentBudget(1, 100, 1.0)
+    assert result.usage is not None
     budget.record(result.usage, 0.25)
     assert (budget.calls, budget.tokens, budget.cost_usd) == (1, tokens, 0.25)
     with pytest.raises(ExperimentBudgetExceeded):
