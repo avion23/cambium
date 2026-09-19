@@ -48,7 +48,8 @@ def is_cache_artifact_path(path: str) -> bool:
         return False
     components = normalized.split("/")
     return normalized.endswith(".pyc") or any(
-        component in _CACHE_ARTIFACT_COMPONENTS for component in components
+        component in _CACHE_ARTIFACT_COMPONENTS or component.endswith(".egg-info")
+        for component in components
     )
 
 

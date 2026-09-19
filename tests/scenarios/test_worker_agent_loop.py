@@ -3034,6 +3034,53 @@ def _finalize_worktree_outcome(
     )
 
 
+@pytest.mark.parametrize("staged", [False, True])
+def test_finalize_worktree_publishes_deleted_files(tmp_path: Path, staged: bool) -> None:
+    repo = tmp_path / "repo"
+    worktree = _make_worktree(repo)
+    config = replace(_agent_config(worktree), base_commit=_base_commit(worktree))
+    if staged:
+        subprocess.run(
+            ["git", "-C", str(worktree), "rm", "alpha.txt"], check=True, capture_output=True
+        )
+    else:
+        (worktree / "alpha.txt").unlink()
+    outcome = _finalize_worktree_outcome(worktree, config, {"scratch_repo": str(repo)})
+    assert outcome["status"] == "succeeded", outcome["failure_reason"]
+    assert outcome["files_changed"] == ["alpha.txt"]
+    assert len(outcome["commits"]) == 1
+    assert "deleted file mode" in outcome["diff"]
+
+
+def test_finalize_worktree_ignores_package_metadata_but_not_arbitrary_ignored_files(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    worktree = _make_worktree(repo)
+    config = replace(_agent_config(worktree), base_commit=_base_commit(worktree))
+    exclude = subprocess.run(
+        ["git", "-C", str(worktree), "rev-parse", "--git-path", "info/exclude"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    with (worktree / exclude).open("a") as handle:
+        handle.write("\n*.egg-info/\nprivate.txt\n")
+    metadata = worktree / "src" / "sample.egg-info"
+    metadata.mkdir(parents=True)
+    (metadata / "PKG-INFO").write_text("generated package metadata\n")
+    private = worktree / "private.txt"
+    private.write_text("not a cache artifact\n")
+    (worktree / "alpha.txt").write_text("real edit\n")
+    run = {"scratch_repo": str(repo)}
+    rejected = _finalize_worktree_outcome(worktree, config, run)
+    assert rejected["status"] == "failed"
+    assert "private.txt" in rejected["failure_reason"]
+    private.unlink()
+    outcome = _finalize_worktree_outcome(worktree, config, run)
+    assert outcome["status"] == "succeeded", outcome["failure_reason"]
+    assert outcome["files_changed"] == ["alpha.txt"]
+    assert "sample.egg-info" not in outcome["diff"]
+
+
 def test_finalize_worktree_excludes_cache_artifacts_from_commit(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     worktree = _make_worktree(repo)

@@ -30,6 +30,7 @@ def test_missing_action_arguments_are_actionable(
 ) -> None:
     result = query(tmp_path, action=action)
     assert not result.ok
+    assert result.error is not None
     assert f"{action} requires {required}" in result.error
 
 

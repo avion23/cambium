@@ -8391,6 +8391,7 @@ def _finalize_worktree(
             outcome["failure_reason"] = f"git status failed: {status_proc.stderr.strip()}"
             return outcome
         changed: list[str] = []
+        unstaged: list[str] = []
         ignored: list[str] = []
         records = iter(status_proc.stdout.split("\0"))
         for record in records:
@@ -8407,6 +8408,9 @@ def _finalize_worktree(
                 ignored.append(path)
                 continue
             changed.append(path)
+            # Already-staged deletions have no remaining path for git add.
+            if record[1] != " ":
+                unstaged.append(path)
         # A provider can commit directly (e.g. via permitted shell): HEAD then
         # no longer matches the base commit, whether or not the worktree is
         # dirty. Never publish such unfenced commits — the fenced-commit path
@@ -8472,7 +8476,7 @@ def _finalize_worktree(
             if terminal_checkpoint is not None:
                 outcome["_context_checkpoint"] = terminal_checkpoint
             return outcome
-        for path in changed:
+        for path in unstaged:
             _require_generation(worktree, generation)
             rc, _out, err = _fenced_git(worktree, generation, "add", "--", path, cwd=worktree)
             if rc != 0:

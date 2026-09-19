@@ -212,6 +212,7 @@ def test_edit_file_source_limit_is_separate_from_read_output(tmp_path: Path, siz
         original.replace("needle", "edited") if result.ok else original
     )
     if not result.ok:
+        assert result.error is not None
         assert "MAX_EDIT_BYTES" in result.error
 
 
