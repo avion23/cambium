@@ -1901,9 +1901,7 @@ def _split_response_chunks(
         raise ValueError("response chunk limit must be a positive integer")
     raw = text.encode("utf-8")
     if len(raw) > total_limit:
-        raise ValueError(
-            f"response exceeds the resource limit ({total_limit} bytes)"
-        )
+        raise ValueError(f"response exceeds the resource limit ({total_limit} bytes)")
     if not raw:
         return ()
     chunks: list[str] = []
@@ -2696,11 +2694,7 @@ def _is_evidence_read_call(call: Mapping[str, Any]) -> bool:
         return True
     arguments = call.get("arguments")
     operation = arguments.get("op") if isinstance(arguments, Mapping) else None
-    return (
-        name == "git_op"
-        and isinstance(operation, str)
-        and operation in INSPECTION_GIT_OPS
-    )
+    return name == "git_op" and isinstance(operation, str) and operation in INSPECTION_GIT_OPS
 
 
 _EDIT_TOOL_NAMES = frozenset({"edit_file", "write_file"})
@@ -3668,9 +3662,7 @@ class _ProgressDetector:
         self.progress_window = progress_window
         self._recent_signatures: deque[str] = deque(maxlen=progress_window)
         self._recent_content_hashes: deque[str] = deque(maxlen=MAX_PROGRESS_CONTENT_HASHES)
-        self._recent_read_pairs: deque[tuple[str, str]] = deque(
-            maxlen=MAX_PROGRESS_CONTENT_HASHES
-        )
+        self._recent_read_pairs: deque[tuple[str, str]] = deque(maxlen=MAX_PROGRESS_CONTENT_HASHES)
         self._branch_snapshots: dict[
             str,
             tuple[
@@ -6779,10 +6771,15 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
             transcript,
         )
 
-    if resume is None and config.context_fork is not None and required_context_mode in {
-        None,
-        "trunk",
-    }:
+    if (
+        resume is None
+        and config.context_fork is not None
+        and required_context_mode
+        in {
+            None,
+            "trunk",
+        }
+    ):
         fork_messages, fork_skip = _resolve_fork_prefix(config, tools, model)
         if required_context_mode == "trunk" and fork_skip is not None:
             return _loop_result(
@@ -7852,9 +7849,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                 if (
                     read_action
                     and no_progress_actions == 1
-                    and not _finalization_due(
-                        turn, finalized, budget_new_tokens, soft_cap, config
-                    )
+                    and not _finalization_due(turn, finalized, budget_new_tokens, soft_cap, config)
                 ):
                     context_continuation, transcript = _append_context_message(
                         {"role": "user", "content": REPEATED_EVIDENCE_DIRECTIVE},
@@ -8413,9 +8408,7 @@ def _finalize_worktree(
             if any(code in {"R", "C"} for code in record[:2]):
                 paths.append(next(records, ""))
             excluded = any(
-                item == ".cambium"
-                or item.startswith(".cambium/")
-                or is_cache_artifact_path(item)
+                item == ".cambium" or item.startswith(".cambium/") or is_cache_artifact_path(item)
                 for item in paths
             )
             # Commit consumes the entire index, including paths skipped below.
@@ -8788,11 +8781,10 @@ async def _run_task(
     outcome["started_at"] = started_at
     outcome["ended_at"] = time.time()
     await _emit_proposed_children(writer, run, task_id)
-    if (
-        _external_stop_requested(stop)
-        and outcome.get("status")
-        in {TaskStatus.SUCCEEDED.value, TaskStatus.SUSPENDED.value}
-    ):
+    if _external_stop_requested(stop) and outcome.get("status") in {
+        TaskStatus.SUCCEEDED.value,
+        TaskStatus.SUSPENDED.value,
+    }:
         outcome["status"] = TaskStatus.CANCELLED.value
         outcome["failure_reason"] = "task cancelled before terminal result"
     return outcome
@@ -8823,9 +8815,7 @@ async def _emit_result_envelope(writer: asyncio.StreamWriter, outcome: dict[str,
     raw_diff = outcome.get("diff", "")
     diff, diff_truncated = cap_diff(raw_diff) if isinstance(raw_diff, str) else ("", False)
     raw_summary = outcome.get("summary", "")
-    summary = (
-        _cap_utf8(raw_summary, MAX_SUMMARY_CHARS) if isinstance(raw_summary, str) else ""
-    )
+    summary = _cap_utf8(raw_summary, MAX_SUMMARY_CHARS) if isinstance(raw_summary, str) else ""
     raw_failure_reason = outcome.get("failure_reason")
     failure_reason = (
         _cap_utf8(raw_failure_reason, MAX_ENVELOPE_FIELD_CHARS)
@@ -8881,9 +8871,7 @@ async def _emit_result_envelope(writer: asyncio.StreamWriter, outcome: dict[str,
     await send(writer, envelope)
 
 
-async def _emit_response_chunks(
-    writer: asyncio.StreamWriter, outcome: dict[str, Any]
-) -> None:
+async def _emit_response_chunks(writer: asyncio.StreamWriter, outcome: dict[str, Any]) -> None:
     """Emit a finish response before its bounded terminal result envelope.
 
     Chunk identity is the run request plus task/generation fence.  Chunks are
@@ -8936,8 +8924,7 @@ async def _emit_terminal_outcome(
         if (
             stop is not None
             and _external_stop_requested(stop)
-            and outcome.get("status")
-            in {TaskStatus.SUCCEEDED.value, TaskStatus.SUSPENDED.value}
+            and outcome.get("status") in {TaskStatus.SUCCEEDED.value, TaskStatus.SUSPENDED.value}
         ):
             outcome["status"] = TaskStatus.CANCELLED.value
             outcome["failure_reason"] = "task cancelled before terminal result"
