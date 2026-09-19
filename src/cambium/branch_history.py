@@ -356,16 +356,17 @@ def _bounded(text: str, limit: int = MAX_HISTORY_OUTPUT_BYTES) -> str:
     return raw[:keep].decode("utf-8", errors="ignore") + marker
 
 
-def _page(lines: Sequence[str], offset: int, limit: int) -> str:
-    if not lines:
-        return ""
-    header = lines[0]
-    data = lines[1:]
-    selected = list(data[offset : offset + limit])
-    suffix = ""
-    if offset + len(selected) < len(data):
-        suffix = f"\nnext_offset={offset + len(selected)}"
-    return _bounded("\n".join((header, *selected)) + suffix)
+def _page(header: str, rows: Sequence[str], offset: int, total: int) -> str:
+    selected = list(rows)
+    sizes = [len(row.encode("utf-8")) + 1 for row in selected]
+    size = len(header.encode("utf-8")) + sum(sizes)
+    # Reserve the cursor before fitting rows, not after truncating the response.
+    budget = MAX_HISTORY_OUTPUT_BYTES - len(f"\nnext_offset={total}")
+    while len(selected) > 1 and size > budget:
+        selected.pop()
+        size -= sizes.pop()
+    suffix = f"\nnext_offset={offset + len(selected)}" if offset + len(selected) < total else ""
+    return _bounded("\n".join((header, *selected)), budget) + suffix
 
 
 def _list_branches(events: Iterable[_Event], offset: int, limit: int) -> str:
@@ -387,8 +388,7 @@ def _list_branches(events: Iterable[_Event], offset: int, limit: int) -> str:
                 )
             )
         )
-    suffix = f"\nnext_offset={offset + len(selected)}" if offset + len(selected) < len(rows) else ""
-    return _bounded("\n".join(lines) + suffix)
+    return _page(lines[0], lines[1:], offset, len(rows))
 
 
 def _tool_events(events: Iterable[_Event], task_id: str | None) -> Iterable[_Event]:
@@ -431,8 +431,7 @@ def _list_tools(events: Iterable[_Event], task_id: str | None, offset: int, limi
                 )
             )
         total += 1
-    suffix = f"\nnext_offset={offset + len(lines)}" if offset + len(lines) < total else ""
-    return _bounded("\n".join((f"tool_calls={total}", *lines)) + suffix)
+    return _page(f"tool_calls={total}", lines, offset, total)
 
 
 def _regular_json(path: Path) -> dict[str, Any]:
@@ -756,7 +755,7 @@ def _latest_transcript(events: Iterable[_Event], task_id: str, offset: int, limi
     for index, message in enumerate(messages):
         content = _bounded(message["content"], MAX_MESSAGE_BYTES)
         lines.append(f"[{index}] {message['role']}\n{content}")
-    return _page(lines, offset, limit)
+    return _page(lines[0], lines[1 + offset : 1 + offset + limit], offset, len(messages))
 
 
 def query_branch_history(session_dir: Path | str, arguments: Mapping[str, Any]) -> str:

@@ -7,7 +7,12 @@ from pathlib import Path
 
 import pytest
 
-from cambium.branch_history import BranchHistoryError, query_branch_history, tool_ref
+from cambium.branch_history import (
+    MAX_HISTORY_OUTPUT_BYTES,
+    BranchHistoryError,
+    query_branch_history,
+    tool_ref,
+)
 from cambium.tools import ToolContext, run_tool
 
 
@@ -103,6 +108,46 @@ def _write_session(
         encoding="utf-8",
     )
     return session
+
+
+@pytest.mark.parametrize("action", ["tools", "transcript"])
+def test_history_byte_bound_preserves_continuation_and_all_rows(
+    tmp_path: Path, action: str
+) -> None:
+    session = _write_session(tmp_path)
+    event_dir = session / ".cambium"
+    checkpoint = event_dir / "checkpoints" / "child" / "turn-002.json"
+    document = json.loads(checkpoint.read_text())
+    contents = [f"row-{index}:" + "界" * 2000 for index in range(12)]
+    document["transcript"] = [{"role": "user", "content": text} for text in contents]
+    checkpoint.write_text(json.dumps(document))
+    events_path = event_dir / "events.db"
+    events = [json.loads(line) for line in events_path.read_text().splitlines()]
+    tool_event = next(event for event in events if event["kind"] == "tool_event")
+    events = [event for event in events if event["kind"] != "tool_event"]
+    events.extend(
+        {**tool_event, "seq": 6 + index, "payload": {**tool_event["payload"], "cmd": text}}
+        for index, text in enumerate(contents)
+    )
+    events_path.write_text("".join(json.dumps(event) + "\n" for event in events))
+
+    offset = 0
+    pages = []
+    while True:
+        page = query_branch_history(
+            session, {"action": action, "task_id": "child", "offset": offset, "limit": 64}
+        )
+        assert len(page.encode("utf-8")) <= MAX_HISTORY_OUTPUT_BYTES
+        pages.append(page)
+        last_line = page.splitlines()[-1]
+        if not last_line.startswith("next_offset="):
+            break
+        next_offset = int(last_line.removeprefix("next_offset="))
+        assert offset < next_offset < len(contents)
+        offset = next_offset
+    assert len(pages) > 1
+    for text in contents:
+        assert "\n".join(pages).count(text) == 1
 
 
 def test_tool_history_reopens_hash_verified_large_output_artifact(tmp_path: Path) -> None:
