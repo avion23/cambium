@@ -55,6 +55,19 @@ def test_read_batch_returns_bounded_files_and_windows(tmp_path: Path) -> None:
     assert len(capped.output.encode()) <= MAX_OUTPUT_BYTES
 
 
+def test_truncated_reads_validate_utf8_without_rejecting_split_characters(tmp_path: Path) -> None:
+    path = tmp_path / "large.txt"
+    for prefix, expected_ok in ((b"\xff", False), (b"", True)):
+        path.write_bytes(prefix + "😀".encode() * READ_BATCH_MAX_BYTES_PER_FILE)
+        result = _run("read_batch", {"paths": [path.name]}, ToolContext(tmp_path))
+        assert result.ok is expected_ok
+        if expected_ok:
+            assert "[file truncated]" in result.output
+            assert "😀" in result.output
+        else:
+            assert "file is not valid UTF-8: large.txt" in result.output
+
+
 def test_read_batch_reports_an_empty_window_past_eof(tmp_path: Path) -> None:
     (tmp_path / "lines.txt").write_text("one\ntwo\n", encoding="utf-8")
 

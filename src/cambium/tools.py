@@ -8,6 +8,7 @@ linting and dependency wiring out of process-global state.
 from __future__ import annotations
 
 import asyncio
+import codecs
 import hashlib
 import os
 import shlex
@@ -306,6 +307,10 @@ def _read_file_sync(
 
         with path.open("rb") as handle:
             raw = handle.read(READ_BATCH_MAX_BYTES_PER_FILE + 1)
+        # Validate the sampled bytes; only a cut-off final character may be incomplete.
+        codecs.getincrementaldecoder("utf-8")().decode(
+            raw, final=len(raw) <= READ_BATCH_MAX_BYTES_PER_FILE
+        )
     except FileNotFoundError as exc:
         raise _ToolFailure(f"file not found: {display_path}") from exc
     except IsADirectoryError as exc:
