@@ -1144,6 +1144,14 @@ def test_serving_reconciliation_preserves_per_provider_model_choices(
         "dead-zen": "zen-model",
         "healthy-codex": "codex-model",
     }
+    # A result naming another provider is not evidence of a coding fallback.
+    assert session.provider == "healthy-codex"
+    assert session.model == "codex-model"
+    session.complete_turn(turn, succeeded=False)
+    resumed = InteractiveSession(session._base_config)
+    next_turn = resumed.prepare_turn("continue")
+    assert next_turn.config.provider == "healthy-codex"
+    assert next_turn.config.model == "codex-model"
     assert session.set_model_preference("healthy-codex")
     assert session.provider == "healthy-codex"
     assert session.model == "codex-model"
@@ -1235,7 +1243,9 @@ def test_summary_serving_observations_do_not_set_interactive_preference(
             turn,
             {
                 "kind": kind,
+                "task_id": "interactive-main",
                 "payload": {
+                    "status": "succeeded",
                     "provider": "healthy-codex",
                     "model": "codex-model",
                     "call_kind": "summary",

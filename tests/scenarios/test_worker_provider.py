@@ -31,6 +31,7 @@ from cambium.fencing import write_generation
 from cambium.ipc import MAX_LINE_BYTES, read_message
 from cambium.prompts import CODING_AGENT
 from cambium.supervisor import read_events, run_plan, run_session
+from cambium.terminal import sanitize_terminal_text
 from cambium.tui_screen import LinearTimeline, Transcript
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -1679,6 +1680,6 @@ def test_run_shell_output_deltas_reach_supervisor_and_tui_rows(tmp_path, monkeyp
         assert "┌ Cambium · conversation" not in output
         assert "OPERATOR RAIL" not in output
         assert output.find("delta-") > len(first_frame)
-        assert "✓ DONE" in output
+        assert "✓ DONE" in sanitize_terminal_text(output)
     finally:
         server.close()
