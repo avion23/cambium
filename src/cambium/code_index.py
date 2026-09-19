@@ -368,6 +368,16 @@ def query_repository(root: str | Path, arguments: dict[str, Any]) -> str:
     """Dispatch the model's bounded navigation query using the existing scanners."""
     root = Path(root).resolve()
     action = arguments["action"]
+    required = {
+        "search": ("query",),
+        "symbols": ("query",),
+        "references": ("query",),
+        "window": ("path", "line"),
+        "lsp": ("path", "method"),
+    }.get(action, ())
+    missing = [field for field in required if field not in arguments]
+    if missing:
+        raise ValueError(f"{action} requires {', '.join(missing)}")
     limit = arguments.get("limit", 40)
     if action == "symbols":
         return locations_json(

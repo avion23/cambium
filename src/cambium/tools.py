@@ -31,6 +31,7 @@ from .tasktree import TaskKind
 from .terminal import sanitize_terminal_text
 
 MAX_READ_BYTES = 100 * 1024
+MAX_EDIT_BYTES = 2 * 1024 * 1024
 MAX_READ_LINES = 2_000
 MAX_OUTPUT_BYTES = 64 * 1024
 SHELL_OUTPUT_MAX_BYTES = 16 * 1024
@@ -211,7 +212,7 @@ def _read_text(path: Path) -> str:
         if not stat.S_ISREG(mode):
             raise _ToolFailure(f"path is not a regular file: {path}")
         with path.open("rb") as handle:
-            raw = handle.read(MAX_READ_BYTES + 1)
+            raw = handle.read(MAX_EDIT_BYTES + 1)
     except FileNotFoundError as exc:
         raise _ToolFailure(f"file not found: {path}") from exc
     except IsADirectoryError as exc:
@@ -221,9 +222,9 @@ def _read_text(path: Path) -> str:
     except OSError as exc:
         raise _ToolFailure(f"could not read {path}: {exc}") from exc
 
-    if len(raw) > MAX_READ_BYTES:
+    if len(raw) > MAX_EDIT_BYTES:
         raise _ToolFailure(
-            f"edit_file source exceeds MAX_READ_BYTES ({MAX_READ_BYTES} bytes): {path}"
+            f"edit_file source exceeds MAX_EDIT_BYTES ({MAX_EDIT_BYTES} bytes): {path}"
         )
     return _decode_utf8(raw, str(path))
 

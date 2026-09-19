@@ -15,6 +15,24 @@ def query(root: Path, **arguments):
     return asyncio.run(run_tool("repo_query", arguments, ToolContext(root)))
 
 
+@pytest.mark.parametrize(
+    ("action", "required"),
+    [
+        ("search", "query"),
+        ("symbols", "query"),
+        ("references", "query"),
+        ("window", "path, line"),
+        ("lsp", "path, method"),
+    ],
+)
+def test_missing_action_arguments_are_actionable(
+    tmp_path: Path, action: str, required: str
+) -> None:
+    result = query(tmp_path, action=action)
+    assert not result.ok
+    assert f"{action} requires {required}" in result.error
+
+
 def test_locate_then_read_without_dumping_the_repository(tmp_path: Path) -> None:
     source = tmp_path / "calc.py"
     source.write_text("def add(a, b):\n    return a + b\n\nvalue = add(2, 3)\n")

@@ -212,6 +212,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "name": "edit_file",
         "description": (
             "Replace exactly one occurrence of old_string inside the assigned worktree. "
+            "Source files may be up to 2 MiB, independent of read output limits. "
             "Paths outside the worktree and reserved .git/.cambium metadata are rejected."
         ),
         "parameters": _parameters(
@@ -302,6 +303,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "literal text; symbols finds declarations; references finds identifier uses "
             "(not semantic references). window reads nearby lines. lsp uses the operator's "
             "configured language server and reports unavailable rather than guessing."
+            " search, symbols and references require query; window requires path and line;"
+            " lsp requires path and method."
         ),
         "parameters": _parameters(
             {

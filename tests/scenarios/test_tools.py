@@ -14,6 +14,7 @@ import pytest
 
 from cambium.lint_diag import LintDiag
 from cambium.tools import (
+    MAX_EDIT_BYTES,
     MAX_OUTPUT_BYTES,
     MAX_READ_BYTES,
     MAX_READ_LINES,
@@ -194,6 +195,24 @@ def test_mutating_tools_stay_inside_normal_worktree_files(
     assert "mutation path must stay inside the assigned worktree" in (result.error or "")
     assert outside.read_text(encoding="utf-8") == "one\n"
     assert not (tmp_path / ".git/config").exists()
+
+
+@pytest.mark.parametrize("size", [MAX_READ_BYTES + 1, MAX_EDIT_BYTES, MAX_EDIT_BYTES + 1])
+def test_edit_file_source_limit_is_separate_from_read_output(tmp_path: Path, size: int) -> None:
+    path = tmp_path / "large.txt"
+    original = "needle\n" + "x" * (size - 7)
+    path.write_text(original, encoding="utf-8")
+    result = _run(
+        "edit_file",
+        {"path": path.name, "old_string": "needle", "new_string": "edited"},
+        ToolContext(tmp_path),
+    )
+    assert result.ok == (size <= MAX_EDIT_BYTES)
+    assert path.read_text() == (
+        original.replace("needle", "edited") if result.ok else original
+    )
+    if not result.ok:
+        assert "MAX_EDIT_BYTES" in result.error
 
 
 def test_edit_file_requires_exactly_one_occurrence(tmp_path: Path) -> None:
