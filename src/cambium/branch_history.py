@@ -770,6 +770,8 @@ def query_branch_history(session_dir: Path | str, arguments: Mapping[str, Any]) 
         choices = ", ".join(action.value for action in HistoryAction)
         raise BranchHistoryError(f"action must be one of: {choices}") from None
     root = Path(session_dir).expanduser().resolve()
+    if re.fullmatch(r"turn-[0-9]+", root.name):
+        root = root.parent
     events = _events(root)
     offset = _non_negative_offset(arguments.get("offset"))
     limit = _positive_limit(arguments.get("limit"))

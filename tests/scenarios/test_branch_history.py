@@ -150,8 +150,11 @@ def test_history_byte_bound_preserves_continuation_and_all_rows(
         assert "\n".join(pages).count(text) == 1
 
 
-def test_tool_history_reopens_hash_verified_large_output_artifact(tmp_path: Path) -> None:
-    session = _write_session(tmp_path)
+@pytest.mark.parametrize("scope", ["session", "turn-0001"])
+def test_tool_history_reopens_hash_verified_large_output_artifact(
+    tmp_path: Path, scope: str
+) -> None:
+    session = _write_session(tmp_path, name=scope)
     exact = ("0123456789abcdef" * 4096).encode()
     spill = session / ".cambium" / "spill" / "exact.txt"
     spill.parent.mkdir(parents=True)
@@ -193,9 +196,27 @@ def test_tool_history_reopens_hash_verified_large_output_artifact(tmp_path: Path
     assert exact[100:164].decode() in page
     assert "next_output_offset=164" in page
 
+    if scope.startswith("turn-"):
+        # Both the live worker's current turn and the enclosing session can
+        # reopen the same scoped artifact, including from a later turn.
+        later = _write_session(tmp_path, name="turn-0002")
+        for root in (tmp_path, later):
+            historical = query_branch_history(
+                root,
+                {
+                    "action": "tool",
+                    "ref": f"tool:child:1:2:0@{scope}",
+                    "output_offset": 100,
+                    "output_limit": 64,
+                },
+            )
+            assert exact[100:164].decode() in historical
+            assert "next_output_offset=164" in historical
+
     spill.write_bytes(b"tampered")
+    ref = tool_ref("child", 1, 2, session=scope if scope.startswith("turn-") else "")
     with pytest.raises(BranchHistoryError, match="byte count|digest"):
-        query_branch_history(session, {"action": "tool", "ref": "tool:child:1:2:0"})
+        query_branch_history(session, {"action": "tool", "ref": ref})
 
 
 @pytest.mark.parametrize("scopes", [("turn-0001", "turn-0002"), ("turn-9999", "turn-10000")])

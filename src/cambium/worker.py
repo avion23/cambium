@@ -8084,6 +8084,17 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                             wall_deadline=absolute_wall_deadline,
                         )
                     if batch_checkpoint is not None:
+                        # Suspension requires an exact resume; a redacted
+                        # snapshot can never satisfy that contract.
+                        if batch_checkpoint.cache_key.redacted:
+                            return _loop_result(
+                                outcome,
+                                "failed",
+                                "context_suspend_failed: checkpoint redacted",
+                                turn,
+                                cumulative_usage,
+                                transcript,
+                            )
                         if writer is not None and not batch_checkpoint_was_emitted:
                             await _emit_context_checkpoint(
                                 writer, config, batch_checkpoint, request_id=run_request_id

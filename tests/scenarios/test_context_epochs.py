@@ -570,6 +570,35 @@ def test_suspend_cuts_epoch_at_delegate_boundary(tmp_path: Path) -> None:
     assert usage and "epoch" not in usage[0]  # pre-epoch turns carry no epoch
 
 
+@pytest.mark.parametrize("context_mode", ["fresh", "semantic"])
+def test_redacted_delegate_checkpoint_fails_before_suspension(
+    tmp_path: Path, context_mode: str
+) -> None:
+    worktree = _make_worktree(tmp_path / "repo")
+    config = _agent_config(
+        worktree,
+        task="inspect SECRETXYZ",
+        checkpoint_root=tmp_path / "ckpts",
+        context_reuse=True,
+        redactor=Redactor(secret_values={"SECRETXYZ"}),
+    )
+    writer = _FakeWriter()
+    action = json.loads(_delegate_action("child-1"))
+    action["arguments"]["spec"]["context_mode"] = context_mode
+    router = _ScriptedRouter([json.dumps(action)])
+
+    outcome = asyncio.run(_drive_loop(config, worktree, router, writer))
+
+    assert outcome["status"] == "failed"
+    assert outcome["failure_reason"] == "context_suspend_failed: checkpoint redacted"
+    assert len(router.prompts) == (2 if context_mode == "semantic" else 1)
+    assert "checkpoint_ref" not in outcome
+    assert all(
+        "SECRETXYZ" not in path.read_text()
+        for path in (tmp_path / "ckpts").rglob("*.json")
+    )
+
+
 def test_finish_cuts_terminal_epoch_when_context_reuse_enabled(
     tmp_path: Path,
 ) -> None:
