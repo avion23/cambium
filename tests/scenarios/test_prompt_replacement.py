@@ -49,6 +49,31 @@ def test_experiment_budget_counts_tokens_when_cash_is_zero() -> None:
         budget.check()
 
 
+@pytest.mark.parametrize(
+    ("usage", "tokens"),
+    [
+        ({}, 0),
+        ({"input_tokens": 23}, 23),
+        ({"output_tokens": 17}, 17),
+        ({"input_tokens": None, "output_tokens": 17}, 17),
+        ({"input_tokens": 23, "output_tokens": 17}, 40),
+        ({"total_tokens": 50}, 50),
+    ],
+)
+def test_experiment_budget_accepts_partial_codex_usage(usage, tokens) -> None:
+    from cambium.diffundo import ProviderConfig, ProviderTier, _CodexRawResponse
+
+    provider = ProviderConfig("p", ProviderTier.FAST, "", "", "m")
+    result = _CodexRawResponse({"response": {"usage": usage}}, 0.1, "done").to_result(
+        provider, {}
+    )
+    budget = ExperimentBudget(1, 100, 1.0)
+    budget.record(result.usage, 0.25)
+    assert (budget.calls, budget.tokens, budget.cost_usd) == (1, tokens, 0.25)
+    with pytest.raises(ExperimentBudgetExceeded):
+        budget.check()
+
+
 def test_gepa_search_reserves_measured_budget_for_final_evaluation() -> None:
     from cambium.prompt_optimize import _effective_search_evals
 

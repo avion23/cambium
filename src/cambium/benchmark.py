@@ -55,8 +55,8 @@ class ExperimentBudget:
         self.tokens += int(
             usage.get("total_tokens", 0)
             or (
-                usage.get("prompt_tokens", usage.get("input_tokens", 0))
-                + usage.get("completion_tokens", usage.get("output_tokens", 0))
+                (usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
+                + (usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0)
             )
         )
         self.cost_usd += max(0.0, float(cost))
