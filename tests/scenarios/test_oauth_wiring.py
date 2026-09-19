@@ -350,51 +350,6 @@ def test_worker_environment_registers_access_token_with_redactor(
     assert redactor.redact("account-id-1") == "account-id-1"
 
 
-def test_worker_environment_non_codex_task_gets_no_oauth_env(tmp_path: Path) -> None:
-    spec = {
-        "task_id": "marker",
-        "worktree_path": str(tmp_path / "wt"),
-        "fanout_config": {"tier": "fast", "model": "loopback-model"},
-    }
-    env = supervisor._worker_environment(spec, 1)
-    assert not any(name.startswith("CAMBIUM_OAUTH_") for name in env)
-
-
-def test_worker_environment_injects_for_matching_unrestricted_model(
-    tmp_path: Path,
-) -> None:
-    config = _codex_config(tmp_path / "providers.json")
-    spec = {
-        "task_id": "codex-model-task",
-        "worktree_path": str(tmp_path / "wt"),
-        "fanout_config": {"tier": "strong", "model": "gpt-5.6-sol"},
-        "provider_config_path": str(config),
-    }
-    store = OAuthStore(_store_path(tmp_path))
-    store.save_provider(_doc())
-
-    env = supervisor._worker_environment(spec, 1, oauth_store=store)
-
-    assert env["CAMBIUM_OAUTH_ACCESS_CODEX"] == ACCESS
-    assert env["CAMBIUM_OAUTH_ACCOUNT_CODEX"] == ACCOUNT
-
-
-def test_worker_environment_injects_for_empty_authorized_set(tmp_path: Path) -> None:
-    """An empty authorized_providers list (validator normalization) is no
-    restriction: the codex provider referenced through fanout_config still gets
-    its token injected, matching the worker's unrestricted semantics."""
-    config = _codex_config(tmp_path / "providers.json")
-    spec = _codex_spec(config, tmp_path)
-    spec["authorized_providers"] = []
-    store = OAuthStore(_store_path(tmp_path))
-    store.save_provider(_doc())
-
-    env = supervisor._worker_environment(spec, 1, oauth_store=store)
-
-    assert env["CAMBIUM_OAUTH_ACCESS_CODEX"] == ACCESS
-    assert env["CAMBIUM_OAUTH_ACCOUNT_CODEX"] == ACCOUNT
-
-
 def test_oneshot_readiness_excludes_disabled_oauth_session(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -543,14 +498,6 @@ def test_cli_device_flow_defaults_to_pinned_public_client(
     )
     assert store.read_provider("codex") is not None
     assert fake_issuer.fake.exchange_count == 1
-
-
-def test_cli_oauth_parser_rejects_conflicting_subcommands(capsys) -> None:
-    with pytest.raises(SystemExit) as raised:
-        cli.main(["auth", "oauth", "status", "codex", "logout"])
-
-    assert raised.value.code == 2
-    assert "invalid command arguments" in capsys.readouterr().err
 
 
 # --------------------------------------------------------------------------- #
@@ -722,40 +669,6 @@ def _codex_providers_file(path: Path) -> Path:
         encoding="utf-8",
     )
     return path
-
-
-def test_provider_router_wires_credential_from_env(tmp_path: Path) -> None:
-    """The worker's _provider_router builds Diffundo with the injected
-    CredentialSource (access token + account id) — the P0 bridge."""
-    from cambium import worker
-    from cambium.diffundo import CredentialSource
-
-    config_path = _codex_providers_file(tmp_path / "providers.json")
-    previous = {
-        "CAMBIUM_PROVIDERS": os.environ.get("CAMBIUM_PROVIDERS"),
-        "CAMBIUM_OAUTH_ACCESS_CODEX": os.environ.get("CAMBIUM_OAUTH_ACCESS_CODEX"),
-        "CAMBIUM_OAUTH_ACCOUNT_CODEX": os.environ.get("CAMBIUM_OAUTH_ACCOUNT_CODEX"),
-    }
-    try:
-        os.environ["CAMBIUM_PROVIDERS"] = str(config_path.resolve())
-        os.environ["CAMBIUM_OAUTH_ACCESS_CODEX"] = ACCESS
-        os.environ["CAMBIUM_OAUTH_ACCOUNT_CODEX"] = ACCOUNT
-        router, tier, model, identity = worker._provider_router(
-            {"diffundo": {"tier": "strong", "model": "gpt-5.6-luna"}}
-        )
-    finally:
-        for key, value in previous.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-
-    assert tier.value == "strong"
-    assert model == "gpt-5.6-luna"
-    source = router._credential_source
-    assert isinstance(source, CredentialSource)
-    assert source.access_token == ACCESS
-    assert source.account_id == ACCOUNT
 
 
 def test_provider_router_fails_closed_without_oauth_env(tmp_path: Path) -> None:

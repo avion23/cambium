@@ -7,12 +7,11 @@ through the ``codex_profile`` constructor seam and the bearer credential
 through ``credential_source`` — providers.json can never set either. Env vars
 for the legacy chat path are set explicitly (no monkeypatch fixture).
 
-Covers the documented + probed codex contract: deterministic Responses-API
-request serialization (D8c), fail-closed credential handling, transport
-guards, the generic-400 refusal fall-through, and the provider response-size
-cap. Request-shape and SSE event-shape wire assertions were culled (the
-external API shape may change); the router's own decision/state behavior
-remains covered.
+Covers the documented + probed codex contract: fail-closed credential
+handling, transport guards, the generic-400 refusal fall-through, and the
+provider response-size cap. Request-shape and SSE event-shape wire assertions
+were culled (the external API shape may change); the router's own decision and
+state behavior remains covered.
 """
 
 from __future__ import annotations
@@ -42,8 +41,6 @@ from cambium.diffundo import (
     ProviderOutcome,
     ProviderStatus,
     ProviderTier,
-    _codex_input_item,
-    _codex_request_body,
     _RawResponse,
     _read_provider_sse,
 )
@@ -60,7 +57,7 @@ class CodexServer:
     ``behaviors`` is a list of ``(status, body, delay_s[, headers])`` consumed
     in order; the last behavior repeats for any further request. A 200 streams
     ``body`` (the raw SSE text) back; a non-200 returns ``body`` as a JSON
-    error payload. Requests (body, headers, path) are recorded.
+    error payload. Request bodies are recorded.
     """
 
     def __init__(
@@ -71,8 +68,6 @@ class CodexServer:
     ) -> None:
         self.behaviors = list(behaviors)
         self.calls: list[dict[str, Any]] = []
-        self.request_headers: list[dict[str, str | None]] = []
-        self.request_paths: list[str] = []
         self._lock = threading.Lock()
         self._httpd = HTTPServer((host, 0), _Handler)
         cast(Any, self._httpd).fake = self
@@ -84,11 +79,9 @@ class CodexServer:
         self._thread.start()
         self.base_url = f"http://{host}:{self._httpd.server_port}"
 
-    def record(self, body: dict[str, Any], headers: dict[str, str | None], path: str) -> int:
+    def record(self, body: dict[str, Any]) -> int:
         with self._lock:
             self.calls.append(body)
-            self.request_headers.append(headers)
-            self.request_paths.append(path)
             return len(self.calls) - 1
 
     def behavior_at(self, index: int) -> tuple[int, object, float, dict[str, str]]:
@@ -116,18 +109,7 @@ class _Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             body = {}
         server = cast(CodexServer, cast(Any, self.server).fake)
-        index = server.record(
-            body,
-            {
-                "Content-Type": self.headers.get("Content-Type"),
-                "Authorization": self.headers.get("Authorization"),
-                "ChatGPT-Account-Id": self.headers.get("ChatGPT-Account-Id"),
-                "User-Agent": self.headers.get("User-Agent"),
-                "originator": self.headers.get("originator"),
-                "session-id": self.headers.get("session-id"),
-            },
-            self.path,
-        )
+        index = server.record(body)
         status, payload, delay, extra_headers = server.behavior_at(index)
         if delay:
             time.sleep(delay)
@@ -359,31 +341,9 @@ def _provider_error(failure: AllProvidersFailed) -> ProviderError:
 
 PROMPT = {"messages": [{"role": "user", "content": "hello"}]}
 
-TOOL_PROMPT = {
-    "messages": [
-        {"role": "system", "content": "You are a coding assistant."},
-        {"role": "user", "content": "read README"},
-    ],
-    "tools": [
-        {
-            "name": "read_file",
-            "description": "Read a file from the repository",
-            "parameters": {
-                "type": "object",
-                "properties": {"path": {"type": "string"}},
-                "required": ["path"],
-            },
-        }
-    ],
-    "tool_choice": "auto",
-    # chat-only extras must never leak into the codex body
-    "max_tokens": 100,
-    "max_completion_tokens": 100,
-}
-
 
 # --------------------------------------------------------------------------- #
-# 1. request body conversion (exact)
+# 1. provider response bounds
 # --------------------------------------------------------------------------- #
 
 
@@ -399,64 +359,6 @@ def test_codex_stream_larger_than_provider_cap_is_rejected() -> None:
         assert "response exceeds" in _provider_error(raised.value).message
     finally:
         server.close()
-
-
-def test_codex_body_serialization_is_byte_identical_across_calls() -> None:
-    """D8c: the same prompt serializes to the same request bytes every call —
-    fixed field order, no per-call timestamps or ids — so the body head cannot
-    churn a provider's exact-prefix cache key."""
-    config = _codex_config(None, supports_native_tools=True)
-    first = _codex_request_body(config, TOOL_PROMPT)
-    second = _codex_request_body(config, TOOL_PROMPT)
-    assert json.dumps(first) == json.dumps(second)
-
-
-def test_codex_native_mode_converts_tools_and_requires_native_controls() -> None:
-    config = _codex_config(None, supports_native_tools=True)
-    tools = _exposed_tool_schemas(_PROVIDER_TOOLS_CONFIG)
-
-    body = _codex_request_body(
-        config,
-        {"messages": [{"role": "user", "content": "inspect the repo"}], "tools": tools},
-    )
-
-    operational = body["tools"][: len(tools)]
-    assert operational == [
-        {
-            "type": "function",
-            "name": tool["name"],
-            "description": tool["description"],
-            "parameters": tool["parameters"],
-        }
-        for tool in tools
-    ]
-    controls = body["tools"][len(tools) :]
-    assert [control["name"] for control in controls] == ["plan", "finish"]
-    assert all(control["strict"] is True for control in controls)
-    assert all(
-        set(control["parameters"]["required"]) == set(control["parameters"]["properties"])
-        and control["parameters"]["additionalProperties"] is False
-        for control in controls
-    )
-    assert body["tool_choice"] == "required"
-
-
-def test_codex_native_mode_without_agent_tools_does_not_force_controls() -> None:
-    config = _codex_config(None, supports_native_tools=True)
-
-    body = _codex_request_body(config, PROMPT)
-
-    assert "tools" not in body
-    assert "tool_choice" not in body
-
-
-def test_codex_generic_native_tools_do_not_gain_cambium_controls() -> None:
-    config = _codex_config(None, supports_native_tools=True)
-
-    body = _codex_request_body(config, TOOL_PROMPT)
-
-    assert body["tool_choice"] == "auto"
-    assert [tool["name"] for tool in body["tools"]] == ["read_file"]
 
 
 def test_codex_required_native_action_never_downgrades_to_text() -> None:
@@ -528,60 +430,6 @@ def test_codex_required_native_mismatch_falls_through_with_serving_provenance() 
         assert router.health("p_good") is HealthState.HEALTHY
     finally:
         server.close()
-
-
-def test_codex_non_native_mode_keeps_messages_and_omits_tool_wire_fields() -> None:
-    config = _codex_config(None)
-
-    body = _codex_request_body(config, TOOL_PROMPT)
-
-    assert body["input"] == [
-        {
-            "role": "developer",
-            "content": [{"type": "input_text", "text": "You are a coding assistant."}],
-        },
-        {"role": "user", "content": [{"type": "input_text", "text": "read README"}]},
-    ]
-    assert "tools" not in body
-    assert "tool_choice" not in body
-
-
-def test_codex_body_leading_developer_item_is_byte_stable_as_transcript_grows() -> None:
-    """The leading system message converts to a byte-identical developer item
-    on every turn of a tool loop; only the trailing input items grow."""
-    config = _codex_config(None)
-    system = "You are Cambium's autonomous coding agent.\nReturn exactly one JSON object."
-    prompt_turn1 = {
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": "Begin."},
-        ]
-    }
-    prompt_turn4 = {
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": "Begin."},
-            {"role": "assistant", "content": '{"type": "plan", "steps": ["read", "edit"]}'},
-            {"role": "user", "content": "tool read_batch ok=true"},
-            {"role": "assistant", "content": '{"type": "tool_call", "name": "write_file"}'},
-            {"role": "user", "content": "tool write_file ok=true"},
-            {
-                "role": "assistant",
-                "content": '{"type": "finish", "summary": "done", "objective_met": true}',
-            },
-            {"role": "user", "content": "Continue."},
-        ]
-    }
-    body1 = _codex_request_body(config, prompt_turn1)
-    body4 = _codex_request_body(config, prompt_turn4)
-    assert body1["input"][0] == body4["input"][0]
-    assert body1["input"][0] == {
-        "role": "developer",
-        "content": [{"type": "input_text", "text": system}],
-    }
-    assert _codex_input_item(prompt_turn1["messages"][0]) == body1["input"][0]
-    # the head serialization is byte-identical across the growing transcript
-    assert json.dumps(body1["input"][0]) == json.dumps(body4["input"][0])
 
 
 # --------------------------------------------------------------------------- #

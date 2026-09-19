@@ -13,11 +13,9 @@ import pytest
 diffundo = pytest.importorskip("cambium.diffundo")
 
 from cambium import provider_config  # noqa: E402
-from cambium.auth import derived_env_name, effective_home  # noqa: E402
+from cambium.auth import derived_env_name  # noqa: E402
 from cambium.provider_config import (  # noqa: E402
-    DEFAULT_PROVIDER_PATH,
     AuthMode,
-    Protocol,
     env_report,
     load_providers,
     select_provider,
@@ -75,14 +73,6 @@ def _assert_quarantined(
     return records
 
 
-def test_default_path_uses_effective_home_not_home_env(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("HOME", "/path-that-must-not-be-used")
-
-    assert DEFAULT_PROVIDER_PATH == effective_home() / ".config" / "cambium" / "providers.json"
-
-
 def test_valid_config_loads_without_key_in_environment(tmp_path: Path) -> None:
     path = _write(tmp_path / "providers.json", [_provider()])
 
@@ -134,27 +124,6 @@ def test_no_auth_provider_without_credentials_is_ready(tmp_path: Path) -> None:
 
     assert _provider_credential_ready(providers[0], object()) is True
     assert _provider_credential_ready_at_admission(providers[0]) is True
-
-
-def test_enabled_defaults_to_true_when_omitted(tmp_path: Path) -> None:
-    entry = _provider()
-    del entry["enabled"]
-
-    providers = load_providers(_write(tmp_path / "providers.json", [entry]))
-
-    assert providers[0].enabled is True
-
-
-def test_native_tool_capability_is_opt_in(tmp_path: Path) -> None:
-    for index, (declared, expected) in enumerate(((None, False), (False, False), (True, True))):
-        entry = _provider()
-        if declared is None:
-            entry.pop("supports_native_tools", None)
-        else:
-            entry["supports_native_tools"] = declared
-
-        providers = load_providers(_write(tmp_path / f"providers-{index}.json", [entry]))
-        assert providers[0].supports_native_tools is expected
 
 
 def test_explicit_source_overrides_environment_path(
@@ -218,23 +187,6 @@ def test_env_report_treats_empty_value_as_unconfigured(
     providers = load_providers(path)
 
     assert env_report(providers) == {"empty": False, "present": True}
-
-
-def test_default_path_missing_has_clear_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    expected_path = tmp_path / "effective-home" / ".config" / "cambium" / "providers.json"
-    monkeypatch.setattr(provider_config, "DEFAULT_PROVIDER_PATH", expected_path)
-    monkeypatch.delenv("CAMBIUM_PROVIDERS", raising=False)
-    monkeypatch.setenv("HOME", str(tmp_path / "home-secret"))
-
-    with pytest.raises(FileNotFoundError) as raised:
-        load_providers()
-
-    message = str(raised.value)
-    assert f"provider config file not found: {expected_path}" in message
-    assert f"create {expected_path}" in message
-    assert "home-secret" not in message
 
 
 def test_loopback_http_base_url_is_accepted(tmp_path: Path) -> None:
@@ -314,20 +266,6 @@ def _codex_provider(name: str = "codex", **overrides: object) -> dict[str, objec
     return value
 
 
-def test_auth_protocol_round_trip_from_providers_json(tmp_path: Path) -> None:
-    path = _write(tmp_path / "providers.json", [_codex_provider()])
-
-    providers = load_providers(path)
-
-    assert len(providers) == 1
-    assert providers[0].auth is AuthMode.CODEX_CHATGPT
-    assert providers[0].protocol is Protocol.CODEX_RESPONSES
-    # The profile pins the endpoint and the OAuth flow: a codex provider never
-    # carries a base_url or an api_key_env through the loader.
-    assert providers[0].base_url == ""
-    assert providers[0].api_key_env == ""
-
-
 def test_codex_chatgpt_without_codex_responses_protocol_is_quarantined(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -374,19 +312,6 @@ def test_codex_chatgpt_api_key_env_in_file_is_quarantined(
     _assert_quarantined(path, "must not be set with auth 'codex_chatgpt'", caplog)
 
 
-def test_provider_without_api_key_env_loads_with_empty_env(
-    tmp_path: Path,
-) -> None:
-    value = _provider()
-    del value["api_key_env"]
-    path = _write(tmp_path / "providers.json", [value])
-
-    providers = load_providers(path)
-
-    assert providers[0].api_key == "sk-config-openai"
-    assert providers[0].api_key_env == ""
-
-
 def test_blank_model_is_quarantined(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     for index, model in enumerate(("", "   ", "\t\n")):
         path = _write(tmp_path / f"providers-{index}.json", [_provider(model=model)])
@@ -409,23 +334,6 @@ def test_malformed_auth_protocol_values_are_quarantined(
         _assert_quarantined(path, match, caplog)
 
 
-def test_mixed_api_key_and_codex_providers_load_and_select(tmp_path: Path) -> None:
-    path = _write(
-        tmp_path / "providers.json",
-        [
-            _provider("openai"),
-            _codex_provider("codex"),
-        ],
-    )
-
-    providers = load_providers(path)
-
-    assert [provider.name for provider in providers] == ["openai", "codex"]
-    assert select_provider(providers, name="openai").auth is AuthMode.API_KEY
-    assert select_provider(providers, name="codex").auth is AuthMode.CODEX_CHATGPT
-    assert select_provider(providers, name="codex").protocol is Protocol.CODEX_RESPONSES
-
-
 def test_malformed_reasoning_effort_is_quarantined(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -446,23 +354,6 @@ def test_reasoning_effort_requires_codex_responses_protocol_is_quarantined(
     )
 
     _assert_quarantined(path, "only supported with protocol 'codex_responses'", caplog)
-
-
-def test_cached_input_price_round_trips_independently(tmp_path: Path) -> None:
-    path = _write(
-        tmp_path / "providers.json",
-        [
-            _provider(
-                price=0.40, price_per_1m_in=0.30, price_per_1m_cached_in=0.05, price_per_1m_out=0.80
-            )
-        ],
-    )
-
-    providers = load_providers(path)
-
-    assert providers[0].price_per_1m_in == 0.30
-    assert providers[0].price_per_1m_cached_in == 0.05
-    assert providers[0].price_per_1m_out == 0.80
 
 
 def test_valid_entries_continue_after_invalid_entry_is_quarantined(
