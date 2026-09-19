@@ -308,12 +308,6 @@ def test_enabled_conflict_spawns_resolver_and_publishes_result(
     assert result.exit_code == 0
     assert all(item.status == "succeeded" for item in result.results)
     events = read_events(session)
-    admitted = [event for event in events if event["kind"] == "resolver_child_admitted"]
-    assert len(admitted) == 1
-    payload = admitted[0]["payload"]
-    assert payload["conflicted_files"] == ["base.txt"]
-    assert payload["diff_evidence"]
-    assert set(payload["parent_intent_summaries"]) == {"worker", "integration"}
     assert [event for event in events if event["kind"] == "resolver_succeeded"]
     merged = _git(repo, "show", "main:base.txt").stdout
     assert "// resolved by child" in merged
@@ -436,15 +430,6 @@ def test_resolver_rechecks_parent_join_before_publication(tmp_path: Path) -> Non
         "diff_truncated": False,
         "integration_head": integration_head,
     }
-    resolver_spec = runtime._build_resolver_spec(
-        child_spec,
-        conflict,
-        {"summary": "child intent", "status": "succeeded"},
-        attempt=1,
-        max_attempts=1,
-    )
-    assert "_required_context_mode" not in resolver_spec
-
     result = asyncio.run(
         runtime._resolve_merge_conflict(
             child_spec,

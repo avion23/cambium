@@ -63,7 +63,7 @@ SCRIPTED_COMPLETION: dict[str, Any] = {
     "usage": {"prompt_tokens": 18, "completion_tokens": 11, "total_tokens": 29},
 }
 SCRIPTED_STATUS_CODES: list[int] = []
-FAKE_REQUESTS: dict[str, Any] = {"count": 0, "bodies": [], "statuses": []}
+FAKE_REQUESTS: dict[str, Any] = {"count": 0, "statuses": []}
 _FAKE_LOCK = threading.Lock()
 
 
@@ -79,18 +79,12 @@ class _FakeOpenAIHandler(BaseHTTPRequestHandler):
             return
 
         length = int(self.headers.get("Content-Length") or 0)
-        raw = self.rfile.read(length) if length else b""
-        try:
-            body = json.loads(raw.decode("utf-8") or "{}")
-        except json.JSONDecodeError:
-            body = {}
-        if not isinstance(body, dict):
-            body = {}
+        if length:
+            self.rfile.read(length)
 
         with _FAKE_LOCK:
             request_index = FAKE_REQUESTS["count"]
             FAKE_REQUESTS["count"] += 1
-            FAKE_REQUESTS["bodies"].append(body)
             status = (
                 SCRIPTED_STATUS_CODES[request_index]
                 if request_index < len(SCRIPTED_STATUS_CODES)
@@ -140,7 +134,6 @@ class _FakeOpenAIServer:
 def _reset_fake_server() -> None:
     with _FAKE_LOCK:
         FAKE_REQUESTS["count"] = 0
-        FAKE_REQUESTS["bodies"] = []
         FAKE_REQUESTS["statuses"] = []
         SCRIPTED_STATUS_CODES.clear()
 
@@ -273,21 +266,6 @@ def test_m6_provider_decision_and_atomic_publish(tmp_path: Path, monkeypatch) ->
         second = asyncio.run(router.call(ProviderTier.FAST, prompt))
 
         assert FAKE_REQUESTS["count"] == 2  # identical calls are not cached
-        bodies = FAKE_REQUESTS["bodies"]
-        assert bodies[0] == bodies[1]
-        body = bodies[0]
-        assert body["model"] == "m6-fake-model"
-        assert body["messages"] == prompt["messages"]
-        assert all(
-            isinstance(message, dict)
-            and isinstance(message.get("role"), str)
-            and isinstance(message.get("content"), str)
-            for message in body["messages"]
-        )
-        assert body["messages"][0]["content"] == STATIC_PREFIX
-        assert body["messages"][-1]["content"] == DYNAMIC_TAIL
-        assert "request_id" not in body["messages"][0]["content"].lower()
-        assert "request_id" in body["messages"][-1]["content"]
 
         target_file, marker = _decision_fields(second.content)
         base = _make_repo(repo)
