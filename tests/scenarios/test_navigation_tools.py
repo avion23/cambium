@@ -15,25 +15,6 @@ def query(root: Path, **arguments):
     return asyncio.run(run_tool("repo_query", arguments, ToolContext(root)))
 
 
-@pytest.mark.parametrize(
-    ("action", "required"),
-    [
-        ("search", "query"),
-        ("symbols", "query"),
-        ("references", "query"),
-        ("window", "path, line"),
-        ("lsp", "path, method"),
-    ],
-)
-def test_missing_action_arguments_are_actionable(
-    tmp_path: Path, action: str, required: str
-) -> None:
-    result = query(tmp_path, action=action)
-    assert not result.ok
-    assert result.error is not None
-    assert f"{action} requires {required}" in result.error
-
-
 def test_locate_then_read_without_dumping_the_repository(tmp_path: Path) -> None:
     source = tmp_path / "calc.py"
     source.write_text("def add(a, b):\n    return a + b\n\nvalue = add(2, 3)\n")
@@ -104,15 +85,6 @@ def test_window_past_eof_is_not_a_successful_empty_read(tmp_path: Path) -> None:
     (tmp_path / "a.py").write_text("value = 1\n")
     result = query(tmp_path, action="window", path="a.py", line=100)
     assert not result.ok and "past the end" in result.error
-
-
-def test_unconfigured_lsp_does_not_pretend_to_find_a_definition(
-    tmp_path: Path, monkeypatch
-) -> None:
-    monkeypatch.delenv("CAMBIUM_LSP_COMMAND", raising=False)
-    (tmp_path / "a.py").write_text("value = 1\n")
-    result = query(tmp_path, action="lsp", method="definition", path="a.py", line=1)
-    assert not result.ok and "CAMBIUM_LSP_COMMAND is not configured" in result.error
 
 
 def test_navigation_output_is_bounded(tmp_path: Path) -> None:

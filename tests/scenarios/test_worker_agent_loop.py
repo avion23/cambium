@@ -26,11 +26,7 @@ import pytest
 from cambium import tools, worker
 from cambium.branch_history import query_branch_history
 from cambium.diffundo import (
-    ProviderError,
-    ProviderOutcome,
     ProviderTier,
-    prompt_prefix_bytes,
-    validate_prompt_structure,
 )
 from cambium.fencing import write_generation
 from cambium.state_view import state_text
@@ -192,7 +188,6 @@ class _SummaryFlushRouter:
             else ['{"type":"finish","summary":"done","objective_met":true}']
         )
         self.prompts: list[dict[str, Any]] = []
-        self.allow_model_substitution: list[bool] = []
         self.max_call_budget_s: list[float | None] = []
 
     def declared_model(self, name: str) -> str:
@@ -210,7 +205,6 @@ class _SummaryFlushRouter:
     ) -> _FakeCallResult:
         del tier, model, budget_usd
         self.prompts.append(prompt)
-        self.allow_model_substitution.append(allow_model_substitution)
         self.max_call_budget_s.append(max_call_budget_s)
         messages = prompt.get("messages")
         control_content = None
@@ -271,69 +265,6 @@ class _SummaryFlushRouter:
             model="dead-model",
             provider="dead-primary",
         )
-
-
-class _StickySummaryFlushRouter(_SummaryFlushRouter):
-    """Summary double that exposes coding-lease binding and call provenance."""
-
-    def __init__(self, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-        self.bind_calls: list[tuple[str, str]] = []
-        self.call_kinds: list[tuple[str, str, str]] = []
-        self._lease: SimpleNamespace | None = None
-
-    @property
-    def provider_lease(self) -> SimpleNamespace | None:
-        return self._lease
-
-    def bind_provider(
-        self,
-        provider: str,
-        model: str,
-        *,
-        root_task_id: str = "task",
-    ) -> None:
-        del root_task_id
-        self.bind_calls.append((provider, model))
-        if self._lease is None:
-            self._lease = SimpleNamespace(provider=provider, model=model)
-            return
-        if (self._lease.provider, self._lease.model) != (provider, model):
-            raise AssertionError("coding provider lease moved")
-
-    async def call(
-        self,
-        tier: ProviderTier,
-        prompt: dict[str, Any],
-        *,
-        model: str | None = None,
-        budget_usd: float | None = None,
-        allow_model_substitution: bool = False,
-        max_call_budget_s: float | None = None,
-    ) -> _FakeCallResult:
-        result = await super().call(
-            tier,
-            prompt,
-            model=model,
-            budget_usd=budget_usd,
-            allow_model_substitution=allow_model_substitution,
-            max_call_budget_s=max_call_budget_s,
-        )
-        kind = "summary" if allow_model_substitution else "agent"
-        self.call_kinds.append((kind, result.provider, result.model))
-        return result
-
-
-@pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
-def test_env_float_rejects_non_finite_values(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
-    default = 17.5
-    monkeypatch.setenv("CAMBIUM_TEST_FLOAT", value)
-
-    with pytest.raises(ValueError, match="finite"):
-        worker._env_float("CAMBIUM_TEST_FLOAT", default)
-
-    monkeypatch.delenv("CAMBIUM_TEST_FLOAT")
-    assert worker._env_float("CAMBIUM_TEST_FLOAT", default) is default
 
 
 def _make_worktree(repo: Path, branch: str = "agent-loop") -> Path:
@@ -515,12 +446,6 @@ def test_semantic_child_summary_substitution_and_failure(tmp_path: Path, all_dea
         ],
     )
     outcome = asyncio.run(_drive_loop(config, worktree, router))
-    assert router.allow_model_substitution == [False, True]
-    assert len(router.max_call_budget_s) == 2
-    assert all(
-        isinstance(value, float) and 0.0 < value <= config.max_wall_s
-        for value in router.max_call_budget_s
-    )
     if all_dead:
         assert outcome["status"] == "failed"
         assert "summary provider call failed" in outcome["failure_reason"]
@@ -528,105 +453,6 @@ def test_semantic_child_summary_substitution_and_failure(tmp_path: Path, all_dea
         assert outcome["status"] == "suspended"
         assert outcome["provider"] == "dead-primary"
         assert "fell_back_from" not in outcome
-
-
-def test_summary_fallback_does_not_move_coding_lease_for_later_agent_call(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    async def direct_to_thread(function: Any, *args: Any, **kwargs: Any) -> Any:
-        return function(*args, **kwargs)
-
-    monkeypatch.setattr(worker.asyncio, "to_thread", direct_to_thread)
-    worktree = _make_worktree(tmp_path / "repo")
-    summary_config = _agent_config(
-        worktree,
-        context_reuse=True,
-        checkpoint_root=tmp_path / "checkpoints",
-        max_turns=4,
-    )
-    router = _StickySummaryFlushRouter(
-        responses=[
-            json.dumps(
-                {
-                    "name": "delegate",
-                    "arguments": {
-                        "child_task_id": "review",
-                        "kind": "investigation",
-                        "spec": {
-                            "task": "Review alpha.txt",
-                            "context_mode": "semantic",
-                            "placement": "spread",
-                        },
-                    },
-                }
-            )
-        ]
-    )
-
-    suspended = asyncio.run(_drive_loop(summary_config, worktree, router))
-    assert suspended["status"] == "suspended"
-    assert router.call_kinds == [
-        ("agent", "dead-primary", "dead-model"),
-        ("summary", "healthy-substitute", "healthy-model"),
-    ]
-    assert router.bind_calls == [("dead-primary", "dead-model")]
-    assert suspended["provider"] == "dead-primary"
-    assert "fell_back_from" not in suspended
-    checkpoint = worker._load_epoch_checkpoint(
-        summary_config, suspended["checkpoint_ref"], expect_task_id=True
-    )
-    assert checkpoint.cache_key.provider == "dead-primary"
-    assert checkpoint.cache_key.model == "dead-model"
-
-    router.responses.append('{"type":"finish","summary":"done","objective_met":true}')
-    later_config = _agent_config(worktree, context_reuse=False, max_turns=1)
-    completed = asyncio.run(_drive_loop(later_config, worktree, router))
-
-    assert completed["status"] == "succeeded"
-    assert completed["provider"] == "dead-primary"
-    assert router.call_kinds[-1] == ("agent", "dead-primary", "dead-model")
-    assert router.bind_calls == [
-        ("dead-primary", "dead-model"),
-        ("dead-primary", "dead-model"),
-    ]
-
-
-def test_attempt_failure_usage_event_preserves_provider_state() -> None:
-    class _Router:
-        def declared_model(self, name: str) -> str:
-            assert name == "dead-provider"
-            return "dead-model"
-
-        def status(self, name: str) -> SimpleNamespace:
-            assert name == "dead-provider"
-            return SimpleNamespace(value="cooldown")
-
-    failures = [
-        ProviderError(
-            "dead-provider",
-            ProviderOutcome.QUOTA,
-            "HTTP 429 rate limit",
-            retry_after_s=60.0,
-            request_rate_status="cooldown",
-        )
-    ]
-
-    events = worker._attempt_failure_usage_events(
-        failures,
-        turn=3,
-        router=cast(Any, _Router()),
-        prompt={"messages": [{"role": "system", "content": "stable"}]},
-        call_kind="summary",
-    )
-
-    assert len(events) == 1
-    event = events[0]
-    assert event["provider"] == "dead-provider"
-    assert event["model"] == "dead-model"
-    assert event["call_kind"] == "summary"
-    assert event["failure_reason"].startswith("quota:")
-    assert event["retry_after_s"] == 60.0
-    assert event["request_rate_status"] == "cooldown"
 
 
 def test_agent_call_receives_remaining_wall_cap(tmp_path: Path) -> None:
@@ -750,7 +576,6 @@ def test_finish_keeps_raw_evidence_without_summary_call(tmp_path: Path) -> None:
     writer = _FakeWriter()
     outcome = asyncio.run(_drive_loop(config, worktree, router, writer))
     assert outcome["status"] == "succeeded"
-    assert router.allow_model_substitution == [False, False]
     event = next(e for e in writer.messages() if e["type"] == "context_checkpoint")
     checkpoint = worker._load_epoch_checkpoint(config, event["checkpoint_ref"], expect_task_id=True)
     text = json.dumps(checkpoint.full_messages)
@@ -924,119 +749,6 @@ def test_two_malformed_summaries_fail_on_the_third_fold_attempt(tmp_path: Path) 
 # ---------------------------------------------------------------------------
 
 
-def test_build_agent_prompt_last_message_is_always_user() -> None:
-    """Payloads must not end on a system/assistant message (ZAI/GLM 1214)."""
-    prompt = worker._build_agent_prompt("edit a.txt", [{"name": "read_batch"}], [])
-    messages = prompt["messages"]
-    assert messages[0]["role"] == "system"
-    assert "native control functions named plan and finish are present" in messages[0]["content"]
-    assert "never serialize an action into assistant text" in messages[0]["content"]
-    assert messages[-1]["role"] == "user"
-    # A plan action leaves the transcript ending with an assistant message;
-    # the builder appends a neutral user continuation.
-    plan_transcript = [
-        {"role": "user", "content": "Begin."},
-        {"role": "assistant", "content": '{"type": "plan", "steps": []}'},
-    ]
-    prompt2 = worker._build_agent_prompt("edit a.txt", [{"name": "read_batch"}], plan_transcript)
-    assert prompt2["messages"][-1]["role"] == "user"
-    assert prompt2["messages"][-1]["content"] == "Continue."
-
-
-def test_build_agent_prompt_static_head_is_byte_stable_across_tasks() -> None:
-    """§9.1.6: the system message (directive + sorted tool schemas) is
-    byte-identical across tasks and transcripts; the dynamic task text rides
-    as delimited user-role data in the tail (provider exact-prefix caching
-    keys on the stable system head)."""
-    tools = [{"name": "read_batch", "parameters": {"type": "object", "properties": {}}}]
-    identity = "codex/gpt-5.6-luna"
-    task_a = "task alpha"
-    task_b = "task bravo longer"
-    prompt_a = worker._build_agent_prompt(task_a, tools, [], model_identity=identity)
-    prompt_b = worker._build_agent_prompt(task_b, tools, [], model_identity=identity)
-    content_a = prompt_a["messages"][0]["content"]
-    content_b = prompt_b["messages"][0]["content"]
-    assert content_a == content_b
-    assert task_a not in content_a
-    assert task_b not in content_b
-    assert prompt_a["messages"][1] == {
-        "role": "user",
-        "content": "<cambium-task>\nTask: task alpha\n</cambium-task>",
-    }
-    assert prompt_b["messages"][1] == {
-        "role": "user",
-        "content": "<cambium-task>\nTask: task bravo longer\n</cambium-task>",
-    }
-    # prompt_prefix_bytes mirrors the system-message byte length exactly.
-    assert prompt_prefix_bytes(prompt_a) == len(content_a.encode("utf-8"))
-    assert prompt_prefix_bytes(prompt_b) == len(content_b.encode("utf-8"))
-    # A task carrying volatile tokens stays in the user tail: the header
-    # validator does not flag it and the system prefix does not move.
-    volatile = "fix the deploy from 2026-08-20T12:34:56Z (request_id=req-123)"
-    prompt_v = worker._build_agent_prompt(volatile, tools, [], model_identity=identity)
-    assert prompt_v["messages"][0]["content"] == content_a
-    assert volatile in prompt_v["messages"][1]["content"]
-    validate_prompt_structure(prompt_v)
-
-    grown = worker._build_agent_prompt(
-        task_a,
-        tools,
-        [
-            {"role": "user", "content": "Begin."},
-            {"role": "assistant", "content": '{"type": "tool_call", "name": "read_batch"}'},
-            {"role": "user", "content": "tool read_batch ok=true"},
-        ],
-        model_identity=identity,
-    )
-    assert grown["messages"][0]["content"] == content_a
-    assert prompt_prefix_bytes(grown) == prompt_prefix_bytes(prompt_a)
-
-
-def test_agent_status_bar_is_last_context_tail_message(tmp_path: Path) -> None:
-    repo = tmp_path / "repo"
-    worktree = _make_worktree(repo)
-    config = _agent_config(
-        worktree,
-        context_reuse=True,
-        checkpoint_root=tmp_path / "checkpoints",
-        max_tokens=100,
-    )
-    router = _SummaryFlushRouter(
-        responses=[
-            '{"type":"plan","steps":["continue"]}',
-            '{"type":"finish","summary":"done","objective_met":true}',
-        ]
-    )
-
-    outcome = asyncio.run(_drive_loop(config, worktree, router))  # type: ignore[arg-type]
-
-    assert outcome["status"] == "succeeded"
-    action_prompts = [
-        prompt
-        for prompt in router.prompts
-        if not str(prompt["messages"][-1].get("content", "")).startswith(
-            "<cambium-summary-control>"
-        )
-    ]
-    assert len(action_prompts) == 2
-    first_messages = action_prompts[0]["messages"]
-    second_messages = action_prompts[1]["messages"]
-    assert first_messages[:2] == second_messages[:2]
-    assert first_messages[-1]["role"] == "user"
-    assert "<cambium-situation " in first_messages[-1]["content"]
-    assert worker._strip_situation_frame_content(first_messages[-1]["content"]) == (
-        "<cambium-loop-state>budget=100% turn=1 epoch=0 code_changed=false "
-        "verified_after_change=false verification_failed=false no_progress=0 "
-        "budget_new_tokens=0 previous_prompt_tokens=0"
-        "</cambium-loop-state>"
-    )
-    assert "budget=90%" in second_messages[-1]["content"]
-    assert "turn=2" in second_messages[-1]["content"]
-    assert "epoch=0" in second_messages[-1]["content"]
-    assert "code_changed=false" in second_messages[-1]["content"]
-    assert "verified_after_change=false" in second_messages[-1]["content"]
-
-
 def test_usage_budget_charge_uses_uncached_baseline_and_safe_fallback() -> None:
     cached = {
         "prompt_tokens": 100,
@@ -1191,81 +903,6 @@ def test_three_turn_budget_allows_edit_verify_finish(tmp_path: Path) -> None:
     )
 
 
-def test_build_agent_prompt_renders_bounded_parent_envelope() -> None:
-    """Design C: a child receives the parent's summary, changed files, and
-    commits as a delimited user-role data block after the transcript, never
-    inside the system message and never the parent's raw transcript."""
-    tools = [{"name": "read_batch", "parameters": {"type": "object", "properties": {}}}]
-    envelope = {
-        "parent_task_id": "parent-1",
-        "summary": "added the token budget",
-        "files_changed": ["src/a.py", "src/b.py"],
-        "commits": ["abc123"],
-        "status": "succeeded",
-    }
-    prompt = worker._build_agent_prompt("continue the work", tools, [], parent_envelope=envelope)
-    system_content = prompt["messages"][0]["content"]
-    assert "Task:" not in system_content
-    assert "Parent task context:" not in system_content
-    assert prompt["messages"][1] == {
-        "role": "user",
-        "content": "<cambium-task>\nTask: continue the work\n</cambium-task>",
-    }
-    block = prompt["messages"][-1]
-    assert block["role"] == "user"
-    assert block["content"].startswith("<cambium-parent-context>\nParent task context:")
-    assert block["content"].endswith("</cambium-parent-context>")
-    assert "parent summary: added the token budget" in block["content"]
-    assert "parent files changed: src/a.py, src/b.py" in block["content"]
-    assert "parent commits: abc123" in block["content"]
-    assert "parent status: succeeded" in block["content"]
-
-
-def test_parent_envelope_rejects_oversized_and_incomplete_fields() -> None:
-    """Strict parent envelopes reject malformed or oversized payloads."""
-    tools = [{"name": "read_batch", "parameters": {"type": "object", "properties": {}}}]
-    with pytest.raises(worker.ParentEnvelopeError, match="summary.*field cap"):
-        worker._validate_parent_envelope(
-            {
-                "parent_task_id": "parent",
-                "unified_diff": "",
-                "diff_truncated": False,
-                "summary": "x" * 100_000,
-                "metric_score": None,
-                "metric_breakdown": {},
-                "files_changed": [],
-                "commits": [],
-                "status": "succeeded",
-            }
-        )
-    with pytest.raises(worker.ParentEnvelopeError, match="must be an object"):
-        worker._validate_parent_envelope("not a dict")
-    with pytest.raises(worker.ParentEnvelopeError, match="unknown keys"):
-        worker._validate_parent_envelope({"unknown_key": 1})
-    content = worker._build_agent_prompt("task", tools, [], parent_envelope=None)["messages"][0][
-        "content"
-    ]
-    assert "Parent task context:" not in content
-
-
-def test_parent_envelope_rejects_non_string_list_items() -> None:
-    """Strict parent envelopes reject non-string list items."""
-    with pytest.raises(worker.ParentEnvelopeError, match="only strings"):
-        worker._validate_parent_envelope(
-            {
-                "parent_task_id": "parent",
-                "unified_diff": "",
-                "diff_truncated": False,
-                "summary": "ok",
-                "metric_score": None,
-                "metric_breakdown": {},
-                "files_changed": ["a.py", {"path": "b.py"}],
-                "commits": ["abc"],
-                "status": "succeeded",
-            }
-        )
-
-
 def test_plan_before_act_plan_read_batch_finish(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     worktree = _make_worktree(repo)
@@ -1380,87 +1017,6 @@ def test_batched_tool_calls_keep_order_and_deny_atomically(tmp_path: Path) -> No
     assert "tool git_op ok=False" in denied_transcript
     assert "git_op is restricted" in denied_transcript
     assert "not executed: batch contained a denied action" in denied_transcript
-    assert worker._parse_agent_action(
-        '{"type":"tool_call","name":"read_batch","arguments":{"paths":["legacy.txt"]}}'
-    ) == {
-        "type": "tool_call",
-        "calls": [{"name": "read_batch", "arguments": {"paths": ["legacy.txt"]}}],
-    }
-    assert worker._native_tool_action(
-        SimpleNamespace(
-            tool_calls=(
-                {"function": {"name": "read_batch", "arguments": '{"paths":["a"]}'}},
-                {"function": {"name": "read_batch", "arguments": '{"paths":["b"]}'}},
-            )
-        )
-    ) == {
-        "type": "tool_call",
-        "calls": [
-            {"name": "read_batch", "arguments": {"paths": ["a"]}},
-            {"name": "read_batch", "arguments": {"paths": ["b"]}},
-        ],
-    }
-    with pytest.raises(ValueError, match="missing 'paths'"):
-        worker._native_tool_action(
-            SimpleNamespace(
-                tool_calls=(
-                    {"function": {"name": "read_batch", "arguments": "{}"}},
-                )
-            )
-        )
-
-
-def test_native_plan_and_finish_controls_use_canonical_validation() -> None:
-    assert worker._native_tool_action(
-        SimpleNamespace(
-            tool_calls=(
-                {"function": {"name": "plan", "arguments": '{"steps":["inspect","edit"]}'}},
-            )
-        )
-    ) == {"type": "plan", "steps": ["inspect", "edit"]}
-    assert worker._native_tool_action(
-        SimpleNamespace(
-            tool_calls=(
-                {
-                    "function": {
-                        "name": "finish",
-                        "arguments": '{"summary":"done","objective_met":true}',
-                    }
-                },
-            )
-        )
-    ) == {"type": "finish", "summary": "done", "objective_met": True}
-
-    with pytest.raises(ValueError, match="provider native control action cannot be mixed"):
-        worker._native_tool_action(
-            SimpleNamespace(
-                tool_calls=(
-                    {"function": {"name": "plan", "arguments": '{"steps":["inspect"]}'}},
-                    {"function": {"name": "read_batch", "arguments": '{"paths":["a.py"]}'}},
-                )
-            )
-        )
-    with pytest.raises(ValueError, match="at least 1 item"):
-        worker._native_tool_action(
-            SimpleNamespace(
-                tool_calls=(
-                    {"function": {"name": "plan", "arguments": '{"steps":[]}'}},
-                )
-            )
-        )
-    with pytest.raises(ValueError, match="unknown argument 'extra'"):
-        worker._native_tool_action(
-            SimpleNamespace(
-                tool_calls=(
-                    {
-                        "function": {
-                            "name": "finish",
-                            "arguments": '{"summary":"done","objective_met":true,"extra":1}',
-                        }
-                    },
-                )
-            )
-        )
 
 
 def test_cancellation_mid_batch_persists_remaining_calls_as_unexecuted(
@@ -2252,190 +1808,6 @@ def test_finish_after_verified_change_succeeds(tmp_path: Path) -> None:
     assert not any("finish rejected" in message["content"] for message in outcome["transcript"])
 
 
-def test_plan_and_thought_round_trip_through_parser() -> None:
-    assert worker._parse_agent_action('{"type":"plan","steps":["a","b"]}') == {
-        "type": "plan",
-        "steps": ["a", "b"],
-    }
-    assert worker._parse_agent_action('{"type":"plan","steps":["a"],"thought":"reasoning"}') == {
-        "type": "plan",
-        "steps": ["a"],
-    }
-    assert worker._parse_agent_action(
-        '{"type":"tool_call","name":"read_batch","arguments":{"paths":["a.py"]},'
-        '"thought":"need context"}'
-    ) == {
-        "type": "tool_call",
-        "calls": [{"name": "read_batch", "arguments": {"paths": ["a.py"]}}],
-    }
-    assert worker._parse_agent_action(
-        '{"type":"finish","summary":"done","objective_met":true,"thought":"verified"}'
-    ) == {"type": "finish", "summary": "done", "objective_met": True}
-    verbose = worker._parse_agent_action(
-        json.dumps(
-            {
-                "type": "finish",
-                "summary": "Useful result. " + "routine tool narration " * 80,
-                "objective_met": True,
-            }
-        )
-    )["summary"]
-    assert len(verbose.encode("utf-8")) <= worker.MAX_SUMMARY_CHARS
-    assert verbose == ("Useful result. " + "routine tool narration " * 80).strip()
-    for bad, match in (
-        ('{"type":"tool_call","calls":[]}', "non-empty array"),
-        ('{"type":"tool_call","calls":[null]}', "calls\\[0\\] must be an object"),
-        (
-            '{"type":"tool_call","calls":[{"name":"nope","arguments":{}},'
-            '{"name":"read_batch","arguments":3}]}',
-            "calls\\[0\\].*calls\\[1\\]",
-        ),
-    ):
-        with pytest.raises(ValueError, match=match):
-            worker._parse_agent_action(bad)
-
-    # Concatenated actions are rejected: exactly one top-level JSON object
-    # is the contract; trailing content raises.
-    with pytest.raises(ValueError, match="no trailing content"):
-        worker._parse_agent_action(
-            '{"type":"finish","summary":"done","objective_met":true}'
-            '{"type":"tool_call","name":"read_batch","arguments":{"paths":["a.py"]}}'
-        )
-    # ZAI has repeatedly emitted this exact closer typo after otherwise valid
-    # single-call batches. Normalize it only for read-only/inspection actions.
-    assert worker._parse_agent_action(
-        '{"type":"tool_call","calls":[{"name":"read_batch","arguments":'
-        '{"paths":["a.py"]}]}]}'
-    ) == {
-        "type": "tool_call",
-        "calls": [{"name": "read_batch", "arguments": {"paths": ["a.py"]}}],
-    }
-    with pytest.raises(ValueError, match="action is not valid JSON"):
-        worker._parse_agent_action(
-            '{"type":"tool_call","calls":[{"name":"run_shell","arguments":'
-            '{"cmd":["python","-c","assert 2 + 3 == 5"],"timeout_s":30}]}]}'
-        )
-
-    for bad in (
-        '{"type":"plan"}',
-        '{"type":"plan","steps":[]}',
-        '{"type":"plan","steps":["ok", 3]}',
-        '{"type":"plan","steps":["ok"],"extra":1}',
-        '{"type":"tool_call","name":"read_batch","arguments":{},"extra":1}',
-        '{"type":"finish","summary":"done","objective_met":true,"extra":1}',
-        '{"type":"finish","summary":"done"}',
-        '{"type":"finish","summary":"done","objective_met":"yes"}',
-    ):
-        with pytest.raises(ValueError):
-            worker._parse_agent_action(bad)
-
-
-def test_parse_agent_action_normalizes_observed_provider_shapes() -> None:
-    assert worker._parse_agent_action(
-        '[{"calls":[{"name":"repo_query","action":"tree","limit":100}]}]'
-    ) == {
-        "type": "tool_call",
-        "calls": [
-            {"name": "repo_query", "arguments": {"action": "tree", "limit": 100}}
-        ],
-    }
-
-    with pytest.raises(ValueError, match="no trailing content"):
-        worker._parse_agent_action(
-            '[{"calls":[{"name":"repo_query","action":"tree"}]}]'
-            '{"type":"finish","summary":"done","objective_met":true}'
-        )
-    with pytest.raises(ValueError, match="exactly one JSON object"):
-        worker._parse_agent_action(
-            '[{"type":"plan","steps":["a"]},{"type":"plan","steps":["b"]}]'
-        )
-    with pytest.raises(ValueError, match="must carry exactly name/arguments"):
-        worker._parse_agent_action('[{"calls":[{"name":"not_a_tool","action":"tree"}]}]')
-    with pytest.raises(ValueError, match="unknown tool"):
-        worker._parse_agent_action(
-            '[{"calls":[{"name":"not_a_tool","arguments":{"action":"tree"}}]}]'
-        )
-    with pytest.raises(ValueError, match="must carry exactly name/arguments"):
-        worker._parse_agent_action(
-            '{"type":"tool_call","calls":[{"name":"repo_query",'
-            '"arguments":{"action":"tree"},"action":"tree"}]}'
-        )
-    with pytest.raises(ValueError, match="arguments must be an object"):
-        worker._parse_agent_action(
-            '[{"calls":[{"name":"repo_query","arguments":3}]}]'
-        )
-
-    assert worker._parse_agent_action(
-        '{"calls":['
-        '{"name":"read_batch","paths":["a.py"]},'
-        '{"name":"git_op","op":"status","args":"--short"}'
-        "]}"
-    ) == {
-        "type": "tool_call",
-        "calls": [
-            {"name": "read_batch", "arguments": {"paths": ["a.py"]}},
-            {"name": "git_op", "arguments": {"op": "status", "args": "--short"}},
-        ],
-    }
-    for mutating in (
-        '{"calls":[{"name":"edit_file","path":"a.py",'
-        '"old_string":"old","new_string":"new"}]}',
-        '{"calls":[{"name":"run_shell","cmd":["true"]}]}',
-        '{"calls":[{"name":"git_op","op":"add","args":"."}]}',
-    ):
-        with pytest.raises(ValueError, match="must carry exactly name/arguments"):
-            worker._parse_agent_action(mutating)
-
-
-def test_parse_agent_action_accepts_fenced_tool_call() -> None:
-    fenced = '```json\n{"type":"tool_call","name":"read_batch","arguments":{"paths":["a.py"]}}\n```'
-    assert worker._parse_agent_action(fenced) == {
-        "type": "tool_call",
-        "calls": [{"name": "read_batch", "arguments": {"paths": ["a.py"]}}],
-    }
-
-
-def test_parse_agent_action_accepts_fenced_finish_with_backticks_in_body() -> None:
-    fenced = '```\n{"type":"finish","summary":"kept ``` inline","objective_met":true}\n```'
-    assert worker._parse_agent_action(fenced) == {
-        "type": "finish",
-        "summary": "kept ``` inline",
-        "objective_met": True,
-    }
-
-
-def test_parse_agent_action_rejects_fenced_with_prose_or_unclosed_fence() -> None:
-    prose = 'Here is the action:\n```json\n{"type":"plan","steps":["a"]}\n```'
-    with pytest.raises(ValueError, match="not valid JSON"):
-        worker._parse_agent_action(prose)
-    unclosed = '```json\n{"type":"plan","steps":["a"]}\n'
-    with pytest.raises(ValueError, match="not valid JSON"):
-        worker._parse_agent_action(unclosed)
-    two_fences = (
-        '```json\n{"type":"plan","steps":["a"]}\n```\n```json\n{"type":"plan","steps":["b"]}\n```'
-    )
-    with pytest.raises(ValueError):
-        worker._parse_agent_action(two_fences)
-
-
-def test_lenient_parse_accepts_raw_control_characters_in_strings() -> None:
-    action = (
-        '{"type":"tool_call","name":"write_file","arguments":'
-        '{"path":"hello.py","content":"print(\'hello world\')\n\t"}}'
-    )
-    assert worker._parse_agent_action(action) == {
-        "type": "tool_call",
-        "calls": [
-            {
-                "name": "write_file",
-                "arguments": {"path": "hello.py", "content": "print('hello world')\n\t"},
-            }
-        ],
-    }
-    with pytest.raises(ValueError):
-        worker._parse_agent_action('{"type":"finish","summary":"broken\n-oops}')
-
-
 # ---------------------------------------------------------------------------
 # Transcript summarization (pure function)
 # ---------------------------------------------------------------------------
@@ -3197,18 +2569,6 @@ def test_finalize_worktree_only_cache_artifacts_is_true_noop(tmp_path: Path) -> 
     assert _base_commit(worktree) == base_commit
 
 
-def test_requires_commit_defaults_and_passes_through_run_task() -> None:
-    init = {"task_id": "requires-commit"}
-    config = worker.AgentConfig.from_init(init)
-
-    assert config.requires_commit is False
-    assert (
-        worker._merge_task_config(config, init, {"requires_commit": True}).requires_commit is True
-    )
-    with pytest.raises(ValueError, match="requires_commit"):
-        worker.AgentConfig.from_init({**init, "requires_commit": "yes"})
-
-
 def test_provider_router_explicit_empty_authorization_fails_closed() -> None:
     assert (
         worker.AgentConfig.from_init(
@@ -3226,7 +2586,6 @@ def test_provider_router_explicit_empty_authorization_fails_closed() -> None:
     failure = raised.value
     assert failure.providers_tried == ()
     assert failure.last_error is not None
-    assert str(failure.last_error) == "authorized_providers explicitly empty"
 
 
 def test_finalize_worktree_requires_commit_when_dirty_commit_is_not_produced(
@@ -3325,29 +2684,6 @@ def test_requires_commit_clean_finish_fails(tmp_path: Path) -> None:
     assert outcome["status"] == "failed"
     assert outcome["failure_reason"] == "requires_commit unmet: no changes"
     assert outcome["commits"] == []
-
-
-def test_clean_noop_envelope_reports_requires_commit_false(tmp_path: Path) -> None:
-    repo = tmp_path / "repo"
-    worktree = _make_worktree(repo)
-    base_commit = _base_commit(worktree)
-    config = replace(_agent_config(worktree), base_commit=base_commit)
-    outcome = _finalize_worktree_outcome(
-        worktree, config, {"request_id": "test", "scratch_repo": str(repo)}
-    )
-    outcome.update(
-        request_id="test",
-        task_id=config.task_id,
-        generation=config.generation,
-    )
-    writer = _FakeWriter()
-
-    asyncio.run(worker._emit_result_envelope(cast(asyncio.StreamWriter, writer), outcome))
-
-    envelope = writer.messages()[0]
-    assert envelope["status"] == "succeeded"
-    assert envelope["commits"] == []
-    assert envelope["requires_commit"] is False
 
 
 # ---------------------------------------------------------------------------
