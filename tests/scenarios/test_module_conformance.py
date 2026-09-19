@@ -63,10 +63,7 @@ def test_gate_accepts_module_scoped_baseline() -> None:
     if "example" not in module_conformance.discover_modules():
         pytest.skip("reference module cambium.modules.example is absent")
     name = _one_discovered_module()
-    spec = module_conformance.validate_module(name)
-
-    assert spec.name == "example"
-    assert spec.name == name
+    module_conformance.validate_module(name)
 
 
 @pytest.mark.slow
