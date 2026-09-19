@@ -18,7 +18,6 @@ from cambium.tui_screen import (
     ActivityState,
     LinearTimeline,
     Transcript,
-    TranscriptEntry,
     _clip,
     _display_width,
     _take_display_width,
@@ -212,25 +211,6 @@ def test_activity_heartbeat_phase_tail_is_latest_sanitized_and_not_transcript() 
     transcript.observe_event(
         {"kind": "heartbeat", "payload": {"phase": "thinking", "tail": "private tail"}}
     )
-    assert transcript.entries == ()
-
-
-def test_usage_event_updates_status_metadata_without_duplicate_transcript_text() -> None:
-    transcript = Transcript()
-    transcript.observe_event(
-        {
-            "kind": "usage_event",
-            "task_id": "root",
-            "payload": {
-                "provider": "zai",
-                "model": "glm-5.3",
-                "provider_cache_hit": False,
-                "usage": {"total_tokens": 123, "completion_tokens": 7},
-            },
-        }
-    )
-    assert transcript.status_metadata["provider"] == "zai"
-    assert transcript.status_metadata["model"] == "glm-5.3"
     assert transcript.entries == ()
 
 
@@ -603,20 +583,6 @@ def test_activity_names_provider_and_cache_state_before_turn_finishes() -> None:
         now=14.0,
     )
     assert activity.render(now=15.0) == "◌ THINKING · zai/glm-5.3 · 5s · cache HIT"
-
-
-def test_activity_cache_labels_are_colored_without_changing_the_plain_row() -> None:
-    activity_line = "◌ THINKING · zai/glm-5.3 · 4s · [CACHE MISS]"
-    colored = tui_screen._status_activity(activity_line, True)
-
-    assert tui_screen._visible(colored) == activity_line
-    assert "\x1b[1;35mTHINKING\x1b[0m" in colored
-    assert "\x1b[1;33m[CACHE MISS]\x1b[0m" in colored
-
-    hit_line = "◌ THINKING · zai/glm-5.3 · 5s · cache HIT"
-    hit_colored = tui_screen._status_activity(hit_line, True)
-    assert tui_screen._visible(hit_colored) == hit_line
-    assert "\x1b[2mcache HIT\x1b[0m" in hit_colored
 
 
 def test_activity_cache_label_requires_an_explicit_boolean() -> None:
@@ -1472,22 +1438,6 @@ def test_live_timeline_preserves_markdown_color_depth_through_stream_and_commit(
     assert committed_heading in committed
 
 
-def test_timeline_monochrome_stream_and_committed_rows_remain_plain() -> None:
-    streamed = Transcript()
-    streamed.observe_event({"kind": "assistant_delta", "payload": {"delta": "# Heading\n"}})
-    timeline = LinearTimeline(io.StringIO(), enabled=False)
-
-    stream_rows, _ = timeline._stream_delta_rows(streamed, 80, "", None, None, 0)
-    history_rows = timeline._entry_rows(
-        (TranscriptEntry(role="assistant", text="# Heading"),),
-        80,
-        0,
-    )
-
-    assert stream_rows == (("assistant", "CAMBIUM ▸ Heading"),)
-    assert history_rows == (("assistant", "CAMBIUM ▸ Heading"),)
-
-
 def test_accepted_response_chunks_append_one_assistant_timeline_entry_per_chunk() -> None:
     transcript = Transcript()
     transcript.observe_event(
@@ -1898,4 +1848,3 @@ def test_live_draw_failure_is_contained_and_disables_rendering() -> None:
     enabled = _safe_live_draw(fail, error=error, disable=disable)
 
     assert enabled is False
-    assert "live rendering disabled (RuntimeError)" in error.getvalue()

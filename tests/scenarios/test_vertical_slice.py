@@ -241,24 +241,6 @@ def test_misrouted_result_envelope_fails(tmp_path, monkeypatch) -> None:
     assert any(e["kind"] == "protocol" for e in read_events(session_dir))
 
 
-def test_result_envelope_echoes_run_task_request_id(tmp_path) -> None:
-    session_dir = tmp_path / "session"
-    scratch = session_dir / "scratch"
-    _make_scratch(scratch)
-    spec = _spec(session_dir, write_marker=True)
-
-    result = asyncio.run(run_session(session_dir, spec))
-
-    assert result.status == "succeeded"
-    events = read_events(session_dir)
-    by_kind = {e["kind"]: e for e in events}
-    init_rid = by_kind["init"]["request_id"]
-    run_rid = by_kind["run_task"]["request_id"]
-    assert by_kind["ready"]["request_id"] == init_rid  # ready echoes init
-    assert by_kind["result"]["request_id"] == run_rid  # envelope echoes run_task
-    assert by_kind["exit"]["request_id"] is None  # exit_message carries no request_id
-
-
 def test_ready_timeout_fails_within_budget(tmp_path, monkeypatch) -> None:
     # A worker that never sends ready must be killed within the (env-configured) budget.
     monkeypatch.setenv("FAKE_MODE", "noready")

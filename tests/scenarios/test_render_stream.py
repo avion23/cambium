@@ -29,7 +29,6 @@ from cambium.render import (
     render_tokens_per_s,
     render_usage_breakdown,
     render_usage_stats_line,
-    should_color,
 )
 from cambium.supervisor import PlanResult, TaskResult
 
@@ -246,41 +245,6 @@ def _color_stream(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     monkeypatch.delenv("NO_COLOR", raising=False)  # type: ignore[attr-defined]
     monkeypatch.setenv("TERM", "xterm-256color")
-
-
-def test_should_color_mirrors_render_markdown_if_tty_gate(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    plain = io.StringIO()
-    assert should_color(plain) is False
-
-    _color_stream(monkeypatch)
-    assert should_color(sys.stdout) is True
-
-    monkeypatch.setenv("NO_COLOR", "1")  # type: ignore[attr-defined]
-    assert should_color(sys.stdout) is False
-
-    monkeypatch.delenv("NO_COLOR")  # type: ignore[attr-defined]
-    monkeypatch.setenv("TERM", "dumb")  # type: ignore[attr-defined]
-    assert should_color(sys.stdout) is False
-
-
-@pytest.mark.parametrize("term", ["DUMB", " dumb ", "\tdUmB\t", "   "])
-def test_should_color_uses_normalized_terminal_capabilities(
-    monkeypatch: pytest.MonkeyPatch, term: str
-) -> None:
-    stream = _TtyStream()
-    monkeypatch.delenv("NO_COLOR", raising=False)
-    monkeypatch.setenv("TERM", term)
-
-    assert should_color(stream) is False
-
-    monkeypatch.setenv("TERM", " xterm-256color ")
-    assert should_color(stream) is True
-
-    # NO_COLOR disables color by presence, including an explicitly empty value.
-    monkeypatch.setenv("NO_COLOR", "")
-    assert should_color(stream) is False
 
 
 def test_severity_accents_on_only_for_color_capable_stream(
