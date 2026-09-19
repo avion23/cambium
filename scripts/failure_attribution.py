@@ -841,21 +841,25 @@ def _state_for_result(
     elif writes:
         changed = bool(changed) or bool(writes)
 
-    verifications = [
+    verification_updates = [
         candidate
         for candidate in events
         if candidate.get("kind") in _TOOL_KINDS
         and _owner(candidate) == owner
         and _event_before(event, candidate)
-        and _command_details(candidate)[0] == "run_shell"
+        and (
+            _command_details(candidate)[0] == "run_shell"
+            or (_write_paths(candidate) and _tool_ok(candidate))
+        )
     ]
     verified = checkpoint.get("_verified") if checkpoint is not None else None
-    if verifications and (
+    if verification_updates and (
         checkpoint is None
         or not isinstance(checkpoint.get("_event_order"), tuple)
-        or verifications[-1]["_order"] > checkpoint["_event_order"]
+        or verification_updates[-1]["_order"] > checkpoint["_event_order"]
     ):
-        verified = _tool_ok(verifications[-1])
+        latest = verification_updates[-1]
+        verified = _command_details(latest)[0] == "run_shell" and _tool_ok(latest)
     if type(verified) is not bool:
         verified = False
     return bool(changed), bool(verified)

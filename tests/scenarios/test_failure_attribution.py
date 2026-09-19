@@ -263,6 +263,36 @@ def test_latest_epoch_checkpoint_can_prove_verification(tmp_path: Path) -> None:
     assert report["verdict"] == "clean"
 
 
+@pytest.mark.parametrize("checkpoint", [False, True])
+@pytest.mark.parametrize("verify_after_write", [False, True])
+def test_writes_invalidate_earlier_verification(
+    tmp_path: Path, checkpoint: bool, verify_after_write: bool
+) -> None:
+    verification = _event(
+        "tool_event", {"tool": "run_shell", "cmd": "run_shell pytest -q", "ok": True}
+    )
+    events = [verification]
+    if checkpoint:
+        events.append(
+            _event("context_checkpoint", {"checkpoint_ref": "task/epoch-001-ref.json"})
+        )
+    events.append(
+        _event("tool_event", {"tool": "write_file", "cmd": _write_cmd("a.py"), "ok": True})
+    )
+    if verify_after_write:
+        events.append(verification)
+    events.append(_event("result", {"status": "succeeded"}))
+    session = _session(tmp_path, events)
+    if checkpoint:
+        _epoch_checkpoint(session, "task/epoch-001-ref.json", verified=True)
+
+    report = _report(session)
+
+    assert ("finish-without-verification" in _detectors(report)) is not verify_after_write
+    if not verify_after_write:
+        assert report["detectors_fired"][0]["evidence"] == [f"root:event-{len(events)}"]
+
+
 def test_objective_met_override_uses_durable_terminal_action(tmp_path: Path) -> None:
     report = _report(
         _session(
