@@ -3052,6 +3052,42 @@ def test_finalize_worktree_publishes_deleted_files(tmp_path: Path, staged: bool)
     assert "deleted file mode" in outcome["diff"]
 
 
+@pytest.mark.parametrize("artifact", [".cambium/private.txt", "src/sample.egg-info/PKG-INFO"])
+@pytest.mark.parametrize("rename", [False, True])
+def test_finalize_worktree_rejects_staged_excluded_artifacts(
+    tmp_path: Path, artifact: str, rename: bool,
+) -> None:
+    repo = tmp_path / "repo"
+    worktree = _make_worktree(repo)
+    target = worktree / artifact
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("private runtime artifact\n")
+    subprocess.run(
+        ["git", "-C", str(worktree), "add", "-f", "--", artifact], check=True,
+        capture_output=True,
+    )
+    if rename:
+        subprocess.run(
+            ["git", "-C", str(worktree), "commit", "-m", "fixture"], check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(worktree), "mv", artifact, "published.txt"], check=True,
+            capture_output=True,
+        )
+    config = replace(_agent_config(worktree), base_commit=_base_commit(worktree))
+    (worktree / "alpha.txt").write_text("real edit\n")
+    index_before = subprocess.check_output(["git", "-C", str(worktree), "write-tree"])
+    outcome = _finalize_worktree_outcome(worktree, config, {"scratch_repo": str(repo)})
+    assert outcome["status"] == "failed"
+    assert "staged excluded artifact" in outcome["failure_reason"]
+    assert _base_commit(worktree) == config.base_commit
+    assert subprocess.check_output(["git", "-C", str(worktree), "write-tree"]) == index_before
+    assert (worktree / ("published.txt" if rename else artifact)).read_text() == (
+        "private runtime artifact\n"
+    )
+
+
 def test_finalize_worktree_ignores_package_metadata_but_not_arbitrary_ignored_files(
     tmp_path: Path,
 ) -> None:
@@ -3081,7 +3117,10 @@ def test_finalize_worktree_ignores_package_metadata_but_not_arbitrary_ignored_fi
     assert "sample.egg-info" not in outcome["diff"]
 
 
-def test_finalize_worktree_excludes_cache_artifacts_from_commit(tmp_path: Path) -> None:
+@pytest.mark.parametrize("filename", ["main.py", "*", ":(glob)*"])
+def test_finalize_worktree_excludes_cache_artifacts_from_commit(
+    tmp_path: Path, filename: str,
+) -> None:
     repo = tmp_path / "repo"
     worktree = _make_worktree(repo)
     (worktree / "main.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
@@ -3095,7 +3134,7 @@ def test_finalize_worktree_excludes_cache_artifacts_from_commit(tmp_path: Path) 
     config = replace(_agent_config(worktree), base_commit=base_commit)
 
     # The agent's real change, left uncommitted in the worktree.
-    (worktree / "main.py").write_text("def add(a, b):\n    return a - b\n", encoding="utf-8")
+    (worktree / filename).write_text("def add(a, b):\n    return a - b\n", encoding="utf-8")
     # Incidental artifacts of the agent's verification tool use.
     pytest_cache = worktree / ".pytest_cache"
     pytest_cache.mkdir()
@@ -3112,7 +3151,7 @@ def test_finalize_worktree_excludes_cache_artifacts_from_commit(tmp_path: Path) 
     assert outcome["status"] == "succeeded"
     assert outcome["failure_reason"] is None
     assert outcome["requires_commit"] is False
-    assert outcome["files_changed"] == ["main.py"]
+    assert outcome["files_changed"] == [filename]
     assert len(outcome["commits"]) == 1
     sha = outcome["commits"][0]
     committed = subprocess.run(
@@ -3130,8 +3169,8 @@ def test_finalize_worktree_excludes_cache_artifacts_from_commit(tmp_path: Path) 
         capture_output=True,
         text=True,
     ).stdout.splitlines()
-    assert committed == ["main.py"]
-    assert "main.py" in outcome["diff"]
+    assert committed == [filename]
+    assert filename in outcome["diff"]
     assert not any(
         ".pyc" in name or "__pycache__" in name or ".pytest_cache" in name for name in committed
     )

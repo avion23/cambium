@@ -8398,11 +8398,23 @@ def _finalize_worktree(
             if not record:
                 continue
             path = record[3:] if len(record) > 3 else ""
+            paths = [path]
             if any(code in {"R", "C"} for code in record[:2]):
-                next(records, None)
-            if not path or path == ".cambium" or path.startswith(".cambium/"):
-                continue
-            if is_cache_artifact_path(path):
+                paths.append(next(records, ""))
+            excluded = any(
+                item == ".cambium"
+                or item.startswith(".cambium/")
+                or is_cache_artifact_path(item)
+                for item in paths
+            )
+            # Commit consumes the entire index, including paths skipped below.
+            # Fail without resetting the index or deleting the worker's data.
+            if excluded and record[0] not in {" ", "?", "!"}:
+                outcome["failure_reason"] = (
+                    "worktree contains a staged excluded artifact; refusing to publish"
+                )
+                return outcome
+            if not path or excluded:
                 continue
             if record[:2] == "!!":
                 ignored.append(path)
