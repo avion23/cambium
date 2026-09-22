@@ -1874,14 +1874,15 @@ class ActivityState:
         if not isinstance(tool_name, str):
             return
         for key in reversed(self._tools):
-            if self._tools[key][0] == tool_name:
-                del self._tools[key]
-                self._heartbeat_tool = None
-                self._responding = False
-                if not self._tools:
-                    self._state = "WAITING"
-                self._mark_progress(("tool-finished", tool_name), now)
-                return
+            if self._tools[key][0] != tool_name or key.startswith("id:"):
+                continue
+            del self._tools[key]
+            self._heartbeat_tool = None
+            self._responding = False
+            if not self._tools:
+                self._state = "WAITING"
+            self._mark_progress(("tool-finished", tool_name), now)
+            return
 
     def _render_multiple_tools(self, current: float, quiet_for: float) -> str:
         tools = tuple(reversed(self._tools.values()))

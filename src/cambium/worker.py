@@ -7922,13 +7922,11 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                     for tool_call, tool_result in zip(tool_calls, shell_results, strict=True):
                         name = tool_call["name"]
                         arguments = tool_call["arguments"]
-                        if tool_result.ok:
-                            verified_after_change = True
-                            verification_failed = False
-                        else:
-                            verification_failed = True
-                            verified_after_change = False
                         batch_results.append((name, arguments, tool_result))
+                    verification_failed = any(
+                        not tool_result.ok for tool_result in shell_results
+                    )
+                    verified_after_change = not verification_failed
                 elif not all(
                     tool_call["name"] in _CONCURRENT_TOOL_NAMES for tool_call in tool_calls
                 ):
