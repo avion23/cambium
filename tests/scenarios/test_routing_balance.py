@@ -707,7 +707,15 @@ def test_sticky_assigned_provider_binding_all_usage_events_on_assigned_provider(
     server_a = FakeServer([(200, _ok_payload("a", model="m1"), 0.0)])
     server_b = FakeServer(
         [
-            (200, _ok_payload('{"type":"plan","steps":["read"]}', model="m1"), 0.0),
+            (
+                200,
+                _ok_payload(
+                    '{"type":"tool_call","name":"read_batch",'
+                    '"arguments":{"paths":["target.txt"]}}',
+                    model="m1",
+                ),
+                0.0,
+            ),
             (
                 200,
                 _ok_payload(

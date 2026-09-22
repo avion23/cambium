@@ -86,12 +86,12 @@ def test_replays_one_turn_from_frozen_prefix(tmp_path: Path) -> None:
 
     def transport(prompt: dict[str, Any]) -> str:
         prompts.append(prompt)
-        return '{"type":"plan","steps":["inspect the failing path"]}'
+        return '{"type":"tool_call","name":"read_batch","arguments":{"paths":["alpha.txt"]}}'
 
-    result = assert_prefix_regression(session, 1, "plan", transport=transport)
+    result = assert_prefix_regression(session, 1, "tool_call", transport=transport)
 
     assert result["passed"] is True
-    assert result["action_class"] == "plan"
+    assert result["action_class"] == "tool_call"
     assert result["replay_turn"] == 2
     assert len(prompts) == 1
     assert prompts[0]["messages"][-1] == {

@@ -151,18 +151,20 @@ def test_selected_provider_controls_native_wire_tools(
     supports_native_tools: bool,
 ) -> None:
     server = FakeServer([(200, _ok_payload("done"), 0.0)])
+    tools = [
+        {
+            "name": "read_file",
+            "description": "Read one file",
+            "parameters": {"type": "object", "properties": {}},
+        }
+    ]
+    embedded_schema = json.dumps(tools, sort_keys=True)
     prompt = {
         "messages": [
-            {"role": "system", "content": "Return one JSON action."},
+            {"role": "system", "content": f"Return one JSON action.\n{embedded_schema}"},
             {"role": "user", "content": "read README"},
         ],
-        "tools": [
-            {
-                "name": "read_file",
-                "description": "Read one file",
-                "parameters": {"type": "object", "properties": {}},
-            }
-        ],
+        "tools": tools,
         "tool_choice": "auto",
     }
     router = Diffundo(
@@ -178,8 +180,11 @@ def test_selected_provider_controls_native_wire_tools(
     try:
         asyncio.run(router.call(ProviderTier.FAST, prompt))
         body = server.calls[0]
-        assert body["messages"] == prompt["messages"]
         if supports_native_tools:
+            assert body["messages"] == [
+                {"role": "system", "content": "Return one JSON action."},
+                {"role": "user", "content": "read README"},
+            ]
             assert body["tools"] == [
                 {
                     "type": "function",
@@ -192,6 +197,7 @@ def test_selected_provider_controls_native_wire_tools(
             ]
             assert body["tool_choice"] == "auto"
         else:
+            assert body["messages"] == prompt["messages"]
             assert "tools" not in body
             assert "tool_choice" not in body
     finally:

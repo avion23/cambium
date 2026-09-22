@@ -1830,6 +1830,40 @@ def _codex_input_item(message: Mapping[str, Any]) -> dict[str, Any]:
     return item
 
 
+def _strip_embedded_tool_schema(prompt: Mapping[str, Any]) -> dict[str, Any]:
+    """Remove the textual schema from a native-tool request copy.
+
+    Worker prompts retain the schema for text-only providers. Native providers
+    receive the same schemas through the top-level function tools, so sending
+    the serialized copy in the system message would duplicate every schema.
+    The input prompt stays unchanged because one router call can retry it on a
+    text-only fallback provider.
+    """
+    tools = prompt.get("tools")
+    messages = prompt.get("messages")
+    if not isinstance(tools, list) or not isinstance(messages, list) or not messages:
+        return dict(prompt)
+    first = messages[0]
+    if not isinstance(first, Mapping) or first.get("role") not in {"system", "developer"}:
+        return dict(prompt)
+    content = first.get("content")
+    if not isinstance(content, str):
+        return dict(prompt)
+    schema = json.dumps(tools, sort_keys=True)
+    suffix = f"\n{schema}"
+    if content.endswith(suffix):
+        content = content[: -len(suffix)]
+    elif content == schema:
+        content = ""
+    else:
+        return dict(prompt)
+    first_copy = dict(first)
+    first_copy["content"] = content
+    copied_messages = list(messages)
+    copied_messages[0] = first_copy
+    return {**prompt, "messages": copied_messages}
+
+
 def _codex_tools(tools: Any) -> list[dict[str, Any]]:
     """Convert Cambium's canonical flat tool schema to Responses function tools."""
     if not isinstance(tools, list):
@@ -1889,6 +1923,8 @@ def _codex_request_body(provider: ProviderConfig, prompt: dict[str, Any]) -> dic
     exact-prefix cache key (D8c). The codex backend's sparse
     ``cached_tokens`` is provider-side (see module docstring).
     """
+    if provider.supports_native_tools:
+        prompt = _strip_embedded_tool_schema(prompt)
     body: dict[str, Any] = {
         "model": provider.model,
         "input": [],
@@ -2554,8 +2590,11 @@ class _ChatCompletionsTransport:
                 f"env var {provider.api_key_env!r} not set",
             )
         url = f"{provider.base_url.rstrip('/')}/chat/completions"
+        wire_prompt = (
+            _strip_embedded_tool_schema(prompt) if provider.supports_native_tools else prompt
+        )
         body = {
-            **prompt,
+            **wire_prompt,
             "model": provider.model,
             "stream": True,
             "stream_options": {"include_usage": True},

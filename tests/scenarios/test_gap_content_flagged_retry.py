@@ -267,7 +267,13 @@ def test_content_flagged_summary_retry_fails_without_health_damage(
             (
                 200,
                 _ok_payload(
-                    json.dumps({"type": "plan", "steps": ["inspect"]}),
+                    json.dumps(
+                        {
+                            "type": "tool_call",
+                            "name": "read_batch",
+                            "arguments": {"paths": ["alpha.txt"]},
+                        }
+                    ),
                     model="loopback-model",
                     usage=_USAGE,
                 ),

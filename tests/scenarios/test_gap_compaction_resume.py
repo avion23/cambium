@@ -178,7 +178,7 @@ def test_valid_summary_response_does_not_defer(tmp_path: Path) -> None:
     worktree = _worktree(tmp_path / "repo")
     router = _SummaryRouter()
     router.responses = [
-        '{"type":"plan","steps":["continue"]}',
+        '{"type":"tool_call","name":"read_batch","arguments":{"paths":["alpha.txt"]}}',
         '{"type":"finish","summary":"done","objective_met":true}',
     ]
     writer = _Writer()
@@ -231,10 +231,10 @@ def test_compaction_deferral_count_survives_generation_boundary(tmp_path: Path) 
     )
     resumed_router = _SummaryRouter(malformed_summaries=4)
     resumed_router.responses = [
-        '{"type":"plan","steps":["continue"]}',
-        '{"type":"plan","steps":["continue again"]}',
-        '{"type":"plan","steps":["continue"]}',
-        '{"type":"plan","steps":["continue again"]}',
+        '{"type":"tool_call","name":"read_batch","arguments":{"paths":["alpha.txt"]}}',
+        '{"type":"tool_call","name":"read_batch","arguments":{"paths":["beta.txt"]}}',
+        '{"type":"tool_call","name":"read_batch","arguments":{"paths":["alpha.txt","beta.txt"]}}',
+        '{"type":"tool_call","name":"run_shell","arguments":{"cmd":["true"]}}',
     ]
     resumed_writer = _Writer()
 

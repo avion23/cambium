@@ -379,7 +379,16 @@ def test_codex_required_native_action_never_downgrades_to_text() -> None:
         pause_timeout_s=0.01,
     )
     prompt = {
-        "messages": [{"role": "user", "content": "finish"}],
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Return one native action.\n"
+                    + json.dumps(_exposed_tool_schemas(_PROVIDER_TOOLS_CONFIG), sort_keys=True)
+                ),
+            },
+            {"role": "user", "content": "finish"},
+        ],
         "tools": _exposed_tool_schemas(_PROVIDER_TOOLS_CONFIG),
     }
     try:
@@ -388,6 +397,10 @@ def test_codex_required_native_action_never_downgrades_to_text() -> None:
         error = _provider_error(raised.value)
         assert error.outcome is ProviderOutcome.CONFIG_ERROR
         assert "required native action" in error.message
+        assert server.calls[0]["input"][0] == {
+            "role": "developer",
+            "content": [{"type": "input_text", "text": "Return one native action."}],
+        }
         assert router.health(config.name) is HealthState.DISABLED
     finally:
         server.close()

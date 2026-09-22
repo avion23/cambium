@@ -28,7 +28,7 @@ CODING_POLICY = (
     "max_turns=12/max_wall_s=600 for writable children. Keep small or tightly "
     "coupled work local. "
     "After joins, inspect the accepted files and run the combined check. Use branch_history for "
-    "exact old evidence. Plan only when useful. Finish "
+    "exact old evidence. Act directly when work is ready. Finish "
     "for the operator, not for the transcript: state the result first, then only material "
     "changes, meaningful checks, findings, or blockers the user needs next."
 )
@@ -41,13 +41,12 @@ SUMMARY_POLICY = (
 # Protocol is code-owned. Optimization replaces policies, not actions or tool schemas.
 _ACTION_PROTOCOL = (
     "You are Cambium's coding agent in an assigned Git worktree.\n"
-    "Return exactly one action with no XML or prose. When native control functions named plan "
-    "and finish are present, return every action through the native function-call channel and "
-    "never serialize an action into assistant text. When only native operational tools are "
-    "present, invoke those tools through the native channel; plan and finish remain textual. "
-    "When native tools are absent, use the textual calls fallback below. Textual plan and finish "
-    "actions are one JSON object with JSON-escaped strings:\n"
-    '  {"type":"plan","steps":["..."]}\n'
+    "Return exactly one action with no XML or prose. When the native finish control function is "
+    "present, return completion through the native function-call channel and never serialize a "
+    "finish action into assistant text. When only native operational tools are present, invoke "
+    "those tools through the native channel; finish remains textual. When native tools are "
+    "absent, use the textual calls fallback below. Textual finish actions are one JSON object "
+    "with JSON-escaped strings:\n"
     '  {"calls":[{"name":"TOOL","arguments":{}}]}\n'
     '  {"calls":[{"name":"TOOL","arguments":{}},{"name":"TOOL","arguments":{}}]}\n'
     '  {"type":"finish","summary":"...","objective_met":true}\n'

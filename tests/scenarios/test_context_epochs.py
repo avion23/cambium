@@ -645,7 +645,7 @@ def test_cast_rollover_is_durable_before_epoch_publication(tmp_path: Path) -> No
     writer = _FakeWriter()
     router = _ScriptedRouter(
         [
-            '{"type":"plan","steps":["inspect"]}',
+            '{"name":"read_batch","arguments":{"paths":["beta.txt"]}}',
             '{"name":"read_batch","arguments":{"paths":["alpha.txt"]}}',
             '{"type":"finish","summary":"done","objective_met":true}',
         ]
@@ -933,7 +933,9 @@ def test_rolling_compact_fold_advances_epoch_and_preserves_head(
         _drive_loop(
             config,
             worktree,
-            _ScriptedRouter(['{"type":"plan","steps":["continue"]}']),
+            _ScriptedRouter(
+                ['{"name":"read_batch","arguments":{"paths":["alpha.txt"]}}']
+            ),
             writer,
             run_request_id="run-compact",
         )
@@ -1025,8 +1027,8 @@ def test_rolling_compact_does_not_refold_below_high(
             worktree,
             _ScriptedRouter(
                 [
-                    '{"type":"plan","steps":["continue"]}',
-                    '{"type":"plan","steps":["continue"]}',
+                    '{"name":"read_batch","arguments":{"paths":["alpha.txt"]}}',
+                    '{"name":"read_batch","arguments":{"paths":["beta.txt"]}}',
                 ]
             ),
             writer,
@@ -1124,7 +1126,7 @@ def test_rolling_compact_internal_opt_out_keeps_existing_epoch_path(
         max_turns=2,
     )
     writer = _FakeWriter()
-    router = _ScriptedRouter(['{"type":"plan","steps":["continue"]}'])
+    router = _ScriptedRouter(['{"name":"read_batch","arguments":{"paths":["alpha.txt"]}}'])
     asyncio.run(_drive_loop(config, worktree, router, writer, run_request_id="run-legacy"))
 
     assert router.prompts[0]["messages"][:-1] == [

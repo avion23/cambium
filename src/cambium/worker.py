@@ -66,15 +66,14 @@ named by the worker's absolute
 ``CAMBIUM_PROVIDERS`` environment variable and iterates bounded
 ``Diffundo.call`` turns, each accepting exactly one JSON action:
 
-    {"type": "plan", "steps": [<non-empty strings>]}
     {"type": "tool_call", "calls": [{"name": <schema name>, "arguments": {...}}, ...]}
     {"type": "finish", "summary": <non-empty summary>, "objective_met": <boolean>}
 
 Legacy tool actions with top-level ``name``/``arguments`` remain accepted and
 are normalized to a one-call batch.
 
-The agent is instructed to emit a short ``plan`` action before any
-``tool_call``; the plan is kept in the transcript. With durable context reuse,
+The agent acts directly through tool calls and finishes when the objective is
+met. With durable context reuse,
 completed raw tails become strict immutable semantic deltas. A typed CAST policy
 rolls an overgrown delta sequence into a deterministic K0 materialized view while
 retaining an immutable rollover manifest outside the active prompt. Without
@@ -162,7 +161,6 @@ from cambium.redact import Redactor, build_session_redactor
 from cambium.schemas import (
     FINISH_ACTION_SCHEMA,
     NATIVE_CONTROL_TOOL_SCHEMAS,
-    PLAN_ACTION_SCHEMA,
     TOOL_SCHEMAS,
     validate_tool_call,
 )
@@ -2270,7 +2268,6 @@ def _parse_agent_action(content: str) -> dict[str, Any]:
 
     Accepted shapes (each may optionally carry a ``thought`` field for
     reasoning; the action fields themselves must be exact):
-        {"type": "plan", "steps": [<non-empty strings>]}
         {"type": "tool_call", "calls": [{"name": <schema name>, "arguments": {...}}, ...]}
         {"type": "finish", "summary": <non-empty str>, "objective_met": <boolean>}
 
@@ -2306,15 +2303,6 @@ def _parse_agent_action(content: str) -> dict[str, Any]:
     if "type" not in parsed and ("calls" in parsed or "name" in parsed):
         parsed["type"] = "tool_call"
     action_type = parsed.get("type")
-    if action_type == "plan":
-        if encoded_size > MAX_ACTION_CONTENT_BYTES:
-            raise ValueError("agent action exceeds the field cap")
-        if not _action_keys(parsed, frozenset({"type", "steps"})):
-            raise ValueError("plan must carry exactly type/steps (plus optional thought)")
-        schema_errors = validate_tool_call(PLAN_ACTION_SCHEMA, parsed)
-        if schema_errors:
-            raise ValueError(schema_errors[0])
-        return {"type": "plan", "steps": list(parsed["steps"])}
     if action_type == "tool_call":
         if encoded_size > MAX_ACTION_CONTENT_BYTES:
             raise ValueError("agent action exceeds the field cap")
@@ -3258,10 +3246,10 @@ def _build_agent_prompt(
         messages.append(_parent_envelope_message(parent_envelope))
     if messages[-1].get("role") != "user":
         # Some providers (e.g. ZAI/GLM) reject payloads whose last message is
-        # not a user message: a plan action leaves the transcript ending with
-        # an assistant message (1214 on the next turn). A neutral user
-        # message keeps every payload valid without changing the static
-        # system prefix (plan step 3 caching).
+        # not a user message: an assistant action leaves the transcript ending
+        # with an assistant message (1214 on the next turn). A neutral user
+        # message keeps every payload valid without changing the static system
+        # prefix (plan step 3 caching).
         messages.append({"role": "user", "content": "Continue."})
     return {"messages": messages, "tools": tools}
 
@@ -3325,8 +3313,6 @@ def _native_tool_action(result: CallResult) -> dict[str, Any] | None:
         validation_errors = validate_tool_call(schema, control["arguments"])
         if validation_errors:
             raise ValueError(f"provider native control action {validation_errors[0]}")
-        if control["name"] == "plan":
-            return {"type": "plan", "steps": list(control["arguments"]["steps"])}
         return {
             "type": "finish",
             "summary": _user_response(control["arguments"]["summary"]),
@@ -7425,59 +7411,6 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                     return _no_progress_failure(
                         outcome, no_progress_actions, turn, cumulative_usage, transcript
                     )
-            if action["type"] == "plan":
-                if base_messages is None:
-                    transcript.append(action_message)
-                else:
-                    context_continuation.append(action_message)
-                    context_continuation.append({"role": "user", "content": "Continue."})
-                    transcript = _sync_context_transcript(
-                        base_messages, context_continuation, transcript
-                    )
-                base_messages, context_continuation, transcript = await _maybe_restore_turn_context(
-                    turn_checkpoint_resumed=turn_checkpoint_resumed,
-                    compaction_deferred=compaction_deferred,
-                    base_messages=base_messages,
-                    context_continuation=context_continuation,
-                    transcript=transcript,
-                    config=config,
-                    tools=tools,
-                    model_identity=model_identity,
-                )
-                (
-                    finalized,
-                    forced_finalization,
-                    finalization_grace_used,
-                    context_continuation,
-                    transcript,
-                ) = _arm_finalization(
-                    turn,
-                    base_messages=base_messages,
-                    context_continuation=context_continuation,
-                    transcript=transcript,
-                    config=config,
-                    budget_new_tokens=budget_new_tokens,
-                    soft_cap=soft_cap,
-                    finalized=finalized,
-                    forced_finalization=forced_finalization,
-                    finalization_grace_used=finalization_grace_used,
-                )
-                if writer is not None:
-                    await _persist_checkpoint(
-                        writer,
-                        config,
-                        turn,
-                        transcript,
-                        cumulative_usage,
-                        [],
-                        compaction_deferred=compaction_deferred,
-                        consecutive_compaction_deferrals=consecutive_compaction_deferrals,
-                        code_changed=code_changed,
-                        no_progress_actions=no_progress_actions,
-                    )
-                    last_turn_checkpoint = turn
-                progress.tool = "plan"
-                continue
             if action["type"] == "finish":
                 if base_messages is None:
                     transcript.append(action_message)

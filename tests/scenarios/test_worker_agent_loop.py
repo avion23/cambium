@@ -597,7 +597,7 @@ def test_malformed_summary_defers_and_task_completes(tmp_path: Path) -> None:
     router = _SummaryFlushRouter(
         malformed_summaries=2,
         responses=[
-            '{"type":"plan","steps":["continue"]}',
+            '{"type":"tool_call","name":"read_batch","arguments":{"paths":["alpha.txt"]}}',
             '{"type":"finish","summary":"done","objective_met":true}',
         ],
     )
@@ -715,9 +715,9 @@ def test_two_malformed_summaries_fail_on_the_third_fold_attempt(tmp_path: Path) 
     router = _SummaryFlushRouter(
         malformed_summaries=6,
         responses=[
-            '{"type":"plan","steps":["first"]}',
-            '{"type":"plan","steps":["second"]}',
-            '{"type":"plan","steps":["third"]}',
+            '{"type":"tool_call","name":"read_batch","arguments":{"paths":["alpha.txt"]}}',
+            '{"type":"tool_call","name":"read_batch","arguments":{"paths":["beta.txt"]}}',
+            '{"type":"tool_call","name":"read_batch","arguments":{"paths":["alpha.txt","beta.txt"]}}',
         ],
     )
 
@@ -745,7 +745,7 @@ def test_two_malformed_summaries_fail_on_the_third_fold_attempt(tmp_path: Path) 
 
 
 # ---------------------------------------------------------------------------
-# Plan-before-act: plan action parses, is stored, and the loop proceeds
+# Direct tool action reaches completion without a plan-only turn
 # ---------------------------------------------------------------------------
 
 
@@ -903,13 +903,12 @@ def test_three_turn_budget_allows_edit_verify_finish(tmp_path: Path) -> None:
     )
 
 
-def test_plan_before_act_plan_read_batch_finish(tmp_path: Path) -> None:
+def test_tool_read_batch_then_finish(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     worktree = _make_worktree(repo)
     config = _agent_config(worktree)
     router = _ScriptedRouter(
         [
-            '{"type":"plan","steps":["read both files","finish"]}',
             '{"type":"tool_call","name":"read_batch","arguments":'
             '{"paths":["alpha.txt","beta.txt"]}}',
             '{"type":"finish","summary":"read both files","objective_met":true}',
@@ -920,16 +919,10 @@ def test_plan_before_act_plan_read_batch_finish(tmp_path: Path) -> None:
 
     assert outcome["status"] == "succeeded"
     assert outcome["summary"] == "read both files"
-    assert outcome["turn"] == 3
-    assert len(router.prompts) == 3
+    assert outcome["turn"] == 2
+    assert len(router.prompts) == 2
 
     transcript = outcome["transcript"]
-    plan_message = worker._plan_message(transcript)
-    assert plan_message is not None
-    assert json.loads(plan_message["content"]) == {
-        "type": "plan",
-        "steps": ["read both files", "finish"],
-    }
     observation = transcript[-2]["content"]
     assert "tool read_batch ok=True" in observation
     assert "alpha-content" in observation
@@ -1633,53 +1626,6 @@ def test_turn_checkpoint_restart_preserves_no_progress_streak(
     assert "no progress" in (resumed_outcome["failure_reason"] or "")
 
 
-def test_plan_checkpoint_restart_preserves_no_progress_streak(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    async def direct_to_thread(function: Any, *args: Any, **kwargs: Any) -> Any:
-        return function(*args, **kwargs)
-
-    monkeypatch.setattr(worker.asyncio, "to_thread", direct_to_thread)
-    worktree = _make_worktree(tmp_path / "repo")
-    checkpoint_root = tmp_path / "checkpoints"
-    config = _agent_config(
-        worktree,
-        checkpoint_root=checkpoint_root,
-        max_no_progress_actions=2,
-        progress_window=3,
-    )
-    action = '{"type":"plan","steps":["repeat"]}'
-    writer = _FakeWriter()
-    first_router = _ScriptedRouter(
-        [action, action, '{"type":"finish","summary":"first run","objective_met":true}']
-    )
-
-    first_outcome = asyncio.run(_drive_loop(config, worktree, first_router, writer))
-
-    assert first_outcome["status"] == "succeeded"
-    checkpoint_path = checkpoint_root / "loop-agent" / "turn-002.json"
-    persisted = json.loads(checkpoint_path.read_text(encoding="utf-8"))
-    assert persisted["no_progress_actions"] == 1
-    resume = worker._validate_resume(
-        {
-            "checkpoint_ref": "loop-agent/turn-002.json",
-            "epoch": 2,
-            "child_results": [],
-            "child_results_truncated": False,
-            "workspace_changed": False,
-            "rejection_feedback": None,
-        }
-    )
-    resumed_config = replace(config, resume=resume)
-    resumed_router = _ScriptedRouter([action])
-
-    resumed_outcome = asyncio.run(_drive_loop(resumed_config, worktree, resumed_router))
-
-    assert resumed_outcome["status"] == "failed"
-    assert resumed_outcome["turn"] == 3
-    assert "no progress" in (resumed_outcome["failure_reason"] or "")
-
-
 @pytest.mark.parametrize("invalid", [True, -1, "1", None])
 def test_turn_checkpoint_rejects_invalid_no_progress_count(tmp_path: Path, invalid: Any) -> None:
     worktree = _make_worktree(tmp_path / "repo")
@@ -1793,7 +1739,6 @@ def test_finish_after_verified_change_succeeds(tmp_path: Path) -> None:
     config = _agent_config(worktree)
     router = _ScriptedRouter(
         [
-            '{"type":"plan","steps":["edit alpha.txt"]}',
             '{"type":"tool_call","name":"edit_file","arguments":'
             '{"path":"alpha.txt","old_string":"alpha-content","new_string":"ALPHA"}}',
             '{"type":"tool_call","name":"run_shell","arguments":{"cmd":["true"]}}',
@@ -1925,7 +1870,7 @@ def test_agent_loop_bounds_transcript_before_every_provider_call(tmp_path: Path)
             f"file-{index}\n" + "x" * 20_000, encoding="utf-8"
         )
     router = _ScriptedRouter(
-        ['{"type":"plan","steps":["inspect repeatedly","finish"]}']
+        ['{"type":"tool_call","name":"read_batch","arguments":{"paths":["large0.txt"]}}']
         + [
             '{"type":"tool_call","name":"read_batch","arguments":{"paths":'
             f'["large{index}.txt"]}}}}'
@@ -2084,7 +2029,6 @@ def test_lint_feedback_visible_in_transcript(
     config = _agent_config(worktree)
     router = _ScriptedRouter(
         [
-            '{"type":"plan","steps":["write a file"]}',
             '{"type":"tool_call","name":"write_file","arguments":'
             '{"path":"broken.py","content":"broken(:\\n"}}',
             '{"type":"tool_call","name":"run_shell","arguments":{"cmd":["true"]}}',
@@ -2186,61 +2130,6 @@ def test_run_task_drain_uses_config_heartbeat_interval(tmp_path: Path) -> None:
     assert elapsed < 1.5
 
 
-# ---------------------------------------------------------------------------
-# Plan-spin guard: consecutive plan actions without a tool call fail fast
-# ---------------------------------------------------------------------------
-
-
-def test_consecutive_plan_actions_fail_fast_with_no_progress_reason(
-    tmp_path: Path,
-) -> None:
-    repo = tmp_path / "repo"
-    worktree = _make_worktree(repo)
-    config = _agent_config(worktree)
-    router = _ScriptedRouter(
-        [
-            '{"type":"plan","steps":["a"]}',
-            '{"type":"plan","steps":["a"]}',
-            '{"type":"plan","steps":["a"]}',
-            '{"type":"plan","steps":["a"]}',
-            '{"type":"plan","steps":["e"]}',
-            '{"type":"finish","summary":"must never be reached","objective_met":true}',
-        ]
-    )
-
-    outcome = asyncio.run(_drive_loop(config, worktree, router))
-
-    assert outcome["status"] == "failed"
-    assert "no progress" in outcome["failure_reason"]
-    assert outcome["turn"] == 3  # failed on the 3rd consecutive plan
-    assert len(router.prompts) == 3  # no further router calls
-    assert not any(
-        "must never be reached" in message["content"] for message in outcome["transcript"]
-    )
-
-
-def test_plan_then_tool_resets_consecutive_plan_counter(tmp_path: Path) -> None:
-    repo = tmp_path / "repo"
-    worktree = _make_worktree(repo)
-    config = _agent_config(worktree)
-    router = _ScriptedRouter(
-        [
-            '{"type":"plan","steps":["read alpha"]}',
-            '{"type":"plan","steps":["read alpha again"]}',
-            '{"type":"tool_call","name":"read_batch","arguments":{"paths":["alpha.txt"]}}',
-            '{"type":"plan","steps":["one more plan before finishing"]}',
-            '{"type":"finish","summary":"read the file","objective_met":true}',
-        ]
-    )
-
-    outcome = asyncio.run(_drive_loop(config, worktree, router))
-
-    assert outcome["status"] == "succeeded"
-    assert outcome["summary"] == "read the file"
-    assert outcome["turn"] == 5
-    assert len(router.prompts) == 5
-
-
 def test_concatenated_actions_are_rejected(tmp_path: Path) -> None:
     """A response carrying several concatenated JSON actions is invalid:
     exactly one top-level object is the action contract, so the loop treats
@@ -2308,7 +2197,7 @@ def test_valid_action_resets_consecutive_invalid_action_bound(tmp_path: Path) ->
     router = _ScriptedRouter(
         [
             "malformed-before-reset",
-            '{"type":"plan","steps":["continue"]}',
+            '{"type":"tool_call","name":"read_batch","arguments":{"paths":["alpha.txt"]}}',
             "malformed-after-reset-one",
             "malformed-after-reset-two",
             "malformed-after-reset-three",
@@ -2325,13 +2214,12 @@ def test_valid_action_resets_consecutive_invalid_action_bound(tmp_path: Path) ->
 
 def test_parse_repair_near_budget_can_still_use_tools(tmp_path: Path) -> None:
     worktree = _make_worktree(tmp_path / "repo")
-    # Four provider responses are required: plan, malformed probe, repaired
-    # read, then the terminal finish.  Keep the declared budget equal to the
-    # number of calls now that max_turns is a hard provider-call cap.
-    config = _agent_config(worktree, max_turns=4)
+    # Three provider responses are required: malformed probe, repaired read,
+    # then the terminal finish. Keep the declared budget equal to the number
+    # of calls now that max_turns is a hard provider-call cap.
+    config = _agent_config(worktree, max_turns=3)
     router = _ScriptedRouter(
         [
-            '{"type":"plan","steps":["read alpha"]}',
             '{"name":"read_batch","arguments":[]}',
             '{"name":"read_batch","arguments":{"paths":["alpha.txt"]}}',
             '{"type":"finish","summary":"read alpha","objective_met":true}',
@@ -2341,7 +2229,7 @@ def test_parse_repair_near_budget_can_still_use_tools(tmp_path: Path) -> None:
     outcome = asyncio.run(_drive_loop(config, worktree, router))
 
     assert outcome["status"] == "succeeded"
-    assert len(router.prompts) == 4
+    assert len(router.prompts) == 3
     assert any(
         message.get("role") == "user" and "alpha-content" in message.get("content", "")
         for message in router.prompts[-1]["messages"]
@@ -2625,7 +2513,6 @@ def test_requires_commit_doc_only_finish_publishes_commit(
     config = replace(_agent_config(worktree), base_commit=base_commit, requires_commit=True)
     router = _ScriptedRouter(
         [
-            '{"type":"plan","steps":["write the release notes","finish"]}',
             '{"type":"tool_call","name":"run_shell","arguments":{"cmd":['
             '"sh","-c","mkdir -p docs && printf \'%s\\n\' \'release notes\' '
             '> docs/release.md"]}}',
@@ -2664,7 +2551,6 @@ def test_requires_commit_clean_finish_fails(tmp_path: Path) -> None:
     config = replace(_agent_config(worktree), base_commit=base_commit, requires_commit=True)
     router = _ScriptedRouter(
         [
-            '{"type":"plan","steps":["finish"]}',
             '{"type":"finish","summary":"nothing changed","objective_met":true}',
         ]
     )

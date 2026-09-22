@@ -118,25 +118,6 @@ def _parameters(properties: dict[str, dict[str, Any]], required: list[str]) -> d
     }
 
 
-PLAN_ACTION_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "description": "Set a non-empty execution plan when planning is useful.",
-    "properties": {
-        "type": {"type": "string", "enum": ["plan"]},
-        "steps": {
-            "type": "array",
-            "minItems": 1,
-            "items": {"type": "string", "minLength": 1, "pattern": "\\S"},
-            "description": "Ordered non-empty plan steps.",
-        },
-        # The worker strips this optional reasoning field before persistence.
-        "thought": {},
-    },
-    "required": ["type", "steps"],
-    "additionalProperties": False,
-}
-
-
 FINISH_ACTION_SCHEMA: dict[str, Any] = {
     "type": "object",
     "description": (
@@ -189,7 +170,7 @@ def _native_control_tool_schema(action_schema: dict[str, Any]) -> dict[str, Any]
 
 
 NATIVE_CONTROL_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = tuple(
-    _native_control_tool_schema(schema) for schema in (PLAN_ACTION_SCHEMA, FINISH_ACTION_SCHEMA)
+    _native_control_tool_schema(schema) for schema in (FINISH_ACTION_SCHEMA,)
 )
 
 
