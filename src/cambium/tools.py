@@ -90,11 +90,18 @@ _PARALLEL_CHECK_MODULES = frozenset(
 _PARALLEL_MUTATION_FLAGS = frozenset(
     {
         "--accept",
+        "--cache",
+        "--cache-location",
         "--deploy",
+        "--export-fixes",
         "--fix",
+        "--fix-errors",
         "--fix-only",
         "--in-place",
         "--install",
+        "--install-types",
+        "--output",
+        "--output-file",
         "--push",
         "--snapshot-update",
         "--update-snapshots",

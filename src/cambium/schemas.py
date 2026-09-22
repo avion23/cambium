@@ -242,6 +242,15 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "default": 120,
                     "description": "Timeout in seconds.",
                 },
+                "parallel": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "Scheduling hint only: set true on every member of a batch of "
+                        "more than one independent local check. The runtime allowlist "
+                        "is authoritative; unsupported or mutating commands stay serial."
+                    ),
+                },
             },
             ["cmd"],
         ),

@@ -185,7 +185,14 @@ from cambium.summary_trunk import (
     summary_entries,
     summary_trunk_tokens,
 )
-from cambium.tools import ToolContext, ToolPermissionPolicy, ToolResult, run_tool
+from cambium.tools import (
+    ToolContext,
+    ToolPermissionPolicy,
+    ToolResult,
+    is_parallel_shell_call,
+    run_shell_batch,
+    run_tool,
+)
 
 SUMMARY_PROTOCOL_LINES = _SUMMARY_PROTOCOL_LINES
 
@@ -7882,7 +7889,49 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                 successful_delegate: dict[str, Any] | None = None
                 batch_cancelled = False
                 batch_deadline_exceeded = False
-                if not all(tool_call["name"] in _CONCURRENT_TOOL_NAMES for tool_call in tool_calls):
+                parallel_shell_batch = len(tool_calls) > 1 and all(
+                    is_parallel_shell_call(tool_call) for tool_call in tool_calls
+                )
+                if parallel_shell_batch:
+                    progress.tool = f"parallel×{len(tool_calls)}"
+                    with ToolContext(
+                        worktree,
+                        lint=lint_diag,
+                        policy=ToolPermissionPolicy(
+                            shell=config.shell_permission,
+                            network=config.network_permission,
+                        ),
+                        progress=None,
+                    ) as ctx:
+                        try:
+                            if writer is not None and lifecycle_ack_waiters is not None:
+                                for batch_index, tool_call in enumerate(tool_calls):
+                                    await _await_tool_lifecycle_ack(
+                                        writer,
+                                        config,
+                                        tool_call["name"],
+                                        turn,
+                                        batch_index,
+                                        len(tool_calls),
+                                        "started",
+                                        lifecycle_ack_waiters,
+                                    )
+                            shell_results = await run_shell_batch(tool_calls, ctx)
+                        finally:
+                            progress.tool = None
+                    for tool_call, tool_result in zip(tool_calls, shell_results, strict=True):
+                        name = tool_call["name"]
+                        arguments = tool_call["arguments"]
+                        if tool_result.ok:
+                            verified_after_change = True
+                            verification_failed = False
+                        else:
+                            verification_failed = True
+                            verified_after_change = False
+                        batch_results.append((name, arguments, tool_result))
+                elif not all(
+                    tool_call["name"] in _CONCURRENT_TOOL_NAMES for tool_call in tool_calls
+                ):
                     for tool_call in tool_calls:
                         if stop.is_set():
                             batch_cancelled = True
