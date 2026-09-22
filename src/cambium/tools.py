@@ -54,6 +54,60 @@ _SPILL_COUNTER = count(1)
 _ALLOWED_TASK_KINDS = frozenset(member.value for member in TaskKind)
 _ALLOWED_TASK_KINDS_TEXT = ", ".join(member.value for member in TaskKind)
 
+# ``run_shell`` is deliberately conservative when a worker asks to overlap
+# commands.  The command still runs under the normal shell permission and
+# environment policy; this allowlist only decides whether two *already
+# requested* calls may share a turn.  Keep wrappers (``sh -c``, package
+# managers, ``sudo``) out because their command shape is opaque here.
+_PARALLEL_CHECK_EXECUTABLES = frozenset(
+    {
+        "pytest",
+        "py.test",
+        "ruff",
+        "mypy",
+        "pyright",
+        "flake8",
+        "pylint",
+        "black",
+        "isort",
+        "eslint",
+        "shellcheck",
+        "clang-tidy",
+        "go",
+        "cargo",
+        "git",
+    }
+)
+_PARALLEL_CHECK_MODULES = frozenset(
+    {
+        "pytest",
+        "unittest",
+        "ruff",
+        "mypy",
+        "pyright",
+    }
+)
+_PARALLEL_MUTATION_FLAGS = frozenset(
+    {
+        "--accept",
+        "--deploy",
+        "--fix",
+        "--fix-only",
+        "--in-place",
+        "--install",
+        "--push",
+        "--snapshot-update",
+        "--update-snapshots",
+        "--upload",
+        "--write",
+    }
+)
+_PARALLEL_CONTROL_TOKENS = frozenset({";", "&&", "||", "|", ">", ">>", "<", "<<"})
+_PARALLEL_BATCH_REJECTION = (
+    "run_shell parallel batch rejected: every call must set parallel=true and use "
+    "an allowlisted local check/test command"
+)
+
 ToolEventSink = Callable[[dict[str, Any]], Awaitable[None] | None]
 ToolProgressSink = Callable[[str, str], Awaitable[None] | None]
 
@@ -863,6 +917,130 @@ async def _run_shell(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
     return _Outcome(True, output, **artifact)
 
 
+def _executable_name(raw: str) -> str:
+    """Return a platform-neutral basename for one argv executable token."""
+    name = Path(raw).name.lower()
+    return name.removesuffix(".exe")
+
+
+def _python_executable(name: str) -> bool:
+    if name in {"python", "python3", "pypy", "pypy3"}:
+        return True
+    if not name.startswith("python"):
+        return False
+    suffix = name.removeprefix("python")
+    return bool(suffix) and all(character.isdigit() or character == "." for character in suffix)
+
+
+def is_parallel_shell_command(command: object) -> bool:
+    """Return whether ``command`` has a known local check/test shape.
+
+    This is an allowlist, not a promise that a test has no side effects.  It
+    excludes command interpreters, package managers, mutating flags, and
+    arbitrary executable names.  Unknown shapes remain serial.
+    """
+    if not isinstance(command, Sequence) or isinstance(command, str | bytes | bytearray):
+        return False
+    tokens = tuple(command)
+    if not tokens or any(not isinstance(token, str) or not token for token in tokens):
+        return False
+    if any(token in _PARALLEL_CONTROL_TOKENS for token in tokens):
+        return False
+    if any(
+        token in _PARALLEL_MUTATION_FLAGS
+        or any(token.startswith(f"{flag}=") for flag in _PARALLEL_MUTATION_FLAGS)
+        for token in tokens
+    ):
+        return False
+    if any(token.startswith("--cov") for token in tokens):
+        # Coverage output is shared by default and can race across siblings.
+        return False
+
+    executable = _executable_name(tokens[0])
+    arguments = tokens[1:]
+    if _python_executable(executable):
+        return (
+            len(arguments) >= 2
+            and arguments[0] == "-m"
+            and arguments[1] in _PARALLEL_CHECK_MODULES
+        )
+    if executable not in _PARALLEL_CHECK_EXECUTABLES:
+        return False
+    if executable == "git":
+        return len(arguments) >= 2 and arguments[0] == "diff" and "--check" in arguments
+    if executable == "go":
+        return bool(arguments) and arguments[0] == "test"
+    if executable == "cargo":
+        return bool(arguments) and arguments[0] in {"test", "check", "clippy"}
+    if executable == "ruff":
+        return bool(arguments) and arguments[0] == "check"
+    if executable == "black":
+        return "--check" in arguments
+    if executable == "isort":
+        return any(argument in {"--check", "--check-only"} for argument in arguments)
+    return True
+
+
+def is_parallel_shell_check(arguments: Mapping[str, Any] | object) -> bool:
+    """Return whether run-shell arguments explicitly opt into a safe check."""
+    return (
+        isinstance(arguments, Mapping)
+        and arguments.get("parallel") is True
+        and is_parallel_shell_command(arguments.get("cmd"))
+    )
+
+
+def _shell_batch_arguments(call: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    arguments = call.get("arguments")
+    if isinstance(arguments, Mapping):
+        return arguments
+    if call.get("name") == "run_shell":
+        return {key: value for key, value in call.items() if key != "name"}
+    return call
+
+
+def is_parallel_shell_call(call: Mapping[str, Any]) -> bool:
+    """Return whether one normalized tool call opts into safe overlap."""
+    if "name" in call and call.get("name") != "run_shell":
+        return False
+    arguments = _shell_batch_arguments(call)
+    return arguments is not None and is_parallel_shell_check(arguments)
+
+
+async def run_shell_batch(
+    calls: Sequence[Mapping[str, Any]], ctx: ToolContext
+) -> tuple[ToolResult, ...]:
+    """Execute an explicitly eligible shell-check batch concurrently.
+
+    The returned tuple follows input order.  Each process uses the existing
+    process-group timeout and cancellation cleanup in ``_run_shell_process``.
+    Callers must perform their durable start barrier before invoking this
+    helper; this function owns execution only.
+    """
+    batch = tuple(calls)
+    if not batch:
+        return ()
+    if not all(is_parallel_shell_call(call) for call in batch):
+        return tuple(ToolResult(ok=False, error=_PARALLEL_BATCH_REJECTION) for _ in batch)
+
+    async def _run(call: Mapping[str, Any]) -> ToolResult:
+        arguments = dict(cast(Mapping[str, Any], _shell_batch_arguments(call)))
+        # ``parallel`` is a scheduling hint, not a run_shell process argument.
+        arguments.pop("parallel", None)
+        return await run_tool("run_shell", arguments, ctx)
+
+    gathered = await asyncio.gather(*(_run(call) for call in batch), return_exceptions=True)
+    results: list[ToolResult] = []
+    for result in gathered:
+        if isinstance(result, asyncio.CancelledError):
+            raise result
+        if isinstance(result, Exception):
+            results.append(ToolResult(ok=False, error=f"run_shell failed: {result}"))
+        else:
+            results.append(cast(ToolResult, result))
+    return tuple(results)
+
+
 async def _read_batch(args: dict[str, Any], ctx: ToolContext) -> _Outcome:
     requested_paths = args["paths"]
     paths = requested_paths[:READ_BATCH_MAX_FILES]
@@ -1181,6 +1359,10 @@ __all__ = [
     "ToolContext",
     "ToolPermissionPolicy",
     "ToolResult",
+    "is_parallel_shell_call",
+    "is_parallel_shell_check",
+    "is_parallel_shell_command",
     "run_read_batch",
+    "run_shell_batch",
     "run_tool",
 ]

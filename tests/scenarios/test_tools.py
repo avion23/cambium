@@ -22,12 +22,126 @@ from cambium.tools import (
     SHELL_OUTPUT_HEAD_BYTES,
     SHELL_OUTPUT_TAIL_BYTES,
     ToolContext,
+    is_parallel_shell_call,
+    is_parallel_shell_check,
+    is_parallel_shell_command,
+    run_shell_batch,
     run_tool,
 )
 
 
 def _run(name: str, args: dict, ctx: ToolContext):
     return asyncio.run(run_tool(name, args, ctx))
+
+
+@pytest.mark.parametrize(
+    ("command", "eligible"),
+    [
+        (["pytest", "-q", "tests/a.py"], True),
+        ([sys.executable, "-m", "ruff", "check", "src"], True),
+        (["ruff", "check", "src"], True),
+        (["git", "diff", "--check"], True),
+        (["python", "-m", "pytest", "tests/a.py", "--cov=src"], False),
+        (["ruff", "check", "--fix", "src"], False),
+        (["sh", "-c", "pytest -q"], False),
+        (["npm", "test"], False),
+        (["git", "status"], False),
+    ],
+)
+def test_parallel_shell_command_allowlist(command: list[str], eligible: bool) -> None:
+    assert is_parallel_shell_command(command) is eligible
+    arguments = {"cmd": command, "parallel": True}
+    assert is_parallel_shell_check(arguments) is eligible
+    assert is_parallel_shell_call({"name": "run_shell", "arguments": arguments}) is eligible
+    assert is_parallel_shell_call(arguments) is eligible
+
+
+@pytest.mark.slow
+def test_parallel_shell_batch_overlaps_eligible_checks_and_preserves_order(tmp_path: Path) -> None:
+    first = tmp_path / "test_first.py"
+    second = tmp_path / "test_second.py"
+    first_started = tmp_path / "first.started"
+    first_finished = tmp_path / "first.finished"
+    second_started = tmp_path / "second.started"
+    second_finished = tmp_path / "second.finished"
+    first.write_text(
+        f"import time\nimport unittest\n\n"
+        "class TestFirst(unittest.TestCase):\n"
+        "    def test_first(self):\n"
+        f"        open({str(first_started)!r}, 'w').write(str(time.time_ns()))\n"
+        "        time.sleep(.25)\n"
+        f"        open({str(first_finished)!r}, 'w').write(str(time.time_ns()))\n",
+        encoding="utf-8",
+    )
+    second.write_text(
+        f"import time\nimport unittest\n\n"
+        "class TestSecond(unittest.TestCase):\n"
+        "    def test_second(self):\n"
+        f"        open({str(second_started)!r}, 'w').write(str(time.time_ns()))\n"
+        "        time.sleep(.25)\n"
+        f"        open({str(second_finished)!r}, 'w').write(str(time.time_ns()))\n",
+        encoding="utf-8",
+    )
+    results = asyncio.run(
+        run_shell_batch(
+            [
+                {
+                    "name": "run_shell",
+                    "arguments": {
+                        "cmd": [
+                            sys.executable,
+                            "-m",
+                            "unittest",
+                            str(first),
+                        ],
+                        "parallel": True,
+                    },
+                },
+                {
+                    "name": "run_shell",
+                    "arguments": {
+                        "cmd": [
+                            sys.executable,
+                            "-m",
+                            "unittest",
+                            str(second),
+                        ],
+                        "parallel": True,
+                    },
+                },
+            ],
+            ToolContext(tmp_path),
+        )
+    )
+
+    assert [result.ok for result in results] == [True, True]
+    assert "OK" in results[0].output
+    assert "OK" in results[1].output
+    starts = [int(first_started.read_text()), int(second_started.read_text())]
+    finishes = [int(first_finished.read_text()), int(second_finished.read_text())]
+    assert max(starts) < min(finishes)
+
+
+def test_parallel_shell_batch_rejects_mixed_or_unopted_calls(tmp_path: Path) -> None:
+    results = asyncio.run(
+        run_shell_batch(
+            [
+                {
+                    "name": "run_shell",
+                    "arguments": {"cmd": ["pytest", "-q"], "parallel": True},
+                },
+                {"name": "run_shell", "arguments": {"cmd": ["pytest", "-q"]}},
+            ],
+            ToolContext(tmp_path),
+        )
+    )
+
+    assert len(results) == 2
+    assert all(not result.ok for result in results)
+    assert {result.error for result in results} == {
+        "run_shell parallel batch rejected: every call must set parallel=true and use "
+        "an allowlisted local check/test command"
+    }
 
 
 def test_read_batch_returns_bounded_files_and_windows(tmp_path: Path) -> None:
