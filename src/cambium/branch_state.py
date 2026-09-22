@@ -2612,6 +2612,8 @@ _GLOSSARY_KINDS = frozenset(
         "log",
         "heartbeat",
         "tool_event",
+        "tool_started",
+        "tool_finished",
         "tool_output_delta",
         "usage_event",
         "provider_boundary_degraded",
@@ -2690,6 +2692,8 @@ def _handler_for(kind: str) -> Callable[[BranchState, Mapping[str, Any]], Branch
         return _reduce_usage
     if kind == "tool_event":
         return _reduce_tool
+    if kind in {"tool_started", "tool_finished"}:
+        return _reduce_noop
     if kind == "tool_output_delta":
         return _reduce_tool_output
     if kind == "context_fork":

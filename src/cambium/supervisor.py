@@ -166,6 +166,7 @@ from .worker import (
     MAX_RESPONSE_DURABLE_TOTAL_BYTES,
     MAX_RESPONSE_TOTAL_BYTES,
     _cap_utf8,
+    _provider_boundary_supports_cache_identity,
     _safe_task_id,
     _split_response_chunks,
     _validate_checkpoint_ref_shape,
@@ -473,8 +474,7 @@ def _invalid_context_checkpoint_fields(msg: dict[str, Any]) -> list[str]:
             invalid.append(f"cache_key.{field}")
     for field in ("provider", "model", "cache_identity", "protocol", "reasoning_effort"):
         if field not in cache_key:
-            if field != "cache_identity":
-                invalid.append(f"cache_key.{field}")
+            invalid.append(f"cache_key.{field}")
             continue
         value = cache_key.get(field)
         if field in ("provider", "reasoning_effort"):
@@ -502,7 +502,11 @@ def _invalid_context_checkpoint_fields(msg: dict[str, Any]) -> list[str]:
         invalid.append("cache_key.provider_boundary")
     else:
         try:
-            _validate_provider_boundary(cache_key["provider_boundary"])
+            boundary = _validate_provider_boundary(cache_key["provider_boundary"])
+            if not cache_key.get("cache_identity") and _provider_boundary_supports_cache_identity(
+                boundary
+            ):
+                invalid.append("cache_key.cache_identity")
         except ValueError:
             invalid.append("cache_key.provider_boundary")
     return invalid
@@ -702,6 +706,7 @@ def _imported_context_epoch(
     for field in (
         "provider",
         "model",
+        "cache_identity",
         "system_sha256",
         "tools_sha256",
         "prefix_sha256",
@@ -712,10 +717,6 @@ def _imported_context_epoch(
     ):
         if descriptor.get(field) != cache_key.get(field):
             return None
-    if "cache_identity" in descriptor and descriptor.get("cache_identity") != cache_key.get(
-        "cache_identity", ""
-    ):
-        return None
     return {
         "epoch": checkpoint.epoch,
         "turn": checkpoint.turn,
@@ -738,12 +739,10 @@ def _validate_advanced_epoch_checkpoint(
         expected_task_id=task_id,
         expected_generation=generation,
     )
-    message_cache_key = dict(msg["cache_key"])
-    message_cache_key.setdefault("cache_identity", "")
     if (
         checkpoint.epoch != msg["epoch"]
         or checkpoint.turn != msg["turn"]
-        or asdict(checkpoint.cache_key) != message_cache_key
+        or asdict(checkpoint.cache_key) != msg["cache_key"]
     ):
         raise ValueError("checkpoint descriptor mismatch")
 
@@ -5466,7 +5465,7 @@ class _Runtime:
             "checkpoint_ref": epoch["checkpoint_ref"],
             "provider": provider,
             "model": cache_key["model"],
-            "cache_identity": cache_key.get("cache_identity", ""),
+            "cache_identity": cache_key["cache_identity"],
             "system_sha256": cache_key["system_sha256"],
             "tools_sha256": cache_key["tools_sha256"],
             "prefix_sha256": cache_key["prefix_sha256"],

@@ -2989,6 +2989,7 @@ class Diffundo:
         # the first request; semantic/fresh contexts keep this new value.
         self._opencode_session_id = f"cambium-{uuid.uuid4().hex}"
         self._codex_session_id = str(uuid.uuid4())
+        self._cache_identity_owner: tuple[str, str] | None = None
         # Measured-usage debt snapshot (weighted routing): provider name ->
         # ProviderDebt-like counters (requests, cache_hit_count/cache_report_count,
         # latency_total_s/latency_count, last_seen) used to order the cascade
@@ -3103,6 +3104,7 @@ class Diffundo:
                     },
                 )
                 try:
+                    self._prepare_transport_cache_identity(provider)
                     attempt_deadline = min(
                         deadline,
                         time.monotonic()
@@ -3222,6 +3224,7 @@ class Diffundo:
         # coding branch's provider session identity.
         summary._opencode_session_id = f"summary-{uuid.uuid4().hex}"
         summary._codex_session_id = str(uuid.uuid4())
+        summary._cache_identity_owner = None
         summary._fallback_origin = None
         summary._active_tier = None
         summary._terminal_death_providers = frozenset()
@@ -3393,10 +3396,29 @@ class Diffundo:
 
     @property
     def cache_identity(self) -> str:
-        """Provider-specific cache/session identity of the active lease."""
+        """Provider-specific cache/session identity of the active lane."""
 
         lease = self._provider_lease
-        return lease.cache_identity if lease is not None else ""
+        if lease is not None:
+            return lease.cache_identity
+        owner = self._cache_identity_owner
+        if owner is None:
+            return ""
+        configured = next(
+            (
+                item
+                for item in self._providers
+                if item.name == owner[0] and item.model == owner[1]
+            ),
+            None,
+        )
+        if configured is None:
+            return ""
+        if configured.auth is AuthMode.CODEX_CHATGPT:
+            return self._codex_session_id
+        if _is_opencode_destination(configured.base_url):
+            return self._opencode_session_id
+        return ""
 
     @staticmethod
     def _new_transport_cache_identity(provider: ProviderConfig) -> str:
@@ -3407,6 +3429,19 @@ class Diffundo:
         if _is_opencode_destination(provider.base_url):
             return f"cambium-{uuid.uuid4().hex}"
         return ""
+
+    def _prepare_transport_cache_identity(self, provider: ProviderConfig) -> None:
+        """Own one transport identity per provider/model lane."""
+
+        owner = (provider.name, provider.model)
+        if self._cache_identity_owner == owner:
+            return
+        identity = self._new_transport_cache_identity(provider)
+        if provider.auth is AuthMode.CODEX_CHATGPT:
+            self._codex_session_id = identity
+        elif _is_opencode_destination(provider.base_url):
+            self._opencode_session_id = identity
+        self._cache_identity_owner = owner
 
     def rotate_cache_identity(self) -> None:
         """Start a new provider cache/session lineage without changing routing."""
@@ -3429,6 +3464,7 @@ class Diffundo:
             self._codex_session_id = identity
         elif _is_opencode_destination(configured.base_url):
             self._opencode_session_id = identity
+        self._cache_identity_owner = (lease.provider, lease.model)
         self._provider_lease = replace(lease, cache_identity=identity)
 
     def bind_provider(
@@ -3476,15 +3512,21 @@ class Diffundo:
             raise ValueError("provider lease does not match an enabled configured lane")
         if not isinstance(cache_identity, str):
             raise ValueError("provider cache identity must be a string")
+        owner = (provider, model)
         if cache_identity:
             if configured.auth is AuthMode.CODEX_CHATGPT:
                 self._codex_session_id = cache_identity
             elif _is_opencode_destination(configured.base_url):
                 self._opencode_session_id = cache_identity
-        elif configured.auth is AuthMode.CODEX_CHATGPT:
-            cache_identity = self._codex_session_id
-        elif _is_opencode_destination(configured.base_url):
-            cache_identity = self._opencode_session_id
+            else:
+                raise ValueError("provider does not support a cache identity")
+            self._cache_identity_owner = owner
+        else:
+            self._prepare_transport_cache_identity(configured)
+            if configured.auth is AuthMode.CODEX_CHATGPT:
+                cache_identity = self._codex_session_id
+            elif _is_opencode_destination(configured.base_url):
+                cache_identity = self._opencode_session_id
         if self._pinned_provider is None:
             # A caller that binds after an unassigned first call still makes
             # this incumbent the origin for terminal-death fallback.
@@ -3504,6 +3546,7 @@ class Diffundo:
         """Clear task-local state when a warm worker is rebound to another task."""
 
         self._provider_lease = None
+        self._cache_identity_owner = None
         self._primary_provider = None
         self._pinned_provider = None
         self._fallback_origin = None

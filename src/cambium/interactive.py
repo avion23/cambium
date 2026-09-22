@@ -73,6 +73,7 @@ _FAILURE_EVENT_KINDS = frozenset(
 _FORK_FIELDS = (
     "provider",
     "model",
+    "cache_identity",
     "system_sha256",
     "tools_sha256",
     "prefix_sha256",
@@ -1727,7 +1728,12 @@ class InteractiveSession:
             return "compact: no successful checkpoint is available"
         seed = self._seed
         try:
-            from .worker import AgentConfig, _load_epoch_checkpoint, _write_epoch_checkpoint
+            from .worker import (
+                AgentConfig,
+                _load_epoch_checkpoint,
+                _new_cache_identity_for_boundary,
+                _write_epoch_checkpoint,
+            )
 
             checkpoint_root = seed.source_session / ".cambium" / "checkpoints"
             config = AgentConfig(
@@ -1770,6 +1776,7 @@ class InteractiveSession:
                 provider=provider,
                 model=cache_key.model,
                 tools_sha256=cache_key.tools_sha256,
+                cache_identity=_new_cache_identity_for_boundary(cache_key.provider_boundary),
                 provider_compat=provider_compat,
                 provider_boundary=cache_key.provider_boundary,
                 code_changed=checkpoint.code_changed,

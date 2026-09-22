@@ -122,6 +122,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 import zlib
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
@@ -142,6 +143,7 @@ from cambium.diffundo import (
     Diffundo,
     ProviderError,
     ProviderTier,
+    _is_opencode_destination,
     prompt_prefix_bytes,
     validate_prompt_structure,
 )
@@ -272,7 +274,7 @@ MAX_ENVELOPE_ITEMS = 16
 MAX_REJECTION_FEEDBACK_CHARS = 1_200
 MAX_CONTEXT_MESSAGES = 512
 CHECKPOINT_EPOCH_SCHEMA = 6
-_LEGACY_CHECKPOINT_EPOCH_SCHEMAS = frozenset({4, 5})
+_LEGACY_CHECKPOINT_EPOCH_SCHEMA = 4
 _CHECKPOINT_CONTENT_KEYS = frozenset({"provider_messages", "continuation_suffix"})
 SITUATION_FRAME_LIMITS = SituationFrameLimits()
 
@@ -454,6 +456,7 @@ _FORK_DESCRIPTOR_KEYS = frozenset(
         "checkpoint_ref",
         "provider",
         "model",
+        "cache_identity",
         "system_sha256",
         "tools_sha256",
         "prefix_sha256",
@@ -463,7 +466,6 @@ _FORK_DESCRIPTOR_KEYS = frozenset(
         "provider_boundary",
     }
 )
-_FORK_DESCRIPTOR_OPTIONAL_KEYS = frozenset({"cache_identity"})
 _RESUME_KEYS = frozenset(
     {
         "checkpoint_ref",
@@ -564,6 +566,24 @@ def _validate_provider_boundary(value: Any) -> dict[str, Any]:
     }
 
 
+def _provider_boundary_supports_cache_identity(boundary: Mapping[str, Any]) -> bool:
+    """Return whether the provider transport exposes a reusable session identity."""
+
+    return boundary.get("authmode") == AuthMode.CODEX_CHATGPT.value or _is_opencode_destination(
+        str(boundary.get("endpoint", ""))
+    )
+
+
+def _new_cache_identity_for_boundary(boundary: Mapping[str, Any]) -> str:
+    """Mint a fresh provider-specific identity for a semantic lineage boundary."""
+
+    if boundary.get("authmode") == AuthMode.CODEX_CHATGPT.value:
+        return str(uuid.uuid4())
+    if _is_opencode_destination(str(boundary.get("endpoint", ""))):
+        return f"cambium-{uuid.uuid4().hex}"
+    return ""
+
+
 class ContextForkError(ValueError):
     """A context fork or resume could not be constructed safely."""
 
@@ -579,10 +599,9 @@ def _validate_context_fork(value: Any) -> dict[str, Any] | None:
         return None
     if not isinstance(value, dict):
         raise ContextForkError("context_fork must be an object")
-    allowed_keys = _FORK_DESCRIPTOR_KEYS | _FORK_DESCRIPTOR_OPTIONAL_KEYS
-    if not _FORK_DESCRIPTOR_KEYS.issubset(value) or set(value) - allowed_keys:
+    if set(value) != _FORK_DESCRIPTOR_KEYS:
         missing = sorted(_FORK_DESCRIPTOR_KEYS - set(value))
-        unknown = sorted(set(value) - allowed_keys)
+        unknown = sorted(set(value) - _FORK_DESCRIPTOR_KEYS)
         details: list[str] = []
         if missing:
             details.append(f"missing keys: {missing}")
@@ -602,7 +621,7 @@ def _validate_context_fork(value: Any) -> dict[str, Any] | None:
     if not isinstance(model, str) or not model:
         raise ContextForkError("context_fork 'model' must be a non-empty string")
     cache_identity = value.get("cache_identity")
-    if "cache_identity" in value and not isinstance(cache_identity, str):
+    if not isinstance(cache_identity, str):
         raise ContextForkError("context_fork 'cache_identity' must be a string")
     for key in (
         "system_sha256",
@@ -618,10 +637,13 @@ def _validate_context_fork(value: Any) -> dict[str, Any] | None:
     if isinstance(prefix_bytes, bool) or not isinstance(prefix_bytes, int) or prefix_bytes < 0:
         raise ContextForkError("context_fork 'prefix_bytes' must be a non-negative integer")
     boundary = _validate_provider_boundary(value.get("provider_boundary"))
+    if not cache_identity and _provider_boundary_supports_cache_identity(boundary):
+        raise ContextForkError("context_fork 'cache_identity' is required for this provider")
     validated = {
         "checkpoint_ref": checkpoint_ref,
         "provider": provider,
         "model": model,
+        "cache_identity": cache_identity,
         "system_sha256": value["system_sha256"],
         "tools_sha256": value["tools_sha256"],
         "prefix_sha256": value["prefix_sha256"],
@@ -630,8 +652,6 @@ def _validate_context_fork(value: Any) -> dict[str, Any] | None:
         "prefix_bytes": prefix_bytes,
         "provider_boundary": boundary,
     }
-    if "cache_identity" in value:
-        validated["cache_identity"] = cache_identity
     return validated
 
 
@@ -3119,9 +3139,7 @@ def _resolve_fork_prefix(
             )
         if descriptor_value != artifact_fields[field]:
             return None, f"fork descriptor {field} mismatch"
-    if "cache_identity" in descriptor and descriptor["cache_identity"] != artifact_fields[
-        "cache_identity"
-    ]:
+    if descriptor.get("cache_identity") != artifact_fields["cache_identity"]:
         return None, "fork descriptor cache_identity mismatch"
     if descriptor["tools_sha256"] != tools_sha256:
         return None, "tool schema mismatch"
@@ -3197,6 +3215,7 @@ def _fork_cache_compatible(
     if set(cache_key) < {
         "provider",
         "model",
+        "cache_identity",
         "protocol",
         "reasoning_effort",
         "tools_sha256",
@@ -3378,6 +3397,8 @@ def _bind_router_checkpoint_lineage(
 ) -> None:
     """Bind a validated exact checkpoint before its first provider request."""
 
+    if checkpoint.schema != CHECKPOINT_EPOCH_SCHEMA:
+        raise ContextForkError("legacy checkpoint cannot preserve provider cache lineage")
     binder = getattr(router, "bind_provider", None)
     if not callable(binder):
         return
@@ -3385,6 +3406,10 @@ def _bind_router_checkpoint_lineage(
     provider = cache_key.provider
     if not isinstance(provider, str) or not provider:
         raise ContextForkError("exact checkpoint has no provider identity")
+    if not cache_key.cache_identity and _provider_boundary_supports_cache_identity(
+        cache_key.provider_boundary
+    ):
+        raise ContextForkError("exact checkpoint has no provider cache identity")
     try:
         binder(
             provider,
@@ -5160,6 +5185,8 @@ def _write_epoch_checkpoint(
         or _default_provider_boundary(config, provider, model, protocol, reasoning_effort)
     )
     boundary = _validate_provider_boundary(boundary)
+    if not cache_identity and _provider_boundary_supports_cache_identity(boundary):
+        raise ContextForkError("checkpoint cache_identity is required for this provider")
     full_messages = [*provider_messages, *continuation_suffix]
     if admitted_child_task_ids is None:
         admitted_child_task_ids = _resume_child_task_ids(full_messages)
@@ -5257,7 +5284,7 @@ def _write_epoch_checkpoint(
         persisted_cache_key = CacheKeyDescriptor(
             provider=redacted_cache_key["provider"],
             model=redacted_cache_key["model"],
-            cache_identity=redacted_cache_key.get("cache_identity", ""),
+            cache_identity=redacted_cache_key["cache_identity"],
             protocol=redacted_cache_key["protocol"],
             reasoning_effort=redacted_cache_key["reasoning_effort"],
             system_sha256=redacted_cache_key["system_sha256"],
@@ -5471,7 +5498,7 @@ def _validate_epoch_checkpoint_data(
     if set(data) != expected_keys:
         raise ContextForkError("checkpoint has an invalid key set")
     schema = data.get("schema")
-    if schema != CHECKPOINT_EPOCH_SCHEMA and schema not in _LEGACY_CHECKPOINT_EPOCH_SCHEMAS:
+    if schema not in (CHECKPOINT_EPOCH_SCHEMA, _LEGACY_CHECKPOINT_EPOCH_SCHEMA):
         raise ContextForkError("checkpoint schema mismatch")
     if not isinstance(data.get("task_id"), str) or not data["task_id"]:
         raise ContextForkError("checkpoint task_id invalid")
@@ -5539,8 +5566,7 @@ def _validate_epoch_checkpoint_data(
     )
     cache_keys = legacy_cache_keys | {"cache_identity"}
     expected_cache_keys = cache_keys if schema == CHECKPOINT_EPOCH_SCHEMA else legacy_cache_keys
-    legacy_with_identity = legacy_cache_keys | {"cache_identity"}
-    if set(cache_key) not in (expected_cache_keys, legacy_with_identity):
+    if set(cache_key) != expected_cache_keys:
         raise ContextForkError("checkpoint cache_key has an invalid key set")
     expected = {
         "system_sha256": _sha256_hex(str(provider_messages[0]["content"]).encode("utf-8")),
@@ -5555,7 +5581,7 @@ def _validate_epoch_checkpoint_data(
             raise ContextForkError(f"checkpoint {key} mismatch")
     try:
         provider = cache_key.get("provider")
-        cache_identity = cache_key.get("cache_identity", "")
+        cache_identity = cache_key["cache_identity"] if schema == CHECKPOINT_EPOCH_SCHEMA else ""
         if provider is not None and (not isinstance(provider, str) or not provider):
             raise ContextForkError("checkpoint cache_key provider invalid")
         if not isinstance(cache_identity, str):
@@ -5583,6 +5609,12 @@ def _validate_epoch_checkpoint_data(
         if type(cache_key.get("redacted")) is not bool:
             raise ContextForkError("checkpoint cache_key redacted invalid")
         boundary = _validate_provider_boundary(cache_key.get("provider_boundary"))
+        if (
+            schema == CHECKPOINT_EPOCH_SCHEMA
+            and not cache_identity
+            and _provider_boundary_supports_cache_identity(boundary)
+        ):
+            raise ContextForkError("checkpoint cache_identity is required for this provider")
         cache_key_descriptor = CacheKeyDescriptor(
             provider=provider,
             model=cache_key["model"],

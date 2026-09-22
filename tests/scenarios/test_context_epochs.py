@@ -285,6 +285,7 @@ def test_validate_context_fork_strict_keys() -> None:
         "checkpoint_ref": _REF,
         "provider": "p1",
         "model": "m1",
+        "cache_identity": "",
         "system_sha256": digest,
         "tools_sha256": digest,
         "prefix_sha256": digest,
@@ -464,6 +465,7 @@ def test_fork_cache_compatible_matrix() -> None:
         "cache_key": {
             "provider": "fake-provider",
             "model": "fake-model",
+            "cache_identity": "",
             "protocol": "loopback",
             "reasoning_effort": None,
             "tools_sha256": tools_sha,
@@ -1164,6 +1166,7 @@ def test_fork_reuses_epoch_prefix(tmp_path: Path) -> None:
             "checkpoint_ref": checkpoint.checkpoint_ref,
             "provider": cache_key.provider,
             "model": cache_key.model,
+            "cache_identity": cache_key.cache_identity,
             "system_sha256": cache_key.system_sha256,
             "tools_sha256": cache_key.tools_sha256,
             "prefix_sha256": cache_key.prefix_sha256,
@@ -1509,6 +1512,7 @@ def test_invalid_context_checkpoint_fields_matrix() -> None:
         "cache_key": {
             "provider": "p",
             "model": "m",
+            "cache_identity": "",
             "protocol": "loopback",
             "reasoning_effort": None,
             "system_sha256": digest,
@@ -2206,7 +2210,8 @@ def test_shared_epoch_validator_accepts_nested_and_legacy_flat_checkpoints(
 
     flat = worker._join_checkpoint_payload(legacy)
     task_component = checkpoint.checkpoint_ref.split("/")[0]
-    flat4 = {**flat, "schema": 4}
+    flat4 = {**flat, "schema": 4, "cache_key": dict(flat["cache_key"])}
+    flat4["cache_key"].pop("cache_identity")
     address_pre = worker._checkpoint_address({**flat4, "checkpoint_ref": ""})
     placeholder = f"{task_component}/epoch-{checkpoint.epoch:03d}-{address_pre}-{'0' * 16}.json"
     flat4["checkpoint_ref"] = placeholder
