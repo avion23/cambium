@@ -2639,7 +2639,7 @@ class _ChatCompletionsTransport:
             "User-Agent": provider.user_agent or USER_AGENT,
         }
         if _is_opencode_destination(provider.base_url):
-            headers["x-opencode-session"] = router._task_id
+            headers["x-opencode-session"] = router._opencode_session_id
         if provider.auth is not AuthMode.NONE:
             headers["Authorization"] = f"Bearer {api_key}"
         request = urllib.request.Request(url, data=data, method="POST", headers=headers)
@@ -2907,7 +2907,8 @@ class Diffundo:
         self._providers = tuple(providers)
         # OpenCode Go requires a stable per-conversation x-opencode-session;
         # a missing header may fail. Never share one id across conversations.
-        # Callers pass their conversation id, otherwise this router mints one.
+        # Exact resumes replace this value from their persisted lease; every
+        # fresh router gets a new identity even when its task id is reused.
         self._task_id = task_id if task_id else f"task-{uuid.uuid4().hex[:12]}"
         # Per-router transport table (defaults to the shared registry) so
         # callers can observe or substitute one protocol's transport without
@@ -2983,7 +2984,10 @@ class Diffundo:
         )
         # Stable per-instance session identity for the codex ``session-id``
         # header: one worker process runs one task, so a per-instance UUID is
-        # a per-session id and must not rotate per request.
+        # a per-session id and must not rotate per request. Exact context
+        # resumes replace this value from the persisted provider lease before
+        # the first request; semantic/fresh contexts keep this new value.
+        self._opencode_session_id = f"cambium-{uuid.uuid4().hex}"
         self._codex_session_id = str(uuid.uuid4())
         # Measured-usage debt snapshot (weighted routing): provider name ->
         # ProviderDebt-like counters (requests, cache_hit_count/cache_report_count,
@@ -3213,6 +3217,11 @@ class Diffundo:
         summary._provider_lease = None
         summary._pinned_provider = None
         summary._primary_provider = None
+        # Summary prompts are provider-neutral semantic work, not an exact
+        # continuation. Do not let a shallow copy accidentally reuse the
+        # coding branch's provider session identity.
+        summary._opencode_session_id = f"summary-{uuid.uuid4().hex}"
+        summary._codex_session_id = str(uuid.uuid4())
         summary._fallback_origin = None
         summary._active_tier = None
         summary._terminal_death_providers = frozenset()
@@ -3382,6 +3391,46 @@ class Diffundo:
 
         return self._provider_lease
 
+    @property
+    def cache_identity(self) -> str:
+        """Provider-specific cache/session identity of the active lease."""
+
+        lease = self._provider_lease
+        return lease.cache_identity if lease is not None else ""
+
+    @staticmethod
+    def _new_transport_cache_identity(provider: ProviderConfig) -> str:
+        """Mint an identity only for transports that expose one."""
+
+        if provider.auth is AuthMode.CODEX_CHATGPT:
+            return str(uuid.uuid4())
+        if _is_opencode_destination(provider.base_url):
+            return f"cambium-{uuid.uuid4().hex}"
+        return ""
+
+    def rotate_cache_identity(self) -> None:
+        """Start a new provider cache/session lineage without changing routing."""
+
+        lease = self._provider_lease
+        if lease is None:
+            return
+        configured = next(
+            (
+                item
+                for item in self._providers
+                if item.name == lease.provider and item.model == lease.model
+            ),
+            None,
+        )
+        if configured is None:
+            raise ValueError("provider lease does not match a configured lane")
+        identity = self._new_transport_cache_identity(configured)
+        if configured.auth is AuthMode.CODEX_CHATGPT:
+            self._codex_session_id = identity
+        elif _is_opencode_destination(configured.base_url):
+            self._opencode_session_id = identity
+        self._provider_lease = replace(lease, cache_identity=identity)
+
     def bind_provider(
         self,
         provider: str,
@@ -3425,6 +3474,17 @@ class Diffundo:
         )
         if configured is None:
             raise ValueError("provider lease does not match an enabled configured lane")
+        if not isinstance(cache_identity, str):
+            raise ValueError("provider cache identity must be a string")
+        if cache_identity:
+            if configured.auth is AuthMode.CODEX_CHATGPT:
+                self._codex_session_id = cache_identity
+            elif _is_opencode_destination(configured.base_url):
+                self._opencode_session_id = cache_identity
+        elif configured.auth is AuthMode.CODEX_CHATGPT:
+            cache_identity = self._codex_session_id
+        elif _is_opencode_destination(configured.base_url):
+            cache_identity = self._opencode_session_id
         if self._pinned_provider is None:
             # A caller that binds after an unassigned first call still makes
             # this incumbent the origin for terminal-death fallback.

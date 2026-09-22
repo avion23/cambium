@@ -264,8 +264,8 @@ MAX_ENVELOPE_ITEMS = 16
 # pathological reject-retry loop cannot bloat the parent context.
 MAX_REJECTION_FEEDBACK_CHARS = 1_200
 MAX_CONTEXT_MESSAGES = 512
-CHECKPOINT_EPOCH_SCHEMA = 5
-_LEGACY_CHECKPOINT_EPOCH_SCHEMA = 4
+CHECKPOINT_EPOCH_SCHEMA = 6
+_LEGACY_CHECKPOINT_EPOCH_SCHEMAS = frozenset({4, 5})
 _CHECKPOINT_CONTENT_KEYS = frozenset({"provider_messages", "continuation_suffix"})
 SITUATION_FRAME_LIMITS = SituationFrameLimits()
 
@@ -372,6 +372,8 @@ class CacheKeyDescriptor:
     ``suffix_sha256`` hashes the post-response continuation kept separately;
     and ``full_sha256`` hashes their concatenation. A fork appends another
     user message, so its full hash is different from this checkpoint hash.
+    ``cache_identity`` is the opaque provider transport/session lineage; it is
+    empty when the selected provider exposes no supported identity field.
     ``redacted`` records whether the session redactor altered any byte of the
     persisted checkpoint. A redacted checkpoint may supply semantic context
     continuity from its persisted, already-redacted text, but exact
@@ -380,6 +382,7 @@ class CacheKeyDescriptor:
 
     provider: str | None
     model: str
+    cache_identity: str
     protocol: str
     reasoning_effort: str | None
     system_sha256: str
@@ -453,6 +456,7 @@ _FORK_DESCRIPTOR_KEYS = frozenset(
         "provider_boundary",
     }
 )
+_FORK_DESCRIPTOR_OPTIONAL_KEYS = frozenset({"cache_identity"})
 _RESUME_KEYS = frozenset(
     {
         "checkpoint_ref",
@@ -568,9 +572,10 @@ def _validate_context_fork(value: Any) -> dict[str, Any] | None:
         return None
     if not isinstance(value, dict):
         raise ContextForkError("context_fork must be an object")
-    if set(value) != _FORK_DESCRIPTOR_KEYS:
+    allowed_keys = _FORK_DESCRIPTOR_KEYS | _FORK_DESCRIPTOR_OPTIONAL_KEYS
+    if not _FORK_DESCRIPTOR_KEYS.issubset(value) or set(value) - allowed_keys:
         missing = sorted(_FORK_DESCRIPTOR_KEYS - set(value))
-        unknown = sorted(set(value) - _FORK_DESCRIPTOR_KEYS)
+        unknown = sorted(set(value) - allowed_keys)
         details: list[str] = []
         if missing:
             details.append(f"missing keys: {missing}")
@@ -589,6 +594,9 @@ def _validate_context_fork(value: Any) -> dict[str, Any] | None:
     model = value.get("model")
     if not isinstance(model, str) or not model:
         raise ContextForkError("context_fork 'model' must be a non-empty string")
+    cache_identity = value.get("cache_identity")
+    if "cache_identity" in value and not isinstance(cache_identity, str):
+        raise ContextForkError("context_fork 'cache_identity' must be a string")
     for key in (
         "system_sha256",
         "tools_sha256",
@@ -603,7 +611,7 @@ def _validate_context_fork(value: Any) -> dict[str, Any] | None:
     if isinstance(prefix_bytes, bool) or not isinstance(prefix_bytes, int) or prefix_bytes < 0:
         raise ContextForkError("context_fork 'prefix_bytes' must be a non-negative integer")
     boundary = _validate_provider_boundary(value.get("provider_boundary"))
-    return {
+    validated = {
         "checkpoint_ref": checkpoint_ref,
         "provider": provider,
         "model": model,
@@ -615,6 +623,9 @@ def _validate_context_fork(value: Any) -> dict[str, Any] | None:
         "prefix_bytes": prefix_bytes,
         "provider_boundary": boundary,
     }
+    if "cache_identity" in value:
+        validated["cache_identity"] = cache_identity
+    return validated
 
 
 def _validate_summary_trunk_ref(value: Any) -> str | None:
@@ -3067,6 +3078,7 @@ def _resolve_fork_prefix(
     artifact_fields: dict[str, Any] = {
         "provider": cache_key.provider,
         "model": cache_key.model,
+        "cache_identity": cache_key.cache_identity,
         "protocol": cache_key.protocol,
         "system_sha256": _sha256_hex(
             str(checkpoint.provider_messages[0]["content"]).encode("utf-8")
@@ -3100,6 +3112,10 @@ def _resolve_fork_prefix(
             )
         if descriptor_value != artifact_fields[field]:
             return None, f"fork descriptor {field} mismatch"
+    if "cache_identity" in descriptor and descriptor["cache_identity"] != artifact_fields[
+        "cache_identity"
+    ]:
+        return None, "fork descriptor cache_identity mismatch"
     if descriptor["tools_sha256"] != tools_sha256:
         return None, "tool schema mismatch"
     if cache_key.model != model or descriptor["model"] != model:
@@ -3339,7 +3355,45 @@ def _bind_router_provider(router: Any, result: CallResult, task_id: str) -> None
 
     binder = getattr(router, "bind_provider", None)
     if callable(binder):
-        binder(result.provider, result.model, root_task_id=task_id)
+        cache_identity = getattr(router, "cache_identity", "")
+        if not isinstance(cache_identity, str):
+            cache_identity = ""
+        binder(
+            result.provider,
+            result.model,
+            root_task_id=task_id,
+            cache_identity=cache_identity,
+        )
+
+
+def _bind_router_checkpoint_lineage(
+    router: Any, checkpoint: ContextCheckpoint, task_id: str
+) -> None:
+    """Bind a validated exact checkpoint before its first provider request."""
+
+    binder = getattr(router, "bind_provider", None)
+    if not callable(binder):
+        return
+    cache_key = checkpoint.cache_key
+    provider = cache_key.provider
+    if not isinstance(provider, str) or not provider:
+        raise ContextForkError("exact checkpoint has no provider identity")
+    try:
+        binder(
+            provider,
+            cache_key.model,
+            root_task_id=task_id,
+            cache_identity=cache_key.cache_identity,
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise ContextForkError(f"exact checkpoint provider lineage unavailable: {exc}") from exc
+
+
+def _router_cache_identity(router: Any) -> str:
+    """Read the active provider lease identity without requiring a concrete router."""
+
+    value = getattr(router, "cache_identity", "")
+    return value if isinstance(value, str) else ""
 
 
 def _canonical_action_message(action: dict[str, Any]) -> dict[str, str]:
@@ -5022,6 +5076,7 @@ def _write_epoch_checkpoint(
     provider: str | None,
     model: str,
     tools_sha256: str,
+    cache_identity: str = "",
     provider_compat: Mapping[str, tuple[str, str | None]] | None = None,
     provider_boundary: Mapping[str, Any] | None = None,
     code_changed: bool = False,
@@ -5090,6 +5145,8 @@ def _write_epoch_checkpoint(
         raise ContextForkError("checkpoint wall_deadline must be finite and positive")
     if provider_compat is None:
         provider_compat = {}
+    if not isinstance(cache_identity, str):
+        raise ContextForkError("checkpoint cache_identity must be a string")
     protocol, reasoning_effort = provider_compat.get(provider or "", ("unknown", None))
     boundary = dict(
         provider_boundary
@@ -5113,6 +5170,7 @@ def _write_epoch_checkpoint(
     cache_key = CacheKeyDescriptor(
         provider=provider,
         model=model,
+        cache_identity=cache_identity,
         protocol=protocol,
         reasoning_effort=reasoning_effort,
         system_sha256=_sha256_hex(str(provider_messages[0].get("content", "")).encode("utf-8")),
@@ -5192,6 +5250,7 @@ def _write_epoch_checkpoint(
         persisted_cache_key = CacheKeyDescriptor(
             provider=redacted_cache_key["provider"],
             model=redacted_cache_key["model"],
+            cache_identity=redacted_cache_key.get("cache_identity", ""),
             protocol=redacted_cache_key["protocol"],
             reasoning_effort=redacted_cache_key["reasoning_effort"],
             system_sha256=redacted_cache_key["system_sha256"],
@@ -5248,6 +5307,7 @@ async def _emit_context_checkpoint(
             "cache_key": {
                 "provider": cache_key.provider,
                 "model": cache_key.model,
+                "cache_identity": cache_key.cache_identity,
                 "protocol": cache_key.protocol,
                 "reasoning_effort": cache_key.reasoning_effort,
                 "system_sha256": cache_key.system_sha256,
@@ -5403,7 +5463,8 @@ def _validate_epoch_checkpoint_data(
     )
     if set(data) != expected_keys:
         raise ContextForkError("checkpoint has an invalid key set")
-    if data.get("schema") not in (CHECKPOINT_EPOCH_SCHEMA, _LEGACY_CHECKPOINT_EPOCH_SCHEMA):
+    schema = data.get("schema")
+    if schema != CHECKPOINT_EPOCH_SCHEMA and schema not in _LEGACY_CHECKPOINT_EPOCH_SCHEMAS:
         raise ContextForkError("checkpoint schema mismatch")
     if not isinstance(data.get("task_id"), str) or not data["task_id"]:
         raise ContextForkError("checkpoint task_id invalid")
@@ -5452,7 +5513,7 @@ def _validate_epoch_checkpoint_data(
     cache_key = data.get("cache_key")
     if not isinstance(cache_key, dict):
         raise ContextForkError("checkpoint cache_key missing")
-    cache_keys = frozenset(
+    legacy_cache_keys = frozenset(
         {
             "provider",
             "model",
@@ -5469,7 +5530,10 @@ def _validate_epoch_checkpoint_data(
             "provider_boundary",
         }
     )
-    if set(cache_key) != cache_keys:
+    cache_keys = legacy_cache_keys | {"cache_identity"}
+    expected_cache_keys = cache_keys if schema == CHECKPOINT_EPOCH_SCHEMA else legacy_cache_keys
+    legacy_with_identity = legacy_cache_keys | {"cache_identity"}
+    if set(cache_key) not in (expected_cache_keys, legacy_with_identity):
         raise ContextForkError("checkpoint cache_key has an invalid key set")
     expected = {
         "system_sha256": _sha256_hex(str(provider_messages[0]["content"]).encode("utf-8")),
@@ -5484,8 +5548,11 @@ def _validate_epoch_checkpoint_data(
             raise ContextForkError(f"checkpoint {key} mismatch")
     try:
         provider = cache_key.get("provider")
+        cache_identity = cache_key.get("cache_identity", "")
         if provider is not None and (not isinstance(provider, str) or not provider):
             raise ContextForkError("checkpoint cache_key provider invalid")
+        if not isinstance(cache_identity, str):
+            raise ContextForkError("checkpoint cache_key cache_identity invalid")
         for key in ("model", "protocol"):
             if not isinstance(cache_key.get(key), str) or not cache_key[key]:
                 raise ContextForkError(f"checkpoint cache_key {key} invalid")
@@ -5512,6 +5579,7 @@ def _validate_epoch_checkpoint_data(
         cache_key_descriptor = CacheKeyDescriptor(
             provider=provider,
             model=cache_key["model"],
+            cache_identity=cache_identity,
             protocol=cache_key["protocol"],
             reasoning_effort=reasoning,
             system_sha256=cache_key["system_sha256"],
@@ -6555,6 +6623,9 @@ async def _bound_context_continuation(
             # lineage's prompt length.
             previous_prompt_tokens = 0
             rollover_reason = "cast_k0_rollover"
+            rotate_cache_identity = getattr(router, "rotate_cache_identity", None)
+            if callable(rotate_cache_identity):
+                rotate_cache_identity()
         # The summary result is provider-neutral semantic state.  Preserve
         # the coding route's cache affinity in the checkpoint instead of
         # persisting a sibling that only served this summary.  A concrete
@@ -6565,6 +6636,9 @@ async def _bound_context_continuation(
         coding_lease = getattr(router, "provider_lease", None)
         coding_provider = getattr(coding_lease, "provider", None)
         coding_model = getattr(coding_lease, "model", None)
+        coding_cache_identity = getattr(coding_lease, "cache_identity", "")
+        if not isinstance(coding_cache_identity, str):
+            coding_cache_identity = ""
         if not isinstance(coding_provider, str) or not coding_provider:
             coding_provider = None
         if not isinstance(coding_model, str) or not coding_model:
@@ -6576,6 +6650,8 @@ async def _bound_context_continuation(
                 coding_provider = prior_provider
                 if coding_model is None and isinstance(prior_cache_key.model, str):
                     coding_model = prior_cache_key.model
+                if rollover_reason is None:
+                    coding_cache_identity = prior_cache_key.cache_identity
         checkpoint_model = coding_model or model
         checkpoint_boundary = (
             provider_boundaries.get(coding_provider) if coding_provider is not None else None
@@ -6591,6 +6667,7 @@ async def _bound_context_continuation(
             provider=coding_provider,
             model=checkpoint_model,
             tools_sha256=_sha256_hex(json.dumps(tools, sort_keys=True).encode("utf-8")),
+            cache_identity=coding_cache_identity,
             provider_compat=provider_compat,
             provider_boundary=checkpoint_boundary,
             code_changed=code_changed,
@@ -6844,6 +6921,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                 raise ContextForkError("resume epoch does not match checkpoint")
             if resume_checkpoint.cache_key.redacted:
                 raise ContextForkError("checkpoint redacted")
+            _bind_router_checkpoint_lineage(router, resume_checkpoint, config.task_id)
         except ContextForkError as exc:
             return _loop_result(
                 outcome,
@@ -6947,15 +7025,29 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
             except ContextForkError as exc:  # pragma: no cover - already validated
                 fork_skip = str(exc)
             else:
-                current_epoch_checkpoint = fork_checkpoint
-                base_messages = tuple(copy.deepcopy(fork_checkpoint.full_messages))
-                context_continuation = [copy.deepcopy(fork_messages[-1])]
-                epoch_count = fork_checkpoint.epoch
-                usage_epoch = fork_checkpoint.epoch
-                usage_fork_of = fork_checkpoint.checkpoint_ref
-                transcript = _sync_context_transcript(
-                    base_messages, context_continuation, transcript
-                )
+                try:
+                    _bind_router_checkpoint_lineage(router, fork_checkpoint, config.task_id)
+                except ContextForkError as exc:
+                    fork_skip = str(exc)
+                else:
+                    current_epoch_checkpoint = fork_checkpoint
+                    base_messages = tuple(copy.deepcopy(fork_checkpoint.full_messages))
+                    context_continuation = [copy.deepcopy(fork_messages[-1])]
+                    epoch_count = fork_checkpoint.epoch
+                    usage_epoch = fork_checkpoint.epoch
+                    usage_fork_of = fork_checkpoint.checkpoint_ref
+                    transcript = _sync_context_transcript(
+                        base_messages, context_continuation, transcript
+                    )
+        if required_context_mode == "trunk" and fork_skip is not None:
+            return _loop_result(
+                outcome,
+                "failed",
+                f"required context_mode=trunk unavailable: {fork_skip}",
+                0,
+                cumulative_usage,
+                transcript,
+            )
         if fork_skip is not None and writer is not None:
             await send(
                 writer,
@@ -7645,6 +7737,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                         "continuation_suffix": terminal_suffix,
                         "provider": terminal_provider,
                         "model": result.model,
+                        "cache_identity": _router_cache_identity(router),
                         "tools_sha256": _sha256_hex(
                             json.dumps(tools, sort_keys=True).encode("utf-8")
                         ),
@@ -8183,6 +8276,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                             tools_sha256=_sha256_hex(
                                 json.dumps(tools, sort_keys=True).encode("utf-8")
                             ),
+                            cache_identity=_router_cache_identity(router),
                             provider_compat=provider_compat,
                             provider_boundary=provider_boundaries.get(result.provider),
                             code_changed=code_changed,
