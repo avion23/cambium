@@ -81,6 +81,21 @@ def test_select_primary_excludes_persisted_cooldown_entries() -> None:
     assert select_primary(providers, ["m1"], debt) == ("ready", "m1")
 
 
+def test_resolve_assignment_excludes_quarantined_providers() -> None:
+    providers = [_provider("dead", "m1"), _provider("ready", "m1")]
+    lanes = {provider.name: LaneState() for provider in providers}
+    debt = {"dead": {"disable_reason": "auth_error: rejected"}}
+
+    assignment = resolve_assignment(providers, ["m1"], debt, lanes)
+
+    assert assignment is not None
+    assert assignment.provider == "ready"
+
+    only_dead = resolve_assignment([providers[0]], ["m1"], debt, lanes)
+
+    assert only_dead is None
+
+
 def test_resolve_assignment_excludes_mapping_cooldown_entries() -> None:
     providers = [_provider("cooldown", "m1"), _provider("ready", "m1")]
     lanes = {provider.name: LaneState() for provider in providers}

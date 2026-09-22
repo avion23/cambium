@@ -4037,9 +4037,11 @@ class Diffundo:
                     timeout_s = provider.timeout_s
                     if remaining is not None:
                         timeout_s = min(timeout_s, remaining)
-                    request_deadline = min(
-                        deadline,
-                        time.monotonic() + _attempt_budget(provider.timeout_s, provider),
+                    attempt_deadline = time.monotonic() + _attempt_budget(
+                        provider.timeout_s, provider
+                    )
+                    request_deadline = (
+                        attempt_deadline if deadline is None else min(deadline, attempt_deadline)
                     )
                     try:
                         raw = await self._post_with_deadline(
