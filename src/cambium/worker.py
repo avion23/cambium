@@ -2686,6 +2686,10 @@ def _is_evidence_read_call(call: Mapping[str, Any]) -> bool:
 
 
 _EDIT_TOOL_NAMES = frozenset({"edit_file", "write_file"})
+# These calls can mutate the worktree or launch an opaque process.  Their
+# lifecycle is persisted by the supervisor before execution and before the
+# following turn checkpoint is published.  Pure reads stay on the cheap path.
+_EFFECTFUL_TOOL_NAMES = frozenset({"run_shell", "write_file", "edit_file", "git_op"})
 # Allowlist, not a denylist: a batch runs concurrently only when EVERY call is
 # a known read-only tool. Anything new or unknown defaults to sequential.
 _CONCURRENT_TOOL_NAMES = frozenset(
@@ -4250,6 +4254,156 @@ async def _emit_tool_event(
     await send(writer, message)
 
 
+def _tool_lifecycle_identity(
+    config: AgentConfig,
+    name: str,
+    turn: int,
+    batch_index: int,
+) -> tuple[str, str]:
+    """Return opaque batch/tool ids for one effectful invocation.
+
+    The identity includes only protocol coordinates, never command or
+    argument data.  Repeating the same call in a later turn therefore gets a
+    distinct id while a generation restart can still recognise a persisted
+    lifecycle row by its stable coordinates.
+    """
+    batch_identity = {
+        "task_id": config.task_id,
+        "generation": config.generation,
+        "turn": turn,
+    }
+    batch_id = hashlib.sha256(
+        json.dumps(batch_identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    tool_identity = {
+        **batch_identity,
+        "batch_index": batch_index,
+        "tool": name,
+    }
+    tool_id = hashlib.sha256(
+        json.dumps(tool_identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return batch_id, tool_id
+
+
+async def _await_tool_lifecycle_ack(
+    writer: asyncio.StreamWriter,
+    config: AgentConfig,
+    name: str,
+    turn: int,
+    batch_index: int,
+    batch_size: int,
+    phase: str,
+    ack_waiters: dict[tuple[str, str], asyncio.Future[dict[str, Any]]],
+    tool_result: ToolResult | None = None,
+) -> tuple[str, str]:
+    """Durably gate one effectful call on its supervisor lifecycle row."""
+    if phase not in {"started", "finished"}:
+        raise ValueError("invalid tool lifecycle phase")
+    batch_id, tool_id = _tool_lifecycle_identity(config, name, turn, batch_index)
+    loop = asyncio.get_running_loop()
+    key = (phase, tool_id)
+    if key in ack_waiters:
+        raise RuntimeError("duplicate tool lifecycle identity")
+    waiter = loop.create_future()
+    ack_waiters[key] = waiter
+    message: dict[str, Any] = {
+        "type": f"tool_{phase}",
+        "task_id": config.task_id,
+        "generation": config.generation,
+        "tool_id": tool_id,
+        "batch_id": batch_id,
+        "tool": name,
+        "turn": turn,
+        "batch_index": batch_index,
+        "batch_size": batch_size,
+    }
+    if phase == "finished":
+        # Result metadata is bounded and contains no command, arguments, or
+        # tool output.  Output remains on the existing tool_event path.
+        message["ok"] = bool(tool_result.ok) if tool_result is not None else False
+        message["duration_ms"] = (
+            max(0, int(tool_result.duration_ms)) if tool_result is not None else 0
+        )
+    await send(writer, message)
+    try:
+        ack = await waiter
+    finally:
+        ack_waiters.pop(key, None)
+    if ack.get("ok") is not True:
+        raise RuntimeError(f"tool lifecycle {phase} was not durably acknowledged")
+    return batch_id, tool_id
+
+
+async def _run_tool_with_lifecycle(
+    name: str,
+    arguments: dict[str, Any],
+    ctx: ToolContext,
+    *,
+    writer: asyncio.StreamWriter | None,
+    config: AgentConfig,
+    turn: int,
+    batch_index: int,
+    batch_size: int,
+    ack_waiters: dict[tuple[str, str], asyncio.Future[dict[str, Any]]] | None,
+) -> ToolResult:
+    """Run one tool and bracket effectful calls with durable lifecycle rows."""
+    if name not in _EFFECTFUL_TOOL_NAMES:
+        return await run_tool(name, arguments, ctx)
+    if writer is None or ack_waiters is None:
+        # Direct unit callers do not have a supervisor transport.  Keep their
+        # existing execution seam; real worker runs always supply both.
+        return await run_tool(name, arguments, ctx)
+    await _await_tool_lifecycle_ack(
+        writer,
+        config,
+        name,
+        turn,
+        batch_index,
+        batch_size,
+        "started",
+        ack_waiters,
+    )
+    try:
+        tool_result = await run_tool(name, arguments, ctx)
+    except asyncio.CancelledError:
+        raise
+    except GenerationFenceError:
+        raise
+    except Exception as exc:
+        tool_result = ToolResult(ok=False, error=f"{name} failed: {exc}")
+    return tool_result
+
+
+async def _finish_tool_lifecycle(
+    writer: asyncio.StreamWriter | None,
+    config: AgentConfig,
+    name: str,
+    turn: int,
+    batch_index: int,
+    batch_size: int,
+    tool_result: ToolResult,
+    ack_waiters: dict[tuple[str, str], asyncio.Future[dict[str, Any]]] | None,
+) -> None:
+    """Persist the terminal lifecycle row after the existing tool event."""
+    if name not in _EFFECTFUL_TOOL_NAMES or writer is None or ack_waiters is None:
+        return
+    # The supervisor handles stdout frames in order. Callers invoke this only
+    # after `_emit_tool_event`, so large-output artifacts remain ahead of the
+    # critical finished row and the following checkpoint.
+    await _await_tool_lifecycle_ack(
+        writer,
+        config,
+        name,
+        turn,
+        batch_index,
+        batch_size,
+        "finished",
+        ack_waiters,
+        tool_result,
+    )
+
+
 def _emit_tool_output_delta(
     writer: asyncio.StreamWriter,
     config: AgentConfig,
@@ -5643,6 +5797,7 @@ async def do_work(
     config: AgentConfig | None = None,
     writer: asyncio.StreamWriter | None = None,
     progress: AgentProgress | None = None,
+    lifecycle_ack_waiters: dict[tuple[str, str], asyncio.Future[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     """Execute one task and return the outcome dict (result-envelope shape).
 
@@ -5666,7 +5821,14 @@ async def do_work(
         config = _config_from_run(run)
     if progress is None:
         progress = AgentProgress()
-    return await _do_provider_work(run, config, stop, writer, progress)
+    return await _do_provider_work(
+        run,
+        config,
+        stop,
+        writer,
+        progress,
+        lifecycle_ack_waiters,
+    )
 
 
 def _fanout_budget_usd(config: dict[str, Any] | None) -> float | None:
@@ -6543,6 +6705,7 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
     provider_boundaries: Mapping[str, Mapping[str, Any]] | None = None,
     run_request_id: str | None = None,
     defer_terminal_checkpoint: bool = False,
+    lifecycle_ack_waiters: dict[tuple[str, str], asyncio.Future[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     """Bounded provider-backed tool loop: one router call per turn, strict
     action parsing, permission checks, tool dispatch, tool_event + checkpoint.
@@ -7654,7 +7817,17 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                             progress=progress_sink,
                         ) as ctx:
                             try:
-                                tool_result = await run_tool(name, arguments, ctx)
+                                tool_result = await _run_tool_with_lifecycle(
+                                    name,
+                                    arguments,
+                                    ctx,
+                                    writer=writer,
+                                    config=config,
+                                    turn=turn,
+                                    batch_index=len(batch_results),
+                                    batch_size=len(tool_calls),
+                                    ack_waiters=lifecycle_ack_waiters,
+                                )
                             finally:
                                 progress.tool = None
                                 if progress_sink is not None:
@@ -7819,6 +7992,16 @@ async def _run_agent_loop(  # pyright: ignore[reportGeneralTypeIssues]
                             turn,
                             tool_result,
                             batch_index=batch_index,
+                        )
+                        await _finish_tool_lifecycle(
+                            writer,
+                            config,
+                            name,
+                            turn,
+                            batch_index,
+                            len(tool_calls),
+                            tool_result,
+                            lifecycle_ack_waiters,
                         )
                     if batch_results or batch_cancelled:
                         await _persist_checkpoint(
@@ -8072,6 +8255,7 @@ async def _do_provider_work(
     stop: threading.Event,
     writer: asyncio.StreamWriter | None,
     progress: AgentProgress,
+    lifecycle_ack_waiters: dict[tuple[str, str], asyncio.Future[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     worktree = Path(run["worktree_path"]).resolve()
     session_root = Path(run["scratch_repo"]).resolve().parent
@@ -8176,6 +8360,7 @@ async def _do_provider_work(
         provider_boundaries=provider_boundaries,
         run_request_id=run.get("request_id"),
         defer_terminal_checkpoint=True,
+        lifecycle_ack_waiters=lifecycle_ack_waiters,
     )
     loop_status = loop_outcome["status"]
     if loop_status not in {"succeeded", TaskStatus.SUSPENDED.value}:
@@ -8672,6 +8857,7 @@ async def _run_task(
     generation: int,
     stop: threading.Event,
     config: AgentConfig,
+    lifecycle_ack_waiters: dict[tuple[str, str], asyncio.Future[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     """Run the task body with heartbeats; returns the terminal outcome."""
     started_at = time.time()
@@ -8683,7 +8869,14 @@ async def _run_task(
     )
     cancellation_requested = False
     try:
-        outcome = await do_work(run, stop, config=config, writer=writer, progress=progress)
+        outcome = await do_work(
+            run,
+            stop,
+            config=config,
+            writer=writer,
+            progress=progress,
+            lifecycle_ack_waiters=lifecycle_ack_waiters,
+        )
         cancellation_requested = bool(getattr(stop, "_cambium_cancel_requested", False))
     finally:
         stop.set()
@@ -9014,6 +9207,9 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
 
     current: asyncio.Task[dict[str, Any]] | None = None
     current_request_id: str | None = None
+    lifecycle_ack_waiters: dict[
+        tuple[str, str], asyncio.Future[dict[str, Any]]
+    ] = {}
     stop = threading.Event()
 
     while True:
@@ -9042,7 +9238,23 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
                 except BaseException:
                     candidate = None
                 if isinstance(candidate, dict):
-                    ready_control = candidate
+                    if candidate.get("type") == "tool_lifecycle_ack":
+                        key = (candidate.get("phase"), candidate.get("tool_id"))
+                        waiter = lifecycle_ack_waiters.get(key)
+                        if (
+                            waiter is None
+                            or candidate.get("task_id") != task_id
+                            or candidate.get("generation") != generation
+                        ):
+                            return await _fatal(
+                                writer,
+                                candidate,
+                                "unknown or stale tool lifecycle acknowledgement",
+                            )
+                        if not waiter.done():
+                            waiter.set_result(candidate)
+                    else:
+                        ready_control = candidate
                     if _cancel_control_message(candidate):
                         # A control message and the task can complete in the
                         # same event-loop turn. Record cancellation before
@@ -9154,6 +9366,19 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
             return 1
 
         mtype = msg.get("type") if isinstance(msg, dict) else None
+        if mtype == "tool_lifecycle_ack":
+            key = (msg.get("phase"), msg.get("tool_id"))
+            waiter = lifecycle_ack_waiters.get(key)
+            if (
+                current is None
+                or waiter is None
+                or msg.get("task_id") != task_id
+                or msg.get("generation") != generation
+            ):
+                return await _fatal(writer, msg, "unknown or stale tool lifecycle acknowledgement")
+            if not waiter.done():
+                waiter.set_result(msg)
+            continue
         if mtype == "init":
             # Rebind: only a reuse-enabled worker accepts a second init. The
             # rebind re-sends the FULL init (worktree, spec, fanout_config,
@@ -9189,6 +9414,7 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
             init_config = new_config
             worker_reuse = bool(msg.get("worker_reuse"))
             stop = threading.Event()
+            lifecycle_ack_waiters = {}
             await send(
                 writer,
                 {
@@ -9220,7 +9446,15 @@ async def run(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> int
             task_config = _merge_task_config(init_config, first, task_run)
             current_request_id = msg["request_id"]
             current = asyncio.create_task(
-                _run_task(writer, task_run, task_id, generation, stop, task_config)
+                _run_task(
+                    writer,
+                    task_run,
+                    task_id,
+                    generation,
+                    stop,
+                    task_config,
+                    lifecycle_ack_waiters,
+                )
             )
         elif mtype == "check_health":
             await _send_ok(writer, msg, task_id, generation)

@@ -129,6 +129,11 @@ CRITICAL_KINDS = frozenset(
         # Chunks are critical so replay never observes a silently dropped
         # middle segment while the event queue is under pressure.
         "response_chunk",
+        # Effectful tool lifecycle barriers.  Workers wait for the supervisor
+        # acknowledgement after these rows are fsync'd before starting or
+        # checkpointing an opaque mutation.
+        "tool_started",
+        "tool_finished",
     }
 )
 

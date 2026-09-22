@@ -1234,6 +1234,8 @@ _TOOL_OUTPUT_REF_RE = re.compile(r"\.cambium/spill/run-[0-9]+-[0-9]+\.txt\Z")
 _TOOL_OUTPUT_SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _TOOL_OUTPUT_DELTA_MAX_BYTES = 2048
 _TOOL_OUTPUT_STREAMS = frozenset({"stdout", "stderr"})
+_TOOL_LIFECYCLE_TOOL_ID_RE = re.compile(r"[0-9a-f]{64}\Z")
+_TOOL_LIFECYCLE_KINDS = frozenset({"tool_started", "tool_finished"})
 _USAGE_EVENT_FORWARD_FIELDS = frozenset(
     {
         "turn",
@@ -1309,6 +1311,56 @@ def _invalid_tool_event_fields(msg: dict[str, Any]) -> list[str]:
         or _TOOL_OUTPUT_SHA256_RE.fullmatch(msg["output_sha256"]) is None
     ):
         invalid.append("output_sha256")
+    return sorted(set(invalid))
+
+
+def _invalid_tool_lifecycle_fields(msg: dict[str, Any]) -> list[str]:
+    """Validate the bounded worker-to-supervisor lifecycle envelope."""
+    expected = {
+        "type",
+        "task_id",
+        "generation",
+        "tool_id",
+        "batch_id",
+        "tool",
+        "turn",
+        "batch_index",
+        "batch_size",
+        "ok",
+        "duration_ms",
+    }
+    invalid = sorted(set(msg) - expected)
+    if not isinstance(msg.get("type"), str) or msg.get("type") not in _TOOL_LIFECYCLE_KINDS:
+        invalid.append("type")
+    for field in ("task_id", "tool", "tool_id", "batch_id"):
+        value = msg.get(field)
+        if not isinstance(value, str) or not value:
+            invalid.append(field)
+    for field in ("tool_id", "batch_id"):
+        value = msg.get(field)
+        if not isinstance(value, str) or _TOOL_LIFECYCLE_TOOL_ID_RE.fullmatch(value) is None:
+            invalid.append(field)
+    for field in ("generation", "turn", "batch_index", "batch_size"):
+        value = msg.get(field)
+        if type(value) is not int or value < 0 or (field == "generation" and value <= 0):
+            invalid.append(field)
+    if type(msg.get("batch_size")) is int and msg["batch_size"] < 1:
+        invalid.append("batch_size")
+    if type(msg.get("batch_index")) is int and type(msg.get("batch_size")) is int:
+        if msg["batch_index"] >= msg["batch_size"]:
+            invalid.append("batch_index")
+    if msg.get("type") == "tool_finished":
+        if type(msg.get("ok")) is not bool:
+            invalid.append("ok")
+        duration = msg.get("duration_ms")
+        if (
+            type(duration) not in (int, float)
+            or not math.isfinite(cast(int | float, duration))
+            or cast(int | float, duration) < 0
+        ):
+            invalid.append("duration_ms")
+    elif "ok" in msg or "duration_ms" in msg:
+        invalid.extend(field for field in ("ok", "duration_ms") if field in msg)
     return sorted(set(invalid))
 
 
@@ -3166,6 +3218,67 @@ class WorktreeRecoveryError(RuntimeError):
     """A destructive worktree recovery command failed."""
 
 
+def _tool_lifecycle_recovery_reason(
+    events: Sequence[Mapping[str, Any]], task_id: str
+) -> str | None:
+    """Return a fail-closed reason for an effectful lifecycle past a checkpoint.
+
+    A finished operation is replay-safe only when a later durable turn
+    checkpoint covers its turn.  Any malformed, duplicate, unfinished, or
+    checkpoint-less lifecycle is ambiguous and blocks automatic recovery.
+    """
+    lifecycle: dict[str, dict[str, Any]] = {}
+    checkpoints: list[tuple[int, int]] = []
+    for event in events:
+        if event.get("task_id") != task_id:
+            continue
+        kind = event.get("kind")
+        seq = event.get("seq")
+        payload = event.get("payload")
+        if type(seq) is not int or seq <= 0 or not isinstance(payload, Mapping):
+            if kind in _TOOL_LIFECYCLE_KINDS:
+                return "ambiguous_effectful_tool_lifecycle"
+            continue
+        if kind == "checkpoint":
+            turn = payload.get("turn")
+            if type(turn) is int and turn >= 0:
+                checkpoints.append((seq, turn))
+            continue
+        if kind not in _TOOL_LIFECYCLE_KINDS:
+            continue
+        tool_id = payload.get("tool_id")
+        turn = payload.get("turn")
+        if (
+            not isinstance(tool_id, str)
+            or _TOOL_LIFECYCLE_TOOL_ID_RE.fullmatch(tool_id) is None
+            or type(turn) is not int
+            or turn < 0
+        ):
+            return "ambiguous_effectful_tool_lifecycle"
+        state = lifecycle.get(tool_id)
+        if kind == "tool_started":
+            if state is not None:
+                return "ambiguous_effectful_tool_lifecycle"
+            lifecycle[tool_id] = {"turn": turn, "started_seq": seq, "finished_seq": None}
+        elif state is None or state["finished_seq"] is not None:
+            return "ambiguous_effectful_tool_lifecycle"
+        else:
+            state["finished_seq"] = seq
+            state["finished_turn"] = turn
+    for state in lifecycle.values():
+        finished_seq = state["finished_seq"]
+        if finished_seq is None:
+            return "ambiguous_effectful_tool_lifecycle"
+        turn = state.get("finished_turn", state["turn"])
+        covered = any(
+            seq > finished_seq and checkpoint_turn >= turn
+            for seq, checkpoint_turn in checkpoints
+        )
+        if not covered:
+            return "ambiguous_effectful_tool_lifecycle"
+    return None
+
+
 class ResolverJoinInvariantError(RuntimeError):
     """A resolver lost the parent join barrier before its ref publication."""
 
@@ -3274,7 +3387,7 @@ class _SessionAdmission:
             raise SessionAlreadyRunningError(
                 f"session is already running: {self._path.parent.parent}"
             ) from exc
-        except BaseException:
+        except Exception:
             try:
                 fcntl.flock(fd, fcntl.LOCK_UN)
             finally:
@@ -4201,6 +4314,24 @@ class _Runtime:
             ref = Path(_safe_task_id(task_id)) / path.name
             return ref.as_posix(), payload
         return None
+
+    async def reject_ambiguous_tool_recovery(self, specs: Sequence[Mapping[str, Any]]) -> None:
+        """Block persisted tasks whose effectful tool result lacks a checkpoint."""
+        events = await asyncio.to_thread(self._store.events_after, 0)
+        for spec in specs:
+            task_id = spec.get("task_id")
+            if not isinstance(task_id, str) or task_id in self._results:
+                continue
+            reason = _tool_lifecycle_recovery_reason(events, task_id)
+            if reason is None:
+                continue
+            await self.emit("worker_failed", task_id=task_id, reason=reason)
+            self._results[task_id] = TaskResult(
+                task_id=task_id,
+                status="failed",
+                exit_code=1,
+                reason=reason,
+            )
 
     async def _checkpoint_resume_payload(self, spec: dict[str, Any]) -> dict[str, Any] | None:
         """Build a resume envelope only when the worktree matches its checkpoint."""
@@ -6755,6 +6886,30 @@ class _Runtime:
                         summary=worker_summary,
                     )
                     return
+                lifecycle_events = await asyncio.to_thread(self._store.events_after, 0)
+                lifecycle_reason = _tool_lifecycle_recovery_reason(lifecycle_events, task_id)
+                if lifecycle_reason is not None:
+                    await self.emit(
+                        "worker_failed",
+                        task_id=task_id,
+                        generation=generation,
+                        reason=lifecycle_reason,
+                    )
+                    await self._reject_child_proposals(
+                        task_id,
+                        outcome.proposals,
+                        reason="EffectfulToolRecoveryBlocked",
+                        message="automatic recovery refused after an uncheckpointed tool lifecycle",
+                    )
+                    self._results[task_id] = TaskResult(
+                        task_id=task_id,
+                        status="failed",
+                        exit_code=1,
+                        reason=lifecycle_reason,
+                        restarts=restarts,
+                        summary=worker_summary,
+                    )
+                    return
                 restarts += 1
                 delay = random.uniform(
                     0.0, min(RESTART_MAX_DELAY_S, RESTART_BASE_DELAY_S * 2**restarts)
@@ -8248,6 +8403,72 @@ class _Runtime:
             **forwarded,
         )
 
+    async def _handle_tool_lifecycle_message(
+        self, state: _GenerationState, msg: dict[str, Any]
+    ) -> None:
+        """Durably record one effectful-tool phase, then acknowledge it."""
+        invalid_fields = _invalid_tool_lifecycle_fields(msg)
+        identity_note = _claimed_identity_mismatch(msg, state.task_id, state.generation)
+        if invalid_fields or identity_note is not None:
+            await self.emit(
+                "protocol",
+                task_id=state.task_id,
+                generation=state.generation,
+                note="tool lifecycle rejected: invalid identity or field(s)",
+                fields=sorted(set(invalid_fields + ([identity_note] if identity_note else []))),
+            )
+            await _kill_worker(state.proc)
+            return
+        event_kind = cast(str, msg["type"])
+        event_payload: dict[str, Any] = {
+            "tool_id": msg["tool_id"],
+            "batch_id": msg["batch_id"],
+            "tool": msg["tool"],
+            "turn": msg["turn"],
+            "batch_index": msg["batch_index"],
+            "batch_size": msg["batch_size"],
+        }
+        if event_kind == "tool_finished":
+            event_payload.update(ok=msg["ok"], duration_ms=msg["duration_ms"])
+        try:
+            await self.emit(
+                event_kind,
+                task_id=state.task_id,
+                generation=state.generation,
+                **event_payload,
+            )
+        except Exception:
+            # A failed critical append must never be turned into permission to
+            # execute or checkpoint the effect.  No store error details cross
+            # the worker boundary.
+            ack = {
+                "type": "tool_lifecycle_ack",
+                "task_id": state.task_id,
+                "generation": state.generation,
+                "tool_id": msg["tool_id"],
+                "phase": event_kind.removeprefix("tool_"),
+                "ok": False,
+            }
+            await _write_json(state.proc, ack, deadline=_stdin_deadline(state.wall_deadline))
+            state.protocol_failure = "TOOL_LIFECYCLE_DURABILITY_FAILED"
+            await _kill_worker(state.proc)
+            return
+        ack = {
+            "type": "tool_lifecycle_ack",
+            "task_id": state.task_id,
+            "generation": state.generation,
+            "tool_id": msg["tool_id"],
+            "phase": event_kind.removeprefix("tool_"),
+            "ok": True,
+        }
+        if not await _write_json(
+            state.proc,
+            ack,
+            deadline=_stdin_deadline(state.wall_deadline),
+        ):
+            state.protocol_failure = "TOOL_LIFECYCLE_ACK_WRITE_FAILED"
+            await _kill_worker(state.proc)
+
     async def _handle_error_message(self, state: _GenerationState, msg: dict[str, Any]) -> None:
         await self.emit(
             "log",
@@ -8338,6 +8559,9 @@ class _Runtime:
         mtype = msg.get("type")
         if mtype == "usage_event":
             await self._handle_usage_event_message(state, msg)
+            return False
+        if isinstance(mtype, str) and mtype in _TOOL_LIFECYCLE_KINDS:
+            await self._handle_tool_lifecycle_message(state, msg)
             return False
         if mtype in ("tool_event", "tool_output_delta", "pong"):
             await self._handle_tool_or_pong_message(state, msg)
@@ -11189,6 +11413,7 @@ async def run_plan(
         runtime.set_session_tasks(specs)
         cancelled = False
         try:
+            await runtime.reject_ambiguous_tool_recovery(specs)
             reclaim_orphaned = getattr(runtime, "reclaim_orphaned_worktrees", None)
             if reclaim_orphaned is not None:
                 await reclaim_orphaned(specs)
