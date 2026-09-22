@@ -202,6 +202,8 @@ _SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇"
 _ACTIVITY_PHASE_GLYPHS = {"thinking": "◌", "streaming": "▸", "waiting": "◒"}
 _STALL_AFTER_S = 12.0
 _ACTIVITY_TAIL_MAX_CHARS = 120
+_ACTIVITY_TOOL_PREVIEW_LIMIT = 3
+_ACTIVITY_TOOL_NAME_LIMIT = 24
 _STATUS_PHASE_RE = re.compile(r"^(\S+)(\s+)([a-z][a-z-]*)(.*)$", re.IGNORECASE)
 _CACHE_HIT_LABEL = "cache HIT"
 _CACHE_MISS_LABEL = "[CACHE MISS]"
@@ -213,6 +215,7 @@ _STATUS_PHASE_STYLES = {
     "responding": "green",
     "running": "cyan",
     "tool": "cyan",
+    "tools": "cyan",
     "provider": "blue",
     "routing": "cyan",
     "children": "pink",
@@ -1880,6 +1883,21 @@ class ActivityState:
                 self._mark_progress(("tool-finished", tool_name), now)
                 return
 
+    def _render_multiple_tools(self, current: float, quiet_for: float) -> str:
+        tools = tuple(reversed(self._tools.values()))
+        parts = [f"TOOLS · {len(tools)} running"]
+        for tool_name, started_at in tools[:_ACTIVITY_TOOL_PREVIEW_LIMIT]:
+            name = _clip(_sanitize(tool_name), _ACTIVITY_TOOL_NAME_LIMIT)
+            elapsed = _fmt_secs(max(0.0, current - started_at))
+            parts.append(f"{name} {elapsed}")
+        omitted = len(tools) - _ACTIVITY_TOOL_PREVIEW_LIMIT
+        if omitted > 0:
+            parts.append(f"+{omitted} more")
+        label = " · ".join(parts)
+        if quiet_for >= _STALL_AFTER_S:
+            label += f" · no output {_fmt_secs(quiet_for)}"
+        return label
+
     @staticmethod
     def _number(data: Mapping[str, Any], *keys: str) -> float | None:
         for key in keys:
@@ -2074,6 +2092,10 @@ class ActivityState:
         turn_elapsed = max(0.0, current - self._turn_started_at)
         quiet_for = max(0.0, current - self._last_progress_at)
         spinner = _SPINNER_FRAMES[self._spinner_index]
+
+        if len(self._tools) >= 2:
+            label = self._render_multiple_tools(current, quiet_for)
+            return f"{spinner} {label} · turn {_fmt_secs(turn_elapsed)}"
 
         tool = self._heartbeat_tool or next(
             (self._tools[key] for key in reversed(self._tools)),
