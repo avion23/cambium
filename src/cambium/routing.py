@@ -178,7 +178,7 @@ class ProviderDebt:
                 except (OverflowError, ValueError):
                     parsed_total = -1.0
                 if math.isfinite(parsed_total) and parsed_total >= 0:
-                    self.tokens += int(round(parsed_total))
+                    self.tokens += int(total)
                     valid_total = True
             if not valid_total:
                 inputs = usage.get("input_tokens", usage.get("prompt_tokens"))
@@ -189,7 +189,7 @@ class ProviderDebt:
                     and isinstance(outputs, int | float)
                     and not isinstance(outputs, bool)
                 ):
-                    self.tokens += int(round(inputs)) + int(round(outputs))
+                    self.tokens += int(inputs) + int(outputs)
             # Total tokens include the prompt, not just generated output.
             # Missing output counts are unknown throughput, not a fast lane.
             for key in ("output_tokens", "completion_tokens"):
@@ -718,8 +718,7 @@ def resolve_assignment(
 
     Filters the loaded ``providers`` to the authorized identity set (carried
     by name so OAuth providers are never dropped), the candidate models, an
-    optional pinned tier, quarantine/cooldown state, and lane capacity, then
-    picks via
+    optional pinned tier, and lane capacity, then picks via
     :func:`select_lane` (max-min admission) or :func:`score_providers` (when
     the task declares requirements). Returns ``None`` when filtering removes
     every provider or all matching lanes are full; the caller decides whether
@@ -740,8 +739,7 @@ def resolve_assignment(
         p
         for p in pool
         if (
-            not _provider_is_quarantined(p.name, debt)
-            and quota_status(p.name, quota_windows, now=timestamp)[1] is None
+            quota_status(p.name, quota_windows, now=timestamp)[1] is None
             and not (_retry_at((debt or {}).get(p.name)) or 0) > timestamp
         )
     ]
@@ -916,12 +914,6 @@ class LaneState:
         by routing.  rpm-only providers intentionally remain on the old lane
         path; a provider declaring either new capacity field opts in through
         ``ProviderConfig._independent_capacity_model``.
-
-        Initialization is one-shot: once a lane tracks request slots, later
-        changes to the provider's capacity fields do not rewrite the live
-        bucket (``_lane_has_capacity`` calls this on every admission check, so
-        re-applying would flap admission).  A config reload builds a fresh
-        lane instead.
         """
         marker = getattr(provider, "_independent_capacity_model", None)
         if marker is False:
@@ -934,8 +926,6 @@ class LaneState:
         rate = getattr(provider, "requests_per_minute", getattr(provider, "rpm", 60))
         max_in_flight = getattr(provider, "max_in_flight", None) or 1
         if self._tracks_request_slots:
-            # One-shot initialization; see the docstring for why a live
-            # bucket is never rewritten here.
             return
         object.__setattr__(self, "requests_per_minute", float(rate))
         object.__setattr__(self, "max_in_flight", int(max_in_flight))
