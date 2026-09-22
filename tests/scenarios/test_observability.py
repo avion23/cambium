@@ -899,6 +899,34 @@ def test_new_root_assignment_resets_prior_turn_parallelism_evidence() -> None:
     assert snapshot.missed_parallelism is ParallelismSignal.LIKELY
 
 
+def test_failed_status_usage_does_not_trigger_parallelism_signal() -> None:
+    snapshot = snapshot_from_events(
+        [
+            _event(1, "task_assigned", task_id="root", alternative_lane_available=True),
+            _event(
+                2,
+                "usage_event",
+                task_id="root",
+                latency_s=3.0,
+                call_kind="agent",
+                status="failed",
+                usage={"total_tokens": 1},
+            ),
+            _event(
+                3,
+                "usage_event",
+                task_id="root",
+                latency_s=4.0,
+                call_kind="agent",
+                status="error",
+                usage={"total_tokens": 1},
+            ),
+        ]
+    )
+
+    assert snapshot.missed_parallelism is ParallelismSignal.UNKNOWN
+
+
 def test_new_root_assignment_without_lane_evidence_clears_prior_true() -> None:
     snapshot = snapshot_from_events(
         [

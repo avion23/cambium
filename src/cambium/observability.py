@@ -682,6 +682,13 @@ class ObservabilityState:
                     and task_id is not None
                     and payload.get("call_kind") != "summary"
                     and _string(payload.get("failure_reason")) is None
+                    and payload.get("status") not in {
+                        "failed",
+                        "cancelled",
+                        "rejected",
+                        "timeout",
+                        "error",
+                    }
                     and latency >= _LONG_PROVIDER_CALL_S
                 ):
                     self._long_root_calls[task_id] = self._long_root_calls.get(task_id, 0) + 1
