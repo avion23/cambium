@@ -8,6 +8,7 @@ import json
 import os
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -203,6 +204,28 @@ def test_status_command_keeps_dropped_context_fields_available(tmp_path: Path) -
     assert "branch=" in text and "generation=" not in text.split("SYSTEM ▸", 1)[0]
     assert "epoch=" in text
     assert "checkpoint=" in text
+
+
+def test_status_timing_line_omits_unknowns_and_labels_cumulative_child_work() -> None:
+    snapshot = SimpleNamespace(
+        phase_timings=SimpleNamespace(
+            provider_time_samples=3,
+            provider_time_s=12.25,
+            summary_time_samples=1,
+            summary_time_s=1.5,
+            child_admission_to_ready_s=0.4,
+            child_runtime_s=65.0,
+            child_integration_s=None,
+            join_resume_s=0.2,
+        ),
+        missed_parallelism=SimpleNamespace(value="likely"),
+    )
+
+    assert tui._timing_line(snapshot) == (
+        "timing: model-work=12.25s summary=1.5s startup-work=0.4s "
+        "child-work=1m05s join=0.2s missed-parallel=likely"
+    )
+    assert tui._timing_line(SimpleNamespace(phase_timings=None)) is None
 
 
 def test_tui_quota_command_renders_seeded_ledger_rows(monkeypatch, tmp_path: Path) -> None:

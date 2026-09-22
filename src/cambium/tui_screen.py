@@ -2880,6 +2880,24 @@ def _compact_checkpoint(value: str) -> str:
     return hashes[0][:8] if hashes else filename
 
 
+def _status_seconds(value: Any) -> str | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(seconds) or seconds < 0:
+        return None
+    if seconds >= 60:
+        minutes, remainder = divmod(int(seconds), 60)
+        if minutes >= 60:
+            hours, minutes = divmod(minutes, 60)
+            return f"{hours}h{minutes:02d}m"
+        return f"{minutes}m{remainder:02d}s"
+    return f"{seconds:.1f}".rstrip("0").rstrip(".") + "s"
+
+
 def _status_line(
     snapshot: Any,
     transcript: Transcript | None,
@@ -2905,10 +2923,16 @@ def _status_line(
     parts = [activity]
     provider = _side_clean(fields.get("provider", ""))
     model = _side_clean(fields.get("model", ""))
-    if provider or model:
-        parts.append(
-            _status_paint(f"{provider or '?'}/{_short_model(model or '?')}", "cyan", color)
-        )
+    provider_label = f"{provider or '?'}/{_short_model(model or '?')}"
+    activity_plain = _side_clean(activity_source)
+    activity_has_provider = bool(
+        provider
+        and model
+        and provider in activity_plain
+        and _side_clean(model) in activity_plain
+    )
+    if (provider or model) and not activity_has_provider:
+        parts.append(_status_paint(provider_label, "cyan", color))
     if transcript is not None and transcript.current_tool_error_count:
         parts.append(f"err{transcript.current_tool_error_count}")
     if token_count := fields.get("tokens"):
@@ -2927,6 +2951,28 @@ def _status_line(
     if calls:
         parts.append(f"{calls} calls")
     if show_detail:
+        signal = getattr(snapshot, "missed_parallelism", None)
+        signal_value = getattr(signal, "value", signal)
+        if signal_value == "likely":
+            parts.append(_status_paint("parallel=likely", "yellow", color))
+        timings = getattr(snapshot, "phase_timings", None)
+        if timings is not None:
+            detail_timings: list[tuple[str, Any]] = []
+            if _usage_int(getattr(timings, "provider_time_samples", 0)):
+                detail_timings.append(("llm", getattr(timings, "provider_time_s", None)))
+            if _usage_int(getattr(timings, "summary_time_samples", 0)):
+                detail_timings.append(("sum", getattr(timings, "summary_time_s", None)))
+            detail_timings.extend(
+                (
+                    ("startup", getattr(timings, "child_admission_to_ready_s", None)),
+                    ("child", getattr(timings, "child_runtime_s", None)),
+                    ("join", getattr(timings, "join_resume_s", None)),
+                )
+            )
+            for label, value in detail_timings:
+                rendered = _status_seconds(value)
+                if rendered is not None:
+                    parts.append(f"{label}={rendered}")
         agent_count = len(getattr(snapshot, "agents", ()))
         active_count = _usage_int(getattr(snapshot, "active_agents", 0))
         if agent_count:
@@ -2948,7 +2994,9 @@ def _status_line(
             visible_parts.append(part)
             continue
         if visible_parts:
-            break
+            # Skip one oversized optional field and keep trying later compact
+            # facts rather than hiding the remainder of the status row.
+            continue
         visible_parts.append(part)
     return _clip(prefix_text + " · ".join(visible_parts), width)
 
@@ -3351,7 +3399,7 @@ class LinearTimeline:
             input_label,
             activity,
         ) = request
-        width = max(8, self._last_size.columns)
+        width = max(1, self._last_size.columns)
         current_entries = transcript.entries
         width_changed = self._last_rendered_width not in {None, width}
         entries_changed = current_entries != self._last_history_entries

@@ -497,6 +497,7 @@ def test_assignment_writes_tier_and_pinned_tier_constrains(tmp_path, monkeypatch
         "fast" if spec["assigned_provider"] == "weak" else "strong"
     )
     assert spec["fanout_config"]["model"] in ("m1", "m2")
+    assert spec["_alternative_lane_available"] is True
 
     # pinned tier "fast": only the fast provider may serve, even though
     # "strong" is idle and would otherwise win on utilization.
@@ -510,3 +511,32 @@ def test_assignment_writes_tier_and_pinned_tier_constrains(tmp_path, monkeypatch
     assert _resolve_model_candidates(pinned, debt, {"weak": LaneState(), "strong": LaneState()})
     assert pinned["assigned_provider"] == "weak"
     assert pinned["fanout_config"]["tier"] == "fast"
+    assert pinned["_alternative_lane_available"] is False
+
+
+def test_assignment_leaves_alternative_lane_unknown_when_only_alternate_is_full(
+    tmp_path, monkeypatch
+) -> None:
+    config_path = _config_file(
+        tmp_path / "providers.json",
+        [
+            ("primary", "m1", "fast", 60),
+            ("busy", "m1", "fast", 60),
+        ],
+    )
+    monkeypatch.setenv("CAMBIUM_PROVIDERS", str(config_path.resolve()))
+    spec: dict[str, Any] = {
+        "task_id": "t1",
+        "fanout_config": {},
+        "model_candidates": ["m1"],
+        "provider_config_path": str(config_path),
+    }
+    lanes = {
+        "primary": LaneState(),
+        "busy": LaneState(in_flight=60, rpm_allowance=60.0),
+    }
+    from cambium.supervisor import _resolve_model_candidates
+
+    assert _resolve_model_candidates(spec, {}, lanes)
+    assert spec["assigned_provider"] == "primary"
+    assert "_alternative_lane_available" not in spec

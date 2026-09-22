@@ -8,7 +8,7 @@ vocabulary.
 
 | Kind | Emit site | Meaning |
 | --- | --- | --- |
-| `task_assigned` | `supervisor.py` | Records validated task admission, branch/base, provider assignment, and requirements. |
+| `task_assigned` | `supervisor.py` | Records validated task admission, branch/base, provider assignment, requirements, and admission-time alternative-lane availability when that fact is provable. |
 | `child_admitted` | `supervisor.py` | Records a validated child revision before its task is created/spawned. |
 | `child_rejected` | `supervisor.py` | Records a rejected child proposal; validation, persistence, or child creation failed. |
 | `child_result` | `supervisor.py` | Records the bounded child resume envelope the parent consumes at join. |

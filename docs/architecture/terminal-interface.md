@@ -65,6 +65,15 @@ separate token ratio. Zero estimated cost is displayed numerically unless an
 explicit billing classification supports a free/subscription label. Neither
 label describes remaining token quota.
 
+`/status` also reports known event-derived timing evidence: cumulative provider
+and summary-call work, child startup/runtime/integration work, and the strict
+last-child-terminal to parent-resume delay. Cumulative child/provider work may
+overlap in wall time and is labeled as work rather than total elapsed time.
+`/detail` keeps the same single transient row and adds only compact known timing
+facts. A `parallel=likely` hint requires durable admission evidence that another
+provider lane was available plus repeated slow successful root calls without a
+child; missing historical lane evidence remains unknown and is not inferred.
+
 ## Live-state vocabulary
 
 Cambium should not collapse all nonterminal time into a spinner. The status row

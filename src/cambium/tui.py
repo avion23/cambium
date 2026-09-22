@@ -236,7 +236,7 @@ _HELP = """Commands:
   /fork       fork a new branch from the current checkpoint
   /quota      show provider quota-window state
   /compact    materialize semantic entries into K0; retain recent raw evidence
-  /detail     toggle extra metadata on the status row
+  /detail     toggle extra metadata and timing on the status row
   /events     recent durable event summaries
   /cancel     cancel the active turn and return to the prompt
   /new        start a fresh semantic branch; old turn artifacts remain
@@ -1045,6 +1045,52 @@ def _context_line(snapshot: SessionSnapshot) -> str:
     )
 
 
+def _timing_seconds(value: Any) -> str | None:
+    """Format one known non-negative duration compactly."""
+    if isinstance(value, bool):
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(seconds) or seconds < 0:
+        return None
+    if seconds >= 60:
+        minutes, remainder = divmod(seconds, 60)
+        if minutes >= 60:
+            hours, minutes = divmod(int(minutes), 60)
+            return f"{hours}h{minutes:02d}m"
+        return f"{int(minutes)}m{int(remainder):02d}s"
+    return f"{seconds:.2f}".rstrip("0").rstrip(".") + "s"
+
+
+def _timing_line(snapshot: Any) -> str | None:
+    """Render known wall-time evidence without adding unknown placeholders."""
+    timings = getattr(snapshot, "phase_timings", None)
+    if timings is None:
+        return None
+    parts: list[str] = []
+    if getattr(timings, "provider_time_samples", 0):
+        if rendered := _timing_seconds(getattr(timings, "provider_time_s", None)):
+            parts.append(f"model-work={rendered}")
+    if getattr(timings, "summary_time_samples", 0):
+        if rendered := _timing_seconds(getattr(timings, "summary_time_s", None)):
+            parts.append(f"summary={rendered}")
+    for name, label in (
+        ("child_admission_to_ready_s", "startup-work"),
+        ("child_runtime_s", "child-work"),
+        ("child_integration_s", "integration-work"),
+        ("join_resume_s", "join"),
+    ):
+        if rendered := _timing_seconds(getattr(timings, name, None)):
+            parts.append(f"{label}={rendered}")
+    signal = getattr(snapshot, "missed_parallelism", None)
+    signal_value = getattr(signal, "value", signal)
+    if isinstance(signal_value, str) and signal_value != "unknown":
+        parts.append(f"missed-parallel={signal_value}")
+    return "timing: " + " ".join(parts) if parts else None
+
+
 def _response_markdown(render: Any, response: Any) -> str:
     summaries = [
         entry.summary
@@ -1265,15 +1311,17 @@ def _command_output(
     if name == "/cancel" and not argument:
         return "No turn is active; press Ctrl-C while a turn is running."
     if name == "/status" and not argument:
-        return "\n".join(
-            [
-                session.describe(),
-                _branch_line(session),
-                _context_line(snapshot),
-                cumulative.line(snapshot=snapshot, active=active),
-                *render_agent_lines(snapshot),
-            ]
-        )
+        lines = [
+            session.describe(),
+            _branch_line(session),
+            _context_line(snapshot),
+            cumulative.line(snapshot=snapshot, active=active),
+        ]
+        timing = _timing_line(snapshot)
+        if timing is not None:
+            lines.append(timing)
+        lines.extend(render_agent_lines(snapshot))
+        return "\n".join(lines)
     return None
 
 

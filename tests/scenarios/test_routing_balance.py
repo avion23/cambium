@@ -598,6 +598,9 @@ def test_debt_aware_selection_balances_across_tasks_and_feeds_ledger(tmp_path, m
             "provider-b",
         ]
         assert {payload["model"] for payload in assigned} == {"m1", "m2"}
+        lane_evidence = [payload.get("alternative_lane_available") for payload in assigned]
+        assert True in lane_evidence
+        assert False not in lane_evidence
 
         # Both actions use their assignment; completion makes no extra call.
         assert len(server_a.calls) == 1

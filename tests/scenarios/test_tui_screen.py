@@ -926,6 +926,109 @@ def test_live_status_prioritizes_owner_phase_provider_tool_and_detail_stays_one_
     assert "agents=" in detailed and "ctx=e3" in detailed
 
 
+def test_detail_status_adds_known_timing_without_changing_normal_row() -> None:
+    snapshot = SimpleNamespace(
+        session_status="running",
+        agents=(),
+        active_agents=1,
+        queued_agents=0,
+        total_tokens=1200,
+        calls=4,
+        output_tokens_per_s=3.0,
+        context=SimpleNamespace(epoch=2, checkpoint_ref=None),
+        phase_timings=SimpleNamespace(
+            provider_time_samples=4,
+            provider_time_s=12.5,
+            summary_time_samples=1,
+            summary_time_s=1.25,
+            child_admission_to_ready_s=0.4,
+            child_runtime_s=65.0,
+            join_resume_s=0.2,
+        ),
+        missed_parallelism=SimpleNamespace(value="likely"),
+    )
+
+    normal = tui_screen._status_line(
+        snapshot,
+        None,
+        session_description="",
+        branch_line="",
+        cumulative_line="",
+        width=220,
+    )
+    detailed = tui_screen._status_line(
+        snapshot,
+        None,
+        session_description="",
+        branch_line="",
+        cumulative_line="",
+        width=220,
+        show_detail=True,
+    )
+
+    assert "parallel=likely" not in normal
+    assert "llm=" not in normal
+    assert all(
+        value in detailed
+        for value in (
+            "parallel=likely",
+            "llm=12.5s",
+            "sum=1.2s",
+            "startup=0.4s",
+            "child=1m05s",
+            "join=0.2s",
+        )
+    )
+    assert len(detailed.splitlines()) == 1
+
+
+def test_status_avoids_duplicate_provider_and_skips_oversized_optional_field() -> None:
+    owner = "child-with-an-intentionally-long-owner-name"
+    agent = SimpleNamespace(
+        task_id=owner,
+        role="subagent",
+        state="active",
+        provider="zai",
+        model="glm-5",
+        tool=None,
+        total_tokens=12,
+        calls=1,
+        turn=7,
+    )
+    snapshot = SimpleNamespace(
+        session_status="running",
+        agents=(agent,),
+        active_agents=1,
+        queued_agents=0,
+        total_tokens=12,
+        calls=1,
+        context=SimpleNamespace(epoch=0, checkpoint_ref=None),
+    )
+    transcript = Transcript()
+    transcript.observe_event(
+        {
+            "kind": "heartbeat",
+            "task_id": owner,
+            "payload": {"phase": "thinking", "provider": "zai", "model": "glm-5"},
+        }
+    )
+
+    status = tui_screen._status_line(
+        snapshot,
+        transcript,
+        session_description="",
+        branch_line="",
+        cumulative_line="",
+        width=52,
+        activity_line="◌ THINKING · zai/glm-5 · 2s",
+    )
+
+    assert status.count("zai/glm-5") == 1
+    assert f"owner={owner}" not in status
+    assert "t7" in status
+    assert _display_width(status) <= 52
+
+
 def test_live_resize_does_not_replay_timeline_history(monkeypatch: pytest.MonkeyPatch) -> None:
     sizes = iter(
         (

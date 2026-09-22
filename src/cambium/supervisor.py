@@ -6291,6 +6291,9 @@ class _Runtime:
                 assigned_payload["model"] = fanout_config["model"]
             if isinstance(spec.get("assigned_provider"), str):
                 assigned_payload["assigned_provider"] = spec["assigned_provider"]
+            alternative_lane_available = spec.get("_alternative_lane_available")
+            if type(alternative_lane_available) is bool:
+                assigned_payload["alternative_lane_available"] = alternative_lane_available
             if isinstance(spec.get("requirements"), dict) and spec["requirements"]:
                 assigned_payload["requirements"] = spec["requirements"]
             await self.emit("task_assigned", **assigned_payload)
@@ -10245,6 +10248,46 @@ def _resolve_model_candidates(
             "waiting for an eligible provider lane or quota reset",
             retry_at=min(resets) if resets else None,
         )
+    # Record only admission-time evidence. If another provider is statically
+    # eligible but blocked by current quota/capacity/cooldown, leave the fact
+    # unknown rather than turning temporary pressure into a durable false.
+    required = validate_requirements(requirements)
+    capability_request = RoutingRequest(
+        model="",
+        allow_model_substitution=True,
+        required_context_tokens=required.get("min_context_window", 0),
+        quality=required.get("quality"),
+        needs_python_tool=required.get("needs_python_tool", False),
+        allow_paid=required.get("allow_paid", True),
+        allow_free=required.get("allow_free", True),
+    )
+    alternate_matches = [
+        provider
+        for provider in providers
+        if provider.name != assignment.provider
+        and provider.model in candidates
+        and (pinned_tier is None or provider.tier.value == pinned_tier)
+        and provider_satisfies_request(provider, capability_request)
+    ]
+    if not alternate_matches:
+        spec["_alternative_lane_available"] = False
+    else:
+        evidence_lanes = copy.deepcopy(lanes)
+        alternate = resolve_assignment(
+            alternate_matches,
+            candidates,
+            debt,
+            evidence_lanes,
+            requirements=requirements if requirements else None,
+            authorized=authorized,
+            pinned_tier=pinned_tier,
+            quota_windows=quota_windows,
+        )
+        if alternate is None:
+            spec.pop("_alternative_lane_available", None)
+        else:
+            spec["_alternative_lane_available"] = True
+
     # The (provider, model, tier) assignment is one atomic unit: the worker
     # routes calls by tier, so the assigned provider's tier must be the call
     # tier or the assignment is filtered out before any request is sent.

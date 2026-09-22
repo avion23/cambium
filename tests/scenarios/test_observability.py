@@ -11,6 +11,7 @@ import pytest
 from cambium.monitor import render_agent_lines, render_dashboard
 from cambium.observability import (
     ObservabilityState,
+    ParallelismSignal,
     RecentEvent,
     _checkpoint_path,
     snapshot_from_events,
@@ -36,6 +37,22 @@ def _event(
     if task_id is not None:
         record["task_id"] = task_id
     return record
+
+
+def _timed_event(
+    seq: int,
+    kind: str,
+    *,
+    monotonic_ms: float | None = None,
+    task_id: str | None = None,
+    **payload,
+) -> dict:
+    event = _event(seq, kind, task_id=task_id, **payload)
+    if monotonic_ms is None:
+        event.pop("monotonic_ms", None)
+    else:
+        event["monotonic_ms"] = monotonic_ms
+    return event
 
 
 def test_unknown_cache_evidence_clears_previous_hit_miss_state() -> None:
@@ -614,3 +631,296 @@ def test_unsequenced_event_hash_ring_is_bounded() -> None:
     state.apply({"kind": "event-64"})
     state.apply({"kind": "event-0"})
     assert len(state.snapshot().recent_events) == 66
+
+
+def test_phase_timings_keep_child_runtime_out_of_join_delay() -> None:
+    snapshot = snapshot_from_events(
+        [
+            _timed_event(
+                1,
+                "task_assigned",
+                task_id="root",
+                monotonic_ms=0,
+                assigned_provider="codex",
+                alternative_lane_available=True,
+            ),
+            _timed_event(
+                2,
+                "child_admitted",
+                task_id="root",
+                monotonic_ms=1_000,
+                parent_task_id="root",
+                child_task_id="child",
+            ),
+            _timed_event(3, "ready", task_id="child", monotonic_ms=1_400),
+            _timed_event(4, "run_task", task_id="child", monotonic_ms=1_500),
+            _timed_event(
+                5,
+                "usage_event",
+                task_id="root",
+                monotonic_ms=1_600,
+                provider="codex",
+                latency_s=3.5,
+                call_kind="agent",
+                usage={"total_tokens": 1},
+            ),
+            _timed_event(
+                6,
+                "usage_event",
+                task_id="child",
+                monotonic_ms=2_000,
+                provider="zai",
+                latency_s=1.5,
+                call_kind="summary",
+                usage={"total_tokens": 1},
+            ),
+            _timed_event(
+                7,
+                "child_result",
+                task_id="child",
+                monotonic_ms=601_500,
+                parent_task_id="root",
+                status="succeeded",
+            ),
+            _timed_event(
+                8,
+                "child_integration_prepared",
+                task_id="child",
+                monotonic_ms=601_700,
+                parent_task_id="root",
+            ),
+            _timed_event(
+                9,
+                "child_integrated",
+                task_id="child",
+                monotonic_ms=601_900,
+                parent_task_id="root",
+            ),
+            _timed_event(10, "context_resume", task_id="root", monotonic_ms=602_500),
+        ]
+    )
+
+    timings = snapshot.phase_timings
+    assert timings.provider_time_s == pytest.approx(5.0)
+    assert timings.provider_time_samples == 2
+    assert timings.summary_time_s == pytest.approx(1.5)
+    assert timings.summary_time_samples == 1
+    assert timings.child_admission_to_ready_s == pytest.approx(0.4)
+    assert timings.child_runtime_s == pytest.approx(600.0)
+    assert timings.child_integration_s == pytest.approx(0.2)
+    assert timings.join_resume_s == pytest.approx(1.0)
+    child = next(agent for agent in snapshot.agents if agent.task_id == "child")
+    assert child.admission_to_ready_s == pytest.approx(0.4)
+    assert child.runtime_s == pytest.approx(600.0)
+    assert child.integration_s == pytest.approx(0.2)
+
+
+def test_join_resume_starts_at_latest_terminal_child() -> None:
+    snapshot = snapshot_from_events(
+        [
+            _timed_event(
+                1,
+                "child_admitted",
+                task_id="root",
+                monotonic_ms=1_000,
+                parent_task_id="root",
+                child_task_id="child-a",
+            ),
+            _timed_event(
+                2,
+                "child_admitted",
+                task_id="root",
+                monotonic_ms=1_100,
+                parent_task_id="root",
+                child_task_id="child-b",
+            ),
+            _timed_event(
+                3,
+                "child_result",
+                task_id="child-a",
+                monotonic_ms=3_000,
+                parent_task_id="root",
+                status="succeeded",
+            ),
+            _timed_event(
+                4,
+                "child_result",
+                task_id="child-b",
+                monotonic_ms=5_000,
+                parent_task_id="root",
+                status="succeeded",
+            ),
+            _timed_event(5, "context_resume", task_id="root", monotonic_ms=6_000),
+        ]
+    )
+
+    assert snapshot.phase_timings.join_resume_s == pytest.approx(1.0)
+
+
+def test_phase_pairs_do_not_mix_clock_domains_or_regressing_time() -> None:
+    mixed = _timed_event(
+        2,
+        "ready",
+        task_id="child",
+        monotonic_ms=None,
+    )
+    mixed["ts"] = "100.0"
+    snapshot = snapshot_from_events(
+        [
+            _timed_event(
+                1,
+                "child_admitted",
+                task_id="root",
+                monotonic_ms=1_000,
+                parent_task_id="root",
+                child_task_id="child",
+            ),
+            mixed,
+            _timed_event(3, "run_task", task_id="child", monotonic_ms=3_000),
+            _timed_event(
+                4,
+                "child_result",
+                task_id="child",
+                monotonic_ms=2_000,
+                parent_task_id="root",
+                status="succeeded",
+            ),
+        ]
+    )
+
+    assert snapshot.phase_timings.child_admission_to_ready_s is None
+    assert snapshot.phase_timings.child_runtime_s is None
+
+
+@pytest.mark.parametrize(
+    ("lane", "slow_calls", "with_child", "expected"),
+    [
+        (None, 2, False, ParallelismSignal.UNKNOWN),
+        (False, 2, False, ParallelismSignal.NONE),
+        (True, 1, False, ParallelismSignal.UNKNOWN),
+        (True, 2, False, ParallelismSignal.LIKELY),
+        (True, 2, True, ParallelismSignal.NONE),
+    ],
+)
+def test_parallelism_signal_requires_durable_capacity_and_slow_root_calls(
+    lane: bool | None,
+    slow_calls: int,
+    with_child: bool,
+    expected: ParallelismSignal,
+) -> None:
+    assignment_payload = {} if lane is None else {"alternative_lane_available": lane}
+    events = [_event(1, "task_assigned", task_id="root", **assignment_payload)]
+    for index in range(slow_calls):
+        events.append(
+            _event(
+                2 + index,
+                "usage_event",
+                task_id="root",
+                latency_s=2.0 + index,
+                call_kind="agent",
+                usage={"total_tokens": 1},
+            )
+        )
+    if with_child:
+        events.append(
+            _event(
+                10,
+                "child_admitted",
+                task_id="root",
+                parent_task_id="root",
+                child_task_id="child",
+            )
+        )
+
+    assert snapshot_from_events(events).missed_parallelism is expected
+
+
+def test_historical_usage_counts_provider_time_without_triggering_parallelism() -> None:
+    historical = _event(
+        2,
+        "usage_event",
+        task_id="root",
+        latency_s=4.0,
+        call_kind="agent",
+        usage={"total_tokens": 1},
+    )
+    historical["_status_historical"] = True
+    historical2 = dict(historical)
+    historical2["seq"] = 3
+    historical2["monotonic_ms"] = 300
+    snapshot = snapshot_from_events(
+        [
+            _event(
+                1,
+                "task_assigned",
+                task_id="root",
+                alternative_lane_available=True,
+            ),
+            historical,
+            historical2,
+        ]
+    )
+
+    assert snapshot.phase_timings.provider_time_s == pytest.approx(8.0)
+    assert snapshot.missed_parallelism is ParallelismSignal.UNKNOWN
+
+
+def test_new_root_assignment_resets_prior_turn_parallelism_evidence() -> None:
+    snapshot = snapshot_from_events(
+        [
+            _event(1, "task_assigned", task_id="root", alternative_lane_available=True),
+            _event(
+                2,
+                "child_admitted",
+                task_id="root",
+                parent_task_id="root",
+                child_task_id="old-child",
+            ),
+            _event(3, "task_assigned", task_id="root", alternative_lane_available=True),
+            _event(
+                4,
+                "usage_event",
+                task_id="root",
+                latency_s=3.0,
+                call_kind="agent",
+                usage={"total_tokens": 1},
+            ),
+            _event(
+                5,
+                "usage_event",
+                task_id="root",
+                latency_s=4.0,
+                call_kind="agent",
+                usage={"total_tokens": 1},
+            ),
+        ]
+    )
+
+    assert snapshot.missed_parallelism is ParallelismSignal.LIKELY
+
+
+def test_new_root_assignment_without_lane_evidence_clears_prior_true() -> None:
+    snapshot = snapshot_from_events(
+        [
+            _event(1, "task_assigned", task_id="root", alternative_lane_available=True),
+            _event(2, "task_assigned", task_id="root"),
+            _event(
+                3,
+                "usage_event",
+                task_id="root",
+                latency_s=3.0,
+                call_kind="agent",
+                usage={"total_tokens": 1},
+            ),
+            _event(
+                4,
+                "usage_event",
+                task_id="root",
+                latency_s=4.0,
+                call_kind="agent",
+                usage={"total_tokens": 1},
+            ),
+        ]
+    )
+
+    assert snapshot.missed_parallelism is ParallelismSignal.UNKNOWN

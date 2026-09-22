@@ -14,7 +14,8 @@ import json
 import math
 from collections import deque
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +60,35 @@ _FAILURE_EVENT_KINDS = frozenset(
 )
 _RECOVERY_EVENT_KINDS = frozenset({"merge_committed", "resolver_succeeded"})
 _STATUS_HISTORICAL_MARKER = "_status_historical"
+_LONG_PROVIDER_CALL_S = 2.0
+
+
+class ParallelismSignal(StrEnum):
+    """Conservative post-hoc evidence about unused provider parallelism."""
+
+    UNKNOWN = "unknown"
+    NONE = "none"
+    LIKELY = "likely"
+
+
+@dataclass(frozen=True, slots=True)
+class PhaseTimings:
+    """Durations derived from durable event boundaries.
+
+    Provider values are cumulative call latency. Child phase values are
+    cumulative work and may overlap in wall time. ``join_resume_s`` is the
+    strict post-child delay from the latest terminal child publication in a
+    join batch to the parent's ``context_resume`` event.
+    """
+
+    provider_time_s: float = 0.0
+    provider_time_samples: int = 0
+    summary_time_s: float = 0.0
+    summary_time_samples: int = 0
+    child_admission_to_ready_s: float | None = None
+    child_runtime_s: float | None = None
+    child_integration_s: float | None = None
+    join_resume_s: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +122,11 @@ class AgentSnapshot:
     assigned_model: str | None = None
     serving_provider: str | None = None
     serving_model: str | None = None
+    provider_time_s: float = 0.0
+    provider_time_samples: int = 0
+    admission_to_ready_s: float | None = None
+    runtime_s: float | None = None
+    integration_s: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,6 +180,8 @@ class SessionSnapshot:
     last_seq: int
     quota_windows: tuple[QuotaWindowSnapshot, ...] = ()
     selected_task_id: str | None = None
+    phase_timings: PhaseTimings = field(default_factory=PhaseTimings)
+    missed_parallelism: ParallelismSignal = ParallelismSignal.UNKNOWN
 
 
 @dataclass(slots=True)
@@ -186,6 +223,11 @@ class _Agent:
     merge_failure_generation: int | None = None
     nonrecoverable_failure: bool = False
     restart_pending: bool = False
+    provider_time_s: float = 0.0
+    provider_time_samples: int = 0
+    admission_to_ready_s: float | None = None
+    runtime_s: float | None = None
+    integration_s: float | None = None
 
 
 def _payload(event: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -268,18 +310,35 @@ def _event_fingerprint(event: Mapping[str, Any]) -> bytes:
     return hashlib.sha256(encoded).digest()
 
 
-def _event_time(event: Mapping[str, Any]) -> float | None:
+def _event_clock_time(event: Mapping[str, Any]) -> tuple[str, float] | None:
+    """Return a finite event timestamp together with its clock domain."""
     value = event.get("monotonic_ms")
     number = _finite_non_negative(value)
     if number is not None:
-        return number / 1000.0
+        return "monotonic", number / 1000.0
     value = event.get("ts")
     if isinstance(value, str):
         try:
             value = float(value)
         except ValueError:
             return None
-    return _finite_non_negative(value)
+    number = _finite_non_negative(value)
+    return ("wall", number) if number is not None else None
+
+
+def _event_time(event: Mapping[str, Any]) -> float | None:
+    timestamp = _event_clock_time(event)
+    return timestamp[1] if timestamp is not None else None
+
+
+def _interval_seconds(
+    start: tuple[str, float] | None,
+    end: tuple[str, float] | None,
+) -> float | None:
+    """Subtract only timestamps from the same non-regressing clock domain."""
+    if start is None or end is None or start[0] != end[0] or end[1] < start[1]:
+        return None
+    return end[1] - start[1]
 
 
 def _string(value: Any) -> str | None:
@@ -540,6 +599,28 @@ class ObservabilityState:
         self._last_time: float | None = None
         self._session_status = "idle"
         self._quota_windows: dict[tuple[str, str], QuotaWindowSnapshot] = {}
+        self._provider_time_s = 0.0
+        self._provider_time_samples = 0
+        self._summary_time_s = 0.0
+        self._summary_time_samples = 0
+        self._child_ids: set[str] = set()
+        self._child_parents: dict[str, str] = {}
+        self._child_admitted_at: dict[str, tuple[str, float]] = {}
+        self._child_ready_at: dict[str, tuple[str, float]] = {}
+        self._child_run_at: dict[str, tuple[str, float]] = {}
+        self._integration_started_at: dict[str, tuple[str, float]] = {}
+        self._pending_join_terminal: dict[str, list[tuple[str, float]]] = {}
+        self._child_admission_to_ready_s = 0.0
+        self._child_admission_to_ready_count = 0
+        self._child_runtime_s = 0.0
+        self._child_runtime_count = 0
+        self._child_integration_s = 0.0
+        self._child_integration_count = 0
+        self._join_resume_s = 0.0
+        self._join_resume_count = 0
+        self._alternative_lane_available: dict[str, bool] = {}
+        self._long_root_calls: dict[str, int] = {}
+        self._root_children: dict[str, set[str]] = {}
 
     @property
     def last_seq(self) -> int:
@@ -552,6 +633,171 @@ class ObservabilityState:
             self._agents[task_id] = agent
             self._order.append(task_id)
         return agent
+
+    @staticmethod
+    def _child_identity(task_id: str | None, payload: Mapping[str, Any]) -> str | None:
+        return _string(payload.get("child_task_id")) or task_id
+
+    def _record_phase_event(
+        self,
+        *,
+        kind: str,
+        task_id: str | None,
+        payload: Mapping[str, Any],
+        event: Mapping[str, Any],
+        historical_usage: bool,
+    ) -> None:
+        """Fold event-derived timing without creating another persisted truth store."""
+        timestamp = _event_clock_time(event)
+
+        if kind == "task_assigned" and task_id is not None:
+            parent_id = _string(payload.get("parent_task_id"))
+            if parent_id is not None and parent_id != task_id:
+                self._child_ids.add(task_id)
+                self._child_parents[task_id] = parent_id
+            else:
+                # Interactive turns reuse the root task id. Reset only the
+                # current-turn opportunity evidence; cumulative timing stays.
+                self._root_children[task_id] = set()
+                self._long_root_calls[task_id] = 0
+                self._alternative_lane_available.pop(task_id, None)
+            lane = payload.get("alternative_lane_available")
+            if type(lane) is bool and parent_id is None:
+                self._alternative_lane_available[task_id] = lane
+
+        if kind == "usage_event":
+            latency = _finite_non_negative(payload.get("latency_s"))
+            if latency is not None:
+                self._provider_time_s += latency
+                self._provider_time_samples += 1
+                if payload.get("call_kind") == "summary":
+                    self._summary_time_s += latency
+                    self._summary_time_samples += 1
+                if task_id is not None:
+                    agent = self._ensure_agent(task_id)
+                    agent.provider_time_s += latency
+                    agent.provider_time_samples += 1
+                if (
+                    not historical_usage
+                    and task_id is not None
+                    and payload.get("call_kind") != "summary"
+                    and _string(payload.get("failure_reason")) is None
+                    and latency >= _LONG_PROVIDER_CALL_S
+                ):
+                    self._long_root_calls[task_id] = self._long_root_calls.get(task_id, 0) + 1
+
+        if kind == "child_admitted":
+            child_id = _string(payload.get("child_task_id"))
+            if child_id is None:
+                return
+            parent_id = _string(payload.get("parent_task_id")) or task_id
+            self._child_ids.add(child_id)
+            if parent_id is not None and parent_id != child_id:
+                self._child_parents[child_id] = parent_id
+                self._root_children.setdefault(parent_id, set()).add(child_id)
+            if timestamp is not None:
+                self._child_admitted_at[child_id] = timestamp
+            return
+
+        if timestamp is None or task_id is None:
+            return
+
+        if kind == "ready" and task_id in self._child_ids:
+            elapsed = _interval_seconds(self._child_admitted_at.pop(task_id, None), timestamp)
+            if elapsed is not None:
+                self._child_admission_to_ready_s += elapsed
+                self._child_admission_to_ready_count += 1
+                agent = self._ensure_agent(task_id)
+                agent.admission_to_ready_s = (agent.admission_to_ready_s or 0.0) + elapsed
+            self._child_ready_at[task_id] = timestamp
+            return
+
+        if kind == "run_task" and task_id in self._child_ids:
+            self._child_run_at[task_id] = timestamp
+            return
+
+        child_id = self._child_identity(task_id, payload)
+        terminal_child = kind in _CHILD_TERMINAL_EVENT_KINDS or (
+            kind in {"result", "result_envelope"}
+            and _terminal_state(payload.get("status"))
+            in {"succeeded", "failed", "cancelled", "rejected"}
+        )
+        if terminal_child and child_id is not None and child_id in self._child_ids:
+            start = self._child_run_at.pop(child_id, None)
+            if start is None:
+                start = self._child_ready_at.pop(child_id, None)
+            else:
+                self._child_ready_at.pop(child_id, None)
+            elapsed = _interval_seconds(start, timestamp)
+            if elapsed is not None:
+                self._child_runtime_s += elapsed
+                self._child_runtime_count += 1
+                agent = self._ensure_agent(child_id)
+                agent.runtime_s = (agent.runtime_s or 0.0) + elapsed
+            parent_id = _string(payload.get("parent_task_id")) or self._child_parents.get(child_id)
+            if parent_id is not None:
+                self._pending_join_terminal.setdefault(parent_id, []).append(timestamp)
+            return
+
+        if kind in {"child_integration_prepared", "merge_started"}:
+            if child_id is not None and child_id in self._child_ids:
+                self._integration_started_at[child_id] = timestamp
+            return
+
+        if kind in {"child_integrated", "merge_committed"}:
+            if child_id is not None and child_id in self._child_ids:
+                elapsed = _interval_seconds(
+                    self._integration_started_at.pop(child_id, None), timestamp
+                )
+                if elapsed is not None:
+                    self._child_integration_s += elapsed
+                    self._child_integration_count += 1
+                    agent = self._ensure_agent(child_id)
+                    agent.integration_s = (agent.integration_s or 0.0) + elapsed
+            return
+
+        if kind == "context_resume":
+            terminals = self._pending_join_terminal.pop(task_id, ())
+            compatible = [
+                mark[1]
+                for mark in terminals
+                if mark[0] == timestamp[0] and mark[1] <= timestamp[1]
+            ]
+            if compatible:
+                elapsed = timestamp[1] - max(compatible)
+                self._join_resume_s += elapsed
+                self._join_resume_count += 1
+
+    def _phase_snapshot(self) -> PhaseTimings:
+        return PhaseTimings(
+            provider_time_s=round(self._provider_time_s, 6),
+            provider_time_samples=self._provider_time_samples,
+            summary_time_s=round(self._summary_time_s, 6),
+            summary_time_samples=self._summary_time_samples,
+            child_admission_to_ready_s=(
+                round(self._child_admission_to_ready_s, 6)
+                if self._child_admission_to_ready_count
+                else None
+            ),
+            child_runtime_s=(
+                round(self._child_runtime_s, 6) if self._child_runtime_count else None
+            ),
+            child_integration_s=(
+                round(self._child_integration_s, 6) if self._child_integration_count else None
+            ),
+            join_resume_s=(round(self._join_resume_s, 6) if self._join_resume_count else None),
+        )
+
+    def _parallelism_signal(self, root_task_id: str | None) -> ParallelismSignal:
+        if root_task_id is None or root_task_id not in self._alternative_lane_available:
+            return ParallelismSignal.UNKNOWN
+        if not self._alternative_lane_available[root_task_id]:
+            return ParallelismSignal.NONE
+        if self._root_children.get(root_task_id):
+            return ParallelismSignal.NONE
+        if self._long_root_calls.get(root_task_id, 0) >= 2:
+            return ParallelismSignal.LIKELY
+        return ParallelismSignal.UNKNOWN
 
     def apply(self, event: Mapping[str, Any]) -> None:
         if not isinstance(event, Mapping):
@@ -835,6 +1081,14 @@ class ObservabilityState:
                             agent.active_context_messages, message_count
                         )
 
+        self._record_phase_event(
+            kind=kind,
+            task_id=task_id,
+            payload=payload,
+            event=event,
+            historical_usage=historical_usage,
+        )
+
         if kind in {"session_started", "session_resumed"}:
             self._session_status = "running"
         elif kind == "session_ended":
@@ -925,6 +1179,17 @@ class ObservabilityState:
                     assigned_model=agent.assigned_model,
                     serving_provider=agent.serving_provider,
                     serving_model=agent.serving_model,
+                    provider_time_s=round(agent.provider_time_s, 6),
+                    provider_time_samples=agent.provider_time_samples,
+                    admission_to_ready_s=(
+                        round(agent.admission_to_ready_s, 6)
+                        if agent.admission_to_ready_s is not None
+                        else None
+                    ),
+                    runtime_s=(round(agent.runtime_s, 6) if agent.runtime_s is not None else None),
+                    integration_s=(
+                        round(agent.integration_s, 6) if agent.integration_s is not None else None
+                    ),
                 )
             )
 
@@ -1003,6 +1268,7 @@ class ObservabilityState:
             if self._first_time is not None and self._last_time is not None
             else None
         )
+        phase_timings = self._phase_snapshot()
         return SessionSnapshot(
             session_status=self._session_status,
             agents=tuple(snapshots),
@@ -1023,6 +1289,8 @@ class ObservabilityState:
             recent_events=tuple(self._recent),
             last_seq=self._last_seq,
             quota_windows=tuple(self._quota_windows[key] for key in sorted(self._quota_windows)),
+            phase_timings=phase_timings,
+            missed_parallelism=self._parallelism_signal(root_task_id),
         )
 
 
@@ -1041,6 +1309,8 @@ __all__ = [
     "AgentSnapshot",
     "ContextSnapshot",
     "ObservabilityState",
+    "ParallelismSignal",
+    "PhaseTimings",
     "RecentEvent",
     "SessionSnapshot",
     "snapshot_from_events",
