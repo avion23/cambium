@@ -1303,7 +1303,7 @@ async def run_tool(name: str, args: dict[str, Any], ctx: ToolContext) -> ToolRes
             duration_ms=_duration_ms(started_ns),
         )
 
-    validation_errors = validate_tool_call(schema, args)
+    validation_errors = validate_tool_call(schema, {"name": name, "arguments": args})
     if validation_errors:
         return ToolResult(
             ok=False,

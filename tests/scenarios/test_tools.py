@@ -34,6 +34,21 @@ def _run(name: str, args: dict, ctx: ToolContext):
     return asyncio.run(run_tool(name, args, ctx))
 
 
+def test_tool_boundary_validates_executed_arguments_not_nested_envelope(tmp_path: Path) -> None:
+    result = _run(
+        "write_file",
+        {
+            "path": "unexpected.txt",
+            "content": "must not be written",
+            "arguments": {"path": "validated.txt", "content": "validated"},
+        },
+        ToolContext(tmp_path),
+    )
+    assert not result.ok
+    assert "unknown argument 'arguments'" in result.error
+    assert not (tmp_path / "unexpected.txt").exists()
+
+
 @pytest.mark.parametrize(
     ("command", "eligible"),
     [
