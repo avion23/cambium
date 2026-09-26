@@ -1851,6 +1851,15 @@ async def _run_interactive(
                         )
                         _draw_final(snapshot)
                         continue
+                    finally:
+                        # asyncio.wait does not cancel its children when the frontend
+                        # exits. Finish supervisor cleanup before releasing the session.
+                        if not turn_task.done():
+                            turn_task.cancel()
+                            try:
+                                await turn_task
+                            except asyncio.CancelledError:
+                                pass
 
                     session.observe_result(dispatch, response)
                     succeeded = response.exit_code == 0

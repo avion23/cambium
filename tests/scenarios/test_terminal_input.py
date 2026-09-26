@@ -116,6 +116,28 @@ def _run(coro: Any) -> Any:
     return asyncio.run(coro)
 
 
+def test_editor_disconnect_during_close_still_saves_history(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        read_fd, write_fd = os.pipe()
+        os.close(read_fd)
+        # Unbuffered writes expose the real EPIPE without another flush on close.
+        with os.fdopen(write_fd, "wb", buffering=0) as pipe:
+            class DisconnectedOutput:
+                def write(self, text: str) -> int:
+                    return pipe.write(text.encode())
+
+                def flush(self) -> None:
+                    pipe.flush()
+
+            with _editor(tmp_path) as (editor, master, timeline, _):
+                _feed(editor, master, b"hello\r")
+                assert _queued(editor) == ["hello"]
+                timeline.stream = DisconnectedOutput()
+        assert (tmp_path / "history").read_text() == "hello\n"
+
+    _run(scenario())
+
+
 def test_terminal_capability_matrix_handles_pipes_term_no_color_and_color_depth(
     monkeypatch,
 ) -> None:

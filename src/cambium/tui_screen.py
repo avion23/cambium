@@ -3134,6 +3134,14 @@ class LinearTimeline:
         raise SystemExit(128 + signum)
 
     def close(self) -> None:
+        # Restore process state before terminal writes, which can fail on disconnect.
+        self._entered = False
+        if self._previous_sigterm_handler is not None:
+            try:
+                signal.signal(signal.SIGTERM, self._previous_sigterm_handler)
+            except (OSError, ValueError):
+                pass
+            self._previous_sigterm_handler = None
         if self.enabled and self._timeline_initialized:
             if self._input_active:
                 self.hide_cursor(commit=True)
@@ -3150,14 +3158,6 @@ class LinearTimeline:
                 self.stream.write("\r\n" if self._cursor_controls else "\n")
                 self.stream.flush()
             self._timeline_initialized = False
-        if self._entered:
-            self._entered = False
-        if self._previous_sigterm_handler is not None:
-            try:
-                signal.signal(signal.SIGTERM, self._previous_sigterm_handler)
-            except (OSError, ValueError):
-                pass
-            self._previous_sigterm_handler = None
 
     def _stream_delta_rows(
         self,
