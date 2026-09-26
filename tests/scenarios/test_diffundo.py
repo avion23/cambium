@@ -24,6 +24,7 @@ import http.client
 import io
 import json
 import socket
+import sqlite3
 import threading
 import time
 import urllib.error
@@ -2336,6 +2337,29 @@ def test_cancelled_post_consumes_late_failure(monkeypatch: pytest.MonkeyPatch) -
         await asyncio.wait_for(consumed.wait(), timeout=1.0)
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("total", [float("nan"), float("inf")])
+def test_nonfinite_usage_total_does_not_leak_quota_reservation(tmp_path, monkeypatch, total):
+    quota_db = tmp_path / "quota.db"
+    monkeypatch.setenv("CAMBIUM_QUOTA_DB", str(quota_db))
+    payload = _ok_payload("done")
+    payload["usage"] = {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": total}
+    server = FakeServer([(200, payload, 0.0)])
+    provider = replace(
+        _config("p", server, "K_QUOTA"),
+        quota_windows=(QuotaWindowSpec("tokens", 3600, token_allowance=100_000),),
+    )
+    try:
+        result = asyncio.run(Diffundo((provider,)).call(ProviderTier.FAST, PROMPT))
+        assert result.content == "done"
+        assert result.quota_windows[0]["used_tokens"] > 0
+        with sqlite3.connect(quota_db) as connection:
+            assert connection.execute(
+                "SELECT reconciled FROM quota_reservations"
+            ).fetchall() == [(1,)]
+    finally:
+        server.close()
 
 
 def test_late_quota_reconciliation_withholds_provider_success(

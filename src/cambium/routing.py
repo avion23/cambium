@@ -691,7 +691,7 @@ def quota_status(
         ):
             if allowance <= 0:
                 continue
-            usable = allowance * (1.0 - window.reserve_fraction)
+            usable = math.floor(allowance * (1.0 - window.reserve_fraction))
             fraction = used / usable if usable > 0 else 1.0
             fractions.append(fraction)
             if fraction >= 1.0:
