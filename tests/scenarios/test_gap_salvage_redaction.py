@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from cambium.supervisor import read_events, run_plan
+from cambium.supervisor import WorktreeRecoveryError, _Runtime, read_events, run_plan
 
 TEST_RESOURCE_THRESHOLDS = {
     "mem_available_frac": 0.0,
@@ -121,6 +121,34 @@ def _task(session: Path, repo: Path, base: str, worker: Path, task_id: str) -> d
         "max_wall_s": 20.0,
         "max_restarts": 1,
     }
+
+
+def test_failed_salvage_diff_does_not_reset_dirty_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session = tmp_path / "session"
+    repo = session / "repo"
+    base = _make_repo(repo)
+    task = _task(session, repo, base, tmp_path / "unused", "salvage-failure")
+    runtime = _Runtime(session, None)
+    real_run = subprocess.run
+
+    def fail_diff(args, **kwargs):
+        if "diff" in args:
+            return subprocess.CompletedProcess(args, 128, b"", b"diff failed")
+        return real_run(args, **kwargs)
+
+    async def scenario() -> None:
+        await runtime._ensure_worktree(task)
+        state = Path(task["worktree_path"]) / "state.txt"
+        state.write_text("unpublished work\n", encoding="utf-8")
+        monkeypatch.setattr("cambium.supervisor.subprocess.run", fail_diff)
+        with pytest.raises(WorktreeRecoveryError):
+            await runtime._recover_worktree(task)
+        assert state.read_text(encoding="utf-8") == "unpublished work\n"
+        assert not (session / "salvage").exists()
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize(

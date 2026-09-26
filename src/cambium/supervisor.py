@@ -4056,7 +4056,11 @@ class _Runtime:
             env=_strip_sensitive_env(scrub_environment(), worktree=worktree),
             start_new_session=True,
         )
-        return result.stdout if result.returncode == 0 else b""
+        if result.returncode != 0:
+            raise WorktreeRecoveryError(
+                f"git diff failed during salvage (rc={result.returncode})"
+            )
+        return result.stdout
 
     async def _snapshot_primary_worktree(self, repo: Path) -> dict[str, Any] | None:
         """Capture caller-owned primary-main state before ref publication."""

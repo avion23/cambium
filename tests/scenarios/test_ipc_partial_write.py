@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import sys
 
 import pytest
 
@@ -107,3 +109,37 @@ def test_non_utf8_line_is_skipped_and_next_frame_is_read() -> None:
         assert await read_message(reader) is None
 
     asyncio.run(scenario())
+
+
+def test_frame_limit_includes_newline_and_preserves_next_message() -> None:
+    async def scenario() -> None:
+        frame = b'{"value":"boundary"}\n'
+        reader = _reader(frame + b'{}\n')
+        with pytest.raises(MessageTooLong):
+            await read_message(reader, limit=len(frame) - 1)
+        assert await read_message(reader, limit=len(frame) - 1) == {}
+        assert await read_message(_reader(frame), limit=len(frame)) == {"value": "boundary"}
+
+    asyncio.run(scenario())
+
+
+def test_integer_conversion_limit_skips_bad_frame() -> None:
+    digits = sys.get_int_max_str_digits()
+    if not digits:
+        pytest.skip("integer conversion limit disabled")
+
+    async def scenario() -> None:
+        reader = _reader(b'{"value":' + b'1' * (digits + 1) + b'}\n{}\n')
+        assert await read_message(reader) == {}
+
+    asyncio.run(scenario())
+
+
+def test_rejected_frame_payload_is_not_logged(caplog: pytest.LogCaptureFixture) -> None:
+    async def scenario() -> None:
+        reader = _reader(b'["private-prompt-content"]\n{}\n')
+        assert await read_message(reader) == {}
+
+    with caplog.at_level(logging.DEBUG, logger="cambium.ipc"):
+        asyncio.run(scenario())
+    assert "private-prompt-content" not in caplog.text

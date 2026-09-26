@@ -116,7 +116,10 @@ async def _read_line(reader: asyncio.StreamReader, limit: int) -> bytes | None:
     reader_with_limit._limit = limit
     try:
         try:
-            return await reader.readuntil(b"\n")
+            line = await reader.readuntil(b"\n")
+            if len(line) > limit:
+                raise MessageTooLong(len(line))
+            return line
         except asyncio.IncompleteReadError as exc:
             return exc.partial or None
         except asyncio.LimitOverrunError as exc:
@@ -150,10 +153,10 @@ async def read_message(
             continue
         try:
             msg = json.loads(content.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
-            logger.debug("skipping unparseable line: %s", exc)
+        except (ValueError, RecursionError):
+            logger.debug("skipping unparseable line")
             continue
         if not isinstance(msg, dict):
-            logger.debug("skipping non-object JSON line: %r", msg)
+            logger.debug("skipping non-object JSON line")
             continue
         return msg
