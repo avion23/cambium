@@ -150,8 +150,11 @@ class TerminalInput:
         self.loop.remove_reader(self.fd)
         termios.tcsetattr(self.fd, termios.TCSANOW, self.saved)
         if self._bracketed_paste:
-            self.timeline.stream.write("\x1b[?2004l")
-            self.timeline.stream.flush()
+            try:
+                self.timeline.stream.write("\x1b[?2004l")
+                self.timeline.stream.flush()
+            except (OSError, ValueError):
+                pass  # Output may already be disconnected during frontend teardown.
         try:
             self.history_path.parent.mkdir(parents=True, exist_ok=True)
             self.history_path.write_text("\n".join(self.history[-1000:]) + "\n")
