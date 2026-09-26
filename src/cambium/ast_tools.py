@@ -278,8 +278,18 @@ def _ast_definition(index: _SourceIndex, node: _stdlib_ast.AST) -> _Definition:
     body = node.body  # type: ignore[attr-defined]
     if body:
         body_start_byte = _ast_start_byte(index, body[0])
+        body_line = body[0].lineno
+        decorators = getattr(body[0], "decorator_list", ())
+        if decorators:
+            body_line = decorators[0].lineno
+            # Parenthesized decorators can start before their expression node.
+            while not _line_text(index, body_line).lstrip().startswith("@"):
+                body_line -= 1
+            body_start_byte = index.byte_offset(
+                body_line, _line_text(index, body_line).index("@")
+            )
         signature = index.decode(start_byte, body_start_byte).strip()
-        body_lines = max(0, node.end_lineno - body[0].lineno + 1)  # type: ignore[attr-defined]
+        body_lines = max(0, node.end_lineno - body_line + 1)  # type: ignore[attr-defined]
     else:
         signature = _line_text(index, node.lineno).strip()  # type: ignore[attr-defined]
         body_lines = 0
@@ -320,11 +330,12 @@ def _attribute_position(index: _SourceIndex, node: _stdlib_ast.Attribute) -> tup
     end_line = cast(int, node.end_lineno)
     end_column = cast(int, node.end_col_offset)
     end_byte = index.byte_offset(end_line, end_column)
-    name_bytes = node.attr.encode("utf-8")
-    start_byte = end_byte - len(name_bytes)
-    if start_byte >= 0 and index.encoded[start_byte:end_byte] == name_bytes:
-        return index.position(start_byte)
-    return index.position(_ast_start_byte(index, node))
+    line, column = index.position(end_byte)
+    source_line = _line_text(index, line)
+    # AST names are NFKC-normalized; their encoded length need not match source.
+    while column and ("_" + source_line[column - 1]).isidentifier():
+        column -= 1
+    return line, column
 
 
 def _find_references_stdlib(source: str, name: str) -> list[dict[str, Any]]:

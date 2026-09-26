@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from cambium import ast_tools
 
 SOURCE = '''"""module docstring with § before the definitions."""
@@ -84,3 +86,22 @@ def test_non_ascii_before_definition_keeps_line_and_signature() -> None:
     assert definition["line"] == 3
     assert definition["col"] == 0
     assert definition["signature"] == "class Café:"
+
+
+@pytest.mark.parametrize("backend", ["stdlib", "tree"])
+def test_decorated_first_statement_belongs_to_body(backend: str) -> None:
+    if backend == "tree" and ast_tools.backend() != "tree-sitter":
+        pytest.skip("optional tree-sitter backend is unavailable")
+    source = "def outer():\n    @decorate\n    def inner():\n        pass\n"
+    result = getattr(ast_tools, f"_extract_signature_{backend}")(source, "outer")
+    assert result["signature"] == "def outer():"
+    assert result["body_lines"] == 3
+
+
+@pytest.mark.parametrize("backend", ["stdlib", "tree"])
+def test_normalized_attribute_reference_keeps_source_column(backend: str) -> None:
+    if backend == "tree" and ast_tools.backend() != "tree-sitter":
+        pytest.skip("optional tree-sitter backend is unavailable")
+    assert getattr(ast_tools, f"_find_references_{backend}")("obj.K\n", "K") == [
+        {"name": "K", "line": 1, "col": 4}
+    ]
