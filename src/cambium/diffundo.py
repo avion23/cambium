@@ -4073,7 +4073,12 @@ class Diffundo:
         if reservation is not None and ledger is not None:
             usage = result.usage if isinstance(result.usage, dict) else {}
             total = usage.get("total_tokens")
-            if isinstance(total, bool) or not isinstance(total, int | float) or total < 0:
+            if (
+                isinstance(total, bool)
+                or not isinstance(total, int | float)
+                or not math.isfinite(total)
+                or total < 0
+            ):
                 total = estimated_tokens
             await self._reconcile_quota(
                 ledger,

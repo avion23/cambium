@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from cambium.diffundo import ProviderConfig, ProviderTier
-from cambium.provider_scheduler import QuotaWindowSnapshot
+from cambium.provider_scheduler import QuotaLedger, QuotaWindowSnapshot, QuotaWindowSpec
 from cambium.routing import DebtStore, LaneState, resolve_assignment
 from cambium.supervisor import _release_lane, _Runtime
 
@@ -25,6 +25,22 @@ def _provider(name):
         max_in_flight=1,
         requests_per_minute=120,
     )
+
+
+@pytest.mark.parametrize("requirements", [None, {"needs_python_tool": True}])
+def test_fractional_request_reserve_blocks_admission_at_integer_cap(tmp_path, requirements):
+    ledger = QuotaLedger(tmp_path / "quota.db")
+    window = QuotaWindowSpec("requests", 3600, request_allowance=3, reserve_fraction=0.5)
+    assert ledger.reserve("a", (window,), 0) is not None
+    assert ledger.reserve("a", (window,), 0) is None
+    assert resolve_assignment(
+        [_provider("a")],
+        ["a"],
+        {},
+        {},
+        quota_windows=ledger.snapshots(),
+        requirements=requirements,
+    ) is None
 
 
 @pytest.mark.parametrize("requirements", [None, {"needs_python_tool": True}])
